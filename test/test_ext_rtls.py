@@ -1,10 +1,11 @@
 """Tests for the client message API of the rtls extension.
 
-The handlers are exercised against the sans-IO protocol core with a
-fake transport: the extension's ``_send`` is replaced by a function
-that hands every outbound datagram to a scripted fake device, whose
-MAVLink replies are pushed back through ``_process_datagram``. No
-sockets are involved.
+The protocol core itself (and its value codec) is covered by the test
+suite of the standalone ``rtls-link`` SDK; here the message handlers
+are exercised against that sans-IO core with a fake transport: the
+extension's ``_send`` is replaced by a function that hands every
+outbound datagram to a scripted fake device, whose MAVLink replies are
+pushed back through ``_process_datagram``. No sockets are involved.
 """
 
 import struct
@@ -14,10 +15,8 @@ import time
 import pytest
 import trio
 import trio.testing
-from flockwave.protocols.mavlink.introspection import import_dialect
-
-from flockwave.server.ext.rtls.extension import RtlsExtension
-from flockwave.server.ext.rtls.protocol import (
+from rtlslink.dialect import load_dialect
+from rtlslink.protocol import (
     PARAM_ACK_FAILED,
     PARAM_TYPE_CUSTOM,
     PARAM_TYPE_INT32,
@@ -25,10 +24,10 @@ from flockwave.server.ext.rtls.protocol import (
     PARAM_TYPE_UINT8,
     RTLS_COMPONENT_ID,
     RtlsProtocol,
-    decode_param_value,
-    encode_param_value,
     raw_field_bytes,
 )
+
+from flockwave.server.ext.rtls.extension import RtlsExtension
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -141,7 +140,7 @@ class StubApp:
 
 @pytest.fixture(scope="module")
 def dialect():
-    return import_dialect("ardupilotmega")
+    return load_dialect()
 
 
 @pytest.fixture
@@ -188,26 +187,6 @@ def autojump_clock():
 
 def make_message(builder, body):
     return builder.create_message(body)
-
-
-# ---- protocol value codec ----------------------------------------------
-
-
-def test_param_value_codec_roundtrip():
-    for value, param_type in [
-        (200, PARAM_TYPE_UINT8),
-        (-7, PARAM_TYPE_INT32),
-        (1.5, PARAM_TYPE_REAL32),
-        ("hello", PARAM_TYPE_CUSTOM),
-    ]:
-        encoded = encode_param_value(value, param_type)
-        assert decode_param_value(encoded, param_type) == value
-
-
-def test_param_value_decode_pads_stripped_trailing_zeros():
-    # the transport may strip trailing NUL bytes from the wire encoding
-    assert decode_param_value(b"\x05", PARAM_TYPE_INT32) == 5
-    assert decode_param_value(b"", PARAM_TYPE_UINT8) == 0
 
 
 # ---- X-RTLS-INF ---------------------------------------------------------

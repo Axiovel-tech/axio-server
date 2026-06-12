@@ -12,28 +12,42 @@ clients through the server's message hub:
   discovery.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
-- **OTA** (`ota.py`): MCUmgr/SMP upload → mark pending → reset, via
-  `smpclient` (asyncio; run in a worker thread from Trio). On the
-  ESP32-S3 MCUboot is overwrite-only — no bootloader revert — so the
-  recovery path is health-check + re-upload of the previous artifact.
+- **OTA**: MCUmgr/SMP upload → mark pending → reset, via
+  `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
+  Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
+  revert — so the recovery path is health-check + re-upload of the
+  previous artifact. `smpclient` is an optional dependency of the SDK
+  (`rtls-link[ota]`); without it, starting an OTA job fails at runtime.
+
+## The rtls-link SDK
+
+The protocol and OTA code lives in the standalone **`rtls-link`**
+Python package (module `rtlslink`), maintained in the firmware repo
+([Axiovel-tech/rtls-link-zephyr](https://github.com/Axiovel-tech/rtls-link-zephyr),
+directory `py/`) and pulled in as a git dependency in `pyproject.toml`.
+This extension is only the message-hub glue over the SDK:
+
+- `rtlslink.protocol.RtlsProtocol` — the sans-IO protocol core (also
+  hosts the PARAM_EXT value codec and the raw-payload extraction that
+  works around pymavlink's lossy `char[]` decoding). The extension
+  drives it from its own Trio UDP socket.
+- `rtlslink.ota.upgrade` — the blocking SMP upgrade helper, run in a
+  worker thread.
+
+The SDK also ships the `rtls-link` CLI for debugging devices directly,
+without a running server: `discover`, `param list/get/set`, `monitor`,
+`ota`, and `selfcheck` (end-to-end protocol check against a live
+firmware; `selfcheck.py` in this directory is just a deprecated shim
+for it). Pass `--debug` for raw frame tracing; inside the server the
+same traces are available by raising the `rtlslink` logger to DEBUG.
 
 ## Layout
 
-- `protocol.py` — sans-IO protocol core: no sockets, no clock, no
-  framework. Also hosts the PARAM_EXT value codec
-  (`encode_param_value` / `decode_param_value`) and the raw payload
-  extraction that works around pymavlink's lossy `char[]` decoding.
-  Verified against live firmware by `selfcheck.py` (plain
-  asyncio/pymavlink, runs without a flockwave install):
-
-  ```sh
-  python3 selfcheck.py --host <device-ip> --port 3333
-  ```
-
-- `extension.py` — the Trio/flockwave wrapper: discovery loop, the
-  awaitable parameter transactions, OTA jobs and the client message
-  handlers documented below.
-- `ota.py` — SMP upgrade helper.
+- `extension.py` — the Trio/flockwave glue over the SDK: discovery
+  loop, the awaitable parameter transactions, OTA jobs and the client
+  message handlers documented below.
+- `selfcheck.py` — deprecated shim forwarding to
+  `rtls-link selfcheck`.
 
 ## Configuration
 
@@ -255,9 +269,13 @@ this extension: `devices()`, `protocol()`, and the awaitable
 ## Testing
 
 `test/test_ext_rtls.py` exercises the message handlers against the
-sans-IO protocol core with a fake transport and a scripted fake device
-(no sockets):
+SDK's sans-IO protocol core with a fake transport and a scripted fake
+device (no sockets):
 
 ```sh
 uv run pytest test/test_ext_rtls.py
 ```
+
+Protocol-level tests (codec roundtrips, heartbeat/param state machine,
+client, CLI) live in the SDK's own test suite in the firmware repo
+(`py/tests/`), not here.

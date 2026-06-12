@@ -1,9 +1,13 @@
-"""Trio/flockwave wrapper around the sans-IO rtls protocol core.
+"""Trio/flockwave glue between the server's message hub and the
+``rtlslink`` SDK (the standalone Python package shipped with the
+rtls-link firmware repo).
 
-Besides running the discovery/keepalive loop, the extension exposes the
-managed devices to Skybrush clients through experimental (``X-``
-prefixed) message types on the server's message hub; see ``README.md``
-in this directory for the message API.
+The sans-IO protocol core (:class:`rtlslink.RtlsProtocol`) and the
+MCUmgr/SMP OTA helper (:func:`rtlslink.ota.upgrade`) live in the SDK;
+this extension only runs the discovery/keepalive loop on the server's
+Trio socket and exposes the managed devices to Skybrush clients through
+experimental (``X-`` prefixed) message types on the message hub; see
+``README.md`` in this directory for the message API.
 """
 
 from __future__ import annotations
@@ -15,29 +19,25 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 import trio
 import trio.socket
-
-from flockwave.server.ext.base import Extension
-
-from .protocol import (
-    PARAM_ACK_ACCEPTED,
-    PARAM_ACK_IN_PROGRESS,
+from rtlslink import (
     ProtocolEvent,
     RtlsProtocol,
     decode_param_value,
     encode_param_value,
+    firmware_version,
     param_type_from_name,
     param_type_to_name,
 )
+from rtlslink.dialect import load_dialect
+from rtlslink.protocol import PARAM_ACK_ACCEPTED, PARAM_ACK_IN_PROGRESS
+
+from flockwave.server.ext.base import Extension
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
     from flockwave.server.model import Client, FlockwaveMessage
 
 __all__ = ("construct", "description", "schema")
-
-#: device parameter that holds the firmware version string, if the
-#: firmware exposes one
-FIRMWARE_VERSION_PARAM = "FW_VERSION"
 
 #: default timeout for a single-parameter read/write transaction, in seconds
 DEFAULT_PARAM_TIMEOUT = 5.0
@@ -72,9 +72,7 @@ class RtlsExtension(Extension):
             (host, port) for host in configuration.get("broadcast", ["255.255.255.255"])
         ]
 
-        from flockwave.protocols.mavlink.introspection import import_dialect
-
-        dialect = import_dialect("ardupilotmega")
+        dialect = load_dialect()
         self._protocol = protocol = RtlsProtocol(
             dialect,
             targets=targets,
@@ -336,7 +334,7 @@ class RtlsExtension(Extension):
     ) -> None:
         upgrade = self._ota_upgrade
         if upgrade is None:
-            from .ota import upgrade
+            from rtlslink.ota import upgrade
 
         def on_progress(offset: int, total: int) -> None:
             # called from the worker thread; plain dict writes only
@@ -555,15 +553,12 @@ class RtlsExtension(Extension):
         return self._protocol
 
     def _device_json(self, device, now: float) -> dict[str, Any]:
-        version = device.params.get(FIRMWARE_VERSION_PARAM)
-        if version is not None:
-            version = version.split(b"\x00")[0].decode("utf-8", errors="replace")
         job = self._ota_jobs.get(device.system_id)
         return {
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "firmwareVersion": version,
+            "firmwareVersion": firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
