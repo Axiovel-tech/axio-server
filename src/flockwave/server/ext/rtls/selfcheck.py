@@ -14,7 +14,6 @@ import argparse
 import importlib.util
 import os
 import socket
-import struct
 import sys
 import time
 
@@ -40,8 +39,9 @@ def main():
     from pymavlink.dialects.v20 import ardupilotmega as dialect
 
     rtls = load_protocol_module()
-    protocol = rtls.RtlsProtocol(dialect, targets=[(args.host, args.port)],
-                                 heartbeat_interval=1.0)
+    protocol = rtls.RtlsProtocol(
+        dialect, targets=[(args.host, args.port)], heartbeat_interval=1.0
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
@@ -81,8 +81,9 @@ def main():
             print(f"param list complete: {len(params)} parameters")
             assert "MAV_SYS_ID" in params, sorted(params)
             current = params["MAV_SYS_ID"][0]
-            request = protocol.set_param(discovered, "MAV_SYS_ID",
-                                         bytes([current]), rtls.PARAM_TYPE_UINT8)
+            request = protocol.set_param(
+                discovered, "MAV_SYS_ID", bytes([current]), rtls.PARAM_TYPE_UINT8
+            )
             sock.sendto(*request)
             set_sent = True
 
@@ -91,8 +92,12 @@ def main():
             print("PASS")
             return 0
 
-    print("FAIL: timed out", f"discovered={discovered}",
-          f"params={len(params)}/{expected}", f"ack={ack}")
+    print(
+        "FAIL: timed out",
+        f"discovered={discovered}",
+        f"params={len(params)}/{expected}",
+        f"ack={ack}",
+    )
     return 1
 
 
