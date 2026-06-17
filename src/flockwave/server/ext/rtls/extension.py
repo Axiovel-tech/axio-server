@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional
 import trio
 import trio.socket
 from rtlslink import (
+    STATS_FIELDS,
     ProtocolEvent,
     RtlsProtocol,
     decode_param_value,
@@ -51,6 +52,9 @@ MAX_PARAM_TIMEOUT = 60.0
 #: how often OTA progress notifications are broadcast at most, in seconds
 OTA_PROGRESS_INTERVAL = 0.5
 
+#: how often per-device stats notifications are broadcast at most, in seconds
+STATS_INTERVAL = 1.0
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -62,6 +66,11 @@ class RtlsExtension(Extension):
         self._nursery: Optional[trio.Nursery] = None
         self._watchers: list[trio.MemorySendChannel] = []
         self._ota_jobs: dict[int, dict[str, Any]] = {}
+        #: latest health-telemetry snapshot per device (server body shape)
+        self._stats: dict[int, dict[str, Any]] = {}
+        #: monotonic timestamp of the last stats broadcast per device, for
+        #: the broadcast throttle
+        self._last_stats_broadcast: dict[int, float] = {}
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
 
@@ -101,6 +110,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-PARAM-GET": self._handle_RTLS_PARAM_GET,
                         "X-RTLS-PARAM-SET": self._handle_RTLS_PARAM_SET,
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
+                        "X-RTLS-STATS": self._handle_RTLS_STATS,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -154,6 +164,11 @@ class RtlsExtension(Extension):
                 request = self._protocol.request_param_list(event.system_id)
                 if request is not None:
                     await self._send(*request)
+            elif event.kind == "stats":
+                # health telemetry arrives unsolicited; cache the latest
+                # snapshot and broadcast it (throttled) so live GCS clients
+                # see device health without polling.
+                await self._on_stats(event.system_id, event.data, now)
             self._dispatch_event(event)
 
     def _dispatch_event(self, event: ProtocolEvent) -> None:
@@ -385,6 +400,38 @@ class RtlsExtension(Extension):
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
         await hub.broadcast_message(hub.create_notification(body))
 
+    async def _on_stats(
+        self, system_id: int, data: dict[str, Any], now: float
+    ) -> None:
+        """Cache the latest health-telemetry snapshot for a device and
+        broadcast it to clients, throttled to at most one per
+        ``STATS_INTERVAL`` per device.
+
+        The firmware emits one NAMED_VALUE_FLOAT per stat, so the SDK's
+        accumulated ``data`` is only complete once a full cycle has arrived.
+        We cache every update (so the X-RTLS-STATS query always has the
+        latest), but only broadcast once the full stat set is present --
+        otherwise the first notification after discovery would carry a
+        half-populated snapshot."""
+        self._stats[system_id] = _stats_json(system_id, data)
+        if not all(field in data for field in STATS_FIELDS):
+            return
+        last = self._last_stats_broadcast.get(system_id)
+        if last is not None and now - last < STATS_INTERVAL:
+            return
+        self._last_stats_broadcast[system_id] = now
+        await self._broadcast_stats(system_id)
+
+    async def _broadcast_stats(self, system_id: int) -> None:
+        if self.app is None:
+            return
+        stats = self._stats.get(system_id)
+        if stats is None:
+            return
+        hub = self.app.message_hub
+        body = {"type": "X-RTLS-STATS", "stats": {str(system_id): dict(stats)}}
+        await hub.broadcast_message(hub.create_notification(body))
+
     # ---- client message handlers ----
 
     async def _handle_RTLS_INF(
@@ -545,6 +592,29 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
+    async def _handle_RTLS_STATS(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        # Optional ``id`` narrows the snapshot to one device; without it the
+        # latest stats for every known device are returned.
+        device_id = message.body.get("id")
+        if device_id is not None:
+            try:
+                system_id = _get_device_id(message)
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+            stats = self._stats.get(system_id)
+            snapshot = {str(system_id): dict(stats)} if stats is not None else {}
+        else:
+            snapshot = {
+                str(sysid): dict(stats) for sysid, stats in self._stats.items()
+            }
+
+        return hub.create_response_or_notification(
+            body={"type": "X-RTLS-STATS", "stats": snapshot},
+            in_response_to=message,
+        )
+
     # ---- helpers / exports ----
 
     def _require_protocol(self) -> RtlsProtocol:
@@ -577,6 +647,22 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return {}
         return dict(self._protocol.devices)
+
+
+def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """Map the SDK's NAMED_VALUE_FLOAT stat names to the UI body shape.
+
+    ``anc``/``agems``/``ancmask`` are integer-semantic floats over the wire
+    (anchor count, milliseconds, bitmask); cast them to int for the UI."""
+    return {
+        "id": int(system_id),
+        "solveRateHz": float(data.get("rate", 0.0)),
+        "solvePct": float(data.get("solvepct", 0.0)),
+        "anchorsSeen": int(data.get("anc", 0)),
+        "fixAgeMs": int(data.get("agems", 0)),
+        "clockPpm": float(data.get("ppm", 0.0)),
+        "anchorMask": int(data.get("ancmask", 0)),
+    }
 
 
 def _get_device_id(message: "FlockwaveMessage") -> int:
