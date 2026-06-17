@@ -1183,7 +1183,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.1.0,<2.0.0" },
     { name = "quart", specifier = ">=0.20.0,<0.21.0" },
     { name = "quart-trio", specifier = ">=0.12.0,<0.13.0" },
-    { name = "rtls-link", git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=worktree-m0-io-mavlink" },
+    { name = "rtls-link", git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=main" },
     { name = "skybrush-ext-dock", marker = "extra == 'collmot'", specifier = ">=1.2.0", index = "https://pypi.collmot.com/" },
     { name = "skybrush-ext-firmware-update", marker = "extra == 'pro'", specifier = ">=0.5.0", index = "https://pypi.collmot.com/" },
     { name = "skybrush-ext-flight-report", marker = "extra == 'pro'", specifier = ">=1.0.3", index = "https://pypi.collmot.com/" },
@@ -2809,7 +2809,7 @@ wheels = [
 [[package]]
 name = "rtls-link"
 version = "0.1.0"
-source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=worktree-m0-io-mavlink#186feb83df4028377258201adff4c922e6bbe2e9" }
+source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=main#9c831ff1890d4a627db201e1bafe693ceaa42aea" }
 dependencies = [
     { name = "anyio" },
     { name = "pymavlink" },
