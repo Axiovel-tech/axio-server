@@ -71,6 +71,10 @@ class RtlsExtension(Extension):
         #: monotonic timestamp of the last stats broadcast per device, for
         #: the broadcast throttle
         self._last_stats_broadcast: dict[int, float] = {}
+        #: snapshot body last broadcast per device; lets the periodic flush
+        #: in the protocol loop tell whether a newer (throttled) update is
+        #: still waiting to be sent
+        self._last_stats_sent: dict[int, dict[str, Any]] = {}
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
 
@@ -126,7 +130,12 @@ class RtlsExtension(Extension):
 
             for event in protocol.expire(now):
                 logger.warning(f"rtls: device sysid {event.system_id} lost")
-                self._dispatch_event(event)
+                self._handle_lost(event)
+
+            # trailing-edge flush: a complete stats update that arrived inside
+            # the throttle window is cached but not yet broadcast; push it once
+            # the window has elapsed so clients see the latest snapshot.
+            await self._flush_pending_stats(now)
 
             with trio.move_on_after(0.25):
                 try:
@@ -412,21 +421,51 @@ class RtlsExtension(Extension):
         We cache every update (so the X-RTLS-STATS query always has the
         latest), but only broadcast once the full stat set is present --
         otherwise the first notification after discovery would carry a
-        half-populated snapshot."""
+        half-populated snapshot.
+
+        On the leading edge of the throttle window we broadcast immediately;
+        a complete update that lands inside the window is only cached here --
+        the periodic flush in :meth:`_run_protocol_loop` pushes the latest
+        snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
         if not all(field in data for field in STATS_FIELDS):
             return
         last = self._last_stats_broadcast.get(system_id)
         if last is not None and now - last < STATS_INTERVAL:
             return
-        self._last_stats_broadcast[system_id] = now
-        await self._broadcast_stats(system_id)
+        await self._broadcast_stats(system_id, now)
 
-    async def _broadcast_stats(self, system_id: int) -> None:
-        if self.app is None:
-            return
+    async def _flush_pending_stats(self, now: float) -> None:
+        """Broadcast any cached stats snapshot that is newer than the last
+        one sent and whose throttle window has elapsed (trailing edge)."""
+        for system_id, stats in list(self._stats.items()):
+            if stats == self._last_stats_sent.get(system_id):
+                continue
+            last = self._last_stats_broadcast.get(system_id)
+            if last is not None and now - last < STATS_INTERVAL:
+                continue
+            await self._broadcast_stats(system_id, now)
+
+    def _handle_lost(self, event: ProtocolEvent) -> None:
+        """React to a device-``lost`` event: drop its cached stats so the
+        X-RTLS-STATS query stops reporting it (mirroring X-RTLS-INF), then
+        forward the event to subscribers."""
+        self._prune_stats(event.system_id)
+        self._dispatch_event(event)
+
+    def _prune_stats(self, system_id: int) -> None:
+        """Drop all cached stats state for a device (e.g. on ``lost``)."""
+        self._stats.pop(system_id, None)
+        self._last_stats_broadcast.pop(system_id, None)
+        self._last_stats_sent.pop(system_id, None)
+
+    async def _broadcast_stats(self, system_id: int, now: float) -> None:
         stats = self._stats.get(system_id)
         if stats is None:
+            return
+        self._last_stats_broadcast[system_id] = now
+        self._last_stats_sent[system_id] = dict(stats)
+        if self.app is None:
             return
         hub = self.app.message_hub
         body = {"type": "X-RTLS-STATS", "stats": {str(system_id): dict(stats)}}

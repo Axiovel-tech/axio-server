@@ -688,3 +688,62 @@ async def test_stats_broadcast_throttled(extension, device):
     assert (
         stats_broadcasts[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 10.0
     )
+
+
+async def test_stats_trailing_flush_delivers_latest_within_interval(extension, device):
+    await discover(extension, device)
+
+    # leading edge: the first complete update broadcasts straight away
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    # a newer complete update lands inside the throttle window, so _on_stats
+    # only caches it -- it is NOT broadcast yet
+    await _feed_stats(extension, device, {**FULL_STATS, "rate": 11.0}, now=0.5)
+
+    stats_broadcasts = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert len(stats_broadcasts) == 1
+
+    # the protocol loop's periodic flush runs once the window has elapsed and
+    # pushes the latest cached snapshot -- even though no new stats arrived
+    await extension._flush_pending_stats(now=1.0)
+
+    stats_broadcasts = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert len(stats_broadcasts) == 2
+    assert stats_broadcasts[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 11.0
+
+    # a redundant flush with no newer data does not re-broadcast
+    await extension._flush_pending_stats(now=5.0)
+    stats_broadcasts = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert len(stats_broadcasts) == 2
+
+
+async def test_lost_device_stats_pruned_from_query(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+
+    # the snapshot is reported before the device is lost
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert str(DEVICE_SYSID) in response.body["stats"]
+
+    # drive the protocol loop's expiry path: the device times out, the
+    # extension handles the lost event and prunes its cached stats
+    protocol = extension._protocol
+    events = protocol.expire(time.monotonic() + 1000)
+    assert [event.kind for event in events] == ["lost"]
+    for event in events:
+        extension._handle_lost(event)
+
+    # the X-RTLS-STATS query no longer reports the timed-out device
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert response.body["stats"] == {}
+    # internal throttle bookkeeping was cleaned up too
+    assert DEVICE_SYSID not in extension._stats
+    assert DEVICE_SYSID not in extension._last_stats_broadcast
+    assert DEVICE_SYSID not in extension._last_stats_sent
