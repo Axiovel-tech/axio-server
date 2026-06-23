@@ -12,6 +12,7 @@ experimental (``X-`` prefixed) message types on the message hub; see
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import contextmanager
 from functools import partial
@@ -482,8 +483,10 @@ class RtlsExtension(Extension):
             str(device.system_id): self._device_json(device, now)
             for device in devices.values()
         }
+        anchors = _site_anchors(devices.values())
         return hub.create_response_or_notification(
-            body={"type": "X-RTLS-INF", "status": status}, in_response_to=message
+            body={"type": "X-RTLS-INF", "status": status, "anchors": anchors},
+            in_response_to=message,
         )
 
     async def _handle_RTLS_PARAM_LIST(
@@ -667,6 +670,7 @@ class RtlsExtension(Extension):
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
+            "role": device_role(device),
             "firmwareVersion": firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
@@ -702,6 +706,103 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         "clockPpm": float(data.get("ppm", 0.0)),
         "anchorMask": int(data.get("ancmask", 0)),
     }
+
+
+# ---- site frame / anchor geometry ----------------------------------------
+#
+# Anchor positions are configuration the GCS already owns: every device
+# carries the shared site frame (ORIGIN_LAT/LON/ALT_E7 + POS_YAW_DEG) and the
+# anchor table (UWB_AN_COUNT + UWB_AN{n}_X/Y/Z, a local NED triple per anchor),
+# all reachable as ordinary PARAM_EXT parameters that are auto-listed on
+# discovery. We read those cached params and project the anchors to GPS so the
+# map can draw the constellation. This is the server-owned "site" view: the
+# frame is derived from the params fanned out to the devices, not redefined
+# per device.
+
+#: metres per 1e-7 degree of latitude (equirectangular; exact enough at
+#: light-show scale and matches the firmware/test convention in tests/sitl).
+_M_PER_E7 = 0.0111319490
+
+#: UWB_ROLE values: 0 disabled, 1 DT-Tag, 2/3 DT-Anchor (initiator/responder).
+_ROLE_NAMES = {0: "disabled", 1: "tag", 2: "anchor", 3: "anchor"}
+
+
+def _param_value(device, name: str):
+    """Decode a device's cached PARAM_EXT value, or None if it is not (yet)
+    in the parameter cache."""
+    raw = device.params.get(name)
+    if raw is None:
+        return None
+    ptype = device.param_types.get(name)
+    if ptype is None:
+        return None
+    try:
+        return decode_param_value(raw, ptype)
+    except Exception:
+        return None
+
+
+def device_role(device) -> Optional[str]:
+    """Coarse role of a device ("tag"/"anchor"/"disabled") from its UWB_ROLE
+    parameter, or None if the device has not reported one."""
+    value = _param_value(device, "UWB_ROLE")
+    if value is None:
+        return None
+    return _ROLE_NAMES.get(int(value), "unknown")
+
+
+def _ned_to_gps(north, east, down, origin_lat_e7, origin_lon_e7,
+                origin_alt_mm, yaw_deg):
+    """Project a local NED offset (metres, relative to the site origin) to a
+    GPS position, applying the same yaw the firmware uses to align the local
+    frame to geographic north."""
+    yaw = math.radians(yaw_deg or 0.0)
+    n = north * math.cos(yaw) - east * math.sin(yaw)
+    e = north * math.sin(yaw) + east * math.cos(yaw)
+    lat_e7 = origin_lat_e7 + n / _M_PER_E7
+    cos_lat = math.cos(math.radians(origin_lat_e7 * 1e-7)) or 1e-9
+    lon_e7 = origin_lon_e7 + e / (_M_PER_E7 * cos_lat)
+    return {
+        "lat": lat_e7 * 1e-7,
+        "lon": lon_e7 * 1e-7,
+        "amsl": (origin_alt_mm or 0) / 1000.0 - down,
+    }
+
+
+def site_anchor_positions(device) -> "list[dict[str, Any]]":
+    """GPS positions of the site's anchors, computed from a device's cached
+    anchor-table + origin parameters. Empty if the device has not reported a
+    usable site frame yet."""
+    origin_lat = _param_value(device, "ORIGIN_LAT_E7")
+    origin_lon = _param_value(device, "ORIGIN_LON_E7")
+    if origin_lat is None or origin_lon is None or (origin_lat == 0 and origin_lon == 0):
+        return []
+    origin_alt = _param_value(device, "ORIGIN_ALT_MM") or 0
+    yaw = _param_value(device, "POS_YAW_DEG") or 0.0
+    count = _param_value(device, "UWB_AN_COUNT")
+    if not count:
+        return []
+    anchors: list[dict[str, Any]] = []
+    for i in range(int(count)):
+        x = _param_value(device, f"UWB_AN{i}_X")
+        y = _param_value(device, f"UWB_AN{i}_Y")
+        z = _param_value(device, f"UWB_AN{i}_Z")
+        if x is None or y is None or z is None:
+            continue
+        gps = _ned_to_gps(x, y, z, int(origin_lat), int(origin_lon),
+                          int(origin_alt), float(yaw))
+        anchors.append({"index": i, **gps})
+    return anchors
+
+
+def _site_anchors(devices) -> "list[dict[str, Any]]":
+    """Anchor constellation for the site. All devices share one frame, so the
+    first device that has reported a usable site frame wins."""
+    for device in devices:
+        anchors = site_anchor_positions(device)
+        if anchors:
+            return anchors
+    return []
 
 
 def _get_device_id(message: "FlockwaveMessage") -> int:

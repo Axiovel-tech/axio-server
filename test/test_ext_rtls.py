@@ -206,7 +206,60 @@ def make_message(builder, body):
 async def test_inf_empty_before_discovery(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body == {"type": "X-RTLS-INF", "status": {}}
+    assert response.body == {"type": "X-RTLS-INF", "status": {}, "anchors": []}
+
+
+async def test_inf_reports_role_and_site_anchors(extension, device, builder, hub):
+    """A device that exposes UWB_ROLE plus the site frame (ORIGIN_* /
+    POS_YAW_DEG) and an anchor table is reported with its role, and the
+    server projects the anchor table to GPS for the map."""
+    # role = 2 (DT-Anchor initiator) -> coarse role "anchor"
+    device.params["UWB_ROLE"] = (bytes([2]), PARAM_TYPE_UINT8)
+    # site origin = the SITL home used across the co-sim suite
+    device.params["ORIGIN_LAT_E7"] = (struct.pack("<i", 413900000), PARAM_TYPE_INT32)
+    device.params["ORIGIN_LON_E7"] = (struct.pack("<i", 21500000), PARAM_TYPE_INT32)
+    device.params["ORIGIN_ALT_MM"] = (struct.pack("<i", 10000), PARAM_TYPE_INT32)
+    # two anchors: one 10 m north, one 20 m east and 5 m up (down = -5)
+    device.params["UWB_AN_COUNT"] = (bytes([2]), PARAM_TYPE_UINT8)
+    device.params["UWB_AN0_X"] = (struct.pack("<f", 10.0), PARAM_TYPE_REAL32)
+    device.params["UWB_AN0_Y"] = (struct.pack("<f", 0.0), PARAM_TYPE_REAL32)
+    device.params["UWB_AN0_Z"] = (struct.pack("<f", 0.0), PARAM_TYPE_REAL32)
+    device.params["UWB_AN1_X"] = (struct.pack("<f", 0.0), PARAM_TYPE_REAL32)
+    device.params["UWB_AN1_Y"] = (struct.pack("<f", 20.0), PARAM_TYPE_REAL32)
+    device.params["UWB_AN1_Z"] = (struct.pack("<f", -5.0), PARAM_TYPE_REAL32)
+
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["role"] == "anchor"
+
+    anchors = response.body["anchors"]
+    assert len(anchors) == 2
+
+    origin_lat, origin_lon = 413900000 * 1e-7, 21500000 * 1e-7
+    a0, a1 = anchors[0], anchors[1]
+    assert a0["index"] == 0 and a1["index"] == 1
+    # 10 m north -> latitude up, longitude ~unchanged
+    assert a0["lat"] > origin_lat
+    assert abs(a0["lon"] - origin_lon) < 1e-6
+    # 20 m east -> longitude up, latitude ~unchanged; 5 m up -> amsl 10+5
+    assert a1["lon"] > origin_lon
+    assert abs(a1["lat"] - origin_lat) < 1e-6
+    assert abs(a1["amsl"] - 15.0) < 0.01
+
+
+async def test_inf_role_none_without_uwb_role(extension, device, builder, hub):
+    """Devices that never report UWB_ROLE carry role=None (e.g. a tag whose
+    sim build does not expose the parameter)."""
+    await discover(extension, device)
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["role"] is None
+    assert response.body["anchors"] == []
 
 
 async def test_inf_lists_discovered_devices(extension, device, builder, hub):
