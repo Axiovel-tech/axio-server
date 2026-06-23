@@ -12,6 +12,12 @@ clients through the server's message hub:
   discovery.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
+- **Anchor map projection**: when a discovered device exposes
+  `ORIGIN_*`, `UWB_AN_COUNT` and `UWB_AN*` parameters, the extension
+  publishes the configured anchors as ordinary Skybrush beacons so they
+  appear on the map and in beacon monitoring views. These beacons are
+  derived from configured geometry; inter-anchor ranging/TWR telemetry
+  is not used as a placement source.
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
   `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
   Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
@@ -55,8 +61,9 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 "EXTENSIONS": {
   "rtls": {
     "port": 3333,
-    "devices": ["192.168.4.1"],        // static addresses (optional)
-    "broadcast": ["255.255.255.255"]   // discovery broadcast
+    "devices": ["192.168.4.1:3333"],   // static addresses; :port optional
+    "broadcast": ["255.255.255.255"],  // discovery broadcast
+    "register_beacons": true           // show configured anchors on the map
   }
 }
 ```
@@ -100,7 +107,9 @@ Response — one entry per live device, keyed by system id (as string):
       "age": 0.52,
       "firmwareVersion": "1.2.3",
       "paramCount": 23,
-      "otaStatus": null
+      "otaStatus": null,
+      "role": "tag",
+      "name": "RTLS tag 42"
     }
   }
 }
@@ -113,6 +122,11 @@ Response — one entry per live device, keyed by system id (as string):
   (the list is auto-fetched on discovery), otherwise `null`.
 - `otaStatus` — status of the device's last OTA job
   (`"running"` / `"success"` / `"error"`) or `null` if there was none.
+- `role` — decoded `UWB_ROLE` when the parameter cache contains it:
+  `"disabled"`, `"tag"`, `"anchor-initiator"` or
+  `"anchor-responder"`.
+- `name` — display name derived from the role and anchor MAC table when
+  enough parameters are known.
 
 Devices that miss their liveness timeout disappear from the map.
 
