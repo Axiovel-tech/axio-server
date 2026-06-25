@@ -104,7 +104,7 @@ plus a site-level `anchors` list:
       "otaStatus": null,
       "role": "tag",
       "name": "RTLS tag 42",
-      "twr": {"twr0": 14.1}
+      "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
     }
   },
   "anchors": [
@@ -132,8 +132,12 @@ plus a site-level `anchors` list:
   when the device does not expose a role.
 - `name` — a human-readable role-aware label (e.g. `"RTLS anchor A0"`);
   absent for devices with no recognised role.
-- `twr` — inter-anchor TWR telemetry: a map of `twr<peer>` → measured
-  distance in metres, present only on anchors that report ranges.
+- `twr` — inter-anchor TWR telemetry: a list (freshest first) of
+  `{peerMac, distanceM, ageMs}` rows, one per peer anchor the device
+  currently hears on the UWB ether. The peer MAC is decoded from the
+  firmware's `twr<peer-mac-hex>` NAMED_VALUE_FLOAT and `ageMs` is the time
+  since that range was last harvested. Present only on anchors that report
+  ranges.
 
 The site-level `anchors` list mirrors the configured cell geometry: each
 anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position

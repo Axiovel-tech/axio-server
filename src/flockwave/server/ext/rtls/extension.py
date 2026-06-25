@@ -66,12 +66,6 @@ ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
 
-#: NAMED_VALUE_FLOAT name prefix the anchor firmware uses for its measured
-#: inter-anchor TWR ranges ("twr<peer-slot>", e.g. ``twr0`` = "I hear A0 at
-#: <value> m"). These are anchor-health telemetry, not part of the tag's solve
-#: stat set, so they are surfaced as a separate ``twr`` map per device.
-TWR_NAME_PREFIX = "twr"
-
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -106,13 +100,9 @@ class RtlsExtension(Extension):
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
         #: latest inter-anchor TWR telemetry per device:
-        #: system_id -> {peer_name: measured_distance_m}. Surfaced in
-        #: X-RTLS-INF; pruned on device loss.
-        self._twr: dict[int, dict[str, float]] = {}
-        #: server-owned MAVLink parser used only to pick inter-anchor TWR
-        #: NAMED_VALUE_FLOATs out of the datagram stream (the SDK forwards only
-        #: the known solve-stat names, so TWR would otherwise be dropped)
-        self._twr_parser = None
+        #: system_id -> {peer_mac: (measured_distance_m, harvest_monotonic_s)}.
+        #: Surfaced in X-RTLS-INF (with a derived age); pruned on device loss.
+        self._twr: dict[int, dict[int, tuple[float, float]]] = {}
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -136,8 +126,6 @@ class RtlsExtension(Extension):
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         dialect = load_dialect()
-        self._twr_parser = dialect.MAVLink(None)
-        self._twr_parser.robust_parsing = True
         self._protocol = protocol = RtlsProtocol(
             dialect,
             targets=targets,
@@ -174,7 +162,6 @@ class RtlsExtension(Extension):
             self._nursery = None
             self._sock = None
             self._beacon_api = None
-            self._twr_parser = None
             self._clear_anchor_beacons()
 
     async def _run_protocol_loop(self, protocol, sock, logger) -> None:
@@ -218,10 +205,6 @@ class RtlsExtension(Extension):
     ) -> None:
         if self._protocol is None:
             return
-        # inter-anchor TWR rides in the same NAMED_VALUE_FLOAT stream but uses
-        # names outside the SDK's solve-stat allow-list, so it is dropped by
-        # ``feed``; harvest it here before the protocol consumes the datagram
-        self._harvest_twr(data)
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -237,6 +220,12 @@ class RtlsExtension(Extension):
                 # snapshot and broadcast it (throttled) so live GCS clients
                 # see device health without polling.
                 await self._on_stats(event.system_id, event.data, now)
+            elif event.kind == "twr":
+                # inter-anchor TWR health telemetry. The SDK surfaces it from
+                # the same feed() pass as a dedicated event (peer MAC decoded
+                # from the wire name); cache it per peer with a harvest stamp so
+                # X-RTLS-INF can report its age.
+                self._on_twr(event.system_id, event.data, now)
             elif event.kind == "param_value":
                 # a freshly learned parameter may complete a tag's cell or
                 # change an anchor's MAC/role; resync the anchor beacons
@@ -244,31 +233,18 @@ class RtlsExtension(Extension):
                 self._refresh_anchor_cells()
             self._dispatch_event(event)
 
-    def _harvest_twr(self, data: bytes) -> None:
-        """Pick inter-anchor TWR NAMED_VALUE_FLOATs out of a datagram and
-        cache them per device. The SDK only forwards the tag's solve stats, so
-        the anchor's ``twr<peer>`` ranges are parsed here with the extension's
-        own MAVLink parser and surfaced as anchor-health telemetry."""
-        parser = self._twr_parser
-        if parser is None:
-            # lazily build the parser the first time a datagram arrives so the
-            # harvest works whether or not run() has wired one up (tests drive
-            # _process_datagram directly)
-            dialect = load_dialect()
-            parser = self._twr_parser = dialect.MAVLink(None)
-            parser.robust_parsing = True
-        try:
-            messages = parser.parse_buffer(data) or []
-        except Exception:
+    def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
+        """Cache one inter-anchor TWR sample (decoded by the SDK from the
+        ``twr<peer-mac-hex>`` NAMED_VALUE_FLOAT) keyed by peer MAC, with the
+        harvest time so X-RTLS-INF can report the measurement's age."""
+        peer_mac = data.get("peerMac")
+        distance_m = data.get("distanceM")
+        if peer_mac is None or distance_m is None:
             return
-        for message in messages:
-            if message.get_type() != "NAMED_VALUE_FLOAT":
-                continue
-            name = _named_value_str(message.name)
-            if not name.startswith(TWR_NAME_PREFIX) or name == TWR_NAME_PREFIX:
-                continue
-            system_id = message.get_srcSystem()
-            self._twr.setdefault(system_id, {})[name] = float(message.value)
+        self._twr.setdefault(system_id, {})[int(peer_mac)] = (
+            float(distance_m),
+            now,
+        )
 
     def _dispatch_event(self, event: ProtocolEvent) -> None:
         for channel in list(self._watchers):
@@ -849,7 +825,18 @@ class RtlsExtension(Extension):
             body["name"] = name
         twr = self._twr.get(device.system_id)
         if twr:
-            body["twr"] = dict(twr)
+            # one row per heard peer, freshest first, with the age derived from
+            # the harvest stamp so the client can flag stale (peer-quiet) rows
+            body["twr"] = [
+                {
+                    "peerMac": peer_mac,
+                    "distanceM": round(distance_m, 3),
+                    "ageMs": round(max(0.0, now - harvested) * 1000.0),
+                }
+                for peer_mac, (distance_m, harvested) in sorted(
+                    twr.items(), key=lambda kv: kv[1][1], reverse=True
+                )
+            ]
         return body
 
     # ---- site / cell / anchor beacons ----
@@ -1146,14 +1133,6 @@ def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
-
-
-def _named_value_str(name) -> str:
-    """Trim a NAMED_VALUE_FLOAT name field to its leading ASCII identifier;
-    pymavlink hands it back as bytes or a NUL-padded str by version."""
-    if isinstance(name, bytes):
-        return name.split(b"\x00")[0].decode(errors="replace")
-    return str(name).split("\x00")[0]
 
 
 def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:

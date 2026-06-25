@@ -526,35 +526,41 @@ async def test_inter_anchor_twr_surfaced_in_inf(extension, device, builder, hub)
     add_rtls_cell_params(device, role=3, uwb_mac=2)
     await discover(extension, device)
 
-    # the anchor reports measured ranges to two peers as NAMED_VALUE_FLOAT;
-    # these names are outside the SDK's solve-stat set, so the extension has to
-    # pick them out of the datagram itself
-    for name, value in (("twr0", 14.1), ("twr1", 9.42)):
+    # the anchor reports measured ranges to two peers as NAMED_VALUE_FLOAT in
+    # the real firmware "twr<peer-mac-hex>" format; the SDK decodes the peer MAC
+    # and the extension surfaces a per-peer row with a derived age. This crosses
+    # the firmware -> SDK -> server name boundary end to end.
+    t0 = time.monotonic()
+    for name, value in (("twr0001", 14.0), ("twr0002", 9.5)):
         await extension._process_datagram(
-            device.named_value_float(name, value), device.address, time.monotonic()
+            device.named_value_float(name, value), device.address, t0
         )
 
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
     entry = response.body["status"][str(DEVICE_SYSID)]
-    assert entry["twr"] == {"twr0": pytest.approx(14.1), "twr1": pytest.approx(9.42)}
+    rows = {row["peerMac"]: row for row in entry["twr"]}
+    assert rows[0x0001]["distanceM"] == pytest.approx(14.0)
+    assert rows[0x0002]["distanceM"] == pytest.approx(9.5)
+    assert all(row["ageMs"] >= 0 for row in entry["twr"])
 
 
 async def test_twr_does_not_pollute_health_stats(extension, device):
     await discover(extension, device)
     # a TWR float must not be mistaken for a solve stat
     await extension._process_datagram(
-        device.named_value_float("twr0", 14.1), device.address, time.monotonic()
+        device.named_value_float("twr0001", 14.0), device.address, time.monotonic()
     )
     assert DEVICE_SYSID not in extension._stats
-    assert extension._twr[DEVICE_SYSID] == {"twr0": pytest.approx(14.1)}
+    distance_m, _harvested = extension._twr[DEVICE_SYSID][0x0001]
+    assert distance_m == pytest.approx(14.0)
 
 
 async def test_twr_pruned_on_device_loss(extension, device, builder, hub):
     add_rtls_cell_params(device, role=3, uwb_mac=2)
     await discover(extension, device)
     await extension._process_datagram(
-        device.named_value_float("twr0", 14.1), device.address, time.monotonic()
+        device.named_value_float("twr0001", 14.0), device.address, time.monotonic()
     )
     assert DEVICE_SYSID in extension._twr
 
