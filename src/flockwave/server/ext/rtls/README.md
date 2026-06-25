@@ -88,7 +88,8 @@ Request:
 {"type": "X-RTLS-INF"}
 ```
 
-Response — one entry per live device, keyed by system id (as string):
+Response — one entry per live device, keyed by system id (as string),
+plus a site-level `anchors` list:
 
 ```json
 {
@@ -100,9 +101,22 @@ Response — one entry per live device, keyed by system id (as string):
       "age": 0.52,
       "firmwareVersion": "1.2.3",
       "paramCount": 23,
-      "otaStatus": null
+      "otaStatus": null,
+      "role": "tag",
+      "name": "RTLS tag 42",
+      "twr": {"twr0": 14.1}
     }
-  }
+  },
+  "anchors": [
+    {
+      "id": "rtls::default::anchor_0",
+      "cell": "default",
+      "index": 0,
+      "mac": 1,
+      "position": {"lat": 41.39, "lon": 2.15, "amsl": 10.0},
+      "active": true
+    }
+  ]
 }
 ```
 
@@ -113,6 +127,21 @@ Response — one entry per live device, keyed by system id (as string):
   (the list is auto-fetched on discovery), otherwise `null`.
 - `otaStatus` — status of the device's last OTA job
   (`"running"` / `"success"` / `"error"`) or `null` if there was none.
+- `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
+  `"disabled"`, derived from the device's `UWB_ROLE` parameter; absent
+  when the device does not expose a role.
+- `name` — a human-readable role-aware label (e.g. `"RTLS anchor A0"`);
+  absent for devices with no recognised role.
+- `twr` — inter-anchor TWR telemetry: a map of `twr<peer>` → measured
+  distance in metres, present only on anchors that report ranges.
+
+The site-level `anchors` list mirrors the configured cell geometry: each
+anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
+(cell origin + NED), and `active` — true only when a live anchor device
+with the matching `UWB_MAC` is online. These anchors are also published
+to clients through the existing Skybrush **beacon** layer (same stable
+ids), so the map renders them without a bespoke anchor layer. Set
+`register_beacons: false` to disable the beacon registration.
 
 Devices that miss their liveness timeout disappear from the map.
 

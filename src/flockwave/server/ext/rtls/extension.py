@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 import trio
 import trio.socket
+from flockwave.gps.vectors import GPSCoordinate
 from rtlslink import (
     STATS_FIELDS,
     ProtocolEvent,
@@ -28,11 +29,15 @@ from rtlslink import (
     firmware_version,
     param_type_from_name,
     param_type_to_name,
+    parse_address,
 )
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import PARAM_ACK_ACCEPTED, PARAM_ACK_IN_PROGRESS
 
 from flockwave.server.ext.base import Extension
+from flockwave.server.registries.errors import RegistryFull
+
+from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -61,6 +66,12 @@ ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
 
+#: NAMED_VALUE_FLOAT name prefix the anchor firmware uses for its measured
+#: inter-anchor TWR ranges ("twr<peer-slot>", e.g. ``twr0`` = "I hear A0 at
+#: <value> m"). These are anchor-health telemetry, not part of the tag's solve
+#: stat set, so they are surfaced as a separate ``twr`` map per device.
+TWR_NAME_PREFIX = "twr"
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -83,6 +94,25 @@ class RtlsExtension(Extension):
         self._last_stats_sent: dict[int, dict[str, Any]] = {}
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
+        #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
+        #: anchor-beacon registration (config ``register_beacons: false`` or no
+        #: beacon extension loaded)
+        self._beacon_api = None
+        #: live anchor beacons we own, keyed by stable beacon id
+        #: (``rtls::<cell>::anchor_<i>``) -> (beacon, ExitStack-less context)
+        self._anchor_beacons: dict[str, tuple[Any, Any]] = {}
+        #: which device (a tag) currently supplies the cell geometry for a
+        #: given cell id; lets us re-home a cell onto another live tag when the
+        #: source tag is lost
+        self._anchor_cell_sources: dict[str, int] = {}
+        #: latest inter-anchor TWR telemetry per device:
+        #: system_id -> {peer_name: measured_distance_m}. Surfaced in
+        #: X-RTLS-INF; pruned on device loss.
+        self._twr: dict[int, dict[str, float]] = {}
+        #: server-owned MAVLink parser used only to pick inter-anchor TWR
+        #: NAMED_VALUE_FLOATs out of the datagram stream (the SDK forwards only
+        #: the known solve-stat names, so TWR would otherwise be dropped)
+        self._twr_parser = None
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -98,12 +128,16 @@ class RtlsExtension(Extension):
                 "are silently dropped)"
             )
         port = int(configuration.get("port", 3333))
-        targets = [(host, port) for host in configuration.get("devices", [])]
-        broadcast = [
-            (host, port) for host in configuration.get("broadcast", ["255.255.255.255"])
-        ]
+        targets = _configured_addresses(configuration.get("devices", []), port)
+        broadcast = _configured_addresses(
+            configuration.get("broadcast", ["255.255.255.255"]), port
+        )
+        register_beacons = bool(configuration.get("register_beacons", True))
+        self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         dialect = load_dialect()
+        self._twr_parser = dialect.MAVLink(None)
+        self._twr_parser.robust_parsing = True
         self._protocol = protocol = RtlsProtocol(
             dialect,
             targets=targets,
@@ -139,6 +173,9 @@ class RtlsExtension(Extension):
         finally:
             self._nursery = None
             self._sock = None
+            self._beacon_api = None
+            self._twr_parser = None
+            self._clear_anchor_beacons()
 
     async def _run_protocol_loop(self, protocol, sock, logger) -> None:
         while True:
@@ -181,6 +218,10 @@ class RtlsExtension(Extension):
     ) -> None:
         if self._protocol is None:
             return
+        # inter-anchor TWR rides in the same NAMED_VALUE_FLOAT stream but uses
+        # names outside the SDK's solve-stat allow-list, so it is dropped by
+        # ``feed``; harvest it here before the protocol consumes the datagram
+        self._harvest_twr(data)
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -196,7 +237,38 @@ class RtlsExtension(Extension):
                 # snapshot and broadcast it (throttled) so live GCS clients
                 # see device health without polling.
                 await self._on_stats(event.system_id, event.data, now)
+            elif event.kind == "param_value":
+                # a freshly learned parameter may complete a tag's cell or
+                # change an anchor's MAC/role; resync the anchor beacons
+                self._sync_anchor_beacons_for_system(event.system_id)
+                self._refresh_anchor_cells()
             self._dispatch_event(event)
+
+    def _harvest_twr(self, data: bytes) -> None:
+        """Pick inter-anchor TWR NAMED_VALUE_FLOATs out of a datagram and
+        cache them per device. The SDK only forwards the tag's solve stats, so
+        the anchor's ``twr<peer>`` ranges are parsed here with the extension's
+        own MAVLink parser and surfaced as anchor-health telemetry."""
+        parser = self._twr_parser
+        if parser is None:
+            # lazily build the parser the first time a datagram arrives so the
+            # harvest works whether or not run() has wired one up (tests drive
+            # _process_datagram directly)
+            dialect = load_dialect()
+            parser = self._twr_parser = dialect.MAVLink(None)
+            parser.robust_parsing = True
+        try:
+            messages = parser.parse_buffer(data) or []
+        except Exception:
+            return
+        for message in messages:
+            if message.get_type() != "NAMED_VALUE_FLOAT":
+                continue
+            name = _named_value_str(message.name)
+            if not name.startswith(TWR_NAME_PREFIX) or name == TWR_NAME_PREFIX:
+                continue
+            system_id = message.get_srcSystem()
+            self._twr.setdefault(system_id, {})[name] = float(message.value)
 
     def _dispatch_event(self, event: ProtocolEvent) -> None:
         for channel in list(self._watchers):
@@ -334,6 +406,16 @@ class RtlsExtension(Extension):
                     result = event.data["result"]
                     if result == PARAM_ACK_IN_PROGRESS:
                         continue  # final ack still to come
+                    if result == PARAM_ACK_ACCEPTED:
+                        # mirror the acknowledged value into the device cache so
+                        # the anchor display reflects the server's own push
+                        # without waiting for the device to re-advertise it
+                        device.params[name] = event.data["value"]
+                        device.param_types[name] = param_type
+                        self._sync_anchor_beacons(
+                            device, _decoded_device_params(device)
+                        )
+                        self._refresh_anchor_cells()
                     return {
                         "value": decode_param_value(event.data["value"], param_type),
                         "type": param_type_to_name(param_type),
@@ -488,9 +570,13 @@ class RtlsExtension(Extension):
 
     def _handle_lost(self, event: ProtocolEvent) -> None:
         """React to a device-``lost`` event: drop its cached stats so the
-        X-RTLS-STATS query stops reporting it (mirroring X-RTLS-INF), then
-        forward the event to subscribers."""
+        X-RTLS-STATS query stops reporting it (mirroring X-RTLS-INF), drop its
+        TWR telemetry, re-home any cell it sourced, then forward the event to
+        subscribers."""
         self._prune_stats(event.system_id)
+        self._twr.pop(event.system_id, None)
+        self._drop_anchor_cells_for_source(event.system_id)
+        self._refresh_anchor_cells()
         self._dispatch_event(event)
 
     def _prune_stats(self, system_id: int) -> None:
@@ -524,7 +610,12 @@ class RtlsExtension(Extension):
             for device in devices.values()
         }
         return hub.create_response_or_notification(
-            body={"type": "X-RTLS-INF", "status": status}, in_response_to=message
+            body={
+                "type": "X-RTLS-INF",
+                "status": status,
+                "anchors": self._site_anchors(),
+            },
+            in_response_to=message,
         )
 
     async def _handle_RTLS_PARAM_LIST(
@@ -740,7 +831,10 @@ class RtlsExtension(Extension):
 
     def _device_json(self, device, now: float) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
-        return {
+        params = _decoded_device_params(device)
+        role = role_from_params(params)
+
+        body = {
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
@@ -748,6 +842,209 @@ class RtlsExtension(Extension):
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
+        if role is not None:
+            body["role"] = role
+        name = _device_name(device.system_id, params, role)
+        if name is not None:
+            body["name"] = name
+        twr = self._twr.get(device.system_id)
+        if twr:
+            body["twr"] = dict(twr)
+        return body
+
+    # ---- site / cell / anchor beacons ----
+
+    def _site_anchors(self) -> list[dict[str, Any]]:
+        """The site-level anchor list for X-RTLS-INF: one entry per anchor in
+        every known cell, with its stable beacon id, GPS position (origin+NED)
+        and ``active`` flag (true iff a matching live anchor device is online).
+        Derived from the same cell the anchor beacons render."""
+        out: list[dict[str, Any]] = []
+        if self._protocol is None:
+            return out
+        for cell_id, source in sorted(self._anchor_cell_sources.items()):
+            device = self._protocol.devices.get(source)
+            if device is None:
+                continue
+            try:
+                cell = cell_from_params(
+                    _decoded_device_params(device), cell_id=cell_id
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            for anchor in cell.anchors:
+                lat_e7, lon_e7, alt_mm = ned_to_global_e7(
+                    cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
+                )
+                out.append(
+                    {
+                        "id": _anchor_beacon_id(cell_id, anchor.index),
+                        "cell": cell_id,
+                        "index": anchor.index,
+                        "mac": anchor.mac,
+                        "position": {
+                            "lat": round(lat_e7 * 1e-7, 7),
+                            "lon": round(lon_e7 * 1e-7, 7),
+                            "amsl": round(alt_mm * 1e-3, 3),
+                        },
+                        "active": self._anchor_device_online(anchor.mac),
+                    }
+                )
+        return out
+
+    def _sync_anchor_beacons_for_system(self, system_id: int) -> None:
+        if self._protocol is None:
+            return
+        device = self._protocol.devices.get(system_id)
+        if device is not None:
+            self._sync_anchor_beacons(device, _decoded_device_params(device))
+
+    def _sync_anchor_beacons(self, device, params: dict[str, Any]) -> None:
+        """Reconcile the anchor beacons for the cell that ``device`` sources.
+        Only a tag carries the cell geometry; any other role (or an invalid
+        role) drops the cell this device used to source."""
+        if self._beacon_api is None:
+            return
+
+        role = _cell_source_role(device, params)
+        if role is None:
+            if "UWB_ROLE" in params:
+                self._drop_anchor_cells_for_source(device.system_id)
+            return
+        if role != "tag":
+            self._drop_anchor_cells_for_source(device.system_id)
+            return
+
+        try:
+            cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
+        except (KeyError, TypeError, ValueError):
+            return
+
+        self._anchor_cell_sources[cell.cell_id] = device.system_id
+        active_ids = set()
+        for anchor in cell.anchors:
+            beacon_id = _anchor_beacon_id(cell.cell_id, anchor.index)
+            active_ids.add(beacon_id)
+            beacon = self._get_or_create_anchor_beacon(beacon_id)
+            if beacon is None:
+                continue
+
+            lat_e7, lon_e7, alt_mm = ned_to_global_e7(
+                cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
+            )
+            beacon.basic_properties.name = f"RTLS A{anchor.index}"
+            beacon.update_status(
+                position=GPSCoordinate(
+                    lat=lat_e7 * 1e-7,
+                    lon=lon_e7 * 1e-7,
+                    amsl=alt_mm * 1e-3,
+                ),
+                active=self._anchor_device_online(anchor.mac),
+            )
+
+        for beacon_id in list(self._anchor_beacons):
+            if (
+                beacon_id.startswith(f"rtls::{cell.cell_id}::")
+                and beacon_id not in active_ids
+            ):
+                self._drop_anchor_beacon(beacon_id)
+
+    def _drop_anchor_cells_for_source(self, system_id: int) -> None:
+        for cell_id, source in list(self._anchor_cell_sources.items()):
+            if source != system_id:
+                continue
+            replacement = self._find_anchor_cell_source(cell_id)
+            if replacement is None:
+                self._drop_anchor_cell(cell_id)
+            else:
+                device, params = replacement
+                self._sync_anchor_beacons(device, params)
+
+    def _refresh_anchor_cells(self) -> None:
+        if self._protocol is None:
+            return
+        for cell_id, source in list(self._anchor_cell_sources.items()):
+            device = self._protocol.devices.get(source)
+            if device is None:
+                replacement = self._find_anchor_cell_source(cell_id)
+                if replacement is None:
+                    self._drop_anchor_cell(cell_id)
+                else:
+                    device, params = replacement
+                    self._sync_anchor_beacons(device, params)
+            else:
+                self._sync_anchor_beacons(device, _decoded_device_params(device))
+
+    def _find_anchor_cell_source(
+        self, cell_id: str
+    ) -> tuple[Any, dict[str, Any]] | None:
+        if self._protocol is None:
+            return None
+        for device in self._protocol.devices.values():
+            params = _decoded_device_params(device)
+            if _cell_source_role(device, params) != "tag":
+                continue
+            try:
+                cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if cell.cell_id == cell_id:
+                return device, params
+        return None
+
+    def _anchor_device_online(self, mac: int | None) -> bool:
+        if mac is None or self._protocol is None:
+            return False
+        for device in self._protocol.devices.values():
+            params = _decoded_device_params(device)
+            if role_from_params(params) not in (
+                "anchor-initiator",
+                "anchor-responder",
+            ):
+                continue
+            try:
+                if int(params.get("UWB_MAC")) == int(mac):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _drop_anchor_cell(self, cell_id: str) -> None:
+        self._anchor_cell_sources.pop(cell_id, None)
+        prefix = f"rtls::{cell_id}::"
+        for beacon_id in list(self._anchor_beacons):
+            if beacon_id.startswith(prefix):
+                self._drop_anchor_beacon(beacon_id)
+
+    def _get_or_create_anchor_beacon(self, beacon_id: str):
+        entry = self._anchor_beacons.get(beacon_id)
+        if entry is not None:
+            return entry[0]
+        if self._beacon_api is None:
+            return None
+
+        context = self._beacon_api.use(beacon_id)
+        try:
+            beacon = context.__enter__()
+        except RegistryFull:
+            if self.app:
+                self.app.handle_registry_full_error(self, "RTLS anchor beacon")
+            return None
+
+        self._anchor_beacons[beacon_id] = (beacon, context)
+        return beacon
+
+    def _drop_anchor_beacon(self, beacon_id: str) -> None:
+        entry = self._anchor_beacons.pop(beacon_id, None)
+        if entry is None:
+            return
+        _, context = entry
+        context.__exit__(None, None, None)
+
+    def _clear_anchor_beacons(self) -> None:
+        for beacon_id in list(self._anchor_beacons):
+            self._drop_anchor_beacon(beacon_id)
+        self._anchor_cell_sources.clear()
 
     def exports(self):
         return {
@@ -764,6 +1061,99 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return {}
         return dict(self._protocol.devices)
+
+
+def _configured_addresses(values, default_port: int) -> list[tuple[str, int]]:
+    """Parse configured ``host`` / ``host:port`` strings into address tuples,
+    defaulting the port to the extension's management port."""
+    return [parse_address(value, default_port) for value in values]
+
+
+def _decoded_device_params(device) -> dict[str, Any]:
+    """Decode a device's cached raw params into plain Python values, keyed by
+    name. Parameters whose type is not yet known are skipped."""
+    params: dict[str, Any] = {}
+    for name, value in device.params.items():
+        param_type = device.param_types.get(name)
+        if param_type is None:
+            continue
+        params[name] = decode_param_value(value, param_type)
+    return params
+
+
+def _cell_id_from_params(params: dict[str, Any]) -> str:
+    value = params.get("RTLS_CELL_ID")
+    return str(value) if value not in (None, "") else "default"
+
+
+def _cell_source_role(device, params: dict[str, Any]) -> str | None:
+    """The role to treat a device as for cell sourcing. A configured
+    ``UWB_ROLE`` is authoritative; lacking it, a device that has finished
+    listing and carries a full cell geometry is treated as a legacy tag (the
+    'cell inferred from tag params' compatibility bridge)."""
+    role = role_from_params(params)
+    if role is not None:
+        return role
+    if "UWB_ROLE" in params:
+        return None
+    if (
+        device.param_count is not None
+        and len(device.params) >= device.param_count
+        and _has_cell_geometry(params)
+    ):
+        return "tag"
+    return None
+
+
+def _has_cell_geometry(params: dict[str, Any]) -> bool:
+    return all(
+        name in params
+        for name in ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "UWB_AN_COUNT")
+    )
+
+
+def _anchor_beacon_id(cell_id: str, index: int) -> str:
+    return f"rtls::{cell_id}::anchor_{index}"
+
+
+def _device_name(
+    system_id: int, params: dict[str, Any], role: str | None
+) -> str | None:
+    if role == "tag":
+        return f"RTLS tag {system_id}"
+    if role in ("anchor-initiator", "anchor-responder"):
+        index = _anchor_index_for_device(params)
+        if index is not None:
+            return f"RTLS anchor A{index}"
+        return f"RTLS anchor {system_id}"
+    return None
+
+
+def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
+    mac = params.get("UWB_MAC")
+    if mac is None:
+        return None
+    try:
+        mac = int(mac)
+        count = int(params.get("UWB_AN_COUNT", 0))
+    except (TypeError, ValueError):
+        return None
+
+    for index in range(max(0, count)):
+        try:
+            if int(params.get(f"UWB_AN{index}_MAC")) == mac:
+                return index
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _named_value_str(name) -> str:
+    """Trim a NAMED_VALUE_FLOAT name field to its leading ASCII identifier;
+    pymavlink hands it back as bytes or a NUL-padded str by version."""
+    if isinstance(name, bytes):
+        return name.split(b"\x00")[0].decode(errors="replace")
+    return str(name).split("\x00")[0]
 
 
 def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -811,6 +1201,7 @@ def _get_timeout(message: "FlockwaveMessage", default: float) -> float:
 
 
 construct = RtlsExtension
+dependencies = ("beacon",)
 description = "Axiovel rtls-link UWB device management"
 schema = {
     "properties": {
@@ -830,6 +1221,11 @@ schema = {
             "title": "Broadcast addresses for discovery",
             "items": {"type": "string"},
             "default": ["255.255.255.255"],
+        },
+        "register_beacons": {
+            "type": "boolean",
+            "title": "Register configured RTLS anchors as map beacons",
+            "default": True,
         },
     }
 }
