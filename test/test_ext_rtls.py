@@ -379,6 +379,26 @@ async def test_inf_site_anchor_list(extension, device, builder, hub):
     assert a1["position"]["amsl"] == pytest.approx(14.8)
 
 
+async def test_inf_site_anchor_list_without_beacon_registration(
+    extension, device, builder, hub
+):
+    # register_beacons:false leaves _beacon_api None, but the X-RTLS-INF site
+    # anchors list must still mirror the tag's advertised cell geometry (the
+    # flag only disables the beacon-layer publication, not the anchors list).
+    add_rtls_cell_params(device)  # tag, role=1
+    assert extension._beacon_api is None
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    anchors = {a["id"]: a for a in response.body["anchors"]}
+    assert set(anchors) == {
+        "rtls::default::anchor_0",
+        "rtls::default::anchor_1",
+    }
+
+
 async def test_site_anchor_active_when_anchor_device_online(extension, device, builder, hub):
     add_rtls_cell_params(device)
     extension._beacon_api = StubBeaconAPI()

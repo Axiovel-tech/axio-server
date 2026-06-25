@@ -887,12 +887,15 @@ class RtlsExtension(Extension):
             self._sync_anchor_beacons(device, _decoded_device_params(device))
 
     def _sync_anchor_beacons(self, device, params: dict[str, Any]) -> None:
-        """Reconcile the anchor beacons for the cell that ``device`` sources.
-        Only a tag carries the cell geometry; any other role (or an invalid
-        role) drops the cell this device used to source."""
-        if self._beacon_api is None:
-            return
+        """Reconcile the cell that ``device`` sources, and (when the beacon API
+        is available) the anchor beacons rendered from it. Only a tag carries
+        the cell geometry; any other role (or an invalid role) drops the cell
+        this device used to source.
 
+        Cell-source bookkeeping (``_anchor_cell_sources``) is maintained
+        unconditionally so the X-RTLS-INF site anchors list reflects the
+        advertised geometry even with ``register_beacons: false``; only the
+        per-anchor beacon create/update/drop is gated on the beacon API."""
         role = _cell_source_role(device, params)
         if role is None:
             if "UWB_ROLE" in params:
@@ -908,6 +911,10 @@ class RtlsExtension(Extension):
             return
 
         self._anchor_cell_sources[cell.cell_id] = device.system_id
+
+        if self._beacon_api is None:
+            return
+
         active_ids = set()
         for anchor in cell.anchors:
             beacon_id = _anchor_beacon_id(cell.cell_id, anchor.index)
