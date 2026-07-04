@@ -2222,7 +2222,7 @@ wheels = [
 [[package]]
 name = "rtls-link"
 version = "0.1.0"
-source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=main#9c831ff1890d4a627db201e1bafe693ceaa42aea" }
+source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=main#8c67afcd61d04407ecb00d01e51454fab8e396fa" }
 dependencies = [
     { name = "anyio" },
     { name = "pymavlink" },

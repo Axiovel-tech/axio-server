@@ -52,6 +52,12 @@ MAX_PARAM_TIMEOUT = 60.0
 #: how often OTA progress notifications are broadcast at most, in seconds
 OTA_PROGRESS_INTERVAL = 0.5
 
+#: UWB_ROLE wire values -> artifact species. Since the firmware's
+#: tag/anchor application split the image IS the role (UWB_ROLE carries
+#: image-pinned bounds: tag 1..1, anchor 2..3), so OTA must ship the
+#: role-matched artifact; see rtls-link-zephyr PR #29.
+ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
+
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
 
@@ -322,6 +328,27 @@ class RtlsExtension(Extension):
                         "result": result,
                         "accepted": result == PARAM_ACK_ACCEPTED,
                     }
+
+    async def verify_species(
+        self, system_id: int, role: str, *, timeout: float = DEFAULT_PARAM_TIMEOUT
+    ) -> None:
+        """Refuses a wrong-species OTA: reads the device's UWB_ROLE and
+        raises ValueError unless it matches the artifact's declared
+        species (``"tag"`` or ``"anchor"``). The role is image-pinned on
+        the device, so uploading the wrong image silently strips the
+        device of its function until it is re-flashed — this is the seam
+        that makes that mistake loud.
+
+        Raises KeyError for unknown devices and trio.TooSlowError when
+        the device does not answer the role read in time."""
+        result = await self.get_param(system_id, "UWB_ROLE", timeout=timeout)
+        species = ROLE_SPECIES.get(int(result["value"]))
+        if species != role:
+            raise ValueError(
+                f"Device {system_id} is {species or 'of unknown role'}; "
+                f"refusing to upload a {role} image (the role is "
+                "image-pinned — OTA the matching artifact)"
+            )
 
     async def start_ota(self, system_id: int, image_path: str) -> dict[str, Any]:
         """Starts an OTA upgrade for a device in the background; returns
@@ -619,6 +646,29 @@ class RtlsExtension(Extension):
         if not os.path.isfile(image):
             return hub.reject(message, reason=f"No such image file: {image}")
 
+        # Optional species guardrail: the client declares which role the
+        # artifact was built for and the server verifies the device
+        # against it before uploading (the tag/anchor split made the
+        # role image-pinned).
+        role = message.body.get("role")
+        if role is not None:
+            if role not in ("tag", "anchor"):
+                return hub.reject(
+                    message, reason=f"Invalid role: {role!r} (expected tag or anchor)"
+                )
+            try:
+                await self.verify_species(system_id, role)
+            except KeyError:
+                return hub.reject(message, reason=f"No such device: {system_id}")
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+            except trio.TooSlowError:
+                return hub.reject(
+                    message,
+                    reason=f"Timeout while reading UWB_ROLE of device "
+                    f"{system_id} for the species check",
+                )
+
         try:
             job = await self.start_ota(system_id, image)
         except KeyError:
@@ -680,6 +730,7 @@ class RtlsExtension(Extension):
             "get_param_list": self.get_param_list,
             "set_param": self.set_param,
             "start_ota": self.start_ota,
+            "verify_species": self.verify_species,
         }
 
     def _get_devices(self):

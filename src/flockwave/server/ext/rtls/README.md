@@ -176,6 +176,14 @@ the raw PARAM_ACK result code (`0` accepted, `1` value unsupported,
 rejection is still a normal response (`accepted: false`); only
 timeouts and malformed requests are NAKed.
 
+Since the firmware's tag/anchor application split, an out-of-bounds
+numeric set is acked `1` (value unsupported) with the **clamped value
+the device actually applied** in the response — not a silent success.
+The motivating case is `UWB_ROLE`, whose bounds are image-pinned
+(tag `1..1`, anchor `2..3`): a device can no longer change species by
+parameter; flash/OTA the role-matched image instead. UIs should show
+`accepted: false` plus the returned value as "device rewrote this".
+
 Request — `paramType` may be omitted when the type is already known
 from an earlier listing (always the case after discovery):
 
@@ -211,11 +219,26 @@ already running for that device); without it, it **queries** the
 status of the device's last job. One job per device at a time; the
 image path is a server-side filesystem path.
 
+The firmware ships as **two role-matched artifacts** since the
+tag/anchor application split (`build/<board>/tag/...` and
+`build/<board>/anchor/...`); a device's role is image-pinned and OTA
+must upload the matching one. The optional `role` field declares which
+species the artifact was built for — the server then reads the
+device's `UWB_ROLE` and NAKs the upload on a mismatch instead of
+letting a wrong-species image strip the device of its function:
+
 Start:
 
 ```json
-{"type": "X-RTLS-OTA", "id": 42, "image": "/srv/firmware/rtls-link-1.3.0.bin"}
+{
+  "type": "X-RTLS-OTA",
+  "id": 42,
+  "image": "/srv/firmware/rtls-link-anchor-1.4.0.bin",
+  "role": "anchor"
+}
 ```
+
+Without `role` the upload is unguarded (pre-split behavior).
 
 Response (job snapshot; also the shape of the status query response,
 whose `job` is `null` when the device never had a job):

@@ -18,6 +18,7 @@ import trio.testing
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
+    PARAM_ACK_VALUE_UNSUPPORTED,
     PARAM_TYPE_CUSTOM,
     PARAM_TYPE_INT32,
     PARAM_TYPE_REAL32,
@@ -387,6 +388,29 @@ async def test_param_set_rejected_by_device(extension, device, builder, hub):
     assert device.params["UWB_CH"][0] == struct.pack("<i", 5)
 
 
+async def test_param_set_clamped_ack_passthrough(extension, device, builder, hub):
+    """Firmware acks VALUE_UNSUPPORTED when a numeric set clamps to the
+    parameter bounds (image-pinned UWB_ROLE is the motivating case); the
+    handler must pass the honest ack through as accepted=False."""
+    await discover(extension, device)
+    device.set_result = PARAM_ACK_VALUE_UNSUPPORTED
+
+    message = make_message(
+        builder,
+        {
+            "type": "X-RTLS-PARAM-SET",
+            "id": DEVICE_SYSID,
+            "name": "MAV_SYS_ID",
+            "value": 250,
+            "paramType": "uint8",
+        },
+    )
+    response = await extension._handle_RTLS_PARAM_SET(message, None, hub)
+    assert response.body["type"] == "X-RTLS-PARAM-SET"
+    assert response.body["accepted"] is False
+    assert response.body["result"] == PARAM_ACK_VALUE_UNSUPPORTED
+
+
 async def test_param_set_unknown_type_rejected(extension, device, builder, hub):
     await discover(extension, device)
     message = make_message(
@@ -482,6 +506,82 @@ async def test_ota_full_flow(extension, device, builder, hub, tmp_path):
     inf = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(inf, None, hub)
     assert response.body["status"][str(DEVICE_SYSID)]["otaStatus"] == "success"
+
+
+async def test_ota_role_guardrail_accepts_matching_species(
+    extension, device, builder, hub, tmp_path
+):
+    device.params["UWB_ROLE"] = (bytes([3]), PARAM_TYPE_UINT8)  # anchor-responder
+    await discover(extension, device)
+
+    image = tmp_path / "anchor.bin"
+    image.write_bytes(b"\x00" * 16)
+    extension._ota_upgrade = lambda address, image_path, *, timeout=10.0, on_progress=None: "9.9.9"
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        start = make_message(
+            builder,
+            {
+                "type": "X-RTLS-OTA",
+                "id": DEVICE_SYSID,
+                "image": str(image),
+                "role": "anchor",
+            },
+        )
+        response = await extension._handle_RTLS_OTA(start, None, hub)
+        assert response.body["type"] == "X-RTLS-OTA"
+        assert response.body["job"]["status"] == "running"
+        with trio.fail_after(5):
+            while extension._ota_jobs[DEVICE_SYSID]["status"] == "running":
+                await trio.sleep(0.01)
+    extension._nursery = None
+    assert extension._ota_jobs[DEVICE_SYSID]["status"] == "success"
+
+
+async def test_ota_role_guardrail_rejects_wrong_species(
+    extension, device, builder, hub, tmp_path
+):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag device
+    await discover(extension, device)
+
+    image = tmp_path / "anchor.bin"
+    image.write_bytes(b"\x00" * 16)
+
+    start = make_message(
+        builder,
+        {
+            "type": "X-RTLS-OTA",
+            "id": DEVICE_SYSID,
+            "image": str(image),
+            "role": "anchor",
+        },
+    )
+    response = await extension._handle_RTLS_OTA(start, None, hub)
+    assert response.body["type"] == "ACK-NAK"
+    assert "image-pinned" in response.body["reason"]
+    assert DEVICE_SYSID not in extension._ota_jobs
+
+
+async def test_ota_role_guardrail_rejects_invalid_role(
+    extension, device, builder, hub, tmp_path
+):
+    await discover(extension, device)
+    image = tmp_path / "fw.bin"
+    image.write_bytes(b"\x00" * 16)
+
+    start = make_message(
+        builder,
+        {
+            "type": "X-RTLS-OTA",
+            "id": DEVICE_SYSID,
+            "image": str(image),
+            "role": "drone",
+        },
+    )
+    response = await extension._handle_RTLS_OTA(start, None, hub)
+    assert response.body["type"] == "ACK-NAK"
+    assert "Invalid role" in response.body["reason"]
 
 
 async def test_ota_rejects_concurrent_jobs(extension, device, builder, hub, tmp_path):
