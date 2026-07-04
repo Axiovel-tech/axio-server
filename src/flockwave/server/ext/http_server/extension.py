@@ -317,6 +317,14 @@ async def run(app: SkybrushServer, configuration: dict[str, Any], logger: Logger
             message += "\nAlternatively, you might have another instance of Skybrush Server running."
 
         logger.error(message, extra={"telemetry": "ignore"})
+
+        # A server whose client channel never came up is not operational:
+        # every other extension would keep running and the log would look
+        # healthy while no client can ever connect. Take the process down
+        # (opt out with exit_on_bind_failure: false).
+        if bool(configuration.get("exit_on_bind_failure", True)):
+            logger.error("Shutting down: the HTTP server port is required.")
+            app.request_shutdown()
         return
 
     # Port seems to be available so try to start the "proper" server
