@@ -52,6 +52,12 @@ MAX_PARAM_TIMEOUT = 60.0
 #: how often OTA progress notifications are broadcast at most, in seconds
 OTA_PROGRESS_INTERVAL = 0.5
 
+#: UWB_ROLE wire values -> artifact species. Since the firmware's
+#: tag/anchor application split the image IS the role (UWB_ROLE carries
+#: image-pinned bounds: tag 1..1, anchor 2..3), so OTA must ship the
+#: role-matched artifact; see rtls-link-zephyr PR #29.
+ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
+
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
 
@@ -79,6 +85,18 @@ class RtlsExtension(Extension):
         self._ota_upgrade = None
 
     async def run(self, app, configuration, logger):
+        # Fail fast on the classic standalone-harness mistake: the server
+        # framework sets ``self.app`` before calling run(), and every
+        # broadcast path (stats, OTA progress) silently no-ops without it.
+        # A test rig that constructs the extension directly must do the
+        # same, or it would "work" while dropping all notifications.
+        if self.app is None:
+            raise RuntimeError(
+                "rtls extension started without an app: set ext.app to the "
+                "application (the server framework does this before run(); "
+                "a standalone harness must too, or stats/OTA broadcasts "
+                "are silently dropped)"
+            )
         port = int(configuration.get("port", 3333))
         targets = [(host, port) for host in configuration.get("devices", [])]
         broadcast = [
@@ -323,6 +341,27 @@ class RtlsExtension(Extension):
                         "accepted": result == PARAM_ACK_ACCEPTED,
                     }
 
+    async def verify_species(
+        self, system_id: int, role: str, *, timeout: float = DEFAULT_PARAM_TIMEOUT
+    ) -> None:
+        """Refuses a wrong-species OTA: reads the device's UWB_ROLE and
+        raises ValueError unless it matches the artifact's declared
+        species (``"tag"`` or ``"anchor"``). The role is image-pinned on
+        the device, so uploading the wrong image silently strips the
+        device of its function until it is re-flashed — this is the seam
+        that makes that mistake loud.
+
+        Raises KeyError for unknown devices and trio.TooSlowError when
+        the device does not answer the role read in time."""
+        result = await self.get_param(system_id, "UWB_ROLE", timeout=timeout)
+        species = ROLE_SPECIES.get(int(result["value"]))
+        if species != role:
+            raise ValueError(
+                f"Device {system_id} is {species or 'of unknown role'}; "
+                f"refusing to upload a {role} image (the role is "
+                "image-pinned — OTA the matching artifact)"
+            )
+
     async def start_ota(self, system_id: int, image_path: str) -> dict[str, Any]:
         """Starts an OTA upgrade for a device in the background; returns
         a snapshot of the newly created job record.
@@ -404,6 +443,7 @@ class RtlsExtension(Extension):
 
     async def _broadcast_ota_status(self, job: dict[str, Any]) -> None:
         if self.app is None:
+            self._warn_no_app()
             return
         hub = self.app.message_hub
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
@@ -466,6 +506,7 @@ class RtlsExtension(Extension):
         self._last_stats_broadcast[system_id] = now
         self._last_stats_sent[system_id] = dict(stats)
         if self.app is None:
+            self._warn_no_app()
             return
         hub = self.app.message_hub
         body = {"type": "X-RTLS-STATS", "stats": {str(system_id): dict(stats)}}
@@ -619,6 +660,29 @@ class RtlsExtension(Extension):
         if not os.path.isfile(image):
             return hub.reject(message, reason=f"No such image file: {image}")
 
+        # Optional species guardrail: the client declares which role the
+        # artifact was built for and the server verifies the device
+        # against it before uploading (the tag/anchor split made the
+        # role image-pinned).
+        role = message.body.get("role")
+        if role is not None:
+            if role not in ("tag", "anchor"):
+                return hub.reject(
+                    message, reason=f"Invalid role: {role!r} (expected tag or anchor)"
+                )
+            try:
+                await self.verify_species(system_id, role)
+            except KeyError:
+                return hub.reject(message, reason=f"No such device: {system_id}")
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+            except trio.TooSlowError:
+                return hub.reject(
+                    message,
+                    reason=f"Timeout while reading UWB_ROLE of device "
+                    f"{system_id} for the species check",
+                )
+
         try:
             job = await self.start_ota(system_id, image)
         except KeyError:
@@ -656,6 +720,19 @@ class RtlsExtension(Extension):
 
     # ---- helpers / exports ----
 
+    def _warn_no_app(self) -> None:
+        """Once-per-instance warning for broadcasts dropped because
+        ``self.app`` was never set (direct-handler use in a harness that
+        bypassed run()'s guard)."""
+        if getattr(self, "_no_app_warned", False):
+            return
+        self._no_app_warned = True
+        if self.log:
+            self.log.warning(
+                "rtls: dropping broadcasts — extension has no app "
+                "(set ext.app when driving the extension outside the server)"
+            )
+
     def _require_protocol(self) -> RtlsProtocol:
         if self._protocol is None:
             raise RuntimeError("rtls protocol is not running")
@@ -680,6 +757,7 @@ class RtlsExtension(Extension):
             "get_param_list": self.get_param_list,
             "set_param": self.set_param,
             "start_ota": self.start_ota,
+            "verify_species": self.verify_species,
         }
 
     def _get_devices(self):
