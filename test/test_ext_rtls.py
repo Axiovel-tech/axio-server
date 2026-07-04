@@ -11,6 +11,8 @@ pushed back through ``_process_datagram``. No sockets are involved.
 import struct
 import threading
 import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import trio
@@ -24,11 +26,14 @@ from rtlslink.protocol import (
     PARAM_TYPE_REAL32,
     PARAM_TYPE_UINT8,
     RTLS_COMPONENT_ID,
+    ProtocolEvent,
     RtlsProtocol,
+    encode_param_value,
+    param_type_from_name,
     raw_field_bytes,
 )
 
-from flockwave.server.ext.rtls.extension import RtlsExtension
+from flockwave.server.ext.rtls.extension import RtlsExtension, _configured_addresses
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -150,6 +155,43 @@ class StubApp:
         self.message_hub = StubMessageHub()
 
 
+class StubBeaconBasicProperties:
+    def __init__(self, name=""):
+        self.name = name
+
+
+class StubBeacon:
+    def __init__(self, id):
+        self.id = id
+        self.basic_properties = StubBeaconBasicProperties()
+        self.position = None
+        self.active = False
+
+    def update_status(self, position=None, heading=None, active=None):
+        if position is not None:
+            self.position = position
+        if active is not None:
+            self.active = bool(active)
+
+
+class StubBeaconAPI:
+    """Stands in for the beacon-registry API the extension imports: ``use``
+    yields a beacon and removes it again when its context exits, mirroring the
+    real registry-backed context manager."""
+
+    def __init__(self):
+        self.beacons = {}
+
+    @contextmanager
+    def use(self, beacon_id):
+        beacon = StubBeacon(beacon_id)
+        self.beacons[beacon_id] = beacon
+        try:
+            yield beacon
+        finally:
+            self.beacons.pop(beacon_id, None)
+
+
 @pytest.fixture(scope="module")
 def dialect():
     return load_dialect()
@@ -211,13 +253,69 @@ async def test_run_without_app_fails_fast(dialect):
         await ext.run(None, {}, None)
 
 
+def set_fake_param(device, name, value, param_type_name):
+    """Write a parameter into a FakeDevice's wire store (raw bytes + type)."""
+    param_type = param_type_from_name(param_type_name)
+    device.params[name] = (encode_param_value(value, param_type), param_type)
+
+
+def set_cached_param(device, name, value, param_type_name):
+    """Write a parameter into a bare device's server-side cache (a
+    SimpleNamespace standing in for an RtlsDevice)."""
+    param_type = param_type_from_name(param_type_name)
+    device.params[name] = encode_param_value(value, param_type)
+    device.param_types[name] = param_type
+
+
+def add_rtls_cell_params(device, *, role=1, uwb_mac=254):
+    """Give a FakeDevice a full RTLS cell: a role, its own MAC, the cell
+    origin and a two-anchor NED table (A1 carries a survey bias)."""
+    for name, value, param_type in (
+        ("UWB_ROLE", role, "uint8"),
+        ("UWB_MAC", uwb_mac, "uint16"),
+        ("ORIGIN_LAT_E7", 413900000, "int32"),
+        ("ORIGIN_LON_E7", 21500000, "int32"),
+        ("ORIGIN_ALT_MM", 10000, "int32"),
+        ("UWB_AN_COUNT", 2, "uint8"),
+        ("UWB_AN0_X", -10.0, "real32"),
+        ("UWB_AN0_Y", -10.0, "real32"),
+        ("UWB_AN0_Z", 0.0, "real32"),
+        ("UWB_AN0_MAC", 1, "uint16"),
+        ("UWB_AN0_BIAS_M", 0.0, "real32"),
+        ("UWB_AN1_X", 10.0, "real32"),
+        ("UWB_AN1_Y", 10.0, "real32"),
+        ("UWB_AN1_Z", -4.8, "real32"),
+        ("UWB_AN1_MAC", 2, "uint16"),
+        ("UWB_AN1_BIAS_M", -0.3, "real32"),
+    ):
+        set_fake_param(device, name, value, param_type)
+
+
+def add_anchor_device(extension, system_id, *, role, uwb_mac):
+    """Register a bare anchor device (role + MAC only) directly in the
+    protocol's device table, as discovery + param-listing would."""
+    anchor = SimpleNamespace(
+        system_id=system_id,
+        address=("192.168.4.%d" % (system_id % 250), 3333),
+        last_seen=time.monotonic(),
+        params={},
+        param_types={},
+        param_count=None,
+    )
+    set_cached_param(anchor, "UWB_ROLE", role, "uint8")
+    set_cached_param(anchor, "UWB_MAC", uwb_mac, "uint16")
+    anchor.param_count = len(anchor.params)
+    extension._protocol.devices[system_id] = anchor
+    return anchor
+
+
 # ---- X-RTLS-INF ---------------------------------------------------------
 
 
 async def test_inf_empty_before_discovery(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body == {"type": "X-RTLS-INF", "status": {}}
+    assert response.body == {"type": "X-RTLS-INF", "status": {}, "anchors": []}
 
 
 async def test_inf_lists_discovered_devices(extension, device, builder, hub):
@@ -236,6 +334,260 @@ async def test_inf_lists_discovered_devices(extension, device, builder, hub):
     assert entry["firmwareVersion"] == "1.2.3"
     assert entry["paramCount"] == len(device.params)
     assert entry["otaStatus"] is None
+    # a device without RTLS params carries neither a role nor a name
+    assert "role" not in entry
+    assert "name" not in entry
+
+
+# ---- role / site anchors / beacons --------------------------------------
+
+
+async def test_inf_includes_rtls_role_and_name(extension, device, builder, hub):
+    add_rtls_cell_params(device, role=2, uwb_mac=1)
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["role"] == "anchor-initiator"
+    assert entry["name"] == "RTLS anchor A0"
+
+
+async def test_inf_site_anchor_list(extension, device, builder, hub):
+    add_rtls_cell_params(device)  # tag, role=1
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    anchors = {a["id"]: a for a in response.body["anchors"]}
+    assert set(anchors) == {
+        "rtls::default::anchor_0",
+        "rtls::default::anchor_1",
+    }
+    a1 = anchors["rtls::default::anchor_1"]
+    assert a1["cell"] == "default"
+    assert a1["index"] == 1
+    assert a1["mac"] == 2
+    # no live anchor device online yet
+    assert a1["active"] is False
+    # origin + NED projected to global
+    assert a1["position"]["lat"] == pytest.approx(41.3900898)
+    assert a1["position"]["lon"] == pytest.approx(2.1501197)
+    assert a1["position"]["amsl"] == pytest.approx(14.8)
+
+
+async def test_inf_site_anchor_list_without_beacon_registration(
+    extension, device, builder, hub
+):
+    # register_beacons:false leaves _beacon_api None, but the X-RTLS-INF site
+    # anchors list must still mirror the tag's advertised cell geometry (the
+    # flag only disables the beacon-layer publication, not the anchors list).
+    add_rtls_cell_params(device)  # tag, role=1
+    assert extension._beacon_api is None
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    anchors = {a["id"]: a for a in response.body["anchors"]}
+    assert set(anchors) == {
+        "rtls::default::anchor_0",
+        "rtls::default::anchor_1",
+    }
+
+
+async def test_site_anchor_active_when_anchor_device_online(extension, device, builder, hub):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    # anchor A1's MAC (2) comes online as a live responder
+    add_anchor_device(extension, 102, role=3, uwb_mac=2)
+    extension._refresh_anchor_cells()
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    anchors = {a["id"]: a for a in response.body["anchors"]}
+    assert anchors["rtls::default::anchor_1"]["active"] is True
+    assert anchors["rtls::default::anchor_0"]["active"] is False
+
+
+async def test_param_cache_registers_configured_anchors_as_beacons(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    api = extension._beacon_api
+    assert set(api.beacons) == {
+        "rtls::default::anchor_0",
+        "rtls::default::anchor_1",
+    }
+    anchor1 = api.beacons["rtls::default::anchor_1"]
+    assert anchor1.basic_properties.name == "RTLS A1"
+    assert anchor1.active is False
+    assert anchor1.position.lat == pytest.approx(41.3900898)
+    assert anchor1.position.lon == pytest.approx(2.1501197)
+    assert anchor1.position.amsl == pytest.approx(14.8)
+
+
+async def test_anchor_beacon_active_reflects_associated_anchor_device(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
+    assert anchor1.active is False
+
+    anchor_device = add_anchor_device(extension, 102, role=3, uwb_mac=2)
+    extension._refresh_anchor_cells()
+    assert anchor1.active is True
+
+    # the anchor process dies -> its beacon goes inactive again
+    extension._protocol.devices.pop(anchor_device.system_id)
+    extension._handle_lost(ProtocolEvent("lost", anchor_device.system_id))
+    assert anchor1.active is False
+
+
+async def test_invalid_role_does_not_register_anchor_beacons(extension, device):
+    add_rtls_cell_params(device, role=99)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    assert extension._beacon_api.beacons == {}
+
+
+async def test_complete_cell_without_role_registers_legacy_tag_beacons(extension, device):
+    add_rtls_cell_params(device)
+    device.params.pop("UWB_ROLE")
+    device.param_count = len(device.params)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+
+
+async def test_source_tag_role_change_drops_anchor_beacons(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+
+    # the tag is re-roled into an anchor: it no longer sources the cell
+    result = await extension.set_param(DEVICE_SYSID, "UWB_ROLE", 3, "uint8")
+    assert result["accepted"] is True
+    assert extension._beacon_api.beacons == {}
+
+
+async def test_lost_source_tag_drops_anchor_beacons(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+
+    events = extension._protocol.expire(time.monotonic() + 1000)
+    assert [event.kind for event in events] == ["lost"]
+    for event in events:
+        extension._handle_lost(event)
+    assert extension._beacon_api.beacons == {}
+
+
+async def test_lost_source_tag_falls_back_to_another_live_tag(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
+
+    # a second tag carries the same cell but a moved A1
+    other = SimpleNamespace(
+        system_id=99,
+        address=("192.168.4.99", 3333),
+        last_seen=time.monotonic(),
+        params=dict(extension._protocol.devices[DEVICE_SYSID].params),
+        param_types=dict(extension._protocol.devices[DEVICE_SYSID].param_types),
+        param_count=extension._protocol.devices[DEVICE_SYSID].param_count,
+    )
+    set_cached_param(other, "UWB_AN1_X", 20.0, "real32")
+    extension._protocol.devices[other.system_id] = other
+
+    extension._protocol.devices.pop(DEVICE_SYSID)
+    extension._handle_lost(ProtocolEvent("lost", DEVICE_SYSID))
+
+    # the cell re-homes onto the surviving tag and re-projects from its geometry
+    assert extension._anchor_cell_sources["default"] == other.system_id
+    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
+    assert anchor1.position.lat == pytest.approx(41.3901797)
+
+
+async def test_anchor_beacon_refreshes_after_param_set(extension, device):
+    add_rtls_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    result = await extension.set_param(DEVICE_SYSID, "UWB_AN1_X", 20.0, "real32")
+    assert result["accepted"] is True
+
+    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
+    assert anchor1.position.lat == pytest.approx(41.3901797)
+    assert anchor1.position.lon == pytest.approx(2.1501197)
+    assert anchor1.position.amsl == pytest.approx(14.8)
+
+
+def test_configured_addresses_allow_per_target_ports():
+    assert _configured_addresses(["192.0.2.10:3344", "192.0.2.11"], 3333) == [
+        ("192.0.2.10", 3344),
+        ("192.0.2.11", 3333),
+    ]
+
+
+# ---- inter-anchor TWR telemetry passthrough -----------------------------
+
+
+async def test_inter_anchor_twr_surfaced_in_inf(extension, device, builder, hub):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+
+    # the anchor reports measured ranges to two peers as NAMED_VALUE_FLOAT in
+    # the real firmware "twr<peer-mac-hex>" format; the SDK decodes the peer MAC
+    # and the extension surfaces a per-peer row with a derived age. This crosses
+    # the firmware -> SDK -> server name boundary end to end.
+    t0 = time.monotonic()
+    for name, value in (("twr0001", 14.0), ("twr0002", 9.5)):
+        await extension._process_datagram(
+            device.named_value_float(name, value), device.address, t0
+        )
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    rows = {row["peerMac"]: row for row in entry["twr"]}
+    assert rows[0x0001]["distanceM"] == pytest.approx(14.0)
+    assert rows[0x0002]["distanceM"] == pytest.approx(9.5)
+    assert all(row["ageMs"] >= 0 for row in entry["twr"])
+
+
+async def test_twr_does_not_pollute_health_stats(extension, device):
+    await discover(extension, device)
+    # a TWR float must not be mistaken for a solve stat
+    await extension._process_datagram(
+        device.named_value_float("twr0001", 14.0), device.address, time.monotonic()
+    )
+    assert DEVICE_SYSID not in extension._stats
+    distance_m, _harvested = extension._twr[DEVICE_SYSID][0x0001]
+    assert distance_m == pytest.approx(14.0)
+
+
+async def test_twr_pruned_on_device_loss(extension, device, builder, hub):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    await extension._process_datagram(
+        device.named_value_float("twr0001", 14.0), device.address, time.monotonic()
+    )
+    assert DEVICE_SYSID in extension._twr
+
+    events = extension._protocol.expire(time.monotonic() + 1000)
+    for event in events:
+        extension._handle_lost(event)
+    assert DEVICE_SYSID not in extension._twr
 
 
 # ---- X-RTLS-PARAM-LIST --------------------------------------------------
