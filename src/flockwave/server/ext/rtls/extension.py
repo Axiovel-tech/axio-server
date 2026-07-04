@@ -85,6 +85,18 @@ class RtlsExtension(Extension):
         self._ota_upgrade = None
 
     async def run(self, app, configuration, logger):
+        # Fail fast on the classic standalone-harness mistake: the server
+        # framework sets ``self.app`` before calling run(), and every
+        # broadcast path (stats, OTA progress) silently no-ops without it.
+        # A test rig that constructs the extension directly must do the
+        # same, or it would "work" while dropping all notifications.
+        if self.app is None:
+            raise RuntimeError(
+                "rtls extension started without an app: set ext.app to the "
+                "application (the server framework does this before run(); "
+                "a standalone harness must too, or stats/OTA broadcasts "
+                "are silently dropped)"
+            )
         port = int(configuration.get("port", 3333))
         targets = [(host, port) for host in configuration.get("devices", [])]
         broadcast = [
@@ -431,6 +443,7 @@ class RtlsExtension(Extension):
 
     async def _broadcast_ota_status(self, job: dict[str, Any]) -> None:
         if self.app is None:
+            self._warn_no_app()
             return
         hub = self.app.message_hub
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
@@ -493,6 +506,7 @@ class RtlsExtension(Extension):
         self._last_stats_broadcast[system_id] = now
         self._last_stats_sent[system_id] = dict(stats)
         if self.app is None:
+            self._warn_no_app()
             return
         hub = self.app.message_hub
         body = {"type": "X-RTLS-STATS", "stats": {str(system_id): dict(stats)}}
@@ -705,6 +719,19 @@ class RtlsExtension(Extension):
         )
 
     # ---- helpers / exports ----
+
+    def _warn_no_app(self) -> None:
+        """Once-per-instance warning for broadcasts dropped because
+        ``self.app`` was never set (direct-handler use in a harness that
+        bypassed run()'s guard)."""
+        if getattr(self, "_no_app_warned", False):
+            return
+        self._no_app_warned = True
+        if self.log:
+            self.log.warning(
+                "rtls: dropping broadcasts — extension has no app "
+                "(set ext.app when driving the extension outside the server)"
+            )
 
     def _require_protocol(self) -> RtlsProtocol:
         if self._protocol is None:

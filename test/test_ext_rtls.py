@@ -201,6 +201,16 @@ def make_message(builder, body):
     return builder.create_message(body)
 
 
+async def test_run_without_app_fails_fast(dialect):
+    """A standalone harness that forgets ext.app must fail loudly at
+    run() instead of silently dropping every stats/OTA broadcast (a real
+    e2e-harness bug this guard exists for)."""
+    ext = RtlsExtension()
+    assert ext.app is None
+    with pytest.raises(RuntimeError, match="without an app"):
+        await ext.run(None, {}, None)
+
+
 # ---- X-RTLS-INF ---------------------------------------------------------
 
 

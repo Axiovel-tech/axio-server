@@ -181,6 +181,18 @@ def main() -> int:
         print("set RTLS_FW_TAG / RTLS_FW_ANCHOR to built native_sim binaries")
         return 2
 
+    # Stale-binary guard (SDK >= the two-apps split ships it): sources
+    # newer than the binary mean this e2e would bless yesterday's firmware.
+    try:
+        from rtlslink.sim import warn_if_stale
+    except ImportError:
+        pass
+    else:
+        for binary in (tag, anchor):
+            report = warn_if_stale(binary, log)
+            if report:
+                print(f"WARNING: {report}", file=sys.stderr)
+
     trio.run(_drive, anchor, "anchor", _check_anchor)
     time.sleep(1)  # let the old mgmt port close
     trio.run(_drive, tag, "tag", _check_tag)
