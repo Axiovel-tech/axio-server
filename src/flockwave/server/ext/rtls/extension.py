@@ -71,8 +71,10 @@ DEFAULT_SLEEP_TIMEOUT = 10.0
 
 #: seconds to wait after an accepted sleep request before reading the
 #: SLEEP parameter back: the firmware's arming gate runs asynchronously
-#: (100 ms reconcile tick) and refuses by flipping the parameter to 0
-DEFAULT_SLEEP_SETTLE = 1.5
+#: and may wait up to its confirmation window (2 s by default) for a
+#: disarmed heartbeat that postdates the request, refusing by flipping
+#: the parameter to 0 -- so the settle must exceed that window
+DEFAULT_SLEEP_SETTLE = 3.0
 
 #: upper bound for client-supplied transaction timeouts, in seconds
 MAX_PARAM_TIMEOUT = 60.0
