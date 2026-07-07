@@ -102,6 +102,7 @@ plus a site-level `anchors` list:
       "firmwareVersion": "1.2.3",
       "paramCount": 23,
       "otaStatus": null,
+      "sleeping": false,
       "role": "tag",
       "name": "RTLS tag 42",
       "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
@@ -127,6 +128,11 @@ plus a site-level `anchors` list:
   (the list is auto-fetched on discovery), otherwise `null`.
 - `otaStatus` — status of the device's last OTA job
   (`"running"` / `"success"` / `"error"`) or `null` if there was none.
+- `sleeping` — `true` while the drone is in sleep mode (power rails to
+  the motors/flight controller, ELRS receiver and UWB module cut; WiFi
+  and this management link still up). Derived from the device's
+  heartbeat (`MAV_STATE_STANDBY`), so it is live even though sleep is
+  commanded through the `SLEEP` parameter.
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
   `"disabled"`, derived from the device's `UWB_ROLE` parameter; absent
   when the device does not expose a role.
@@ -244,6 +250,47 @@ Response:
 }
 ```
 
+### X-RTLS-SLEEP — sleep / wake drones
+
+Puts one or more devices into sleep mode, or wakes them. Sleep is
+commanded through the firmware's `SLEEP` parameter; the firmware
+**refuses** to sleep while its flight controller is armed (or, in the
+default strict gate mode, while a live disarmed heartbeat cannot be
+confirmed) by flipping the parameter back to `0` — the server detects
+that by reading the parameter back after a settle delay and reports
+the refusal per device. A sleeping drone keeps WiFi and the
+management channel up, stays discoverable (`sleeping: true` in
+`X-RTLS-INF`) and can be woken with the same message.
+
+On hardware, a woken device reboots a moment after acknowledging the
+wake (to re-initialize the power-cycled UWB module) and drops off the
+network for a few seconds before re-appearing.
+
+Request — `ids` lists the target devices (a single `id` is also
+accepted); `sleeping` selects the direction:
+
+```json
+{
+  "type": "X-RTLS-SLEEP",
+  "ids": [42, 43],
+  "sleeping": true
+}
+```
+
+Response — one entry per device; `accepted: false` with a `detail`
+of the refusal is a normal response (only malformed requests NAK):
+
+```json
+{
+  "type": "X-RTLS-SLEEP",
+  "sleeping": true,
+  "result": {
+    "42": {"requested": true, "accepted": true, "sleeping": true, "detail": "asleep"},
+    "43": {"requested": true, "accepted": false, "sleeping": false, "detail": "refused by device (arming gate: vehicle armed or flight controller not confirmed disarmed)"}
+  }
+}
+```
+
 ### X-RTLS-OTA — firmware update
 
 With an `image` field the message **starts** an OTA job for the device
@@ -319,7 +366,8 @@ query.
 Other server extensions can use the same machinery via the exports of
 this extension: `devices()`, `protocol()`, and the awaitable
 `get_param(system_id, name)`, `get_param_list(system_id)`,
-`set_param(system_id, name, value, param_type=None)` and
+`set_param(system_id, name, value, param_type=None)`,
+`set_sleep(system_id, sleeping)` and
 `start_ota(system_id, image_path)`.
 
 ## Testing
