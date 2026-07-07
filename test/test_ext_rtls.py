@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import trio
 import trio.testing
+import rtlslink as rtlslink_module
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
@@ -824,7 +825,17 @@ async def test_param_set_timeout(extension, device, builder, hub, autojump_clock
 
 # ---- X-RTLS-SLEEP -------------------------------------------------------
 
+# Some sleep assertions need an SDK that tracks the heartbeat system_status
+# and the `slp` stat; with the pinned pre-sleep SDK the command path still
+# works but the state is invisible. Those tests are skipped until the
+# rtls-link pin moves past fw feature/sleep-mode.
+requires_sleep_sdk = pytest.mark.skipif(
+    not hasattr(rtlslink_module, "SLEEP_PARAM"),
+    reason="pinned rtls-link SDK predates sleep mode",
+)
 
+
+@requires_sleep_sdk
 async def test_sleep_accepted(extension, device, builder, hub, autojump_clock):
     await discover(extension, device)
 
@@ -915,6 +926,11 @@ async def test_sleep_rejects_malformed_requests(extension, device, builder, hub)
         {"type": "X-RTLS-SLEEP", "ids": ["42"], "sleeping": True},
         {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID]},
         {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": "yes"},
+        # bool is an int subclass; JSON true must not target sysid 1
+        {"type": "X-RTLS-SLEEP", "ids": [True], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [0], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [256], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": list(range(1, 255)) * 2, "sleeping": True},
     ):
         message = make_message(builder, body)
         response = await extension._handle_RTLS_SLEEP(message, None, hub)
@@ -1223,6 +1239,7 @@ async def test_stats_query_returns_latest_snapshot(extension, device, builder, h
     assert entry["anchorMask"] == 254
 
 
+@requires_sleep_sdk
 async def test_stats_query_carries_sleep_state(extension, device, builder, hub):
     await discover(extension, device)
     await _feed_stats(extension, device, {**FULL_STATS, "slp": 1.0}, now=0.0)

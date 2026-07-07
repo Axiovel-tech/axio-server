@@ -21,7 +21,6 @@ import trio
 import trio.socket
 from flockwave.gps.vectors import GPSCoordinate
 from rtlslink import (
-    SLEEP_PARAM,
     STATS_FIELDS,
     ProtocolEvent,
     RtlsProtocol,
@@ -34,6 +33,14 @@ from rtlslink import (
 )
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import PARAM_ACK_ACCEPTED, PARAM_ACK_IN_PROGRESS
+
+try:
+    from rtlslink import SLEEP_PARAM
+except ImportError:  # pragma: no cover
+    # An SDK that predates sleep mode must not take the whole extension
+    # down with an ImportError (the extension manager would silently drop
+    # discovery/params/OTA too). The constant is just the parameter name.
+    SLEEP_PARAM = "SLEEP"
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
@@ -437,26 +444,44 @@ class RtlsExtension(Extension):
         after the ack (to re-initialize the power-cycled UWB module) and
         drops off the network for a few seconds."""
         request = 1 if sleeping else 0
-        ack = await self.set_param(
-            system_id, SLEEP_PARAM, request, "uint8", timeout=timeout
-        )
-        if not ack["accepted"]:
-            return {
-                "requested": sleeping,
-                "accepted": False,
-                "sleeping": None,
-                "detail": f"parameter write rejected (code {ack['result']})",
-            }
-        if not sleeping:
-            return {
-                "requested": False,
-                "accepted": True,
-                "sleeping": False,
-                "detail": "awake",
-            }
+        # `timeout` bounds the whole transaction (write + settle + readback),
+        # not each parameter operation separately, so a caller's deadline
+        # holds.
+        with trio.fail_after(timeout + settle):
+            ack = await self.set_param(
+                system_id, SLEEP_PARAM, request, "uint8", timeout=timeout
+            )
+            if not ack["accepted"]:
+                return {
+                    "requested": sleeping,
+                    "accepted": False,
+                    "sleeping": None,
+                    "detail": f"parameter write rejected (code {ack['result']})",
+                }
+            if not sleeping:
+                return {
+                    "requested": False,
+                    "accepted": True,
+                    "sleeping": False,
+                    "detail": "awake",
+                }
 
-        await trio.sleep(settle)
-        state = await self.get_param(system_id, SLEEP_PARAM, timeout=timeout)
+            await trio.sleep(settle)
+            try:
+                state = await self.get_param(
+                    system_id, SLEEP_PARAM, timeout=timeout
+                )
+            except (KeyError, trio.TooSlowError):
+                # The write was acknowledged, so the device is most likely
+                # asleep -- report the verification gap instead of a plain
+                # timeout that reads like the command failed.
+                return {
+                    "requested": True,
+                    "accepted": False,
+                    "sleeping": None,
+                    "detail": "sleep acknowledged but verification failed "
+                    "(device state unknown)",
+                }
         asleep = bool(state["value"])
         return {
             "requested": True,
@@ -782,7 +807,13 @@ class RtlsExtension(Extension):
         if (
             not isinstance(ids, list)
             or not ids
-            or not all(isinstance(i, int) for i in ids)
+            or len(ids) > 256
+            or not all(
+                # bool is an int subclass: JSON `true` would otherwise pass
+                # and target sysid 1
+                isinstance(i, int) and not isinstance(i, bool) and 1 <= i <= 255
+                for i in ids
+            )
         ):
             return hub.reject(
                 message, reason="Missing or invalid device ids ('ids' or 'id')"
@@ -812,6 +843,9 @@ class RtlsExtension(Extension):
                     sleeping,
                     f"Timeout while waiting for device {system_id}",
                 )
+            except Exception as ex:  # noqa: BLE001
+                # never let one device's failure cancel the siblings
+                results[key] = _sleep_error(sleeping, str(ex))
 
         # one request per device, concurrently: the sleep verification
         # includes a settle delay, so a serial loop over a fleet would
