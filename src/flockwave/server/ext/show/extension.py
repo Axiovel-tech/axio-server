@@ -66,6 +66,7 @@ class DroneShowExtension(Extension):
             "get_configuration": self._get_configuration,
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
             "get_light_configuration": self._get_light_configuration,
+            "schedule_start": self._schedule_start,
         }
 
     def handle_SHOW_CFG(self, message, sender, hub):
@@ -214,6 +215,25 @@ class DroneShowExtension(Extension):
     def _get_clock(self) -> ShowClock | None:
         """Returns a reference to the show clock."""
         return self._clock
+
+    def _schedule_start(self, start_time: float) -> None:
+        """Schedules the show start at the given UNIX timestamp through the
+        regular configuration-update path, exactly as if a client had set it
+        (all change signals fire, so the start time propagates to the drones
+        and to connected clients). Switches the start method to AUTO: the
+        caller (e.g. the RC start reflector) has turned an external trigger
+        into a concrete scheduled start owned by the server."""
+        self._config.update_from_json(
+            {
+                "start": {
+                    "time": start_time,
+                    "clock": None,
+                    "method": "auto",
+                    "authorized": self._config.authorized_to_start,
+                    "authorizationScope": self._config.authorization_scope.value,
+                }
+            }
+        )
 
     def _get_configuration(self) -> DroneShowConfiguration:
         """Returns a copy of the current drone show configuration."""
