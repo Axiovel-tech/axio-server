@@ -1266,7 +1266,9 @@ def _decoded_device_params(device) -> dict[str, Any]:
 
 
 def _cell_id_from_params(params: dict[str, Any]) -> str:
-    value = params.get("RTLS_CELL_ID")
+    # CELL_ID is the firmware's operator-facing cell label; RTLS_CELL_ID is
+    # the older speculative name kept as a fallback.
+    value = params.get("CELL_ID") or params.get("RTLS_CELL_ID")
     return str(value) if value not in (None, "") else "default"
 
 

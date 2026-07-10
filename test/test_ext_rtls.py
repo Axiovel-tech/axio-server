@@ -1518,3 +1518,13 @@ async def test_show_clock_lost_device_repinned_on_return(extension, device):
     for event in events:
         extension._handle_lost(event)
     assert DEVICE_SYSID not in extension._show_clock._pinned
+
+
+def test_cell_id_from_params_reads_firmware_label():
+    from flockwave.server.ext.rtls.extension import _cell_id_from_params
+
+    assert _cell_id_from_params({}) == "default"
+    assert _cell_id_from_params({"CELL_ID": "arena-north"}) == "arena-north"
+    # legacy speculative name still honored
+    assert _cell_id_from_params({"RTLS_CELL_ID": "old"}) == "old"
+    assert _cell_id_from_params({"CELL_ID": ""}) == "default"
