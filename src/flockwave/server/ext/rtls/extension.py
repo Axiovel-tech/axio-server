@@ -59,12 +59,6 @@ DEFAULT_PARAM_TIMEOUT = 5.0
 #: default timeout for a full parameter list transaction, in seconds
 DEFAULT_PARAM_LIST_TIMEOUT = 10.0
 
-#: stat fields that must be present before a snapshot is broadcast.
-#: ``slp`` (sleep state) is deliberately optional: firmware that predates
-#: sleep mode never sends it, and gating on it would silence the health
-#: broadcast for those devices entirely.
-REQUIRED_STATS_FIELDS = tuple(f for f in STATS_FIELDS if f != "slp")
-
 #: default timeout for a sleep/wake transaction, in seconds (the request
 #: itself is one parameter write; see also DEFAULT_SLEEP_SETTLE)
 DEFAULT_SLEEP_TIMEOUT = 10.0
@@ -624,7 +618,11 @@ class RtlsExtension(Extension):
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
-        if not all(field in data for field in REQUIRED_STATS_FIELDS):
+        # STATS_FIELDS is the SDK's required legacy set; newer stats
+        # (``slp`` sleep state, the cluster clock) are optional and must
+        # not gate the broadcast, or firmware without them would never
+        # get a health snapshot out.
+        if not all(field in data for field in STATS_FIELDS):
             return
         last = self._last_stats_broadcast.get(system_id)
         if last is not None and now - last < STATS_INTERVAL:
