@@ -1369,3 +1369,162 @@ async def test_lost_device_stats_pruned_from_query(extension, device, builder, h
     assert DEVICE_SYSID not in extension._stats
     assert DEVICE_SYSID not in extension._last_stats_broadcast
     assert DEVICE_SYSID not in extension._last_stats_sent
+
+
+# ---- show-clock pin (cluster -> GPS) ----
+
+
+def _add_pin_params(device):
+    """Give the fake device the GPS_PIN_* param slots the firmware defines."""
+    device.params.update(
+        {
+            "GPS_PIN_WEEK": (struct.pack("<H", 0), 4),  # MAV_PARAM_EXT_TYPE_UINT16
+            "GPS_PIN_TOW_MS": (struct.pack("<I", 0), 5),  # UINT32
+            "GPS_PIN_C0_HI": (struct.pack("<I", 0), 5),
+            "GPS_PIN_C0_LO": (struct.pack("<I", 0), 5),
+        }
+    )
+
+
+CLUSTER_STATS = {
+    "rate": 8.0,
+    "solvepct": 80.0,
+    "agems": 20.0,
+    "ppm": -1.25,
+    "ancmask": 254.0,
+    "clkh": 0.0,
+    "clks": 120.5,
+    "clkok": 1.0,
+}
+
+
+def test_show_clock_pin_pure():
+    """mint_pin pairs cluster seconds with wall UTC; pin_writes follows the
+    week-zero-first contract; the restart prediction tracks wall time."""
+    from flockwave.server.ext.rtls.show_clock import mint_pin, pin_writes
+    from rtlslink import TICK_SECONDS
+
+    pin = mint_pin(120.5, now_unix=1_752_000_000.0)
+    assert pin.c0_ticks == round(120.5 / TICK_SECONDS)
+    assert 0 < pin.week < 4096
+    assert 0 <= pin.tow_ms < 604_800_000
+
+    writes = pin_writes(pin)
+    # week zeroed first, written last; C0 split into the two u32 halves
+    assert writes[0] == ("GPS_PIN_WEEK", 0, "uint16")
+    assert writes[-1] == ("GPS_PIN_WEEK", pin.week, "uint16")
+    assert ("GPS_PIN_C0_HI", (pin.c0_ticks >> 32) & 0xFFFFFFFF, "uint32") in writes
+    assert ("GPS_PIN_C0_LO", pin.c0_ticks & 0xFFFFFFFF, "uint32") in writes
+
+    # ten wall seconds later a live cluster should read ~10 s further
+    assert pin.predicted_cluster_seconds(1_752_000_010.0) == pytest.approx(130.5)
+
+
+async def test_show_clock_pin_distributed_on_fresh_stats(extension, device):
+    """A clkok stats snapshot mints the pin and pushes it to the device in
+    the contract order; the device ends up carrying the minted pin."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+        # nursery exit waits for the spawned push to complete
+    extension._nursery = None
+
+    pin = extension._show_clock.pin
+    assert pin is not None
+    assert DEVICE_SYSID in extension._show_clock._pinned
+
+    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
+    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
+    c0_hi = struct.unpack("<I", device.params["GPS_PIN_C0_HI"][0])[0]
+    c0_lo = struct.unpack("<I", device.params["GPS_PIN_C0_LO"][0])[0]
+    assert week == pin.week
+    assert tow == pin.tow_ms
+    assert (c0_hi << 32) | c0_lo == pin.c0_ticks
+
+
+async def test_show_clock_pin_not_minted_without_clkok(extension, device):
+    """Stale or missing cluster stats must never mint a pin."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    stale = dict(CLUSTER_STATS, clkok=0.0)
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, stale, now=0.0)
+    extension._nursery = None
+
+    assert extension._show_clock.pin is None
+    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
+    assert week == 0
+
+
+async def test_show_clock_repin_on_cluster_restart(extension, device):
+    """A cluster time far off the pin's prediction re-mints the pin and
+    redistributes it (the restart makes every distributed pin invalid)."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    extension._nursery = None
+    first_pin = extension._show_clock.pin
+    assert DEVICE_SYSID in extension._show_clock._pinned
+
+    # the cluster restarts: reported time drops far below the prediction
+    restarted = dict(CLUSTER_STATS, clks=2.0)
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, restarted, now=1.0)
+    extension._nursery = None
+
+    second_pin = extension._show_clock.pin
+    assert second_pin is not first_pin
+    assert DEVICE_SYSID in extension._show_clock._pinned
+    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
+    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
+    assert (week, tow) == (second_pin.week, second_pin.tow_ms)
+
+
+async def test_show_clock_lost_device_repinned_on_return(extension, device):
+    """A lost device is dropped from the pinned set, so its next fresh
+    stats snapshot after rediscovery pushes the pin again (it may have
+    rebooted with default params)."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    extension._nursery = None
+    assert DEVICE_SYSID in extension._show_clock._pinned
+
+    events = extension._protocol.expire(time.monotonic() + 1000)
+    for event in events:
+        extension._handle_lost(event)
+    assert DEVICE_SYSID not in extension._show_clock._pinned
+
+
+def test_cell_id_from_params_reads_firmware_label():
+    from flockwave.server.ext.rtls.extension import _cell_id_from_params
+
+    assert _cell_id_from_params({}) == "default"
+    assert _cell_id_from_params({"CELL_ID": "arena-north"}) == "arena-north"
+    # legacy speculative name still honored
+    assert _cell_id_from_params({"RTLS_CELL_ID": "old"}) == "old"
+    assert _cell_id_from_params({"CELL_ID": ""}) == "default"
