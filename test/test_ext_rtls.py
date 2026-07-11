@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import trio
 import trio.testing
+import rtlslink as rtlslink_module
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
@@ -61,21 +62,31 @@ class FakeDevice:
             "UWB_CH": (struct.pack("<i", 5), PARAM_TYPE_INT32),
             "POS_X": (struct.pack("<f", 1.5), PARAM_TYPE_REAL32),
             "FW_VERSION": (b"1.2.3", PARAM_TYPE_CUSTOM),
+            "SLEEP": (bytes([0]), PARAM_TYPE_UINT8),
         }
 
         self.respond_to_list = True
         self.respond_to_read = True
         self.respond_to_set = True
         self.set_result = 0  # PARAM_ACK_ACCEPTED
+        #: emulate the firmware's arming gate: a SLEEP=1 write is acked
+        #: but flipped back to 0, as the real device does while armed
+        self.refuse_sleep = False
+
+    @property
+    def sleeping(self) -> bool:
+        return self.params["SLEEP"][0][:1] == b"\x01"
 
     def heartbeat(self) -> bytes:
         d = self.dialect
+        # a sleeping device advertises STANDBY, like the firmware
+        status = d.MAV_STATE_STANDBY if self.sleeping else d.MAV_STATE_ACTIVE
         message = d.MAVLink_heartbeat_message(
             type=d.MAV_TYPE_GENERIC,
             autopilot=d.MAV_AUTOPILOT_INVALID,
             base_mode=0,
             custom_mode=0,
-            system_status=d.MAV_STATE_ACTIVE,
+            system_status=status,
             mavlink_version=3,
         )
         return bytes(message.pack(self._mav))
@@ -112,6 +123,9 @@ class FakeDevice:
                 out.append(
                     self._param_ack(name, value, message.param_type, self.set_result)
                 )
+                if name == "SLEEP" and self.refuse_sleep and self.sleeping:
+                    # the arming gate runs after the ack on the firmware
+                    self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
         return out
 
     def _param_value(self, name: str, index: int) -> bytes:
@@ -334,6 +348,7 @@ async def test_inf_lists_discovered_devices(extension, device, builder, hub):
     assert entry["firmwareVersion"] == "1.2.3"
     assert entry["paramCount"] == len(device.params)
     assert entry["otaStatus"] is None
+    assert entry["sleeping"] is False
     # a device without RTLS params carries neither a role nor a name
     assert "role" not in entry
     assert "name" not in entry
@@ -808,6 +823,120 @@ async def test_param_set_timeout(extension, device, builder, hub, autojump_clock
     assert "Timeout" in response.body["reason"]
 
 
+# ---- X-RTLS-SLEEP -------------------------------------------------------
+
+# Some sleep assertions need an SDK that tracks the heartbeat system_status
+# and the `slp` stat; with the pinned pre-sleep SDK the command path still
+# works but the state is invisible. Those tests are skipped until the
+# rtls-link pin moves past fw feature/sleep-mode.
+requires_sleep_sdk = pytest.mark.skipif(
+    not hasattr(rtlslink_module, "SLEEP_PARAM"),
+    reason="pinned rtls-link SDK predates sleep mode",
+)
+
+
+@requires_sleep_sdk
+async def test_sleep_accepted(extension, device, builder, hub, autojump_clock):
+    await discover(extension, device)
+
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": True},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+
+    assert response.body["type"] == "X-RTLS-SLEEP"
+    assert response.body["sleeping"] is True
+    entry = response.body["result"][str(DEVICE_SYSID)]
+    assert entry["accepted"] is True
+    assert entry["sleeping"] is True
+    assert device.sleeping is True
+
+    # the device now advertises STANDBY; the next heartbeat marks the
+    # cached device and X-RTLS-INF reports it
+    await discover(extension, device)
+    inf = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert inf.body["status"][str(DEVICE_SYSID)]["sleeping"] is True
+
+
+async def test_sleep_refused_by_arming_gate(
+    extension, device, builder, hub, autojump_clock
+):
+    await discover(extension, device)
+    device.refuse_sleep = True
+
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "id": DEVICE_SYSID, "sleeping": True},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+
+    entry = response.body["result"][str(DEVICE_SYSID)]
+    assert entry["accepted"] is False
+    assert entry["sleeping"] is False
+    assert "refused" in entry["detail"]
+    assert device.sleeping is False
+
+
+async def test_sleep_wake(extension, device, builder, hub, autojump_clock):
+    await discover(extension, device)
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": False},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+
+    entry = response.body["result"][str(DEVICE_SYSID)]
+    assert entry == {
+        "requested": False,
+        "accepted": True,
+        "sleeping": False,
+        "detail": "awake",
+    }
+    assert device.sleeping is False
+
+
+async def test_sleep_multi_device_reports_unknown(
+    extension, device, builder, hub, autojump_clock
+):
+    await discover(extension, device)
+
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID, 99], "sleeping": True},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+
+    result = response.body["result"]
+    assert result[str(DEVICE_SYSID)]["accepted"] is True
+    assert result["99"]["accepted"] is False
+    assert "No such device" in result["99"]["detail"]
+
+
+async def test_sleep_rejects_malformed_requests(extension, device, builder, hub):
+    await discover(extension, device)
+
+    for body in (
+        {"type": "X-RTLS-SLEEP", "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": ["42"], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID]},
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": "yes"},
+        # bool is an int subclass; JSON true must not target sysid 1
+        {"type": "X-RTLS-SLEEP", "ids": [True], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [0], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": [256], "sleeping": True},
+        {"type": "X-RTLS-SLEEP", "ids": list(range(1, 255)) * 2, "sleeping": True},
+    ):
+        message = make_message(builder, body)
+        response = await extension._handle_RTLS_SLEEP(message, None, hub)
+        assert response.body.get("type") == "ACK-NAK", body
+
+
 # ---- X-RTLS-OTA ---------------------------------------------------------
 
 
@@ -1065,6 +1194,9 @@ FULL_STATS = {
     "agems": 20.0,
     "ppm": -1.25,
     "ancmask": 254.0,
+    # fed last on purpose: the leading-edge broadcast fires on whichever
+    # field completes the set, and these tests assert on the rate values
+    "slp": 0.0,
 }
 
 
@@ -1105,6 +1237,34 @@ async def test_stats_query_returns_latest_snapshot(extension, device, builder, h
     assert entry["solveRateHz"] == 8.0
     assert entry["anchorsSeen"] == 7
     assert entry["anchorMask"] == 254
+
+
+@requires_sleep_sdk
+async def test_stats_query_carries_sleep_state(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_stats(extension, device, {**FULL_STATS, "slp": 1.0}, now=0.0)
+
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+
+    entry = response.body["stats"][str(DEVICE_SYSID)]
+    assert entry["sleeping"] is True
+
+
+async def test_stats_without_slp_omits_sleep_state(extension, device, builder, hub):
+    # firmware that predates sleep mode never sends slp: the snapshot
+    # must still broadcast/query fine, with the key absent (unknown),
+    # not False
+    await discover(extension, device)
+    legacy = {k: v for k, v in FULL_STATS.items() if k != "slp"}
+    await _feed_stats(extension, device, legacy, now=0.0)
+
+    stats_broadcasts = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert stats_broadcasts, "legacy stats must still broadcast"
+    entry = stats_broadcasts[-1]["stats"][str(DEVICE_SYSID)]
+    assert "sleeping" not in entry
 
 
 async def test_stats_query_by_id(extension, device, builder, hub):

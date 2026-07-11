@@ -34,6 +34,14 @@ from rtlslink import (
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import PARAM_ACK_ACCEPTED, PARAM_ACK_IN_PROGRESS
 
+try:
+    from rtlslink import SLEEP_PARAM
+except ImportError:  # pragma: no cover
+    # An SDK that predates sleep mode must not take the whole extension
+    # down with an ImportError (the extension manager would silently drop
+    # discovery/params/OTA too). The constant is just the parameter name.
+    SLEEP_PARAM = "SLEEP"
+
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
@@ -50,6 +58,17 @@ DEFAULT_PARAM_TIMEOUT = 5.0
 
 #: default timeout for a full parameter list transaction, in seconds
 DEFAULT_PARAM_LIST_TIMEOUT = 10.0
+
+#: default timeout for a sleep/wake transaction, in seconds (the request
+#: itself is one parameter write; see also DEFAULT_SLEEP_SETTLE)
+DEFAULT_SLEEP_TIMEOUT = 10.0
+
+#: seconds to wait after an accepted sleep request before reading the
+#: SLEEP parameter back: the firmware's arming gate runs asynchronously
+#: and may wait up to its confirmation window (2 s by default) for a
+#: disarmed heartbeat that postdates the request, refusing by flipping
+#: the parameter to 0 -- so the settle must exceed that window
+DEFAULT_SLEEP_SETTLE = 3.0
 
 #: upper bound for client-supplied transaction timeouts, in seconds
 MAX_PARAM_TIMEOUT = 60.0
@@ -153,6 +172,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-PARAM-LIST": self._handle_RTLS_PARAM_LIST,
                         "X-RTLS-PARAM-GET": self._handle_RTLS_PARAM_GET,
                         "X-RTLS-PARAM-SET": self._handle_RTLS_PARAM_SET,
+                        "X-RTLS-SLEEP": self._handle_RTLS_SLEEP,
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                     }
@@ -399,6 +419,78 @@ class RtlsExtension(Extension):
                         "accepted": result == PARAM_ACK_ACCEPTED,
                     }
 
+    async def set_sleep(
+        self,
+        system_id: int,
+        sleeping: bool,
+        *,
+        settle: float = DEFAULT_SLEEP_SETTLE,
+        timeout: float = DEFAULT_PARAM_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Puts a device to sleep (``sleeping=True``) or wakes it, and
+        verifies the outcome. Sleep is commanded through the ``SLEEP``
+        parameter; the firmware refuses the request while its flight
+        controller is armed (or not confirmed disarmed, in strict gate
+        mode) by flipping the parameter back to 0 shortly after the ack,
+        so a sleep request is read back after ``settle`` seconds.
+
+        Returns ``{"requested", "accepted", "sleeping", "detail"}``.
+        Raises KeyError for unknown devices and trio.TooSlowError on
+        timeout. Note that on hardware a woken device reboots shortly
+        after the ack (to re-initialize the power-cycled UWB module) and
+        drops off the network for a few seconds."""
+        request = 1 if sleeping else 0
+        # `timeout` bounds the whole transaction (write + settle + readback),
+        # not each parameter operation separately, so a caller's deadline
+        # holds.
+        with trio.fail_after(timeout + settle):
+            ack = await self.set_param(
+                system_id, SLEEP_PARAM, request, "uint8", timeout=timeout
+            )
+            if not ack["accepted"]:
+                return {
+                    "requested": sleeping,
+                    "accepted": False,
+                    "sleeping": None,
+                    "detail": f"parameter write rejected (code {ack['result']})",
+                }
+            if not sleeping:
+                return {
+                    "requested": False,
+                    "accepted": True,
+                    "sleeping": False,
+                    "detail": "awake",
+                }
+
+            await trio.sleep(settle)
+            try:
+                state = await self.get_param(
+                    system_id, SLEEP_PARAM, timeout=timeout
+                )
+            except (KeyError, trio.TooSlowError):
+                # The write was acknowledged, so the device is most likely
+                # asleep -- report the verification gap instead of a plain
+                # timeout that reads like the command failed.
+                return {
+                    "requested": True,
+                    "accepted": False,
+                    "sleeping": None,
+                    "detail": "sleep acknowledged but verification failed "
+                    "(device state unknown)",
+                }
+        asleep = bool(state["value"])
+        return {
+            "requested": True,
+            "accepted": asleep,
+            "sleeping": asleep,
+            "detail": (
+                "asleep"
+                if asleep
+                else "refused by device (arming gate: vehicle armed or "
+                "flight controller not confirmed disarmed)"
+            ),
+        }
+
     async def verify_species(
         self, system_id: int, role: str, *, timeout: float = DEFAULT_PARAM_TIMEOUT
     ) -> None:
@@ -526,6 +618,10 @@ class RtlsExtension(Extension):
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
+        # STATS_FIELDS is the SDK's required legacy set; newer stats
+        # (``slp`` sleep state, the cluster clock) are optional and must
+        # not gate the broadcast, or firmware without them would never
+        # get a health snapshot out.
         if not all(field in data for field in STATS_FIELDS):
             return
         last = self._last_stats_broadcast.get(system_id)
@@ -698,6 +794,75 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
+    async def _handle_RTLS_SLEEP(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        body = message.body
+        ids = body.get("ids")
+        if ids is None:
+            try:
+                ids = [_get_device_id(message)]
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or len(ids) > 256
+            or not all(
+                # bool is an int subclass: JSON `true` would otherwise pass
+                # and target sysid 1
+                isinstance(i, int) and not isinstance(i, bool) and 1 <= i <= 255
+                for i in ids
+            )
+        ):
+            return hub.reject(
+                message, reason="Missing or invalid device ids ('ids' or 'id')"
+            )
+        sleeping = body.get("sleeping")
+        if not isinstance(sleeping, bool):
+            return hub.reject(message, reason="Missing 'sleeping' boolean")
+        try:
+            timeout = _get_timeout(message, DEFAULT_SLEEP_TIMEOUT)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+
+        results: dict[str, dict[str, Any]] = {}
+
+        async def run_one(system_id: int) -> None:
+            key = str(system_id)
+            try:
+                results[key] = await self.set_sleep(
+                    system_id, sleeping, timeout=timeout
+                )
+            except KeyError:
+                results[key] = _sleep_error(sleeping, f"No such device: {system_id}")
+            except ValueError as ex:
+                results[key] = _sleep_error(sleeping, str(ex))
+            except trio.TooSlowError:
+                results[key] = _sleep_error(
+                    sleeping,
+                    f"Timeout while waiting for device {system_id}",
+                )
+            except Exception as ex:  # noqa: BLE001
+                # never let one device's failure cancel the siblings
+                results[key] = _sleep_error(sleeping, str(ex))
+
+        # one request per device, concurrently: the sleep verification
+        # includes a settle delay, so a serial loop over a fleet would
+        # multiply it
+        async with trio.open_nursery() as nursery:
+            for system_id in dict.fromkeys(ids):
+                nursery.start_soon(run_one, system_id)
+
+        return hub.create_response_or_notification(
+            body={
+                "type": "X-RTLS-SLEEP",
+                "sleeping": sleeping,
+                "result": results,
+            },
+            in_response_to=message,
+        )
+
     async def _handle_RTLS_OTA(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
@@ -817,6 +982,8 @@ class RtlsExtension(Extension):
             "firmwareVersion": firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
+            # getattr: tolerate an SDK that predates sleep mode
+            "sleeping": bool(getattr(device, "sleeping", False)),
         }
         if role is not None:
             body["role"] = role
@@ -1047,6 +1214,7 @@ class RtlsExtension(Extension):
             "get_param": self.get_param,
             "get_param_list": self.get_param_list,
             "set_param": self.set_param,
+            "set_sleep": self.set_sleep,
             "start_ota": self.start_ota,
             "verify_species": self.verify_species,
         }
@@ -1055,6 +1223,16 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return {}
         return dict(self._protocol.devices)
+
+
+def _sleep_error(requested: bool, detail: str) -> dict[str, Any]:
+    """Uniform per-device error entry for an X-RTLS-SLEEP result."""
+    return {
+        "requested": requested,
+        "accepted": False,
+        "sleeping": None,
+        "detail": detail,
+    }
 
 
 def _configured_addresses(values, default_port: int) -> list[tuple[str, int]]:
@@ -1147,7 +1325,7 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
 
     ``anc``/``agems``/``ancmask`` are integer-semantic floats over the wire
     (anchor count, milliseconds, bitmask); cast them to int for the UI."""
-    return {
+    body = {
         "id": int(system_id),
         "solveRateHz": float(data.get("rate", 0.0)),
         "solvePct": float(data.get("solvepct", 0.0)),
@@ -1156,6 +1334,11 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         "clockPpm": float(data.get("ppm", 0.0)),
         "anchorMask": int(data.get("ancmask", 0)),
     }
+    if "slp" in data:
+        # sleep state rides the stats stream too; omitted (not False) for
+        # firmware that predates sleep mode, so the UI can tell "unknown"
+        body["sleeping"] = bool(data["slp"])
+    return body
 
 
 def _get_device_id(message: "FlockwaveMessage") -> int:
