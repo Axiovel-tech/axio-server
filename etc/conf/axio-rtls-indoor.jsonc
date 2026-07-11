@@ -1,0 +1,32 @@
+// Axiovel indoor show configuration: MAVLink drones positioned by the
+// RTLS-Link UWB system. The RTLS tag bridges the FC's MAVLink stream to
+// this machine on UDP 14550 (wifi.gcsIp/udpPort on the tag), which matches
+// the "default" connection of the mavlink extension (listen 14550,
+// broadcast 14555).
+{
+  "EXTENSIONS": {
+    // Listen on all interfaces so Skybrush Live can connect from anywhere
+    "http_server": {
+      "host": ""
+    },
+
+    // MAVLink-based drones via the RTLS-Link UART bridge
+    "mavlink": {
+      "enabled": true,
+      "networks": {
+        "mav": {
+          "connections": ["default"]
+        }
+      }
+    },
+
+    // Indoor show: started with the RC start switch (RC option 248).
+    // Do NOT use "auto" here: with no scheduled start time, the server
+    // broadcasts a "clear start time" START_CONFIG packet at 1 Hz, which
+    // cancels an RC-scheduled countdown on drones in internal sync mode
+    // (SHOW_SYNC_MODE=0).
+    "show": {
+      "default_start_method": "rc"
+    }
+  }
+}

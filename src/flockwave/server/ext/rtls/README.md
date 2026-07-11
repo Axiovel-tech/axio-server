@@ -19,6 +19,16 @@ clients through the server's message hub:
   previous artifact. `smpclient` is an optional dependency of the SDK
   (`rtls-link[ota]`); without it, starting an OTA job fails at runtime.
 
+## Firmware requirements
+
+This extension speaks only the **zephyr-generation** rtls-link protocol
+(`rtls-link-zephyr`): management heartbeats on component id 197, stats
+as `NAMED_VALUE_FLOAT`, PARAM_EXT configuration and MCUmgr/SMP OTA.
+Legacy `rtls-link` (ESP32/Arduino) devices use a different dialect
+(component id 191, `RTLS_DEVICE_STATUS`/`RTLS_COMMAND`, HTTP OTA) and
+are **invisible to this extension by design** — manage them with the
+standalone `rtls-link-manager` application instead.
+
 ## The rtls-link SDK
 
 The protocol and OTA code lives in the standalone **`rtls-link`**
@@ -176,7 +186,7 @@ Response:
   "count": 4,
   "params": {
     "MAV_SYS_ID": {"value": 42, "type": "uint8", "index": 0},
-    "UWB_CH": {"value": 5, "type": "int32", "index": 1},
+    "UWB_CHANNEL": {"value": 5, "type": "int32", "index": 1},
     "POS_X": {"value": 1.5, "type": "real32", "index": 2},
     "FW_VERSION": {"value": "1.2.3", "type": "custom", "index": 3}
   }
@@ -191,7 +201,7 @@ device (NAK on timeout).
 Request:
 
 ```json
-{"type": "X-RTLS-PARAM-GET", "id": 42, "name": "UWB_CH"}
+{"type": "X-RTLS-PARAM-GET", "id": 42, "name": "UWB_CHANNEL"}
 ```
 
 Response:
@@ -200,7 +210,7 @@ Response:
 {
   "type": "X-RTLS-PARAM-GET",
   "id": 42,
-  "name": "UWB_CH",
+  "name": "UWB_CHANNEL",
   "value": 5,
   "paramType": "int32"
 }
@@ -230,7 +240,7 @@ from an earlier listing (always the case after discovery):
 {
   "type": "X-RTLS-PARAM-SET",
   "id": 42,
-  "name": "UWB_CH",
+  "name": "UWB_CHANNEL",
   "value": 9,
   "paramType": "int32"
 }
@@ -242,7 +252,7 @@ Response:
 {
   "type": "X-RTLS-PARAM-SET",
   "id": 42,
-  "name": "UWB_CH",
+  "name": "UWB_CHANNEL",
   "value": 9,
   "paramType": "int32",
   "result": 0,
