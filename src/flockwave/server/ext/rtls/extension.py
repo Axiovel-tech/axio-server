@@ -46,7 +46,6 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .show_clock import ShowClockPinManager
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -119,9 +118,6 @@ class RtlsExtension(Extension):
         #: given cell id; lets us re-home a cell onto another live tag when the
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
-        #: cluster->GPS pin lifecycle for the UWB-timebase show clock
-        #: (``None`` when disabled via config ``show_clock_pin: false``)
-        self._show_clock: Optional[ShowClockPinManager] = None
         #: latest inter-anchor TWR telemetry per device:
         #: system_id -> {peer_mac: (measured_distance_m, harvest_monotonic_s)}.
         #: Surfaced in X-RTLS-INF (with a derived age); pruned on device loss.
@@ -146,8 +142,6 @@ class RtlsExtension(Extension):
             configuration.get("broadcast", ["255.255.255.255"]), port
         )
         register_beacons = bool(configuration.get("register_beacons", True))
-        if bool(configuration.get("show_clock_pin", True)):
-            self._show_clock = ShowClockPinManager(self)
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         dialect = load_dialect()
@@ -624,12 +618,8 @@ class RtlsExtension(Extension):
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
-        # the show-clock pin rides the same stats feed: fresh cluster time
-        # (clkok) mints/verifies the pin and unpinned devices get a push
-        if self._show_clock is not None and self._nursery is not None:
-            self._show_clock.on_stats(system_id, data, self._nursery)
         # STATS_FIELDS is the SDK's required legacy set; newer stats
-        # (``slp`` sleep state, the cluster clock) are optional and must
+        # (``slp`` sleep state, show synchronization) are optional and must
         # not gate the broadcast, or firmware without them would never
         # get a health snapshot out.
         if not all(field in data for field in STATS_FIELDS):
@@ -657,8 +647,6 @@ class RtlsExtension(Extension):
         subscribers."""
         self._prune_stats(event.system_id)
         self._twr.pop(event.system_id, None)
-        if self._show_clock is not None:
-            self._show_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
         self._refresh_anchor_cells()
         self._dispatch_event(event)
@@ -1339,7 +1327,7 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
 
     ``anc``/``agems``/``ancmask`` are integer-semantic floats over the wire
     (anchor count, milliseconds, bitmask); cast them to int for the UI."""
-    body = {
+    body: dict[str, Any] = {
         "id": int(system_id),
         "solveRateHz": float(data.get("rate", 0.0)),
         "solvePct": float(data.get("solvepct", 0.0)),
@@ -1352,6 +1340,17 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # sleep state rides the stats stream too; omitted (not False) for
         # firmware that predates sleep mode, so the UI can tell "unknown"
         body["sleeping"] = bool(data["slp"])
+    if any(name in data for name in ("ltclk", "shok", "shgen", "shtogo")):
+        show_sync: dict[str, Any] = {}
+        if "ltclk" in data:
+            show_sync["ltcLocked"] = bool(data["ltclk"])
+        if "shok" in data:
+            show_sync["deadlineValid"] = bool(data["shok"])
+        if "shgen" in data:
+            show_sync["generation"] = int(data["shgen"])
+        if "shtogo" in data:
+            show_sync["secondsToStart"] = float(data["shtogo"])
+        body["showSync"] = show_sync
     return body
 
 

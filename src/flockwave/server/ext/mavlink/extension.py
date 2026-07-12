@@ -8,7 +8,10 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from functools import partial
+from time import monotonic
 from typing import TYPE_CHECKING, Any, overload
+
+from trio import sleep
 
 from flockwave.server.ext.base import UAVExtension
 from flockwave.server.ext.mavlink.fw_upload import FirmwareUpdateTarget
@@ -25,8 +28,12 @@ from .driver import MAVLinkDriver, MAVLinkUAV
 from .errors import InvalidSigningKeyError
 from .led_lights import LEDLightConfigurationSignalDispatcher
 from .network import MAVLinkNetwork
-from .packets import create_rc_override_packet
-from .rc_start import RCStartReflector
+from .packets import (
+    DroneShowStatus,
+    DroneShowStatusFlag,
+    ShowStartState,
+    create_rc_override_packet,
+)
 from .rssi import RSSIMode
 from .rtk import RTKCorrectionPacketSignalManager
 from .takeoff import ScheduledTakeoffSignalDispatcher
@@ -45,6 +52,8 @@ if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
     from flockwave.server.ext.rc import RCState
     from flockwave.server.ext.show.config import DroneShowConfiguration
+    from flockwave.server.message_hub import MessageHub
+    from flockwave.server.model import Client, FlockwaveMessage
     from flockwave.server.tasks.led_lights import LightConfiguration
 
 
@@ -57,6 +66,9 @@ the configuration file."""
 
 DEFAULT_ROUTING: MAVLinkMessageRoutingTable = {"rtk": (0,), "rc": (0,), "show": (0,)}
 """Default routing configuration for networks."""
+
+SHOW_SYNC_STATUS_TIMEOUT = 5.0
+"""Maximum age of flight-controller show-sync telemetry, in seconds."""
 
 
 class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
@@ -86,6 +98,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         self._networks = {}
         self._start_method = None
         self._uavs = None
+        self._show_sync_status: dict[str, dict[str, Any]] = {}
+        self._show_sync_status_updated_at: dict[str, float] = {}
 
         self._led_light_configuration_signal_dispatcher = (
             LEDLightConfigurationSignalDispatcher()
@@ -153,6 +167,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         driver.mandatory_custom_mode = optional_int(configuration.get("custom_mode"))
         driver.run_in_background = self.run_in_background
         driver.send_packet = self._send_packet
+        driver.show_sync_status_updated = self._on_show_sync_status_updated
+        driver.show_sync_status_lost = self._remove_show_sync_status
         driver.use_bulk_parameter_uploads = use_bulk_parameter_uploads
 
     def exports(self) -> dict[str, Any]:
@@ -219,6 +235,11 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                         "show:lights_updated": self._on_show_light_configuration_changed,
                         "show_pro:time_axis_config_updated": self._on_show_pro_time_axis_config_updated,
                     }
+                )
+            )
+            stack.enter_context(
+                app.message_hub.use_message_handlers(
+                    {"X-SHOW-SYNC": self._handle_SHOW_SYNC}
                 )
             )
 
@@ -297,17 +318,66 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     nursery.start_soon(
                         check_uavs_alive, uavs, status_summary_signal, self.log
                     )
-
-                    # Reflect an RC-initiated show start (one drone's
-                    # DRONE_SHOW_START aux schedule) into a fleet-wide
-                    # scheduled start so every drone fires on the SAME
-                    # shared-clock instant (see rc_start.py). Enabled by
-                    # default; disable with ``rc_start_reflection: false``.
-                    if bool(configuration.get("rc_start_reflection", True)):
-                        nursery.start_soon(self._run_rc_start_reflector, uavs)
+                    nursery.start_soon(self._expire_show_sync_status)
             finally:
                 for uav in uavs:
                     app.object_registry.remove(uav)
+                self._show_sync_status.clear()
+                self._show_sync_status_updated_at.clear()
+
+    def _on_show_sync_status_updated(
+        self, uav_id: str, status: DroneShowStatus
+    ) -> None:
+        value = _show_sync_json(status)
+        self._show_sync_status_updated_at[uav_id] = monotonic()
+        if self._show_sync_status.get(uav_id) == value:
+            return
+        self._show_sync_status[uav_id] = value
+        self.run_in_background(partial(self._broadcast_show_sync_status, uav_id))
+
+    def _remove_show_sync_status(self, uav_id: str) -> None:
+        if self._show_sync_status.pop(uav_id, None) is None:
+            return
+        self._show_sync_status_updated_at.pop(uav_id, None)
+        self.run_in_background(partial(self._broadcast_show_sync_status, uav_id))
+
+    async def _expire_show_sync_status(self) -> None:
+        while True:
+            await sleep(0.5)
+            deadline = monotonic() - SHOW_SYNC_STATUS_TIMEOUT
+            expired = [
+                uav_id
+                for uav_id, updated_at in self._show_sync_status_updated_at.items()
+                if updated_at <= deadline
+            ]
+            for uav_id in expired:
+                self._remove_show_sync_status(uav_id)
+
+    async def _broadcast_show_sync_status(self, uav_id: str) -> None:
+        value = self._show_sync_status.get(uav_id)
+        if self.app is None:
+            return
+        hub = self.app.message_hub
+        body = {
+            "type": "X-SHOW-SYNC",
+            "status": {uav_id: dict(value) if value is not None else None},
+        }
+        await hub.broadcast_message(hub.create_notification(body))
+
+    async def _handle_SHOW_SYNC(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        uav_id = message.body.get("id")
+        if uav_id is None:
+            status = {key: dict(value) for key, value in self._show_sync_status.items()}
+        else:
+            key = str(uav_id)
+            value = self._show_sync_status.get(key)
+            status = {key: dict(value)} if value is not None else {}
+        return hub.create_response_or_notification(
+            body={"type": "X-SHOW-SYNC", "status": status},
+            in_response_to=message,
+        )
 
     @staticmethod
     @contextmanager
@@ -461,26 +531,6 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     self.log.warning(
                         f"Failed to enqueue RTK correction packet to network {name!r}"
                     )
-
-    async def _run_rc_start_reflector(self, uavs: list[MAVLinkUAV]) -> None:
-        """Periodically checks whether a drone reports an RC-initiated show
-        start and, when armed for it (start method RC + authorized + no
-        scheduled start yet), reflects the earliest reported start time into
-        the show configuration -- the regular scheduled-start machinery then
-        distributes the SAME instant to the whole fleet."""
-        from trio import sleep
-
-        show_api = self.app.import_api("show", ShowExtensionAPI)
-        reflector = RCStartReflector(
-            show_api.get_configuration, show_api.schedule_start, log=self.log
-        )
-        while True:
-            try:
-                reflector.check(uavs)
-            except Exception:
-                if self.log:
-                    self.log.exception("RC start reflector scan failed")
-            await sleep(1)
 
     def _on_show_clock_changed(self, sender) -> None:
         """Handler that is called when the show clock is started, stopped or
@@ -745,3 +795,21 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
             self.log.warning(
                 "Failed to dispatch time axis configuration signal to other extensions"
             )
+
+
+def _show_sync_json(status: DroneShowStatus) -> dict[str, Any]:
+    source = {
+        ShowStartState.NONE: "none",
+        ShowStartState.RC: "rc",
+        ShowStartState.UWB_LTC_LOCKED: "uwb-ltc",
+        ShowStartState.UWB_LTC_COMMITTED: "uwb-ltc",
+    }[status.start_state]
+    scheduled = bool(status.flags & DroneShowStatusFlag.HAS_START_TIME)
+    return {
+        "source": source,
+        "locked": status.start_state
+        in (ShowStartState.UWB_LTC_LOCKED, ShowStartState.UWB_LTC_COMMITTED),
+        "committed": status.start_state is ShowStartState.UWB_LTC_COMMITTED,
+        "scheduled": scheduled,
+        "secondsToStart": -int(status.elapsed_time) if scheduled else None,
+    }

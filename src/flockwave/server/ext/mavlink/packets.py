@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DroneShowStatus",
+    "ShowStartState",
     "create_led_control_packet",
     "create_rc_override_packet",
     "create_start_time_configuration_packet",
@@ -315,6 +316,15 @@ class DroneShowExecutionStage(IntEnum):
         return description
 
 
+class ShowStartState(IntEnum):
+    """Active synchronization source encoded in ``flags3``."""
+
+    NONE = 0
+    RC = 1
+    UWB_LTC_LOCKED = 2
+    UWB_LTC_COMMITTED = 3
+
+
 @dataclass
 class DroneShowStatus:
     """Dataclass representing a Skybrush-specific drone show status object.
@@ -350,6 +360,9 @@ class DroneShowStatus:
 
     authorization_scope: AuthorizationScope = AuthorizationScope.NONE
     """Authorization scope of the scheduled start of the drone show."""
+
+    start_state: ShowStartState = ShowStartState.NONE
+    """Active show-start source and UWB/LTC commit state."""
 
     rtcm_counters: Sequence[int | None] = (None, None)
     """Number of RTCM messages received from the primary and secondary channels
@@ -400,6 +413,7 @@ class DroneShowStatus:
         flags |= (flags3 & 0xF0) << 10
         flags |= (flags2 & 0xF0) << 4
         stage = flags2 & 0x0F
+        start_state = ShowStartState((flags3 >> 4) & 0x03)
 
         if data_len <= 9:
             # No "flags3" field in the original packet. "flags3" contains the
@@ -441,6 +455,7 @@ class DroneShowStatus:
             gps_fix=GPSFixType.to_ours(gps_health & 0x07),
             num_satellites=gps_health >> 3,
             authorization_scope=scope,
+            start_state=start_state,
             rtcm_counters=rtcm_counters,
             extension=extension,
         )
