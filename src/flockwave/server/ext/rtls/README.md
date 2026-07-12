@@ -359,6 +359,73 @@ responses) on progress changes (at most every 0.5 s) and once on
 completion. UIs may rely on the notifications or poll with the status
 query.
 
+### X-RTLS-STATS — health and show synchronization
+
+Returns the latest health telemetry for every device, or for one device
+when the optional `id` is present. The same body is broadcast when fresh
+telemetry arrives:
+
+```json
+{
+  "type": "X-RTLS-STATS",
+  "stats": {
+    "42": {
+      "id": 42,
+      "solveRateHz": 8.0,
+      "showSync": {
+        "ltcLocked": true,
+        "deadlineValid": true,
+        "generation": 7,
+        "secondsToStart": 12.4
+      }
+    }
+  }
+}
+```
+
+`showSync` is omitted on firmware without show-synchronization telemetry.
+Its members are independently optional because they differ by role:
+
+- `ltcLocked` is reported only by Anchor 0 and means its analog or simulated
+  LTC source is locked.
+- `deadlineValid` means this device currently has a fresh pre-commit UWB
+  show deadline.
+- `generation` identifies the current deadline or cancellation generation.
+- `secondsToStart` is negative when no active deadline exists.
+
+This API is observational. Scheduling is performed by Anchor 0 from LTC and
+distributed over UWB; the server does not translate clocks or distribute a
+start over WiFi.
+
+The flight controller reports its independently latched start state through
+the MAVLink extension's read-only `X-SHOW-SYNC` message. Its request accepts
+an optional UAV `id`; responses and change notifications are keyed by UAV ID:
+
+```json
+{
+  "type": "X-SHOW-SYNC",
+  "status": {
+    "1": {
+      "source": "uwb-ltc",
+      "locked": true,
+      "committed": false,
+      "scheduled": true,
+      "secondsToStart": 12
+    }
+  }
+}
+```
+
+`source` is `none`, `rc`, or `uwb-ltc`. `locked` is true for either UWB/LTC
+pre-commit tracking or committed holdover; `committed` distinguishes the
+latter. The packet uses the previously unused bits 4–5 of the DATA16 `flags3`
+byte (`0` none/legacy, `1` RC, `2` UWB/LTC locked, `3` committed). Existing
+`flags` bit 6 remains the scheduled-start-present indicator. A negative
+`secondsToStart` means the scheduled instant has passed. If DATA16 telemetry
+becomes stale or the UAV disconnects, the server broadcasts a tombstone for
+that UAV (`{"status": {"1": null}}`) so clients cannot retain a stale locked
+or committed state.
+
 ### Notes for control-UI developers
 
 - The server treats `X-`-prefixed messages as experimental: they skip

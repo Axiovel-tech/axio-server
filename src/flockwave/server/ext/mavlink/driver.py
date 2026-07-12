@@ -173,6 +173,12 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     run an asynchronous function in the background.
     """
 
+    show_sync_status_updated: Callable[[str, DroneShowStatus], None]
+    """Callback invoked when a drone reports its show-start state."""
+
+    show_sync_status_lost: Callable[[str], None]
+    """Callback invoked when a drone's MAVLink connection is lost."""
+
     send_packet: PacketSenderFn
     """A function that should be called by the driver whenever it wants to send
     a packet. The function must be called with the packet to send, and a pair
@@ -202,6 +208,8 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         self.mandatory_custom_mode = None
         self.run_in_background = None  # type: ignore
         self.send_packet = None  # type: ignore
+        self.show_sync_status_updated = nop
+        self.show_sync_status_lost = nop
 
         self._default_timeout = 2
         self._default_retries = 10
@@ -1790,6 +1798,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         data = DroneShowStatus.from_mavlink_message(message)
 
         self._last_skybrush_status_info = data
+        self.driver.show_sync_status_updated(self.id, data)
 
         # Process the basic part of the packet that is always present (both with
         # the standard and the compact telemetry profile)
@@ -2108,6 +2117,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         drone have ceased arriving.
         """
         self._set_connection_state(ConnectionState.DISCONNECTED, None)
+        self.driver.show_sync_status_lost(self.id)
 
     def _notify_rebooted_by_us(self) -> None:
         """Notifies the UAV state object that we have rebooted the UAV ourselves

@@ -2,6 +2,7 @@ from flockwave.server.ext.mavlink.packets import (
     DroneShowExecutionStage,
     DroneShowStatus,
     DroneShowStatusFlag,
+    ShowStartState,
     authorization_scope_from_int,
     authorization_scope_to_int,
 )
@@ -73,3 +74,30 @@ def test_drone_show_status_from_bytes():
     assert status.authorization_scope is AuthorizationScope.LIGHTS_ONLY
     assert status.elapsed_time == 2826
     assert status.has_high_esc_error_rate
+
+
+def test_drone_show_status_decodes_start_state():
+    packet = bytearray(14)
+    packet[9] = ShowStartState.UWB_LTC_COMMITTED << 4
+
+    status = DroneShowStatus.from_bytes(bytes(packet))
+
+    assert status.start_state is ShowStartState.UWB_LTC_COMMITTED
+
+
+def test_show_sync_json_reports_committed_deadline():
+    from flockwave.server.ext.mavlink.extension import _show_sync_json
+
+    status = DroneShowStatus(
+        elapsed_time=-12,
+        flags=DroneShowStatusFlag.HAS_START_TIME,
+        start_state=ShowStartState.UWB_LTC_COMMITTED,
+    )
+
+    assert _show_sync_json(status) == {
+        "source": "uwb-ltc",
+        "locked": True,
+        "committed": True,
+        "scheduled": True,
+        "secondsToStart": 12,
+    }
