@@ -1721,12 +1721,47 @@ async def test_pos_pruned_on_device_loss(extension, device, builder, hub):
     assert response.body["positions"] == {}
 
 
-async def test_pos_nonfinite_values_ignored(extension, device):
+async def test_pos_nonfinite_ned_invalidates_only_that_cycle(extension, device):
     await discover(extension, device)
     await _feed_pos(
         extension, device, float("nan"), 2.0, -0.5, time_boot_ms=1, now=0.0
     )
     assert not _pos_broadcasts(extension)
+
+    # the next (finite) cycle regroups on its fresh stamp and broadcasts
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=2, now=0.0)
+    broadcasts = _pos_broadcasts(extension)
+    assert len(broadcasts) == 1
+    assert broadcasts[-1]["positions"][str(DEVICE_SYSID)]["north"] == 1.0
+
+
+async def test_pos_nonfinite_sigma_does_not_blackhole_the_stream(
+    extension, device
+):
+    # a persistently non-finite psig (covariance blow-up) must degrade to
+    # "no sigma", not silence the whole stream: the poisoned field still
+    # counts for the cycle grouping
+    await discover(extension, device)
+    await _feed_pos(
+        extension, device, 1.0, 2.0, -0.5, sigma=float("inf"),
+        time_boot_ms=1, now=0.0,
+    )
+
+    broadcasts = _pos_broadcasts(extension)
+    assert len(broadcasts) == 1
+    entry = broadcasts[-1]["positions"][str(DEVICE_SYSID)]
+    assert entry["north"] == 1.0
+    assert "sigma" not in entry
+
+
+async def test_pos_from_unknown_sysid_is_ignored(extension, device):
+    # no discovery: an unknown sysid has no `lost` path, so caching it
+    # would grow the pos dicts unboundedly (or resurrect a pruned device)
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=1, now=0.0)
+
+    assert not _pos_broadcasts(extension)
+    assert not extension._pos
+    assert not extension._pos_wire
 
 
 async def test_inf_site_anchor_list_carries_ned(extension, device, builder, hub):

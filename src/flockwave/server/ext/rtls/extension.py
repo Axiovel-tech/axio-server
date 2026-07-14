@@ -99,6 +99,16 @@ POS_DEBUG_FIELDS = frozenset(("pn", "pe", "pd", "psig"))
 #: throttled stream of the latest estimate)
 POS_INTERVAL = 0.1
 
+#: byte patterns that gate the position-debug scan: a datagram that carries
+#: none of the field names cannot contain the stream, so the second parse
+#: is skipped (the stream is off by default -- steady-state stats/heartbeat
+#: traffic must not pay for it). The names cannot be matched NUL-terminated:
+#: ``name`` is the trailing payload field and MAVLink 2 truncates trailing
+#: zero bytes, so a short name may end the payload without its padding.
+#: False positives (the two bytes appearing elsewhere in a frame) just fall
+#: through to the parse + exact name check.
+_POS_DEBUG_MARKERS = (b"pn", b"pe", b"pd", b"psig")
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -143,8 +153,9 @@ class RtlsExtension(Extension):
         #: (lazily created; see :meth:`_scan_pos_debug`)
         self._pos_parser = None
         #: accumulated position-debug wire fields per device:
-        #: system_id -> {name: (value, time_boot_ms)}
-        self._pos_wire: dict[int, dict[str, tuple[float, int]]] = {}
+        #: system_id -> {name: (value, time_boot_ms)}; a ``None`` value
+        #: marks a non-finite wire value (see _pos_json)
+        self._pos_wire: dict[int, dict[str, tuple[Optional[float], int]]] = {}
         #: latest complete position-debug snapshot per device (body shape
         #: without the derived ``ageMs``), plus its harvest monotonic stamp
         self._pos: dict[int, dict[str, Any]] = {}
@@ -695,10 +706,11 @@ class RtlsExtension(Extension):
         inter-anchor TWR telemetry used before it moved into the SDK).
 
         All fields of one estimate share a ``time_boot_ms`` stamp; a
-        snapshot is complete once ``pn``/``pe``/``pd`` agree on it (the
-        trailing ``psig`` joins the cached snapshot when it lands).
-        Complete snapshots broadcast as X-RTLS-POS, throttled per device
-        like the stats."""
+        snapshot is complete once the whole quad agrees on it (see
+        :func:`_pos_json`). Complete snapshots broadcast as X-RTLS-POS,
+        throttled per device like the stats."""
+        if not any(marker in data for marker in _POS_DEBUG_MARKERS):
+            return
         parser = self._pos_parser
         if parser is None:
             dialect = load_dialect()
@@ -711,12 +723,27 @@ class RtlsExtension(Extension):
             name = _named_value_name(message.name)
             if name not in POS_DEBUG_FIELDS:
                 continue
-            value = float(message.value)
-            if not math.isfinite(value):
-                continue
             system_id = message.get_srcSystem()
+            if (
+                self._protocol is None
+                or system_id not in self._protocol.devices
+            ):
+                # Only known (heartbeating) devices may populate the caches:
+                # an unknown sysid has no ``lost`` path, so accepting it here
+                # would grow the pos dicts unboundedly (spoofed traffic) or
+                # resurrect a device right after ``_prune_pos``.
+                continue
+            value = float(message.value)
+            # A non-finite value invalidates its field but still counts for
+            # the cycle grouping: dropping the field entirely would freeze
+            # its stamp and silently blackhole every later cycle (e.g. a
+            # covariance blow-up producing inf sigma forever -- exactly the
+            # regime a debug stream exists for).
             wire = self._pos_wire.setdefault(system_id, {})
-            wire[name] = (value, int(message.time_boot_ms))
+            wire[name] = (
+                value if math.isfinite(value) else None,
+                int(message.time_boot_ms),
+            )
             snapshot = _pos_json(system_id, wire)
             if snapshot is None:
                 continue
@@ -1528,9 +1555,9 @@ def _named_value_name(value) -> str:
     return str(value).split("\x00", 1)[0]
 
 
-def _pos_json(system_id: int, wire: dict[str, tuple[float, int]]) -> Optional[
-    dict[str, Any]
-]:
+def _pos_json(
+    system_id: int, wire: dict[str, tuple[Optional[float], int]]
+) -> Optional[dict[str, Any]]:
     """Assemble the client-facing position snapshot from the accumulated
     debug-stream wire fields, or ``None`` while the current cycle is
     incomplete.
@@ -1542,8 +1569,11 @@ def _pos_json(system_id: int, wire: dict[str, tuple[float, int]]) -> Optional[
     snapshot one message before its sigma). A cycle that loses a
     datagram is skipped; the next one regroups on its fresh stamp.
 
-    ``sigma`` is attached only when non-negative -- the firmware sends
-    ``-1`` for "no covariance available"."""
+    A ``None`` field value marks a non-finite wire value: it satisfies
+    the grouping but poisons the NED triple (the cycle yields no
+    snapshot), while a poisoned ``sigma`` merely omits the key. ``sigma``
+    is also omitted when negative -- the firmware sends ``-1`` for "no
+    covariance available"."""
     try:
         north, stamp = wire["pn"]
         east, stamp_e = wire["pe"]
@@ -1553,6 +1583,8 @@ def _pos_json(system_id: int, wire: dict[str, tuple[float, int]]) -> Optional[
         return None
     if not (stamp == stamp_e == stamp_d == stamp_s):
         return None
+    if north is None or east is None or down is None:
+        return None
     body: dict[str, Any] = {
         "id": int(system_id),
         "north": round(north, 3),
@@ -1560,7 +1592,7 @@ def _pos_json(system_id: int, wire: dict[str, tuple[float, int]]) -> Optional[
         "down": round(down, 3),
         "timeBootMs": stamp,
     }
-    if sigma >= 0.0:
+    if sigma is not None and sigma >= 0.0:
         body["sigma"] = round(sigma, 3)
     return body
 
