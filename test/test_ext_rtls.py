@@ -15,9 +15,9 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+import rtlslink as rtlslink_module
 import trio
 import trio.testing
-import rtlslink as rtlslink_module
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
@@ -34,7 +34,11 @@ from rtlslink.protocol import (
     raw_field_bytes,
 )
 
-from flockwave.server.ext.rtls.extension import RtlsExtension, _configured_addresses
+from flockwave.server.ext.rtls.extension import (
+    RtlsExtension,
+    _configured_addresses,
+    _stats_json,
+)
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -1200,6 +1204,18 @@ FULL_STATS = {
 }
 
 
+def test_stats_json_carries_optional_battery_voltage():
+    entry = _stats_json(DEVICE_SYSID, {**FULL_STATS, "vbat": 12.34567})
+
+    assert entry["batteryVoltage"] == 12.346
+
+
+def test_stats_json_without_vbat_omits_battery_voltage():
+    entry = _stats_json(DEVICE_SYSID, FULL_STATS)
+
+    assert "batteryVoltage" not in entry
+
+
 async def test_stats_broadcast_on_update(extension, device):
     await discover(extension, device)
     await _feed_stats(extension, device, FULL_STATS, now=0.0)
@@ -1401,8 +1417,9 @@ CLUSTER_STATS = {
 def test_show_clock_pin_pure():
     """mint_pin pairs cluster seconds with wall UTC; pin_writes follows the
     week-zero-first contract; the restart prediction tracks wall time."""
-    from flockwave.server.ext.rtls.show_clock import mint_pin, pin_writes
     from rtlslink import TICK_SECONDS
+
+    from flockwave.server.ext.rtls.show_clock import mint_pin, pin_writes
 
     pin = mint_pin(120.5, now_unix=1_752_000_000.0)
     assert pin.c0_ticks == round(120.5 / TICK_SECONDS)
