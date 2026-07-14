@@ -628,9 +628,9 @@ class RtlsExtension(Extension):
         # (clkok) mints/verifies the pin and unpinned devices get a push
         if self._show_clock is not None and self._nursery is not None:
             self._show_clock.on_stats(system_id, data, self._nursery)
-        # STATS_FIELDS is the SDK's required legacy set; newer stats
-        # (``slp`` sleep state, the cluster clock) are optional and must
-        # not gate the broadcast, or firmware without them would never
+        # STATS_FIELDS is the SDK's required legacy set; newer stats (``slp``
+        # sleep state, ``vbat`` battery voltage, the cluster clock) are optional
+        # and must not gate the broadcast, or firmware without them would never
         # get a health snapshot out.
         if not all(field in data for field in STATS_FIELDS):
             return
@@ -1352,6 +1352,10 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # sleep state rides the stats stream too; omitted (not False) for
         # firmware that predates sleep mode, so the UI can tell "unknown"
         body["sleeping"] = bool(data["slp"])
+    if "vbat" in data:
+        # Battery voltage is optional because only newer boards can measure it
+        # while the flight-controller rail is off.
+        body["batteryVoltage"] = round(float(data["vbat"]), 3)
     return body
 
 
