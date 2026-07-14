@@ -99,6 +99,15 @@ POS_DEBUG_FIELDS = frozenset(("pn", "pe", "pd", "psig"))
 #: throttled stream of the latest estimate)
 POS_INTERVAL = 0.1
 
+#: how far ``time_boot_ms`` must jump backwards to be treated as a device
+#: reboot (clearing the quad-assembly state) rather than a late, reordered
+#: datagram of an older cycle (which is dropped). Reordering is bounded by
+#: the emit spacing (<= 1 s at the slowest POS_DBG_HZ=1), while a reboot
+#: rewinds the stamp by the device's whole uptime; a device that manages to
+#: reboot AND resume streaming within this window is re-accepted as soon as
+#: its uptime passes the pre-reboot stamp.
+POS_REBOOT_BACKSTEP_MS = 5000
+
 #: byte patterns that gate the position-debug scan: a datagram that carries
 #: none of the field names cannot contain the stream, so the second parse
 #: is skipped (the stream is off by default -- steady-state stats/heartbeat
@@ -243,7 +252,7 @@ class RtlsExtension(Extension):
             # the throttle window is cached but not yet broadcast; push it once
             # the window has elapsed so clients see the latest snapshot.
             await self._flush_pending_stats(now)
-            await self._flush_pending_pos(now)
+            self._flush_pending_pos(now)
 
             with trio.move_on_after(0.25):
                 try:
@@ -271,7 +280,7 @@ class RtlsExtension(Extension):
     ) -> None:
         if self._protocol is None:
             return
-        await self._scan_pos_debug(data, now)
+        self._scan_pos_debug(data, now)
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -693,7 +702,7 @@ class RtlsExtension(Extension):
 
     # ---- position-estimate debug stream (X-RTLS-POS) ----
 
-    async def _scan_pos_debug(self, data: bytes, now: float) -> None:
+    def _scan_pos_debug(self, data: bytes, now: float) -> None:
         """Harvest the tag's position-estimate debug stream from a raw
         management datagram (rtls-link-zephyr#14).
 
@@ -734,16 +743,31 @@ class RtlsExtension(Extension):
                 # resurrect a device right after ``_prune_pos``.
                 continue
             value = float(message.value)
+            stamp = int(message.time_boot_ms)
+            wire = self._pos_wire.setdefault(system_id, {})
+            if wire:
+                # The assembly only ever holds fields of ONE cycle (they all
+                # share a stamp). A newer stamp starts a new cycle; an older
+                # one is either a late replay of a previous cycle (dropped,
+                # so it cannot regress a field of the current assembly) or a
+                # device reboot rewinding time_boot_ms (assembly cleared, or
+                # post-reboot fields would pair with pre-reboot leftovers
+                # under a recurring stamp).
+                current = next(iter(wire.values()))[1]
+                if stamp != current:
+                    if (
+                        stamp > current
+                        or current - stamp > POS_REBOOT_BACKSTEP_MS
+                    ):
+                        wire.clear()
+                    else:
+                        continue
             # A non-finite value invalidates its field but still counts for
             # the cycle grouping: dropping the field entirely would freeze
             # its stamp and silently blackhole every later cycle (e.g. a
             # covariance blow-up producing inf sigma forever -- exactly the
             # regime a debug stream exists for).
-            wire = self._pos_wire.setdefault(system_id, {})
-            wire[name] = (
-                value if math.isfinite(value) else None,
-                int(message.time_boot_ms),
-            )
+            wire[name] = (value if math.isfinite(value) else None, stamp)
             snapshot = _pos_json(system_id, wire)
             if snapshot is None:
                 continue
@@ -752,9 +776,9 @@ class RtlsExtension(Extension):
             last = self._last_pos_broadcast.get(system_id)
             if last is not None and now - last < POS_INTERVAL:
                 continue
-            await self._broadcast_pos(system_id, now)
+            self._broadcast_pos(system_id, now)
 
-    async def _flush_pending_pos(self, now: float) -> None:
+    def _flush_pending_pos(self, now: float) -> None:
         """Trailing-edge flush for X-RTLS-POS, mirroring the stats flush:
         pushes a cached snapshot that is newer than the last one sent once
         its throttle window has elapsed (so the final estimate of a burst
@@ -765,9 +789,21 @@ class RtlsExtension(Extension):
             last = self._last_pos_broadcast.get(system_id)
             if last is not None and now - last < POS_INTERVAL:
                 continue
-            await self._broadcast_pos(system_id, now)
+            self._broadcast_pos(system_id, now)
 
-    async def _broadcast_pos(self, system_id: int, now: float) -> None:
+    def _broadcast_pos(self, system_id: int, now: float) -> None:
+        """Enqueues an X-RTLS-POS notification for a device.
+
+        Deliberately non-blocking: this is called from the extension's
+        single receive/expiry loop, so awaiting the hub's bounded TX queue
+        (``broadcast_message``) would let outbound backpressure stall
+        datagram processing and device-loss handling for the whole
+        extension. ``enqueue_broadcast_message`` drops the notification on
+        overflow instead, which is the right trade for this stream: the
+        next estimate supersedes it and the trailing-edge flush re-sends
+        the latest snapshot once the queue drains. (The pre-existing stats
+        broadcast path still awaits the hub and shares the exposure at its
+        much lower 1 Hz rate; fixing it is out of scope here.)"""
         snapshot = self._pos.get(system_id)
         if snapshot is None:
             return
@@ -781,7 +817,7 @@ class RtlsExtension(Extension):
             "type": "X-RTLS-POS",
             "positions": {str(system_id): self._pos_entry(system_id, now)},
         }
-        await hub.broadcast_message(hub.create_notification(body))
+        hub.enqueue_broadcast_message(hub.create_notification(body))
 
     def _pos_entry(self, system_id: int, now: float) -> dict[str, Any]:
         """The client-facing X-RTLS-POS entry for a device: the cached
