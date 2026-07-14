@@ -12,6 +12,7 @@ experimental (``X-`` prefixed) message types on the message hub; see
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import contextmanager
 from functools import partial
@@ -86,6 +87,37 @@ ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
 
+#: NAMED_VALUE_FLOAT names of the tag's position-estimate debug stream
+#: (rtls-link-zephyr#14): the solved NED triple plus the reported NE sigma,
+#: emitted per solve when the tag's ``POS_DBG_HZ`` parameter is nonzero
+#: (off by default). All fields of one estimate share a ``time_boot_ms``
+#: stamp, which is what groups a cycle on the receive side.
+POS_DEBUG_FIELDS = frozenset(("pn", "pe", "pd", "psig"))
+
+#: how often per-device position-debug notifications are broadcast at
+#: most, in seconds (the firmware emits at up to 50 Hz; clients get a
+#: throttled stream of the latest estimate)
+POS_INTERVAL = 0.1
+
+#: how far ``time_boot_ms`` must jump backwards to be treated as a device
+#: reboot (clearing the quad-assembly state) rather than a late, reordered
+#: datagram of an older cycle (which is dropped). Reordering is bounded by
+#: the emit spacing (<= 1 s at the slowest POS_DBG_HZ=1), while a reboot
+#: rewinds the stamp by the device's whole uptime; a device that manages to
+#: reboot AND resume streaming within this window is re-accepted as soon as
+#: its uptime passes the pre-reboot stamp.
+POS_REBOOT_BACKSTEP_MS = 5000
+
+#: byte patterns that gate the position-debug scan: a datagram that carries
+#: none of the field names cannot contain the stream, so the second parse
+#: is skipped (the stream is off by default -- steady-state stats/heartbeat
+#: traffic must not pay for it). The names cannot be matched NUL-terminated:
+#: ``name`` is the trailing payload field and MAVLink 2 truncates trailing
+#: zero bytes, so a short name may end the payload without its padding.
+#: False positives (the two bytes appearing elsewhere in a frame) just fall
+#: through to the parse + exact name check.
+_POS_DEBUG_MARKERS = (b"pn", b"pe", b"pd", b"psig")
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -126,6 +158,21 @@ class RtlsExtension(Extension):
         #: system_id -> {peer_mac: (measured_distance_m, harvest_monotonic_s)}.
         #: Surfaced in X-RTLS-INF (with a derived age); pruned on device loss.
         self._twr: dict[int, dict[int, tuple[float, float]]] = {}
+        #: dedicated MAVLink parser for the position-estimate debug stream
+        #: (lazily created; see :meth:`_scan_pos_debug`)
+        self._pos_parser = None
+        #: accumulated position-debug wire fields per device:
+        #: system_id -> {name: (value, time_boot_ms)}; a ``None`` value
+        #: marks a non-finite wire value (see _pos_json)
+        self._pos_wire: dict[int, dict[str, tuple[Optional[float], int]]] = {}
+        #: latest complete position-debug snapshot per device (body shape
+        #: without the derived ``ageMs``), plus its harvest monotonic stamp
+        self._pos: dict[int, dict[str, Any]] = {}
+        self._pos_stamp: dict[int, float] = {}
+        #: broadcast throttle bookkeeping for X-RTLS-POS, mirroring the
+        #: stats throttle
+        self._last_pos_broadcast: dict[int, float] = {}
+        self._last_pos_sent: dict[int, dict[str, Any]] = {}
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -181,6 +228,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-SLEEP": self._handle_RTLS_SLEEP,
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
+                        "X-RTLS-POS": self._handle_RTLS_POS,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -204,6 +252,7 @@ class RtlsExtension(Extension):
             # the throttle window is cached but not yet broadcast; push it once
             # the window has elapsed so clients see the latest snapshot.
             await self._flush_pending_stats(now)
+            self._flush_pending_pos(now)
 
             with trio.move_on_after(0.25):
                 try:
@@ -231,6 +280,7 @@ class RtlsExtension(Extension):
     ) -> None:
         if self._protocol is None:
             return
+        self._scan_pos_debug(data, now)
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -650,12 +700,149 @@ class RtlsExtension(Extension):
                 continue
             await self._broadcast_stats(system_id, now)
 
+    # ---- position-estimate debug stream (X-RTLS-POS) ----
+
+    def _scan_pos_debug(self, data: bytes, now: float) -> None:
+        """Harvest the tag's position-estimate debug stream from a raw
+        management datagram (rtls-link-zephyr#14).
+
+        When ``POS_DBG_HZ`` is nonzero the tag streams every solved NED
+        estimate as NAMED_VALUE_FLOAT ``pn``/``pe``/``pd``/``psig`` on the
+        same channel as the health stats -- but the SDK's feed() accepts
+        only its known stat names, so these are dropped before the event
+        stream. Until the SDK grows a dedicated event for them, scan the
+        datagram with a second parser (the same transitional pattern the
+        inter-anchor TWR telemetry used before it moved into the SDK).
+
+        All fields of one estimate share a ``time_boot_ms`` stamp; a
+        snapshot is complete once the whole quad agrees on it (see
+        :func:`_pos_json`). Complete snapshots broadcast as X-RTLS-POS,
+        throttled per device like the stats."""
+        if not any(marker in data for marker in _POS_DEBUG_MARKERS):
+            return
+        parser = self._pos_parser
+        if parser is None:
+            dialect = load_dialect()
+            parser = dialect.MAVLink(None)
+            parser.robust_parsing = True
+            self._pos_parser = parser
+        for message in parser.parse_buffer(data) or []:
+            if message.get_type() != "NAMED_VALUE_FLOAT":
+                continue
+            name = _named_value_name(message.name)
+            if name not in POS_DEBUG_FIELDS:
+                continue
+            system_id = message.get_srcSystem()
+            if (
+                self._protocol is None
+                or system_id not in self._protocol.devices
+            ):
+                # Only known (heartbeating) devices may populate the caches:
+                # an unknown sysid has no ``lost`` path, so accepting it here
+                # would grow the pos dicts unboundedly (spoofed traffic) or
+                # resurrect a device right after ``_prune_pos``.
+                continue
+            value = float(message.value)
+            stamp = int(message.time_boot_ms)
+            wire = self._pos_wire.setdefault(system_id, {})
+            if wire:
+                # The assembly only ever holds fields of ONE cycle (they all
+                # share a stamp). A newer stamp starts a new cycle; an older
+                # one is either a late replay of a previous cycle (dropped,
+                # so it cannot regress a field of the current assembly) or a
+                # device reboot rewinding time_boot_ms (assembly cleared, or
+                # post-reboot fields would pair with pre-reboot leftovers
+                # under a recurring stamp).
+                current = next(iter(wire.values()))[1]
+                if stamp != current:
+                    if (
+                        stamp > current
+                        or current - stamp > POS_REBOOT_BACKSTEP_MS
+                    ):
+                        wire.clear()
+                    else:
+                        continue
+            # A non-finite value invalidates its field but still counts for
+            # the cycle grouping: dropping the field entirely would freeze
+            # its stamp and silently blackhole every later cycle (e.g. a
+            # covariance blow-up producing inf sigma forever -- exactly the
+            # regime a debug stream exists for).
+            wire[name] = (value if math.isfinite(value) else None, stamp)
+            snapshot = _pos_json(system_id, wire)
+            if snapshot is None:
+                continue
+            self._pos[system_id] = snapshot
+            self._pos_stamp[system_id] = now
+            last = self._last_pos_broadcast.get(system_id)
+            if last is not None and now - last < POS_INTERVAL:
+                continue
+            self._broadcast_pos(system_id, now)
+
+    def _flush_pending_pos(self, now: float) -> None:
+        """Trailing-edge flush for X-RTLS-POS, mirroring the stats flush:
+        pushes a cached snapshot that is newer than the last one sent once
+        its throttle window has elapsed (so the final estimate of a burst
+        is never lost to the throttle)."""
+        for system_id, snapshot in list(self._pos.items()):
+            if snapshot == self._last_pos_sent.get(system_id):
+                continue
+            last = self._last_pos_broadcast.get(system_id)
+            if last is not None and now - last < POS_INTERVAL:
+                continue
+            self._broadcast_pos(system_id, now)
+
+    def _broadcast_pos(self, system_id: int, now: float) -> None:
+        """Enqueues an X-RTLS-POS notification for a device.
+
+        Deliberately non-blocking: this is called from the extension's
+        single receive/expiry loop, so awaiting the hub's bounded TX queue
+        (``broadcast_message``) would let outbound backpressure stall
+        datagram processing and device-loss handling for the whole
+        extension. ``enqueue_broadcast_message`` drops the notification on
+        overflow instead, which is the right trade for this stream: the
+        next estimate supersedes it and the trailing-edge flush re-sends
+        the latest snapshot once the queue drains. (The pre-existing stats
+        broadcast path still awaits the hub and shares the exposure at its
+        much lower 1 Hz rate; fixing it is out of scope here.)"""
+        snapshot = self._pos.get(system_id)
+        if snapshot is None:
+            return
+        self._last_pos_broadcast[system_id] = now
+        self._last_pos_sent[system_id] = dict(snapshot)
+        if self.app is None:
+            self._warn_no_app()
+            return
+        hub = self.app.message_hub
+        body = {
+            "type": "X-RTLS-POS",
+            "positions": {str(system_id): self._pos_entry(system_id, now)},
+        }
+        hub.enqueue_broadcast_message(hub.create_notification(body))
+
+    def _pos_entry(self, system_id: int, now: float) -> dict[str, Any]:
+        """The client-facing X-RTLS-POS entry for a device: the cached
+        snapshot plus the derived ``ageMs`` (time since the estimate was
+        harvested, for client-side staleness fading)."""
+        entry = dict(self._pos[system_id])
+        harvested = self._pos_stamp.get(system_id, now)
+        entry["ageMs"] = round(max(0.0, now - harvested) * 1000.0)
+        return entry
+
+    def _prune_pos(self, system_id: int) -> None:
+        """Drop all cached position-debug state for a device (on ``lost``)."""
+        self._pos_wire.pop(system_id, None)
+        self._pos.pop(system_id, None)
+        self._pos_stamp.pop(system_id, None)
+        self._last_pos_broadcast.pop(system_id, None)
+        self._last_pos_sent.pop(system_id, None)
+
     def _handle_lost(self, event: ProtocolEvent) -> None:
         """React to a device-``lost`` event: drop its cached stats so the
         X-RTLS-STATS query stops reporting it (mirroring X-RTLS-INF), drop its
         TWR telemetry, re-home any cell it sourced, then forward the event to
         subscribers."""
         self._prune_stats(event.system_id)
+        self._prune_pos(event.system_id)
         self._twr.pop(event.system_id, None)
         if self._show_clock is not None:
             self._show_clock.forget_device(event.system_id)
@@ -962,6 +1149,34 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
+    async def _handle_RTLS_POS(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        # Optional ``id`` narrows the snapshot to one device; without it the
+        # latest position estimate of every reporting device is returned.
+        now = time.monotonic()
+        device_id = message.body.get("id")
+        if device_id is not None:
+            try:
+                system_id = _get_device_id(message)
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+            positions = (
+                {str(system_id): self._pos_entry(system_id, now)}
+                if system_id in self._pos
+                else {}
+            )
+        else:
+            positions = {
+                str(system_id): self._pos_entry(system_id, now)
+                for system_id in self._pos
+            }
+
+        return hub.create_response_or_notification(
+            body={"type": "X-RTLS-POS", "positions": positions},
+            in_response_to=message,
+        )
+
     # ---- helpers / exports ----
 
     def _warn_no_app(self) -> None:
@@ -1052,6 +1267,15 @@ class RtlsExtension(Extension):
                             "lat": round(lat_e7 * 1e-7, 7),
                             "lon": round(lon_e7 * 1e-7, 7),
                             "amsl": round(alt_mm * 1e-3, 3),
+                        },
+                        # native cell-frame NED (meters) alongside the derived
+                        # GPS position: the position-debug view plots anchors
+                        # and the X-RTLS-POS estimates in the same frame
+                        # without a lossy GPS round-trip
+                        "ned": {
+                            "north": round(anchor.north_m, 3),
+                            "east": round(anchor.east_m, 3),
+                            "down": round(anchor.down_m, 3),
                         },
                         "active": self._anchor_device_online(anchor.mac),
                     }
@@ -1356,6 +1580,56 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # Battery voltage is optional because only newer boards can measure it
         # while the flight-controller rail is off.
         body["batteryVoltage"] = round(float(data["vbat"]), 3)
+    return body
+
+
+def _named_value_name(value) -> str:
+    """NUL-trimmed string from a pymavlink NAMED_VALUE_FLOAT ``name``
+    (a fixed char[10], not NUL-terminated when full)."""
+    if isinstance(value, bytes):
+        return value.split(b"\x00", 1)[0].decode(errors="replace")
+    return str(value).split("\x00", 1)[0]
+
+
+def _pos_json(
+    system_id: int, wire: dict[str, tuple[Optional[float], int]]
+) -> Optional[dict[str, Any]]:
+    """Assemble the client-facing position snapshot from the accumulated
+    debug-stream wire fields, or ``None`` while the current cycle is
+    incomplete.
+
+    The firmware emits the full ``pn``/``pe``/``pd``/``psig`` quad per
+    estimate, all stamped with one ``time_boot_ms``, with ``psig``
+    trailing -- so a cycle is complete exactly when all four agree on
+    the stamp (completing on the NED triple alone would broadcast every
+    snapshot one message before its sigma). A cycle that loses a
+    datagram is skipped; the next one regroups on its fresh stamp.
+
+    A ``None`` field value marks a non-finite wire value: it satisfies
+    the grouping but poisons the NED triple (the cycle yields no
+    snapshot), while a poisoned ``sigma`` merely omits the key. ``sigma``
+    is also omitted when negative -- the firmware sends ``-1`` for "no
+    covariance available"."""
+    try:
+        north, stamp = wire["pn"]
+        east, stamp_e = wire["pe"]
+        down, stamp_d = wire["pd"]
+        sigma, stamp_s = wire["psig"]
+    except KeyError:
+        return None
+    if not (stamp == stamp_e == stamp_d == stamp_s):
+        return None
+    if north is None or east is None or down is None:
+        return None
+    body: dict[str, Any] = {
+        "id": int(system_id),
+        "north": round(north, 3),
+        "east": round(east, 3),
+        "down": round(down, 3),
+        "timeBootMs": stamp,
+    }
+    if sigma is not None and sigma >= 0.0:
+        body["sigma"] = round(sigma, 3)
     return body
 
 
