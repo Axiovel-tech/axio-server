@@ -1545,3 +1545,208 @@ def test_cell_id_from_params_reads_firmware_label():
     # legacy speculative name still honored
     assert _cell_id_from_params({"RTLS_CELL_ID": "old"}) == "old"
     assert _cell_id_from_params({"CELL_ID": ""}) == "default"
+
+
+# ---- X-RTLS-POS position-estimate debug stream ---------------------------
+
+
+async def _feed_pos(
+    extension, device, north, east, down, sigma=-1.0, *, time_boot_ms=0, now=0.0
+):
+    """Feed one POS_DBG_HZ emit cycle (NAMED_VALUE_FLOAT pn/pe/pd/psig), all
+    stamped with the same time_boot_ms as the firmware does. The firmware
+    always trails the cycle with psig, sending -1 when the solver had no
+    covariance -- the default mirrors that."""
+    fields = [("pn", north), ("pe", east), ("pd", down), ("psig", sigma)]
+    for name, value in fields:
+        await extension._process_datagram(
+            device.named_value_float(name, value, time_boot_ms),
+            device.address,
+            now,
+        )
+
+
+def _pos_broadcasts(extension):
+    return [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-POS"
+    ]
+
+
+async def test_pos_broadcast_on_complete_cycle(extension, device):
+    await discover(extension, device)
+    await _feed_pos(
+        extension, device, 1.2044, -0.3506, -0.82, sigma=0.1204,
+        time_boot_ms=1234, now=0.0,
+    )
+
+    broadcasts = _pos_broadcasts(extension)
+    assert broadcasts
+    entry = broadcasts[-1]["positions"][str(DEVICE_SYSID)]
+    assert entry == {
+        "id": DEVICE_SYSID,
+        "north": 1.204,
+        "east": -0.351,
+        "down": -0.82,
+        "sigma": 0.12,
+        "timeBootMs": 1234,
+        "ageMs": 0,
+    }
+
+
+async def test_pos_negative_sigma_omitted(extension, device):
+    # the firmware reports psig = -1 when the solver had no covariance
+    await discover(extension, device)
+    await _feed_pos(
+        extension, device, 1.0, 2.0, -0.5, sigma=-1.0, time_boot_ms=10, now=0.0
+    )
+
+    entry = _pos_broadcasts(extension)[-1]["positions"][str(DEVICE_SYSID)]
+    assert "sigma" not in entry
+    assert entry["north"] == 1.0
+
+
+async def test_pos_incomplete_cycle_does_not_broadcast(extension, device):
+    await discover(extension, device)
+    # pn/pe only: the NED triple never completes
+    for name, value in (("pn", 1.0), ("pe", 2.0)):
+        await extension._process_datagram(
+            device.named_value_float(name, value, 5), device.address, 0.0
+        )
+    assert not _pos_broadcasts(extension)
+
+    # a pd from a *different* emit cycle must not complete the stale pn/pe
+    await extension._process_datagram(
+        device.named_value_float("pd", -0.5, 6), device.address, 0.0
+    )
+    assert not _pos_broadcasts(extension)
+
+
+async def test_pos_does_not_pollute_health_stats(extension, device):
+    await discover(extension, device)
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=1, now=0.0)
+
+    assert DEVICE_SYSID not in extension._stats
+    assert not [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+
+
+async def test_pos_broadcast_throttled(extension, device):
+    await discover(extension, device)
+
+    # first complete cycle broadcasts immediately (leading edge)
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=1, now=0.0)
+    # a second cycle well within POS_INTERVAL must not broadcast again
+    await _feed_pos(extension, device, 1.1, 2.1, -0.5, time_boot_ms=2, now=0.02)
+    assert len(_pos_broadcasts(extension)) == 1
+
+    # once the interval elapses, a further cycle broadcasts the latest values
+    await _feed_pos(extension, device, 1.5, 2.5, -0.6, time_boot_ms=3, now=0.2)
+    broadcasts = _pos_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert broadcasts[-1]["positions"][str(DEVICE_SYSID)]["north"] == 1.5
+
+
+async def test_pos_trailing_edge_flush(extension, device):
+    await discover(extension, device)
+
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=1, now=0.0)
+    # this cycle lands inside the throttle window: cached, not broadcast
+    await _feed_pos(extension, device, 1.9, 2.9, -0.7, time_boot_ms=2, now=0.02)
+    assert len(_pos_broadcasts(extension)) == 1
+
+    # the run loop's periodic flush pushes the pending snapshot once the
+    # window has elapsed, so the last estimate of a burst is never lost
+    await extension._flush_pending_pos(0.2)
+    broadcasts = _pos_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert broadcasts[-1]["positions"][str(DEVICE_SYSID)]["north"] == 1.9
+
+    # nothing newer pending: a further flush is a no-op
+    await extension._flush_pending_pos(0.4)
+    assert len(_pos_broadcasts(extension)) == 2
+
+
+async def test_pos_query_returns_latest_snapshot(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_pos(
+        extension, device, 1.0, 2.0, -0.5, sigma=0.2, time_boot_ms=7, now=0.0
+    )
+
+    message = make_message(builder, {"type": "X-RTLS-POS"})
+    response = await extension._handle_RTLS_POS(message, None, hub)
+
+    assert response.body["type"] == "X-RTLS-POS"
+    entry = response.body["positions"][str(DEVICE_SYSID)]
+    assert entry["north"] == 1.0
+    assert entry["east"] == 2.0
+    assert entry["down"] == -0.5
+    assert entry["sigma"] == 0.2
+    assert entry["ageMs"] >= 0
+
+
+async def test_pos_query_by_id(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=7, now=0.0)
+
+    message = make_message(builder, {"type": "X-RTLS-POS", "id": DEVICE_SYSID})
+    response = await extension._handle_RTLS_POS(message, None, hub)
+    assert set(response.body["positions"]) == {str(DEVICE_SYSID)}
+
+    # an unknown device id yields an empty snapshot, not an error
+    other = make_message(builder, {"type": "X-RTLS-POS", "id": 99})
+    response = await extension._handle_RTLS_POS(other, None, hub)
+    assert response.body["positions"] == {}
+
+
+async def test_pos_query_empty_before_any_estimate(extension, builder, hub):
+    message = make_message(builder, {"type": "X-RTLS-POS"})
+    response = await extension._handle_RTLS_POS(message, None, hub)
+    assert response.body == {"type": "X-RTLS-POS", "positions": {}}
+
+
+async def test_pos_pruned_on_device_loss(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=7, now=0.0)
+    assert DEVICE_SYSID in extension._pos
+
+    events = extension._protocol.expire(time.monotonic() + 1000)
+    for event in events:
+        extension._handle_lost(event)
+
+    assert DEVICE_SYSID not in extension._pos
+    assert DEVICE_SYSID not in extension._pos_wire
+    message = make_message(builder, {"type": "X-RTLS-POS"})
+    response = await extension._handle_RTLS_POS(message, None, hub)
+    assert response.body["positions"] == {}
+
+
+async def test_pos_nonfinite_values_ignored(extension, device):
+    await discover(extension, device)
+    await _feed_pos(
+        extension, device, float("nan"), 2.0, -0.5, time_boot_ms=1, now=0.0
+    )
+    assert not _pos_broadcasts(extension)
+
+
+async def test_inf_site_anchor_list_carries_ned(extension, device, builder, hub):
+    # the debug position view plots anchors in the same NED frame as the
+    # X-RTLS-POS estimates, so the anchors list carries the native
+    # cell-frame coordinates beside the derived GPS position
+    add_rtls_cell_params(device)  # tag, role=1
+    await discover(extension, device)
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+
+    anchors = {a["id"]: a for a in response.body["anchors"]}
+    assert anchors["rtls::default::anchor_0"]["ned"] == {
+        "north": -10.0,
+        "east": -10.0,
+        "down": 0.0,
+    }
+    assert anchors["rtls::default::anchor_1"]["ned"] == {
+        "north": 10.0,
+        "east": 10.0,
+        "down": -4.8,
+    }

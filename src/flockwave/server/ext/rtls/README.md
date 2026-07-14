@@ -125,6 +125,7 @@ plus a site-level `anchors` list:
       "index": 0,
       "mac": 1,
       "position": {"lat": 41.39, "lon": 2.15, "amsl": 10.0},
+      "ned": {"north": -10.0, "east": -10.0, "down": 0.0},
       "active": true
     }
   ]
@@ -157,8 +158,11 @@ plus a site-level `anchors` list:
 
 The site-level `anchors` list mirrors the configured cell geometry: each
 anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
-(cell origin + NED), and `active` — true only when a live anchor device
-with the matching `UWB_MAC` is online. These anchors are also published
+(cell origin + NED), its native cell-frame NED coordinates in meters
+(`ned` — the frame the X-RTLS-POS estimates are expressed in, so a
+debug view can plot both without a lossy GPS round-trip), and `active`
+— true only when a live anchor device with the matching `UWB_MAC` is
+online. These anchors are also published
 to clients through the existing Skybrush **beacon** layer (same stable
 ids), so the map renders them without a bespoke anchor layer. Set
 `register_beacons: false` to disable the beacon registration.
@@ -358,6 +362,57 @@ with the same body shape (no `refs` member, since they are not
 responses) on progress changes (at most every 0.5 s) and once on
 completion. UIs may rely on the notifications or poll with the status
 query.
+
+### X-RTLS-POS — live position-estimate debug stream
+
+Surfaces the tag firmware's position-estimate debug emit
+([rtls-link-zephyr#14](https://github.com/Axiovel-tech/rtls-link-zephyr/issues/14)):
+when a tag's `POS_DBG_HZ` parameter is nonzero (off by default; set it
+with `X-RTLS-PARAM-SET`), every solved NED position streams to the
+server as `NAMED_VALUE_FLOAT pn`/`pe`/`pd`/`psig`, and the server
+**broadcasts** `X-RTLS-POS` notifications with the latest estimate per
+device, throttled to at most one per device per 100 ms. Intended for
+the "Debug Pos Estimates" pre-flight view in control; anchors for the
+same plot come from the `ned` member of the `X-RTLS-INF` anchor list.
+
+The same body shape is available as a **query** (optional `id` narrows
+it to one device; unknown ids yield an empty snapshot, not an error):
+
+```json
+{"type": "X-RTLS-POS"}
+```
+
+Response / notification body — one entry per device that has reported
+a complete estimate, keyed by system id (as string):
+
+```json
+{
+  "type": "X-RTLS-POS",
+  "positions": {
+    "42": {
+      "id": 42,
+      "north": 1.204,
+      "east": -0.351,
+      "down": -0.82,
+      "sigma": 0.12,
+      "timeBootMs": 123456,
+      "ageMs": 3
+    }
+  }
+}
+```
+
+- `north` / `east` / `down` — the solved position in the cell's NED
+  frame, meters.
+- `sigma` — the firmware's reported NE sigma (meters); absent when the
+  solver had no covariance for this estimate.
+- `timeBootMs` — the device-side timestamp of the estimate (the stamp
+  that groups one emit cycle on the wire).
+- `ageMs` — server-side age of the estimate at send time; with the
+  stream on, notifications carry ~0, while a query answered from cache
+  can be older. Clients should fade/flag entries whose updates stop.
+
+Estimates of a device that drops off the network are pruned with it.
 
 ### Notes for control-UI developers
 
