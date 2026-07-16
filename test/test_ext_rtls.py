@@ -1188,6 +1188,123 @@ async def test_lost_device_disappears_from_inf(extension, device, builder, hub):
     assert response.body["status"] == {}
 
 
+# ---- X-RTLS-INF push notifications --------------------------------------
+#
+# The GUI's device list comes from a one-shot X-RTLS-INF query, so the
+# server pushes the full list (same body shape as the query response, for
+# a wholesale replace) whenever a device is gained or lost -- otherwise
+# an unplugged anchor stays green on every connected client.
+
+
+def _inf_broadcasts(extension):
+    return [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-INF"
+    ]
+
+
+async def _feed_heartbeat(extension, device, now):
+    """Feed one device heartbeat at a controlled monotonic time (the
+    ``discover`` helper uses the real clock, which the INF throttle tests
+    cannot work with)."""
+    await extension._process_datagram(device.heartbeat(), device.address, now)
+
+
+async def test_inf_broadcast_on_discovery(extension, device, builder, hub):
+    await _feed_heartbeat(extension, device, now=0.0)
+
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 1
+    body = broadcasts[-1]
+    # same body shape as the query response, so clients can apply a
+    # wholesale replace
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert set(body) == set(response.body)
+    assert set(body["status"]) == {str(DEVICE_SYSID)}
+    entry = body["status"][str(DEVICE_SYSID)]
+    assert entry["id"] == DEVICE_SYSID
+    assert entry["address"] == list(DEVICE_ADDRESS)
+
+
+async def test_inf_broadcast_on_loss(extension, device):
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # the device goes silent past its timeout; the protocol loop handles the
+    # lost event (which only marks the list dirty -- the handler is sync) and
+    # then runs the periodic flush, which broadcasts the now-empty list
+    events = extension._protocol.expire(1000.0)
+    assert [event.kind for event in events] == ["lost"]
+    for event in events:
+        extension._handle_lost(event)
+    await extension._flush_pending_inf(now=1000.0)
+
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert broadcasts[-1]["status"] == {}
+
+
+async def test_inf_broadcast_coalesces_bursts(extension, device, dialect):
+    # leading edge: the first discovery broadcasts straight away
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # a second device appears inside the throttle window (during a show,
+    # drone tags flap in bursts): only marked pending, NOT broadcast yet
+    second = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
+    second.address = ("192.168.4.43", 3333)
+    await extension._process_datagram(second.heartbeat(), second.address, 0.5)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # ...and a flush inside the window stays quiet too
+    await extension._flush_pending_inf(now=0.9)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # the protocol loop's flush delivers the coalesced list (trailing edge)
+    # once the window has elapsed, carrying both devices
+    await extension._flush_pending_inf(now=1.5)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert set(broadcasts[-1]["status"]) == {
+        str(DEVICE_SYSID),
+        str(DEVICE_SYSID + 1),
+    }
+
+    # nothing pending: a further flush does not re-broadcast
+    await extension._flush_pending_inf(now=2.0)
+    assert len(_inf_broadcasts(extension)) == 2
+
+
+async def test_inf_rebroadcast_refreshes_ages(extension, device):
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # without a transition the list is only rebroadcast on the slow
+    # heartbeat, so ages keep refreshing on clients
+    await extension._flush_pending_inf(now=5.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    await extension._flush_pending_inf(now=10.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 2
+    entry = broadcasts[-1]["status"][str(DEVICE_SYSID)]
+    assert entry["age"] == pytest.approx(10.0)
+
+
+async def test_inf_no_rebroadcast_without_devices(extension, device):
+    await _feed_heartbeat(extension, device, now=0.0)
+    for event in extension._protocol.expire(1000.0):
+        extension._handle_lost(event)
+    await extension._flush_pending_inf(now=1000.0)
+    assert len(_inf_broadcasts(extension)) == 2
+
+    # an empty device table has no ages to refresh: the slow heartbeat
+    # stays quiet until the next transition
+    await extension._flush_pending_inf(now=2000.0)
+    assert len(_inf_broadcasts(extension)) == 2
+
+
 # ---- X-RTLS-STATS health telemetry --------------------------------------
 
 
