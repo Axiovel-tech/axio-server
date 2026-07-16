@@ -9,6 +9,7 @@ pushed back through ``_process_datagram``. No sockets are involved.
 """
 
 import logging
+import socket
 import struct
 import sys
 import threading
@@ -1673,8 +1674,10 @@ async def test_show_clock_lost_device_repinned_on_return(extension, device):
 # every ADV_PERIOD_S: one datagram = HEARTBEAT + SYSTEM_TIME +
 # PARAM_EXT_VALUE FW_VERSION/UWB_ROLE. The extension parses it with the
 # SDK's parse_advertisement (a seam, so these tests run against the
-# pinned SDK even when it predates the module) and feeds the raw frames
-# through the same protocol seam as management-channel datagrams.
+# pinned SDK even when it predates the module) and feeds ONLY the
+# advertiser's own validated frames — re-serialized by a fresh
+# per-datagram parser — through the same protocol seam as
+# management-channel datagrams.
 
 #: an advertisement's UDP source: the firmware sends it from a throwaway
 #: ephemeral port that never receives -- the extension must record the
@@ -1840,6 +1843,59 @@ async def test_advertisement_without_enrichment_keeps_param_path(
     assert "role" not in entry
 
 
+async def test_advertisement_piggybacked_frames_are_dropped(
+    extension, device, dialect
+):
+    """A single valid heartbeat must not smuggle extra frames into the
+    protocol: piggybacked HEARTBEAT/PARAM_EXT_VALUE frames for OTHER
+    system ids (and non-advertisement message types) are stripped before
+    the datagram content reaches the shared protocol core."""
+    device.respond_to_list = False
+    intruder = FakeDevice(dialect, system_id=99)
+    # sysid 99 is already legitimately known via the management channel
+    await extension._process_datagram(intruder.heartbeat(), intruder.address, 0.0)
+    victim = extension._protocol.devices[99]
+    assert victim.last_seen == 0.0
+    baseline_params = dict(victim.params)
+
+    extension._parse_advertisement = stub_advertisement_parser()
+    datagram = (
+        make_advertisement(device)
+        + intruder.heartbeat()  # spoofed liveness for sysid 99
+        + intruder._param_value("FW_VERSION", 3)  # spoofed param for sysid 99
+        + device.named_value_float("rate", 8.0)  # wrong type, even if own sysid
+    )
+    await extension._process_advertisement(datagram, ADV_SOURCE, 50.0)
+
+    # the advertiser itself went through the normal machinery...
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 50.0
+    # ...but the piggybacked frames changed nothing for sysid 99
+    assert victim.last_seen == 0.0
+    assert victim.params == baseline_params
+    # and the smuggled stats frame never became a stats event
+    assert extension._stats == {}
+
+
+async def test_advertisement_truncated_tail_does_not_poison_protocol_parser(
+    extension, device, dialect
+):
+    """The protocol core's MAVLink parser is stateful across datagrams: raw
+    advertisement bytes ending in a truncated frame would leave it
+    mid-frame and eat the first frame of the NEXT management datagram.
+    The sanitizing re-serialization must isolate it."""
+    device.respond_to_list = False
+    extension._parse_advertisement = stub_advertisement_parser()
+
+    truncated = make_advertisement(device) + device.heartbeat()[:-3]
+    await extension._process_advertisement(truncated, ADV_SOURCE, 0.0)
+    assert DEVICE_SYSID in extension._protocol.devices
+
+    # the very next management-channel datagram must still parse whole
+    second = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
+    await extension._process_datagram(second.heartbeat(), second.address, 1.0)
+    assert DEVICE_SYSID + 1 in extension._protocol.devices
+
+
 async def test_advertisement_enrichment_pruned_on_loss(extension, device):
     extension._parse_advertisement = stub_advertisement_parser(
         version="9.9.9", uptime_ms=1000
@@ -1933,10 +1989,13 @@ def _passive_extension(extension, dialect, device):
 
 
 async def test_passive_any_datagram_refreshes_liveness(extension, dialect, device):
-    """In passive mode ANY attributable inbound datagram counts as proof
-    of life -- the pinned protocol core refreshes last_seen on heartbeats
-    only, so without this a board whose heartbeats are lost to a
-    contended AP would flap between the 60 s hellos."""
+    """In passive mode ANY inbound datagram from a known device's address
+    counts as proof of life -- the pinned protocol core refreshes
+    last_seen on heartbeats only, so without this a board whose
+    heartbeats are lost to a contended AP would flap between the 60 s
+    hellos. Attribution is by source address, not by protocol events:
+    real firmware datagrams exist that yield no event at all (the pn/pe/pd
+    position stats and SYSTEM_TIME are dropped by the pinned SDK)."""
     _passive_extension(extension, dialect, device)
     # the fake transport answers the discovery param listing on the REAL
     # clock, which would itself refresh last_seen under passive keepalive
@@ -1949,10 +2008,22 @@ async def test_passive_any_datagram_refreshes_liveness(extension, dialect, devic
         device.named_value_float("rate", 8.0), device.address, 25.0
     )
     assert extension._protocol.devices[DEVICE_SYSID].last_seen == 25.0
+
+    # so does a datagram the SDK emits NO event for (a position stat)
+    await extension._process_datagram(
+        device.named_value_float("pn", 1.25), device.address, 28.0
+    )
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 28.0
     assert extension._protocol.expire(31.0) == []
 
+    # but not one from an UNKNOWN address (nothing to attribute it to)
+    await extension._process_datagram(
+        device.named_value_float("pn", 1.25), ("192.168.4.250", 3333), 30.0
+    )
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 28.0
+
     # total silence past the timeout still expires the device
-    assert [e.kind for e in extension._protocol.expire(56.0)] == ["lost"]
+    assert [e.kind for e in extension._protocol.expire(59.0)] == ["lost"]
 
 
 async def test_active_mode_stats_do_not_refresh_liveness(extension, device):
@@ -2049,6 +2120,43 @@ async def test_run_degrades_gracefully_without_advertisement_sdk(monkeypatch):
         assert len(warnings) == 1
         assert "advertisement" in warnings[0]
         nursery.cancel_scope.cancel()
+
+
+async def test_run_disables_listener_on_bind_collision():
+    """The listener binds WITHOUT SO_REUSEADDR: a port collision must fail
+    loudly (EADDRINUSE -> one warning, listener disabled) instead of two
+    reuse-enabled sockets silently splitting unicast delivery."""
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("0.0.0.0", 0))  # a REAL socket already owns the port
+    port = blocker.getsockname()[1]
+
+    ext = RtlsExtension()
+    ext.app = app = RunStubApp()
+    # pretend the SDK ships the parser so run() reaches the bind
+    ext._parse_advertisement = stub_advertisement_parser()
+    warnings = []
+    log = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda message, *args, **kwargs: warnings.append(message),
+    )
+
+    try:
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(
+                ext.run,
+                app,
+                {"advertisement_port": port, "broadcast": [], "devices": []},
+                log,
+            )
+            with trio.fail_after(5):
+                while not warnings:
+                    await trio.sleep(0.01)
+            assert ext._adv_sock is None
+            assert len(warnings) == 1
+            assert str(port) in warnings[0]
+            nursery.cancel_scope.cancel()
+    finally:
+        blocker.close()
 
 
 def test_cell_id_from_params_reads_firmware_label():

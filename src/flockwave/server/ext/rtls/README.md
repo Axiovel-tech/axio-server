@@ -117,10 +117,15 @@ advertisement image) are still tracked, with caveats:
   intuition that a board "answering each 60 s hello" would expire on a
   30 s timeout: boards are not reply-only, they free-run once peered.)
 - As extra insurance, in passive mode the extension refreshes liveness
-  from **any** attributable inbound datagram on either socket (stats,
-  TWR, param replies/acks — the SDK protocol core itself only counts
-  heartbeats), so a board whose heartbeats are lost to a contended AP
-  stays alive as long as anything from it gets through.
+  from **any** inbound datagram whose source address matches a known
+  device, on either socket — attribution is by address, not by decoded
+  content, because real firmware datagrams exist that the SDK protocol
+  core emits no event for at all (the `pn`/`pe`/`pd` position stats,
+  SYSTEM_TIME; the core itself only counts heartbeats). A board whose
+  heartbeats are lost to a contended AP stays alive as long as anything
+  from it gets through. A device must still be *discovered* by a
+  heartbeat or advertisement first — unattributable datagrams from
+  unknown addresses refresh nothing.
 - Residual gaps: after a legacy board reboots (or the server restarts
   on a new source port), the board sends nothing until the next hello,
   so its (re)discovery can take up to `hello_interval` — advertising

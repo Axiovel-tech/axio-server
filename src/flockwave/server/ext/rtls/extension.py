@@ -33,7 +33,11 @@ from rtlslink import (
     parse_address,
 )
 from rtlslink.dialect import load_dialect
-from rtlslink.protocol import PARAM_ACK_ACCEPTED, PARAM_ACK_IN_PROGRESS
+from rtlslink.protocol import (
+    PARAM_ACK_ACCEPTED,
+    PARAM_ACK_IN_PROGRESS,
+    RTLS_COMPONENT_ID,
+)
 
 try:
     from rtlslink import SLEEP_PARAM
@@ -285,9 +289,10 @@ class RtlsExtension(Extension):
                     trio.socket.AF_INET, trio.socket.SOCK_DGRAM
                 )
                 try:
-                    adv_sock.setsockopt(
-                        trio.socket.SOL_SOCKET, trio.socket.SO_REUSEADDR, 1
-                    )
+                    # deliberately NO SO_REUSEADDR: on Linux it would let a
+                    # second reuse-enabled listener bind the same port and
+                    # silently steal unicast delivery — a collision must
+                    # fail loudly (EADDRINUSE) into the warning below
                     await adv_sock.bind(("0.0.0.0", advertisement_port))
                 except OSError as ex:
                     adv_sock.close()
@@ -400,14 +405,18 @@ class RtlsExtension(Extension):
         self, data: bytes, address: tuple[str, int], now: float
     ) -> None:
         """One datagram from the advertisement socket: parse it, cache the
-        enrichment (firmware version / role / uptime), then feed the raw
-        frames through the same protocol seam as a management-channel
-        datagram — the advertisement is HEARTBEAT + SYSTEM_TIME +
-        PARAM_EXT_VALUE frames by design, so discovery, liveness refresh,
-        the param cache and the X-RTLS-INF gained/lost broadcasts behave
-        exactly as for active discovery. The datagram's source PORT is a
-        throwaway sender the firmware never reads from; the device is
-        recorded at (source IP, management port) instead."""
+        enrichment (firmware version / role / uptime), then feed the
+        SANITIZED frames through the same protocol seam as a
+        management-channel datagram — the advertisement is HEARTBEAT +
+        SYSTEM_TIME + PARAM_EXT_VALUE frames by design, so discovery,
+        liveness refresh, the param cache and the X-RTLS-INF gained/lost
+        broadcasts behave exactly as for active discovery. The datagram's
+        source PORT is a throwaway sender the firmware never reads from;
+        the device is recorded at (source IP, management port) instead.
+
+        Only the advertiser's own validated frames reach the protocol
+        (see :func:`_sanitized_advertisement_frames`): the raw datagram
+        must never touch the protocol's shared parser."""
         if self._parse_advertisement is None or self._protocol is None:
             return
         try:
@@ -432,7 +441,9 @@ class RtlsExtension(Extension):
         if advertisement.uptime_ms is not None:
             entry["uptimeMs"] = int(advertisement.uptime_ms)
         self._adv[advertisement.system_id] = entry
-        await self._process_datagram(data, tuple(mgmt_address), now)
+        frames = _sanitized_advertisement_frames(data, advertisement.system_id)
+        if frames:
+            await self._process_datagram(frames, tuple(mgmt_address), now)
 
     async def _process_datagram(
         self, data: bytes, address: tuple[str, int], now: float
@@ -440,19 +451,22 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        events = self._protocol.feed(data, address, now)
         if self._passive:
             # In passive mode the boards are probed only every
-            # hello_interval, so ANY attributable inbound datagram (stats,
-            # TWR, param replies/acks — the protocol core itself refreshes
-            # liveness on heartbeats only) counts as proof of life;
-            # without this, a legacy board whose heartbeats are lost to a
-            # contended AP would flap on the slow hello cadence.
-            for event in events:
-                device = self._protocol.devices.get(event.system_id)
-                if device is not None:
+            # hello_interval, so ANY inbound datagram from a known
+            # device's address counts as proof of life. Attribution is by
+            # source address, NOT by emitted protocol events: real
+            # firmware datagrams exist that yield no event at all (the
+            # pn/pe/pd position stats and SYSTEM_TIME are dropped by the
+            # pinned SDK, which itself refreshes liveness on heartbeats
+            # only), and without this a board whose heartbeats are lost
+            # to a contended AP would flap on the slow hello cadence.
+            source = tuple(address)
+            for device in self._protocol.devices.values():
+                if tuple(device.address) == source:
                     device.last_seen = max(device.last_seen, now)
-        for event in events:
+                    break
+        for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
                     self.log.info(
@@ -1734,6 +1748,37 @@ def _presence_config(configuration) -> tuple[float, float]:
             configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)
         )
     return heartbeat_interval, device_timeout
+
+
+def _sanitized_advertisement_frames(data: bytes, system_id: int) -> bytes:
+    """Re-serializes exactly the frames of one advertisement datagram that
+    belong to the advertising device: its HEARTBEAT(s) and its
+    PARAM_EXT_VALUE frames (component id 197, same system id as the
+    validated advertisement). Everything else is dropped.
+
+    The raw datagram must never be fed to the protocol core:
+
+    - its shared parser is STATEFUL across datagrams, so a truncated
+      trailing frame would leave it mid-frame and eat the first frame of
+      the next management datagram (cross-socket parser pollution);
+      the fresh per-datagram parser here provides isolation, and only
+      complete, re-serialized frames come out;
+    - frames piggybacked after a valid heartbeat could otherwise
+      fabricate other devices, refresh their liveness or overwrite their
+      cached parameters from a single spoofed datagram.
+    """
+    parser = load_dialect().MAVLink(None)
+    parser.robust_parsing = True
+    frames: list[bytes] = []
+    for message in parser.parse_buffer(bytes(data)) or []:
+        if (
+            message.get_srcSystem() != system_id
+            or message.get_srcComponent() != RTLS_COMPONENT_ID
+            or message.get_type() not in ("HEARTBEAT", "PARAM_EXT_VALUE")
+        ):
+            continue
+        frames.append(bytes(message.get_msgbuf()))
+    return b"".join(frames)
 
 
 def _load_advertisement_parser(log):
