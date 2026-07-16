@@ -2016,7 +2016,9 @@ async def test_passive_any_datagram_refreshes_liveness(extension, dialect, devic
     assert extension._protocol.devices[DEVICE_SYSID].last_seen == 28.0
     assert extension._protocol.expire(31.0) == []
 
-    # but not one from an UNKNOWN address (nothing to attribute it to)
+    # but not the same sysid's frames from a FOREIGN source IP: the
+    # refresh is guarded by the known address, and an actual move is
+    # left to the heartbeat seam (which migrates the recorded address)
     await extension._process_datagram(
         device.named_value_float("pn", 1.25), ("192.168.4.250", 3333), 30.0
     )
@@ -2024,6 +2026,39 @@ async def test_passive_any_datagram_refreshes_liveness(extension, dialect, devic
 
     # total silence past the timeout still expires the device
     assert [e.kind for e in extension._protocol.expire(59.0)] == ["lost"]
+
+
+async def test_passive_refresh_not_fooled_by_dhcp_address_reuse(
+    extension, dialect, device
+):
+    """Bench DHCP reassigns IPs across power cycles. When device A's IP is
+    reused by device B, B's traffic must refresh B ONLY: liveness is
+    attributed by the MAVLink header system id (with the source IP as a
+    guard), never by source address — an address-keyed refresh would
+    keep ghost A alive forever on B's datagrams."""
+    _passive_extension(extension, dialect, device)
+    device.respond_to_list = False
+    await _feed_heartbeat(extension, device, now=0.0)  # A = sysid 42 at IP X
+
+    # power cycle: the SAME IP now belongs to sysid 43
+    successor = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
+    await extension._process_datagram(successor.heartbeat(), DEVICE_ADDRESS, 5.0)
+    assert DEVICE_SYSID + 1 in extension._protocol.devices
+
+    # B keeps chattering from the reused address, including datagrams
+    # that yield no protocol event (position stats)
+    for now in (10.0, 20.0, 28.0):
+        await extension._process_datagram(
+            successor.named_value_float("pn", 1.0), DEVICE_ADDRESS, now
+        )
+
+    assert extension._protocol.devices[DEVICE_SYSID + 1].last_seen == 28.0
+    # ghost A was never refreshed by its successor's traffic...
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 0.0
+    # ...so it expires on schedule while B stays alive
+    events = extension._protocol.expire(31.0)
+    assert [(e.kind, e.system_id) for e in events] == [("lost", DEVICE_SYSID)]
+    assert DEVICE_SYSID + 1 in extension._protocol.devices
 
 
 async def test_active_mode_stats_do_not_refresh_liveness(extension, device):

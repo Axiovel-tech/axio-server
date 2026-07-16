@@ -453,19 +453,24 @@ class RtlsExtension(Extension):
         self._scan_pos_debug(data, now)
         if self._passive:
             # In passive mode the boards are probed only every
-            # hello_interval, so ANY inbound datagram from a known
-            # device's address counts as proof of life. Attribution is by
-            # source address, NOT by emitted protocol events: real
-            # firmware datagrams exist that yield no event at all (the
-            # pn/pe/pd position stats and SYSTEM_TIME are dropped by the
-            # pinned SDK, which itself refreshes liveness on heartbeats
-            # only), and without this a board whose heartbeats are lost
-            # to a contended AP would flap on the slow hello cadence.
-            source = tuple(address)
-            for device in self._protocol.devices.values():
-                if tuple(device.address) == source:
+            # hello_interval, so ANY inbound datagram from a device counts
+            # as proof of life — content-independent, because real
+            # firmware datagrams exist that yield no protocol event at all
+            # (the pn/pe/pd position stats and SYSTEM_TIME are dropped by
+            # the pinned SDK, which itself refreshes liveness on
+            # heartbeats only), and without this a board whose heartbeats
+            # are lost to a contended AP would flap on the slow hello
+            # cadence. Attribution is by the MAVLink header system id,
+            # NOT by source address: bench DHCP reassigns IPs across
+            # power cycles, and an address-keyed refresh would keep a
+            # ghost device alive forever on its successor's traffic. The
+            # source IP is only a guard — on a mismatch (the device
+            # moved) nothing is refreshed here and the normal heartbeat
+            # seam migrates the recorded address instead.
+            for system_id in _datagram_system_ids(data):
+                device = self._protocol.devices.get(system_id)
+                if device is not None and device.address[0] == address[0]:
                     device.last_seen = max(device.last_seen, now)
-                    break
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -1748,6 +1753,20 @@ def _presence_config(configuration) -> tuple[float, float]:
             configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)
         )
     return heartbeat_interval, device_timeout
+
+
+def _datagram_system_ids(data: bytes) -> set[int]:
+    """The system ids carried in the MAVLink frame headers of one
+    datagram, extracted with a fresh throwaway parser (never the
+    protocol's shared stateful one). Undecodable bytes yield nothing."""
+    parser = load_dialect().MAVLink(None)
+    parser.robust_parsing = True
+    system_ids: set[int] = set()
+    for message in parser.parse_buffer(bytes(data)) or []:
+        if message.get_type() == "BAD_DATA":
+            continue
+        system_ids.add(message.get_srcSystem())
+    return system_ids
 
 
 def _sanitized_advertisement_frames(data: bytes, system_id: int) -> bytes:
