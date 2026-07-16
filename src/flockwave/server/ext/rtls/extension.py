@@ -118,6 +118,16 @@ POS_REBOOT_BACKSTEP_MS = 5000
 #: through to the parse + exact name check.
 _POS_DEBUG_MARKERS = (b"pn", b"pe", b"pd", b"psig")
 
+#: how often the X-RTLS-INF device list is broadcast at most, in seconds;
+#: gained/lost transitions inside the window coalesce into one trailing-edge
+#: notification (during a show, drone tags flap in bursts)
+INF_INTERVAL = 1.0
+
+#: how often the X-RTLS-INF device list is rebroadcast without any
+#: gained/lost transition, in seconds, so client-side ``age`` values keep
+#: refreshing between transitions
+INF_REFRESH_INTERVAL = 10.0
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -138,6 +148,13 @@ class RtlsExtension(Extension):
         #: in the protocol loop tell whether a newer (throttled) update is
         #: still waiting to be sent
         self._last_stats_sent: dict[int, dict[str, Any]] = {}
+        #: True while a device gained/lost transition still awaits an
+        #: X-RTLS-INF broadcast (set on the transition, cleared by the
+        #: broadcast); the periodic flush in the protocol loop delivers it
+        self._inf_pending = False
+        #: monotonic timestamp of the last X-RTLS-INF broadcast, for the
+        #: broadcast throttle and the age-refresh rebroadcast
+        self._last_inf_broadcast: Optional[float] = None
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
         #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
@@ -254,6 +271,11 @@ class RtlsExtension(Extension):
             await self._flush_pending_stats(now)
             self._flush_pending_pos(now)
 
+            # same for the device list: coalesced gained/lost transitions are
+            # pushed once their throttle window elapses, and the list is
+            # rebroadcast on a slow heartbeat so client-side ages refresh.
+            await self._flush_pending_inf(now)
+
             with trio.move_on_after(0.25):
                 try:
                     data, address = await sock.recvfrom(2048)
@@ -291,6 +313,9 @@ class RtlsExtension(Extension):
                 request = self._protocol.request_param_list(event.system_id)
                 if request is not None:
                     await self._send(*request)
+                # push the new device list so clients that only listen (the
+                # GUI queries X-RTLS-INF once) see the device appear
+                await self._on_inf_change(now)
             elif event.kind == "stats":
                 # health telemetry arrives unsolicited; cache the latest
                 # snapshot and broadcast it (throttled) so live GCS clients
@@ -840,7 +865,9 @@ class RtlsExtension(Extension):
         """React to a device-``lost`` event: drop its cached stats so the
         X-RTLS-STATS query stops reporting it (mirroring X-RTLS-INF), drop its
         TWR telemetry, re-home any cell it sourced, then forward the event to
-        subscribers."""
+        subscribers. Also marks the device list dirty; the periodic flush in
+        the protocol loop broadcasts the updated X-RTLS-INF (this handler is
+        synchronous, so it cannot broadcast itself)."""
         self._prune_stats(event.system_id)
         self._prune_pos(event.system_id)
         self._twr.pop(event.system_id, None)
@@ -848,6 +875,7 @@ class RtlsExtension(Extension):
             self._show_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
         self._refresh_anchor_cells()
+        self._inf_pending = True
         self._dispatch_event(event)
 
     def _prune_stats(self, system_id: int) -> None:
@@ -869,21 +897,64 @@ class RtlsExtension(Extension):
         body = {"type": "X-RTLS-STATS", "stats": {str(system_id): dict(stats)}}
         await hub.broadcast_message(hub.create_notification(body))
 
+    async def _on_inf_change(self, now: float) -> None:
+        """A device was gained (or lost, via :meth:`_handle_lost` and the
+        periodic flush): broadcast the full X-RTLS-INF device list, throttled
+        to at most one per ``INF_INTERVAL``.
+
+        On the leading edge of the throttle window the list is broadcast
+        immediately; transitions inside the window only mark the list dirty --
+        the periodic flush in :meth:`_run_protocol_loop` pushes the coalesced
+        result once the window elapses, so no transition is ever dropped."""
+        self._inf_pending = True
+        last = self._last_inf_broadcast
+        if last is not None and now - last < INF_INTERVAL:
+            return
+        await self._broadcast_inf(now)
+
+    async def _flush_pending_inf(self, now: float) -> None:
+        """Broadcast the device list when a gained/lost transition is still
+        pending and its throttle window has elapsed (trailing edge); with no
+        transition pending, rebroadcast every ``INF_REFRESH_INTERVAL`` while
+        devices are known so client-side ``age`` values keep refreshing."""
+        last = self._last_inf_broadcast
+        if self._inf_pending:
+            if last is None or now - last >= INF_INTERVAL:
+                await self._broadcast_inf(now)
+        elif (
+            last is not None
+            and now - last >= INF_REFRESH_INTERVAL
+            and self._protocol is not None
+            and self._protocol.devices
+        ):
+            await self._broadcast_inf(now)
+
+    async def _broadcast_inf(self, now: float) -> None:
+        """Broadcast the current X-RTLS-INF body (same shape as the query
+        response: the full status map plus the site anchors list, so clients
+        can apply a wholesale replace)."""
+        self._inf_pending = False
+        self._last_inf_broadcast = now
+        if self.app is None:
+            self._warn_no_app()
+            return
+        hub = self.app.message_hub
+        body = {
+            "type": "X-RTLS-INF",
+            "status": self._inf_status(now),
+            "anchors": self._site_anchors(),
+        }
+        await hub.broadcast_message(hub.create_notification(body))
+
     # ---- client message handlers ----
 
     async def _handle_RTLS_INF(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
-        devices = self._protocol.devices if self._protocol else {}
-        now = time.monotonic()
-        status = {
-            str(device.system_id): self._device_json(device, now)
-            for device in devices.values()
-        }
         return hub.create_response_or_notification(
             body={
                 "type": "X-RTLS-INF",
-                "status": status,
+                "status": self._inf_status(time.monotonic()),
                 "anchors": self._site_anchors(),
             },
             in_response_to=message,
@@ -1196,6 +1267,16 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             raise RuntimeError("rtls protocol is not running")
         return self._protocol
+
+    def _inf_status(self, now: float) -> dict[str, dict[str, Any]]:
+        """The full X-RTLS-INF status map: one entry per live device, keyed
+        by system id (as string). Shared by the query response and the
+        gained/lost broadcast so both carry the same body shape."""
+        devices = self._protocol.devices if self._protocol else {}
+        return {
+            str(device.system_id): self._device_json(device, now)
+            for device in devices.values()
+        }
 
     def _device_json(self, device, now: float) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)

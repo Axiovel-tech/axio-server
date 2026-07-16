@@ -169,6 +169,14 @@ ids), so the map renders them without a bespoke anchor layer. Set
 
 Devices that miss their liveness timeout disappear from the map.
 
+The server also **broadcasts** `X-RTLS-INF` notifications with the same
+body shape (no `refs` member, since they are not responses) whenever a
+device is discovered or lost — throttled to at most one per second,
+with transitions inside the window coalesced into one trailing-edge
+notification — and every 10 s without transitions so `age` values keep
+refreshing. Each notification carries the **full** current status map;
+clients should replace their device list wholesale rather than merge.
+
 ### X-RTLS-PARAM-LIST — full parameter list
 
 Drives a full PARAM_EXT list transaction against the device and
