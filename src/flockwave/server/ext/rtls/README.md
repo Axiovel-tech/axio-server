@@ -4,12 +4,16 @@ Manages rtls-link UWB positioning devices over their management UDP
 channel (MAVLink 2, default port 3333) and exposes them to Skybrush
 clients through the server's message hub:
 
-- **Discovery**: the extension announces itself with GCS heartbeats
-  (unicast to configured `devices` plus `broadcast` addresses); each
-  device's management link learns the server from inbound datagrams and
-  heartbeats back (component id 197). Devices are tracked with liveness
-  timeout, and their full parameter list is fetched automatically on
-  discovery.
+- **Discovery / presence**: the extension announces itself with GCS
+  heartbeats (unicast to configured `devices` plus `broadcast`
+  addresses); each device's management link learns the server from
+  inbound datagrams and heartbeats back (component id 197). Devices are
+  tracked with a liveness timeout, and their full parameter list is
+  fetched automatically on discovery. In addition, the extension
+  listens for the firmware's autonomous **state advertisements**
+  (UDP :3343, see below) so devices are found and kept fresh without
+  being probed; `passive: true` makes advertisements the primary
+  presence source.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
@@ -66,10 +70,70 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   "rtls": {
     "port": 3333,
     "devices": ["192.168.4.1"],        // static addresses (optional)
-    "broadcast": ["255.255.255.255"]   // discovery broadcast
+    "broadcast": ["255.255.255.255"],  // discovery broadcast
+    "advertisement_port": 3343,        // state-advertisement listener (0 disables)
+    "passive": false,                  // advertisement-driven presence (see below)
+    "hello_interval": 60               // active probe cadence in passive mode, s
   }
 }
 ```
+
+## Passive presence (state advertisements)
+
+Firmware with the state-advertisement feature (fw PR
+`feature/state-advertisement`) announces itself autonomously: one UDP
+datagram to `:3343` after every DHCP bind and then every `ADV_PERIOD_S`
+(device parameter, default 10 s), carrying HEARTBEAT (identity + sleep
+state), SYSTEM_TIME (uptime) and PARAM_EXT_VALUE frames for
+`FW_VERSION` and `UWB_ROLE`. The extension always listens on
+`advertisement_port` (default 3343; `0`/`null` disables) and treats
+every advertisement as a device heartbeat: the device is discovered /
+kept alive at *(source IP, management `port`)* — the datagram itself
+leaves a throwaway socket the firmware never reads from — its
+version/role/sleep/uptime are refreshed, and the same
+gained/lost `X-RTLS-INF` notifications fire as for active discovery.
+
+With `passive: false` (default) nothing else changes: the extension
+still probes with GCS heartbeats every `heartbeat_interval` (2 s) and
+expires devices after `device_timeout` (6 s); advertisements just
+discover boards earlier and enrich `X-RTLS-INF`.
+
+With `passive: true` the mgmt channel stops being hammered — during
+shows the 2.4 GHz AP is contended, and management flapping is
+operator-visible noise. Active probing slows to one "hello" every
+`hello_interval` (default 60 s; still needed so boards learn the server
+address for their unicast telemetry, and so legacy boards get probed at
+all), and `device_timeout` defaults to 30 s (3× the 10 s advertisement
+period) unless configured explicitly.
+
+**Fleet requirements and legacy boards.** `passive: true` assumes the
+fleet runs advertisement-capable firmware. Legacy boards (no
+advertisement image) are still tracked, with caveats:
+
+- Once a legacy board hears one hello, its management link locks onto
+  the server and its firmware streams **1 Hz heartbeats** (plus ~2 Hz
+  stats) to it unconditionally — the board keeps *itself* alive; the
+  30 s timeout does not flap it in steady state. (Contrary to the
+  intuition that a board "answering each 60 s hello" would expire on a
+  30 s timeout: boards are not reply-only, they free-run once peered.)
+- As extra insurance, in passive mode the extension refreshes liveness
+  from **any** attributable inbound datagram on either socket (stats,
+  TWR, param replies/acks — the SDK protocol core itself only counts
+  heartbeats), so a board whose heartbeats are lost to a contended AP
+  stays alive as long as anything from it gets through.
+- Residual gaps: after a legacy board reboots (or the server restarts
+  on a new source port), the board sends nothing until the next hello,
+  so its (re)discovery can take up to `hello_interval` — advertising
+  boards re-announce within `ADV_PERIOD_S` instead. A legacy board that
+  goes fully silent is only re-probed on the hello cadence, so a true
+  outage is detected within `device_timeout` but recovery detection can
+  lag by up to `hello_interval`.
+
+If the pinned `rtls-link` SDK predates the advertisement parser
+(`rtlslink.advertisement`), the extension logs one warning, disables
+the listener and otherwise works exactly as before — `passive: true`
+then degrades to just the slow hello + 30 s timeout, which is only
+safe with self-heartbeating boards (see above).
 
 ## Client message API
 
@@ -110,6 +174,7 @@ plus a site-level `anchors` list:
       "address": ["192.168.4.42", 3333],
       "age": 0.52,
       "firmwareVersion": "1.2.3",
+      "uptimeMs": 123456,
       "paramCount": 23,
       "otaStatus": null,
       "sleeping": false,
@@ -132,9 +197,14 @@ plus a site-level `anchors` list:
 }
 ```
 
-- `age` — seconds since the last heartbeat from the device.
-- `firmwareVersion` — value of the device's `FW_VERSION` parameter if
-  it exposes one, otherwise `null`.
+- `age` — seconds since the last heartbeat from the device (in passive
+  mode: since any datagram from it).
+- `firmwareVersion` — from the device's latest state advertisement when
+  one has been received, else the `FW_VERSION` parameter if the device
+  exposes one, otherwise `null`.
+- `uptimeMs` — device uptime in milliseconds, as reported by its latest
+  state advertisement; absent for devices that never advertised (the
+  underlying counter wraps after ~49.7 days, like the firmware's).
 - `paramCount` — size of the device's parameter registry once known
   (the list is auto-fetched on discovery), otherwise `null`.
 - `otaStatus` — status of the device's last OTA job
@@ -145,8 +215,8 @@ plus a site-level `anchors` list:
   heartbeat (`MAV_STATE_STANDBY`), so it is live even though sleep is
   commanded through the `SLEEP` parameter.
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
-  `"disabled"`, derived from the device's `UWB_ROLE` parameter; absent
-  when the device does not expose a role.
+  `"disabled"`, from the latest state advertisement or the device's
+  `UWB_ROLE` parameter; absent when the device exposes neither.
 - `name` — a human-readable role-aware label (e.g. `"RTLS anchor A0"`);
   absent for devices with no recognised role.
 - `twr` — inter-anchor TWR telemetry: a list (freshest first) of

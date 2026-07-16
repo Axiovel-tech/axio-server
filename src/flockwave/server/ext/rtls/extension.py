@@ -128,6 +128,24 @@ INF_INTERVAL = 1.0
 #: refreshing between transitions
 INF_REFRESH_INTERVAL = 10.0
 
+#: default UDP port of the firmware's phone-home / state-advertisement
+#: datagrams (CONFIG_RTLS_LINK_NET_PHONE_HOME_PORT; mirrors
+#: rtlslink.advertisement.ADVERTISEMENT_PORT without requiring the module,
+#: which pre-advertisement SDK pins do not ship)
+DEFAULT_ADVERTISEMENT_PORT = 3343
+
+#: active-mode presence defaults: the classic 2 s heartbeat probe with a
+#: 6 s liveness timeout (three missed probes)
+DEFAULT_HEARTBEAT_INTERVAL = 2.0
+DEFAULT_DEVICE_TIMEOUT = 6.0
+
+#: passive-mode presence defaults: a slow 60 s "hello" (boards still need
+#: to learn the server address for their unicast telemetry, and legacy
+#: boards without advertisement firmware still need an occasional probe)
+#: and a 30 s timeout = 3x the firmware's 10 s advertisement period
+DEFAULT_HELLO_INTERVAL = 60.0
+DEFAULT_PASSIVE_DEVICE_TIMEOUT = 30.0
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -190,6 +208,25 @@ class RtlsExtension(Extension):
         #: stats throttle
         self._last_pos_broadcast: dict[int, float] = {}
         self._last_pos_sent: dict[int, dict[str, Any]] = {}
+        #: ``rtlslink.advertisement.parse_advertisement`` once resolved (a
+        #: seam: tests may pre-set a fake); ``None`` while unresolved or when
+        #: the pinned SDK predates the advertisement module
+        self._parse_advertisement = None
+        #: passive-presence mode (config ``passive``): the active heartbeat
+        #: slows to the hello cadence and ANY attributable inbound datagram
+        #: refreshes device liveness, not just heartbeats
+        self._passive = False
+        #: management UDP port of the fleet (config ``port``); an
+        #: advertisement's source IP is combined with it to form the
+        #: device's real address (the datagram leaves a throwaway socket)
+        self._management_port = 3333
+        #: socket of the state-advertisement listener; ``None`` when the
+        #: listener is disabled (config, or a pre-advertisement SDK pin)
+        self._adv_sock = None
+        #: latest advertisement-borne enrichment per device (keys among
+        #: ``firmwareVersion``/``role``/``uptimeMs``); fresher than the
+        #: param cache, pruned on device loss
+        self._adv: dict[int, dict[str, Any]] = {}
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -214,13 +251,17 @@ class RtlsExtension(Extension):
             self._show_clock = ShowClockPinManager(self)
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
+        self._passive = bool(configuration.get("passive", False))
+        self._management_port = port
+        heartbeat_interval, device_timeout = _presence_config(configuration)
+
         dialect = load_dialect()
         self._protocol = protocol = RtlsProtocol(
             dialect,
             targets=targets,
             broadcast_targets=broadcast,
-            heartbeat_interval=float(configuration.get("heartbeat_interval", 2)),
-            device_timeout=float(configuration.get("device_timeout", 6)),
+            heartbeat_interval=heartbeat_interval,
+            device_timeout=device_timeout,
         )
 
         sock = trio.socket.socket(trio.socket.AF_INET, trio.socket.SOCK_DGRAM)
@@ -228,14 +269,56 @@ class RtlsExtension(Extension):
         await sock.bind(("0.0.0.0", 0))
         self._sock = sock
 
+        # Passive presence: listen for the firmware's autonomous state
+        # advertisements (phone-home datagrams) next to the active
+        # management conversation. Both a config of 0/None and a pinned
+        # SDK without the advertisement parser disable the listener; the
+        # rest of the extension is unaffected either way.
+        advertisement_port = int(configuration.get(
+            "advertisement_port", DEFAULT_ADVERTISEMENT_PORT
+        ) or 0)
+        if advertisement_port:
+            if self._parse_advertisement is None:
+                self._parse_advertisement = _load_advertisement_parser(logger)
+            if self._parse_advertisement is not None:
+                adv_sock = trio.socket.socket(
+                    trio.socket.AF_INET, trio.socket.SOCK_DGRAM
+                )
+                try:
+                    adv_sock.setsockopt(
+                        trio.socket.SOL_SOCKET, trio.socket.SO_REUSEADDR, 1
+                    )
+                    await adv_sock.bind(("0.0.0.0", advertisement_port))
+                except OSError as ex:
+                    adv_sock.close()
+                    logger.warning(
+                        f"rtls: cannot listen for state advertisements on "
+                        f"UDP :{advertisement_port} ({ex}); passive "
+                        f"presence disabled"
+                    )
+                else:
+                    self._adv_sock = adv_sock
+
         logger.info(
             f"rtls: managing devices on UDP :{port} "
-            f"({len(targets)} static, broadcast {len(broadcast)})"
+            f"({len(targets)} static, broadcast {len(broadcast)}, "
+            f"{'passive' if self._passive else 'active'} presence, "
+            f"advertisements "
+            + (
+                f"on UDP :{advertisement_port}"
+                if self._adv_sock is not None
+                else "off"
+            )
+            + ")"
         )
 
         try:
             async with trio.open_nursery() as nursery:
                 self._nursery = nursery
+                if self._adv_sock is not None:
+                    nursery.start_soon(
+                        self._run_advertisement_loop, self._adv_sock
+                    )
                 with app.message_hub.use_message_handlers(
                     {
                         "X-RTLS-INF": self._handle_RTLS_INF,
@@ -252,6 +335,10 @@ class RtlsExtension(Extension):
         finally:
             self._nursery = None
             self._sock = None
+            if self._adv_sock is not None:
+                self._adv_sock.close()
+                self._adv_sock = None
+            self._adv.clear()
             self._beacon_api = None
             self._clear_anchor_beacons()
 
@@ -297,13 +384,75 @@ class RtlsExtension(Extension):
         except OSError:
             pass
 
+    async def _run_advertisement_loop(self, sock) -> None:
+        """Consumes the firmware's autonomous state advertisements
+        (one datagram per board every ADV_PERIOD_S, plus a burst on DHCP
+        bind) so presence tracking works without probing the boards."""
+        while True:
+            try:
+                data, address = await sock.recvfrom(2048)
+            except OSError:
+                await trio.sleep(1)
+                continue
+            await self._process_advertisement(data, address, time.monotonic())
+
+    async def _process_advertisement(
+        self, data: bytes, address: tuple[str, int], now: float
+    ) -> None:
+        """One datagram from the advertisement socket: parse it, cache the
+        enrichment (firmware version / role / uptime), then feed the raw
+        frames through the same protocol seam as a management-channel
+        datagram — the advertisement is HEARTBEAT + SYSTEM_TIME +
+        PARAM_EXT_VALUE frames by design, so discovery, liveness refresh,
+        the param cache and the X-RTLS-INF gained/lost broadcasts behave
+        exactly as for active discovery. The datagram's source PORT is a
+        throwaway sender the firmware never reads from; the device is
+        recorded at (source IP, management port) instead."""
+        if self._parse_advertisement is None or self._protocol is None:
+            return
+        try:
+            advertisement = self._parse_advertisement(
+                data, address, management_port=self._management_port
+            )
+        except Exception:
+            # the port is open to the world; a garbage datagram must not
+            # take the listener down
+            return
+        if advertisement is None:
+            return
+        mgmt_address = advertisement.address
+        if mgmt_address is None:
+            return
+        entry: dict[str, Any] = {}
+        if advertisement.firmware_version is not None:
+            entry["firmwareVersion"] = advertisement.firmware_version
+        kind = getattr(advertisement, "kind", None)
+        if kind is not None:
+            entry["role"] = kind
+        if advertisement.uptime_ms is not None:
+            entry["uptimeMs"] = int(advertisement.uptime_ms)
+        self._adv[advertisement.system_id] = entry
+        await self._process_datagram(data, tuple(mgmt_address), now)
+
     async def _process_datagram(
         self, data: bytes, address: tuple[str, int], now: float
     ) -> None:
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        for event in self._protocol.feed(data, address, now):
+        events = self._protocol.feed(data, address, now)
+        if self._passive:
+            # In passive mode the boards are probed only every
+            # hello_interval, so ANY attributable inbound datagram (stats,
+            # TWR, param replies/acks — the protocol core itself refreshes
+            # liveness on heartbeats only) counts as proof of life;
+            # without this, a legacy board whose heartbeats are lost to a
+            # contended AP would flap on the slow hello cadence.
+            for event in events:
+                device = self._protocol.devices.get(event.system_id)
+                if device is not None:
+                    device.last_seen = max(device.last_seen, now)
+        for event in events:
             if event.kind == "discovered":
                 if self.log:
                     self.log.info(
@@ -871,6 +1020,7 @@ class RtlsExtension(Extension):
         self._prune_stats(event.system_id)
         self._prune_pos(event.system_id)
         self._twr.pop(event.system_id, None)
+        self._adv.pop(event.system_id, None)
         if self._show_clock is not None:
             self._show_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
@@ -1281,18 +1431,26 @@ class RtlsExtension(Extension):
     def _device_json(self, device, now: float) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
         params = _decoded_device_params(device)
-        role = role_from_params(params)
+        # the state advertisement re-announces version/role every
+        # ADV_PERIOD_S, so it is a fresher source than the param cache
+        # (filled on discovery / explicit reads); the param path stays the
+        # fallback for boards without advertisement firmware
+        adv = self._adv.get(device.system_id, {})
+        role = adv.get("role") or role_from_params(params)
 
         body = {
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "firmwareVersion": firmware_version(device),
+            "firmwareVersion": adv.get("firmwareVersion")
+            or firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
             # getattr: tolerate an SDK that predates sleep mode
             "sleeping": bool(getattr(device, "sleeping", False)),
         }
+        if "uptimeMs" in adv:
+            body["uptimeMs"] = adv["uptimeMs"]
         if role is not None:
             body["role"] = role
         name = _device_name(device.system_id, params, role)
@@ -1552,6 +1710,51 @@ def _sleep_error(requested: bool, detail: str) -> dict[str, Any]:
     }
 
 
+def _presence_config(configuration) -> tuple[float, float]:
+    """Resolve the presence cadence from the extension configuration:
+    returns ``(heartbeat_interval, device_timeout)`` in seconds.
+
+    Active mode (default) keeps the classic 2 s probe / 6 s timeout.
+    Passive mode (``passive: true``) slows the probe to ``hello_interval``
+    (default 60 s) and defaults the timeout to 30 s — 3x the firmware's
+    10 s advertisement period — unless ``device_timeout`` is configured
+    explicitly."""
+    if configuration.get("passive", False):
+        heartbeat_interval = float(
+            configuration.get("hello_interval", DEFAULT_HELLO_INTERVAL)
+        )
+        device_timeout = float(
+            configuration.get("device_timeout", DEFAULT_PASSIVE_DEVICE_TIMEOUT)
+        )
+    else:
+        heartbeat_interval = float(
+            configuration.get("heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)
+        )
+        device_timeout = float(
+            configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)
+        )
+    return heartbeat_interval, device_timeout
+
+
+def _load_advertisement_parser(log):
+    """Resolves ``rtlslink.advertisement.parse_advertisement``, or returns
+    ``None`` (after one warning) when the pinned rtls-link SDK predates
+    the advertisement module — the listener is then disabled and the rest
+    of the extension works as before."""
+    try:
+        from rtlslink.advertisement import parse_advertisement
+    except ImportError:
+        if log:
+            log.warning(
+                "rtls: the pinned rtls-link SDK has no advertisement "
+                "parser (rtlslink.advertisement); state advertisements "
+                "will not be consumed — bump the rtls-link pin to enable "
+                "passive presence"
+            )
+        return None
+    return parse_advertisement
+
+
 def _configured_addresses(values, default_port: int) -> list[tuple[str, int]]:
     """Parse configured ``host`` / ``host:port`` strings into address tuples,
     defaulting the port to the extension's management port."""
@@ -1768,6 +1971,25 @@ schema = {
             "type": "boolean",
             "title": "Register configured RTLS anchors as map beacons",
             "default": True,
+        },
+        "advertisement_port": {
+            "type": "integer",
+            "title": "UDP port for the devices' state advertisements "
+            "(0 disables the listener)",
+            "default": 3343,
+        },
+        "passive": {
+            "type": "boolean",
+            "title": "Passive presence: track devices from their state "
+            "advertisements and slow active probing to the hello interval "
+            "(requires advertisement-capable firmware on the fleet)",
+            "default": False,
+        },
+        "hello_interval": {
+            "type": "number",
+            "title": "Interval of the active hello probe in passive mode, "
+            "in seconds",
+            "default": 60,
         },
     }
 }

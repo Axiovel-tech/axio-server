@@ -8,7 +8,9 @@ outbound datagram to a scripted fake device, whose MAVLink replies are
 pushed back through ``_process_datagram``. No sockets are involved.
 """
 
+import logging
 import struct
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -37,6 +39,8 @@ from rtlslink.protocol import (
 from flockwave.server.ext.rtls.extension import (
     RtlsExtension,
     _configured_addresses,
+    _load_advertisement_parser,
+    _presence_config,
     _stats_json,
 )
 from flockwave.server.message_hub import MessageHub
@@ -1661,6 +1665,390 @@ async def test_show_clock_lost_device_repinned_on_return(extension, device):
     for event in events:
         extension._handle_lost(event)
     assert DEVICE_SYSID not in extension._show_clock._pinned
+
+
+# ---- passive presence: state advertisements ------------------------------
+#
+# Firmware with feature/state-advertisement announces itself to UDP :3343
+# every ADV_PERIOD_S: one datagram = HEARTBEAT + SYSTEM_TIME +
+# PARAM_EXT_VALUE FW_VERSION/UWB_ROLE. The extension parses it with the
+# SDK's parse_advertisement (a seam, so these tests run against the
+# pinned SDK even when it predates the module) and feeds the raw frames
+# through the same protocol seam as management-channel datagrams.
+
+#: an advertisement's UDP source: the firmware sends it from a throwaway
+#: ephemeral port that never receives -- the extension must record the
+#: device at (source IP, management port) instead
+ADV_SOURCE = (DEVICE_ADDRESS[0], 49321)
+
+
+def make_advertisement(device, *, uptime_ms=120_000):
+    """One state-advertisement datagram as lib/net/phone_home_advert.cpp
+    packs it: HEARTBEAT first, then SYSTEM_TIME (uptime) and the
+    PARAM_EXT_VALUE frames for FW_VERSION and UWB_ROLE (when present),
+    back to back in one datagram."""
+    d = device.dialect
+    frames = [device.heartbeat()]
+    system_time = d.MAVLink_system_time_message(
+        time_unix_usec=0, time_boot_ms=uptime_ms
+    )
+    frames.append(bytes(system_time.pack(device._mav)))
+    for name in ("FW_VERSION", "UWB_ROLE"):
+        if name in device.params:
+            frames.append(device._param_value(name, list(device.params).index(name)))
+    return b"".join(frames)
+
+
+def stub_advertisement_parser(
+    *,
+    system_id=DEVICE_SYSID,
+    version=None,
+    kind=None,
+    uptime_ms=None,
+    sleeping=False,
+):
+    """A parse_advertisement stand-in decoupled from the (possibly
+    pre-advertisement) pinned SDK: returns an Advertisement-shaped record
+    with the caller-declared enrichment and the real parser's address
+    contract (source IP + management port, never the source port)."""
+
+    def parse(data, source_address, *, management_port=3333):
+        return SimpleNamespace(
+            system_id=system_id,
+            component_id=RTLS_COMPONENT_ID,
+            system_status=3 if sleeping else 4,
+            source_address=source_address,
+            firmware_version=version,
+            role=None,
+            uptime_ms=uptime_ms,
+            management_port=management_port,
+            address=(source_address[0], management_port),
+            sleeping=sleeping,
+            kind=kind,
+        )
+
+    return parse
+
+
+try:
+    from rtlslink.advertisement import (
+        parse_advertisement as real_parse_advertisement,
+    )
+except ImportError:  # pinned SDK predates the module
+    real_parse_advertisement = None
+
+requires_advertisement_sdk = pytest.mark.skipif(
+    real_parse_advertisement is None,
+    reason="pinned rtls-link SDK predates state advertisements",
+)
+
+
+def test_presence_config_active_defaults():
+    assert _presence_config({}) == (2.0, 6.0)
+    # explicit values still win, as before
+    assert _presence_config({"heartbeat_interval": 1, "device_timeout": 4}) == (
+        1.0,
+        4.0,
+    )
+
+
+def test_presence_config_passive_defaults():
+    # 60 s hello (boards must still learn the server address; legacy
+    # boards still get probed) and 30 s timeout = 3x the 10 s
+    # advertisement period
+    assert _presence_config({"passive": True}) == (60.0, 30.0)
+
+
+def test_presence_config_passive_respects_explicit_overrides():
+    config = {"passive": True, "hello_interval": 20, "device_timeout": 45}
+    assert _presence_config(config) == (20.0, 45.0)
+    # heartbeat_interval is the ACTIVE-mode knob; passive mode uses
+    # hello_interval only
+    assert _presence_config({"passive": True, "heartbeat_interval": 1}) == (
+        60.0,
+        30.0,
+    )
+
+
+async def test_advertisement_discovers_device_and_broadcasts_inf(
+    extension, device, builder, hub
+):
+    """An advertisement alone (no active probe, no param listing) must
+    discover the device at its management address, push X-RTLS-INF, and
+    enrich the entry with the advertised version/role/uptime."""
+    set_fake_param(device, "UWB_ROLE", 1, "uint8")
+    device.respond_to_list = False  # nothing but the advertisement
+    extension._parse_advertisement = stub_advertisement_parser(
+        version="9.9.9", kind="tag", uptime_ms=120_000
+    )
+
+    await extension._process_advertisement(make_advertisement(device), ADV_SOURCE, 0.0)
+
+    # discovered at (source IP, management port), not the throwaway source
+    recorded = extension._protocol.devices[DEVICE_SYSID]
+    assert recorded.address == DEVICE_ADDRESS
+    # the discovery pushed the device list, exactly like an active discovery
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 1
+    assert set(broadcasts[-1]["status"]) == {str(DEVICE_SYSID)}
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["address"] == list(DEVICE_ADDRESS)
+    # advertisement beats the param cache (the raw frames carried the
+    # param-store version "1.2.3"; the advertisement record is fresher)
+    assert entry["firmwareVersion"] == "9.9.9"
+    assert entry["role"] == "tag"
+    assert entry["uptimeMs"] == 120_000
+    assert entry["sleeping"] is False
+
+
+async def test_advertisement_refreshes_known_device(extension, device):
+    """For an already known device an advertisement is a liveness refresh
+    (a heartbeat), not a rediscovery: last_seen moves, no INF push."""
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+    extension._parse_advertisement = stub_advertisement_parser()
+
+    await extension._process_advertisement(
+        make_advertisement(device), ADV_SOURCE, 100.0
+    )
+
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 100.0
+    assert extension._protocol.expire(105.0) == []  # 5 s < 6 s timeout
+    assert len(_inf_broadcasts(extension)) == 1  # no gained/lost transition
+
+
+async def test_advertisement_without_enrichment_keeps_param_path(
+    extension, device, builder, hub
+):
+    """Old advertisement firmware (heartbeat-only datagram) yields a record
+    with None enrichment: no uptime is invented and the firmware version
+    still comes from the param path."""
+    extension._parse_advertisement = stub_advertisement_parser()  # all None
+
+    await extension._process_advertisement(device.heartbeat(), ADV_SOURCE, 0.0)
+    # discovery auto-fetched the param list through the fake transport
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["firmwareVersion"] == "1.2.3"  # param path intact
+    assert "uptimeMs" not in entry
+    assert "role" not in entry
+
+
+async def test_advertisement_enrichment_pruned_on_loss(extension, device):
+    extension._parse_advertisement = stub_advertisement_parser(
+        version="9.9.9", uptime_ms=1000
+    )
+    await extension._process_advertisement(make_advertisement(device), ADV_SOURCE, 0.0)
+    assert DEVICE_SYSID in extension._adv
+
+    for event in extension._protocol.expire(1000.0):
+        extension._handle_lost(event)
+    assert DEVICE_SYSID not in extension._adv
+
+
+async def test_advertisement_garbage_is_ignored(extension, device):
+    # a non-advertisement datagram parses to None -> dropped
+    extension._parse_advertisement = lambda data, addr, management_port=3333: None
+    await extension._process_advertisement(b"not mavlink", ADV_SOURCE, 0.0)
+    assert extension._protocol.devices == {}
+    assert _inf_broadcasts(extension) == []
+
+    # a parser blowing up on hostile input must not kill the listener path
+    def exploding(data, addr, *, management_port=3333):
+        raise ValueError("boom")
+
+    extension._parse_advertisement = exploding
+    await extension._process_advertisement(b"\xfd\x00garbage", ADV_SOURCE, 0.0)
+    assert extension._protocol.devices == {}
+
+
+async def test_advertisement_noop_without_parser(extension, device):
+    """With the listener disabled (pre-advertisement SDK) the datagram
+    path is inert; nothing else in the extension is affected."""
+    assert extension._parse_advertisement is None
+    await extension._process_advertisement(make_advertisement(device), ADV_SOURCE, 0.0)
+    assert extension._protocol.devices == {}
+
+
+def test_load_advertisement_parser_degrades_without_sdk(monkeypatch):
+    """Requirement: an old pinned SDK (no rtlslink.advertisement) logs ONE
+    warning and disables the listener instead of breaking the extension."""
+    monkeypatch.setitem(sys.modules, "rtlslink.advertisement", None)
+    warnings = []
+    log = SimpleNamespace(warning=lambda message, *args, **kwargs: warnings.append(message))
+
+    assert _load_advertisement_parser(log) is None
+
+    assert len(warnings) == 1
+    assert "advertisement" in warnings[0]
+    # a logger-less caller (unit harness) must not crash either
+    assert _load_advertisement_parser(None) is None
+
+
+@requires_advertisement_sdk
+async def test_advertisement_full_path_with_real_parser(
+    extension, device, builder, hub
+):
+    """End to end against the real SDK parser (runs once the rtls-link pin
+    ships rtlslink.advertisement; skipped on older pins): a firmware-shaped
+    advertisement datagram discovers + enriches the device."""
+    set_fake_param(device, "UWB_ROLE", 1, "uint8")
+    device.respond_to_list = False
+    extension._parse_advertisement = real_parse_advertisement
+
+    await extension._process_advertisement(
+        make_advertisement(device, uptime_ms=45_000), ADV_SOURCE, 0.0
+    )
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["address"] == list(DEVICE_ADDRESS)
+    assert entry["firmwareVersion"] == "1.2.3"
+    assert entry["role"] == "tag"
+    assert entry["uptimeMs"] == 45_000
+
+
+# ---- passive presence: liveness across the slow hello --------------------
+
+
+def _passive_extension(extension, dialect, device):
+    """Reconfigure the fixture extension the way run() does for
+    passive mode: 60 s hello, 30 s timeout, passive keepalive."""
+    extension._passive = True
+    extension._protocol = RtlsProtocol(
+        dialect,
+        targets=[device.address],
+        heartbeat_interval=60.0,
+        device_timeout=30.0,
+    )
+    return extension
+
+
+async def test_passive_any_datagram_refreshes_liveness(extension, dialect, device):
+    """In passive mode ANY attributable inbound datagram counts as proof
+    of life -- the pinned protocol core refreshes last_seen on heartbeats
+    only, so without this a board whose heartbeats are lost to a
+    contended AP would flap between the 60 s hellos."""
+    _passive_extension(extension, dialect, device)
+    # the fake transport answers the discovery param listing on the REAL
+    # clock, which would itself refresh last_seen under passive keepalive
+    # and defeat the controlled timeline below
+    device.respond_to_list = False
+    await _feed_heartbeat(extension, device, now=0.0)
+
+    # a lone stats datagram (no heartbeat) 25 s in refreshes liveness
+    await extension._process_datagram(
+        device.named_value_float("rate", 8.0), device.address, 25.0
+    )
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 25.0
+    assert extension._protocol.expire(31.0) == []
+
+    # total silence past the timeout still expires the device
+    assert [e.kind for e in extension._protocol.expire(56.0)] == ["lost"]
+
+
+async def test_active_mode_stats_do_not_refresh_liveness(extension, device):
+    """The pinned-protocol truth this feature is built around: only
+    HEARTBEATs refresh last_seen in RtlsProtocol.feed; stats/param traffic
+    does not. Active mode keeps that behavior byte for byte."""
+    await _feed_heartbeat(extension, device, now=0.0)
+    await extension._process_datagram(
+        device.named_value_float("rate", 8.0), device.address, 5.0
+    )
+
+    assert extension._protocol.devices[DEVICE_SYSID].last_seen == 0.0
+    # default 6 s timeout: the stats at t=5 did not keep it alive
+    assert [e.kind for e in extension._protocol.expire(6.5)] == ["lost"]
+
+
+async def test_passive_legacy_board_kept_alive_by_own_heartbeats(
+    extension, dialect, device
+):
+    """A LEGACY board (no advertisement firmware) does not flap in passive
+    mode: once it learns the server address (any hello), its firmware
+    HeartbeatService streams 1 Hz heartbeats to that peer unconditionally,
+    and heartbeats refresh last_seen even in the pinned protocol. Fed here
+    every 10 s (sparser than reality) across two hello periods."""
+    _passive_extension(extension, dialect, device)
+    device.respond_to_list = False  # keep the timeline heartbeat-only
+    for now in range(0, 130, 10):
+        await _feed_heartbeat(extension, device, now=float(now))
+        assert extension._protocol.expire(float(now) + 9.0) == []
+    assert DEVICE_SYSID in extension._protocol.devices
+
+
+# ---- passive presence: run() wiring ---------------------------------------
+
+
+class RunStubHub(StubMessageHub):
+    @contextmanager
+    def use_message_handlers(self, handlers):
+        yield
+
+
+class RunStubApp:
+    def __init__(self):
+        self.message_hub = RunStubHub()
+
+    def import_api(self, name):
+        return StubBeaconAPI()
+
+
+async def test_run_applies_passive_presence_config():
+    """run() must translate passive:true into the slow hello + 30 s
+    timeout on the protocol, and advertisement_port:0 must disable the
+    listener socket."""
+    ext = RtlsExtension()
+    ext.app = app = RunStubApp()
+    config = {
+        "passive": True,
+        "advertisement_port": 0,
+        "broadcast": [],
+        "devices": [],
+    }
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(ext.run, app, config, logging.getLogger("test-rtls"))
+        with trio.fail_after(5):
+            while ext._protocol is None:
+                await trio.sleep(0.01)
+        assert ext._passive is True
+        assert ext._protocol._heartbeat_interval == 60.0
+        assert ext._protocol._device_timeout == 30.0
+        assert ext._adv_sock is None
+        nursery.cancel_scope.cancel()
+
+
+async def test_run_degrades_gracefully_without_advertisement_sdk(monkeypatch):
+    """With an old pinned SDK, run() warns once, skips the listener (and
+    its socket bind) and keeps the whole extension operational."""
+    monkeypatch.setitem(sys.modules, "rtlslink.advertisement", None)
+    ext = RtlsExtension()
+    ext.app = app = RunStubApp()
+    warnings = []
+    log = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda message, *args, **kwargs: warnings.append(message),
+    )
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(ext.run, app, {"broadcast": [], "devices": []}, log)
+        with trio.fail_after(5):
+            while ext._protocol is None:
+                await trio.sleep(0.01)
+        assert ext._parse_advertisement is None
+        assert ext._adv_sock is None
+        assert len(warnings) == 1
+        assert "advertisement" in warnings[0]
+        nursery.cancel_scope.cancel()
 
 
 def test_cell_id_from_params_reads_firmware_label():
