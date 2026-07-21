@@ -1,8 +1,8 @@
 // Axiovel indoor show configuration: MAVLink drones positioned by the
-// RTLS-Link UWB system. The RTLS tag bridges the FC's MAVLink stream to
-// this machine on UDP 14550 (wifi.gcsIp/udpPort on the tag), which matches
-// the "default" connection of the mavlink extension (listen 14550,
-// broadcast 14555).
+// RTLS-Link UWB system. Each Zephyr RTLS tag exposes the FC's MAVLink stream
+// on UDP 14550 and learns its peer from the first inbound datagram. The local
+// listener ports below are paired with unicast adapters to each tag because
+// wired-to-wireless broadcast is blocked on the bench AP.
 {
   "EXTENSIONS": {
     // Listen on all interfaces so Skybrush Live can connect from anywhere
@@ -10,12 +10,31 @@
       "host": ""
     },
 
+
+    // RTLS-Link devices (anchors + tag) for the RTLS panel. Broadcast
+    // discovery does not work on this multi-homed host (see
+    // docs/bench-reliability-findings.md in the fw repo) -- static list.
+    // NOTE: DHCP shuffles these per power cycle; refresh when boards move.
+    "rtls": {
+      "enabled": true,
+      // Passive presence trial 2026-07-16: track boards from their
+      // autonomous :3343 state advertisements; active hello slows to 60 s.
+      "passive": true,
+      "devices": ["192.168.0.101", "192.168.0.102", "192.168.0.103", "192.168.0.104", "192.168.0.105", "192.168.0.106", "192.168.0.107", "192.168.0.108", "192.168.0.109", "192.168.0.110", "192.168.0.111", "192.168.0.112"]
+    },
     // MAVLink-based drones via the RTLS-Link UART bridge
     "mavlink": {
       "enabled": true,
       "networks": {
         "mav": {
-          "connections": ["default"]
+          "connections": [
+            // The RTLS-Link tags bridge their flight controllers' MAVLink
+            // to this host on UDP 14550 (matches the "rtls-link mavlink"
+            // ufw allow rule on enp2s0); one shared listener on all
+            // interfaces replaces the former per-drone localhost ports,
+            // which never saw the board-network traffic.
+            "udp-listen://:14550?broadcast_port=14555"
+          ]
         }
       }
     },
