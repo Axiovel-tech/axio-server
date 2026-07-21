@@ -16,6 +16,11 @@ clients through the server's message hub:
   presence source.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
+- **Telemetry**: the firmware's unsolicited health stats are cached and
+  re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
+  debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
+  `X-RTLS-INF`. The same stats feed drives the cluster->GPS show-clock
+  pin distribution (see below).
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
   `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
   Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
@@ -60,6 +65,11 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 - `extension.py` — the Trio/flockwave glue over the SDK: discovery
   loop, the awaitable parameter transactions, OTA jobs and the client
   message handlers documented below.
+- `show_clock.py` — the cluster->GPS show-clock pin manager (see
+  below).
+- `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
+  NED table, NED->global) for SDK pins that predate them; the
+  `rtlslink` implementations are used when present.
 - `selfcheck.py` — deprecated shim forwarding to
   `rtls-link selfcheck`.
 
@@ -73,10 +83,16 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
     "broadcast": ["255.255.255.255"],  // discovery broadcast
     "advertisement_port": 3343,        // state-advertisement listener (0 disables)
     "passive": false,                  // advertisement-driven presence (see below)
-    "hello_interval": 60               // active probe cadence in passive mode, s
+    "hello_interval": 60,              // active probe cadence in passive mode, s
+    "register_beacons": true,          // anchors as map beacons (see X-RTLS-INF)
+    "show_clock_pin": true             // cluster->GPS show-clock pin (see below)
   }
 }
 ```
+
+`heartbeat_interval` and `device_timeout` (seconds) may also be set to
+override the presence cadence; the defaults are 2 s / 6 s in active mode
+and `hello_interval` / 30 s in passive mode.
 
 ## Passive presence (state advertisements)
 
@@ -143,6 +159,38 @@ If the pinned `rtls-link` SDK predates the advertisement parser
 the listener and otherwise works exactly as before — `passive: true`
 then degrades to just the slow hello + 30 s timeout, which is only
 safe with self-heartbeating boards (see above).
+
+## Show-clock GPS pin (UWB-timebase show start)
+
+Tags recover a shared absolute cluster time from the UWB anchor cluster
+and report it in their health stats (`clkh`/`clks` cluster seconds, with
+a `clkok` freshness flag). On the first fresh sample the extension mints
+a *pin* — "at cluster tick C0 the GPS time is (week, tow)" — by pairing
+the reported cluster time with the server's own wall clock, and
+distributes the **identical** pin to every tag as the `GPS_PIN_WEEK` /
+`GPS_PIN_TOW_MS` / `GPS_PIN_C0_HI` / `GPS_PIN_C0_LO` parameters. Each
+tag then synthesizes the same GPS time from its own cluster clock and
+feeds it to its autopilot as GPS_INPUT, so ArduPilot's native
+GPS-synchronized show scheduler self-triggers in lockstep across the
+fleet with no go-time packet. Inter-drone agreement rides entirely on
+the shared cluster clock; the pin's absolute accuracy (server clock +
+stats latency, tens of ms) only offsets the show against wall clock,
+equally for every drone.
+
+- Writes follow the firmware's ordering contract: `GPS_PIN_WEEK` is
+  zeroed first and written with the real week **last**, so a
+  half-applied pin reads as disabled on the tag instead of mixing old
+  and new C0 halves.
+- Pushes ride the stats feed, so they retry until every write is
+  acknowledged; a device that is lost and rediscovered is re-pinned (it
+  may have rebooted with default parameters).
+- A cluster restart (a tag's reported cluster time deviating from the
+  pin's prediction by more than 5 s — e.g. the time-reference anchor
+  power-cycled) invalidates every distributed pin: the extension logs a
+  warning, mints a fresh pin and redistributes it to the whole fleet.
+
+Set `show_clock_pin: false` in the configuration to disable pin
+management entirely.
 
 ## Client message API
 
@@ -450,6 +498,53 @@ responses) on progress changes (at most every 0.5 s) and once on
 completion. UIs may rely on the notifications or poll with the status
 query.
 
+### X-RTLS-STATS — health telemetry
+
+The firmware streams health stats unsolicited (one `NAMED_VALUE_FLOAT`
+per stat, ~2 Hz); the server caches the latest snapshot per device and
+**broadcasts** `X-RTLS-STATS` notifications, throttled to at most one
+per device per second (with a trailing-edge flush, so the newest
+snapshot inside a throttle window is never lost). A notification carries
+the entry of the device that updated; the query returns every known
+device, or one with the optional `id` (an unknown id yields an empty
+snapshot, not an error). Snapshots of devices that drop off the network
+are pruned with them.
+
+Request:
+
+```json
+{"type": "X-RTLS-STATS"}
+```
+
+Response / notification body — entries keyed by system id (as string):
+
+```json
+{
+  "type": "X-RTLS-STATS",
+  "stats": {
+    "42": {
+      "id": 42,
+      "solveRateHz": 12.5,
+      "solvePct": 98.0,
+      "anchorsSeen": 4,
+      "fixAgeMs": 80,
+      "clockPpm": 1.2,
+      "anchorMask": 15,
+      "sleeping": false,
+      "batteryVoltage": 7.812
+    }
+  }
+}
+```
+
+- `sleeping` — mirrors the `slp` stat; **omitted** (not `false`) for
+  firmware that predates sleep mode, so a UI can tell "unknown".
+- `batteryVoltage` — the optional `vbat` stat, in volts; omitted on
+  boards that cannot measure it.
+- The first broadcast for a device waits until the full legacy stat set
+  (`solveRateHz` … `anchorMask`) has arrived once, so it never carries a
+  half-populated snapshot; optional stats never gate the broadcast.
+
 ### X-RTLS-POS — live position-estimate debug stream
 
 Surfaces the tag firmware's position-estimate debug emit
@@ -519,7 +614,8 @@ Other server extensions can use the same machinery via the exports of
 this extension: `devices()`, `protocol()`, and the awaitable
 `get_param(system_id, name)`, `get_param_list(system_id)`,
 `set_param(system_id, name, value, param_type=None)`,
-`set_sleep(system_id, sleeping)` and
+`set_sleep(system_id, sleeping)`,
+`verify_species(system_id, role)` and
 `start_ota(system_id, image_path)`.
 
 ## Testing
