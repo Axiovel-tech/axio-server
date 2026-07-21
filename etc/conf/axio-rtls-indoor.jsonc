@@ -10,7 +10,16 @@
       "host": ""
     },
 
-    // MAVLink-based drones via the RTLS-Link UART bridge
+    // NOTE: device management (the RTLS panel, sleep/wake, OTA, the
+    // show-clock GPS pin) is provided by the "rtls" extension, which is
+    // NOT in the server's default extension list. To manage boards from
+    // this server, add an entry like
+    //   "rtls": { "enabled": true, "devices": ["<board-ip>", ...] }
+    // here; see src/flockwave/server/ext/rtls/README.md for all keys.
+
+    // MAVLink-based drones via the RTLS-Link UART bridge. Live-fleet
+    // convention: ALL tags converge on this one shared 14550 listener;
+    // do not configure per-drone ports.
     "mavlink": {
       "enabled": true,
       "networks": {
