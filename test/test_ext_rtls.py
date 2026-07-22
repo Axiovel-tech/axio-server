@@ -1475,6 +1475,96 @@ async def test_inf_no_rebroadcast_without_devices(extension, device):
     assert len(_inf_broadcasts(extension)) == 2
 
 
+# ---- tag<->drone association (source-IP join) ---------------------------
+
+
+def _set_uav_addresses(extension, addresses):
+    """Install a fake UAV source-address feed (the seam through which the
+    extension reads the mavlink extension's API)."""
+    extension._uav_source_addresses = lambda: addresses
+
+
+async def test_uav_mapping_appears_in_inf(extension, device, builder, hub):
+    await discover(extension, device)
+
+    # before any UAV shares the tag's IP the device is unassociated
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+
+    # a connected UAV heard from the tag's bridge IP associates with it
+    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+    assert extension._refresh_uav_map() is True
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    assert response.body["status"][str(DEVICE_SYSID)]["uav"] == "05"
+
+
+async def test_uav_mapping_clears_on_ip_change(extension, device, builder, hub):
+    await discover(extension, device)
+    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+    assert extension._refresh_uav_map() is True
+
+    # a DHCP renewal moves the UAV's source IP off the tag: the mapping
+    # must clear on the next recompute, never persist
+    _set_uav_addresses(extension, {"05": ("192.168.4.99", 14550)})
+    assert extension._refresh_uav_map() is True
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+
+
+async def test_uav_mapping_ambiguous_ip_maps_nothing(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    # two UAVs claiming one source IP cannot be told apart; mapping either
+    # would risk exactly the mis-attribution this feature exists to prevent
+    _set_uav_addresses(
+        extension,
+        {"05": (DEVICE_ADDRESS[0], 14550), "06": (DEVICE_ADDRESS[0], 14551)},
+    )
+    assert extension._refresh_uav_map() is False
+
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+
+
+async def test_uav_mapping_change_pushes_inf(extension, device):
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # the association appearing is a mapping change: the poll in the
+    # protocol loop pushes the device list (throttled, like gained/lost)
+    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+    await extension._poll_uav_map(now=2.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["uav"] == "05"
+
+    # an unchanged mapping stays quiet
+    await extension._poll_uav_map(now=4.0)
+    assert len(_inf_broadcasts(extension)) == 2
+
+    # the UAV disappearing clears the mapping and pushes again
+    _set_uav_addresses(extension, {})
+    await extension._poll_uav_map(now=6.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 3
+    assert "uav" not in broadcasts[-1]["status"][str(DEVICE_SYSID)]
+
+
+def test_uav_addresses_empty_without_mavlink_api(extension):
+    # no mavlink extension (or one that is not loaded) leaves every device
+    # unassociated instead of failing
+    assert extension._mavlink_api is None
+    assert extension._uav_source_addresses() == {}
+    extension._mavlink_api = SimpleNamespace(loaded=False)
+    assert extension._uav_source_addresses() == {}
+
+
 @requires_sleep_sdk
 async def test_inf_broadcast_on_sleeping_flip(extension, device):
     """An ACTIVE<->STANDBY heartbeat transition must push X-RTLS-INF

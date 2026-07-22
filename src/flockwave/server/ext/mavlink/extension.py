@@ -157,8 +157,29 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     def exports(self) -> dict[str, Any]:
         return {
             "find_network_by_id": self._find_network_by_id,
+            "get_uav_source_addresses": self._get_uav_source_addresses,
             "use_mavlink_message_channel_factory": use_mavlink_message_channel_factory,
         }
+
+    def _get_uav_source_addresses(self) -> dict[str, tuple[str, int]]:
+        """Returns a mapping from the IDs of the connected UAVs to the
+        ``(host, port)`` source address each UAV was last heard from, across
+        all the networks managed by this extension.
+
+        UAVs that are not currently connected, or whose last source address
+        is not a host-port pair (e.g. UAVs on a serial link), are omitted.
+        """
+        result: dict[str, tuple[str, int]] = {}
+        for network in (self._networks or {}).values():
+            for uav, address in network.uav_addresses().items():
+                if (
+                    uav.is_connected
+                    and isinstance(address, tuple)
+                    and len(address) == 2
+                    and isinstance(address[0], str)
+                ):
+                    result[uav.id] = address
+        return result
 
     def _find_network_by_id(self, network_id: str) -> MAVLinkNetwork | None:
         """Finds a MAVLink network managed by this extension by its ID.
