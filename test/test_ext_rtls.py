@@ -38,6 +38,9 @@ from rtlslink.protocol import (
 )
 
 from flockwave.server.ext.rtls.extension import (
+    REFILL_INITIAL_DELAY,
+    REFILL_MAX_ATTEMPTS,
+    REFILL_READ_SPACING,
     SLEEP_PIN_TIMEOUT,
     RtlsExtension,
     _configured_addresses,
@@ -77,6 +80,13 @@ class FakeDevice:
 
         self.respond_to_list = True
         self.respond_to_read = True
+        #: parameter names omitted from full-list responses, simulating
+        #: the datagrams a real dump loses to UDP under the startup burst
+        self.drop_from_list: set[str] = set()
+        #: every parameter name the server asked for with a targeted
+        #: PARAM_EXT_REQUEST_READ, in arrival order (recorded even while
+        #: ``respond_to_read`` is off)
+        self.read_requests: list[str] = []
         self.respond_to_set = True
         self.set_result = 0  # PARAM_ACK_ACCEPTED
         #: emulate the firmware's arming gate: a SLEEP=1 write is acked
@@ -118,10 +128,13 @@ class FakeDevice:
             kind = message.get_type()
             if kind == "PARAM_EXT_REQUEST_LIST" and self.respond_to_list:
                 for index, name in enumerate(self.params):
+                    if name in self.drop_from_list:
+                        continue
                     out.append(self._param_value(name, index))
-            elif kind == "PARAM_EXT_REQUEST_READ" and self.respond_to_read:
+            elif kind == "PARAM_EXT_REQUEST_READ":
                 name = message.param_id
-                if name in self.params:
+                self.read_requests.append(name)
+                if self.respond_to_read and name in self.params:
                     index = list(self.params).index(name)
                     out.append(self._param_value(name, index))
             elif kind == "PARAM_EXT_SET" and self.respond_to_set:
@@ -564,6 +577,246 @@ async def test_anchor_beacon_refreshes_after_param_set(extension, device):
     assert anchor1.position.lat == pytest.approx(41.3901797)
     assert anchor1.position.lon == pytest.approx(2.1501197)
     assert anchor1.position.amsl == pytest.approx(14.8)
+
+
+# ---- identity-param snapshot refill -------------------------------------
+
+
+def add_anchor_identity_params(device, *, uwb_mac=2):
+    """Give a FakeDevice an anchor identity: responder role, its own MAC
+    and a two-entry anchor MAC table (MAC 2 -> index A1)."""
+    for name, value, param_type in (
+        ("UWB_ROLE", 3, "uint8"),
+        ("UWB_MAC", uwb_mac, "uint16"),
+        ("UWB_AN_COUNT", 2, "uint8"),
+        ("UWB_AN0_MAC", 1, "uint16"),
+        ("UWB_AN1_MAC", 2, "uint16"),
+    ):
+        set_fake_param(device, name, value, param_type)
+
+
+async def test_refill_requests_only_missing_anchor_params(extension, device):
+    add_anchor_identity_params(device)
+    # the startup burst loses two identity datagrams of the dump
+    device.drop_from_list = {"UWB_MAC", "UWB_AN1_MAC"}
+    await discover(extension, device)
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert "UWB_MAC" not in cached.params
+
+    device.read_requests.clear()
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+
+    # exactly the missing names were re-requested, and the replies
+    # completed the snapshot (dropping the refill bookkeeping)
+    assert sorted(device.read_requests) == ["UWB_AN1_MAC", "UWB_MAC"]
+    assert "UWB_MAC" in cached.params
+    assert "UWB_AN1_MAC" in cached.params
+    assert DEVICE_SYSID not in extension._refill
+
+    # a complete snapshot is never polled again
+    await extension._poll_param_refill(time.monotonic() + 10_000)
+    assert sorted(device.read_requests) == ["UWB_AN1_MAC", "UWB_MAC"]
+
+
+async def test_refill_restores_anchor_name(extension, device, builder, hub):
+    add_anchor_identity_params(device)  # own MAC 2 -> A1
+    device.drop_from_list = {"UWB_MAC"}
+    await discover(extension, device)
+
+    # degraded: without its own MAC the anchor renders the generic name
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["name"] == f"RTLS anchor {DEVICE_SYSID}"
+
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["name"] == "RTLS anchor A1"
+
+
+async def test_refill_backs_off_and_gives_up_at_the_retry_cap(
+    extension, device
+):
+    add_anchor_identity_params(device)
+    device.drop_from_list = {"UWB_MAC"}
+    await discover(extension, device)
+    # ... and the device never answers targeted reads either
+    device.respond_to_read = False
+    device.read_requests.clear()
+
+    base = time.monotonic() + REFILL_INITIAL_DELAY + 1
+    await extension._poll_param_refill(base)
+    assert device.read_requests == ["UWB_MAC"]
+
+    # inside the backoff window nothing new is requested
+    await extension._poll_param_refill(base + 1)
+    assert device.read_requests == ["UWB_MAC"]
+
+    # the retry cap bounds the total number of rounds, then the refill
+    # sheds its bookkeeping: no infinite polling of a dead-silent device
+    now = base
+    for _ in range(REFILL_MAX_ATTEMPTS + 3):
+        now += 10_000
+        await extension._poll_param_refill(now)
+    assert device.read_requests == ["UWB_MAC"] * REFILL_MAX_ATTEMPTS
+    assert DEVICE_SYSID not in extension._refill
+
+    # rediscovery re-arms the refill (fresh attempt budget)
+    extension._protocol.devices.pop(DEVICE_SYSID)
+    extension._handle_lost(ProtocolEvent("lost", DEVICE_SYSID))
+    await discover(extension, device)
+    assert DEVICE_SYSID in extension._refill
+
+
+async def test_refill_skips_complete_but_unmatched_anchor(extension, device):
+    # an anchor whose identity params are all PRESENT but whose own MAC
+    # genuinely is not in the anchor table is a configuration state, not
+    # dump loss: no re-requests (POS_X is dropped so the snapshot is not
+    # count-complete and the semantic check itself is exercised)
+    add_anchor_identity_params(device, uwb_mac=99)
+    device.drop_from_list = {"POS_X"}
+    await discover(extension, device)
+    device.read_requests.clear()
+
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    assert device.read_requests == []
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_ignores_lost_non_identity_params(extension, device):
+    # a lossy dump that only lost params irrelevant to naming/geometry
+    # must not trigger any targeted reads
+    add_anchor_identity_params(device)
+    device.drop_from_list = {"POS_X", "UWB_CH"}
+    await discover(extension, device)
+    device.read_requests.clear()
+
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    assert device.read_requests == []
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_skips_count_complete_snapshot(extension, device):
+    # the stock FakeDevice has no UWB_ROLE at all; its dump arrives
+    # complete (params == param_count), so nothing was lost and the
+    # absent role param must not be polled for
+    await discover(extension, device)
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert cached.param_count == len(cached.params)
+    device.read_requests.clear()
+
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    assert device.read_requests == []
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_restores_tag_cell_and_beacons(extension, device):
+    add_rtls_cell_params(device)  # tag, full cell
+    extension._beacon_api = StubBeaconAPI()
+    # the lossy dump punched holes in the origin AND the per-anchor
+    # table (cell_from_params needs the NED triple of every counted
+    # anchor, and the MAC drives the beacon's active matching)
+    device.drop_from_list = {"ORIGIN_LAT_E7", "UWB_AN1_X", "UWB_AN1_MAC"}
+    await discover(extension, device)
+    # the incomplete cell geometry renders no beacons
+    assert extension._beacon_api.beacons == {}
+
+    device.read_requests.clear()
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+
+    assert sorted(device.read_requests) == [
+        "ORIGIN_LAT_E7",
+        "UWB_AN1_MAC",
+        "UWB_AN1_X",
+    ]
+    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_redumps_when_role_is_unknown(extension, device):
+    add_anchor_identity_params(device)
+    # the whole dump is lost at discovery: the server cannot even
+    # classify the device, and targeted reads cannot enumerate holes
+    # whose names were never listed — the refill re-requests the dump
+    device.respond_to_list = False
+    await discover(extension, device)
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert not cached.params
+
+    device.respond_to_list = True  # this time the dump gets through
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    # no targeted reads were needed: the re-dump filled the snapshot
+    assert device.read_requests == []
+    assert "UWB_ROLE" in cached.params
+    assert "UWB_AN1_MAC" in cached.params
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_repairs_legacy_tag_without_role_param(
+    extension, device
+):
+    # a legacy tag (no UWB_ROLE param at all; the _cell_source_role
+    # compatibility bridge) is recognized only once its snapshot is
+    # count-complete — even a lost NON-identity param (POS_X) keeps it
+    # unrecognized, so the refill must re-dump rather than issue
+    # targeted reads for names it cannot know
+    add_rtls_cell_params(device)
+    device.params.pop("UWB_ROLE")
+    extension._beacon_api = StubBeaconAPI()
+    device.drop_from_list = {"ORIGIN_LAT_E7", "POS_X"}
+    await discover(extension, device)
+    assert extension._beacon_api.beacons == {}
+
+    device.drop_from_list = set()  # the retransmitted dump gets through
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    # snapshot count-complete -> the legacy tag inference activates and
+    # the cell renders
+    assert device.read_requests == []
+    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+    assert DEVICE_SYSID not in extension._refill
+
+
+async def test_refill_paces_targeted_reads(extension, device, autojump_clock):
+    add_anchor_identity_params(device)
+    device.drop_from_list = {"UWB_MAC", "UWB_AN0_MAC", "UWB_AN1_MAC"}
+    await discover(extension, device)
+    device.respond_to_read = False
+
+    stamps = []
+    transport = extension._send
+
+    async def recording_send(payload, address):
+        stamps.append(trio.current_time())
+        await transport(payload, address)
+
+    extension._send = recording_send
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+    assert device.read_requests == ["UWB_MAC", "UWB_AN0_MAC", "UWB_AN1_MAC"]
+    # the reads of one round are spaced out, not blasted as one burst
+    # the firmware's management TX queue would drop replies from
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert len(gaps) == 2
+    assert all(gap >= REFILL_READ_SPACING for gap in gaps)
 
 
 def test_configured_addresses_allow_per_target_ports():
