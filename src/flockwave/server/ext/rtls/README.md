@@ -235,6 +235,7 @@ plus a site-level `anchors` list:
       "paramCount": 23,
       "otaStatus": null,
       "sleeping": false,
+      "uav": "05",
       "role": "tag",
       "name": "RTLS tag 42",
       "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
@@ -283,6 +284,16 @@ plus a site-level `anchors` list:
   contradicting in-flight heartbeats (the firmware acks the `SLEEP`
   write before its power task cuts over) are overridden until a
   heartbeat confirms the new state or the pin expires.
+- `uav` — the flockwave id of the drone this device is associated with,
+  or absent when there is none (anchors, spare tags, tags without a
+  WiFi-UART bridge). The association is **derived, never configured**: a
+  drone's flight-controller MAVLink reaches the server through its tag's
+  WiFi-UART bridge, so a connected UAV whose UDP source IP equals a
+  device's management IP is that device's drone. It is recomputed
+  continuously (DHCP renewals move it, a disappearing UAV or device
+  clears it) and an IP claimed by more than one UAV maps to none —
+  better unmapped than mis-attributed. An `X-RTLS-INF` notification is
+  pushed (throttled) whenever a device's mapping changes.
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
   `"disabled"`, from the latest state advertisement or the device's
   `UWB_ROLE` parameter; absent when the device exposes neither.

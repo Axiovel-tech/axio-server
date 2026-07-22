@@ -688,6 +688,13 @@ class MAVLinkNetwork:
         """
         return self._uavs.values() if self._uavs else []
 
+    def uav_addresses(self) -> dict[MAVLinkUAV, Any]:
+        """Returns a snapshot of the source addresses the UAVs of this
+        network were last heard from, keyed by UAV. UAVs that have not been
+        heard from yet are not included.
+        """
+        return dict(self._uav_addresses)
+
     def _create_uav(self, system_id: int) -> MAVLinkUAV:
         """Creates a new UAV with the given system ID in this network and
         registers it in the UAV registry.
