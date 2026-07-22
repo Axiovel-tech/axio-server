@@ -157,6 +157,41 @@ DEFAULT_PASSIVE_DEVICE_TIMEOUT = 30.0
 MAV_STATE_STANDBY = 3
 MAV_STATE_ACTIVE = 4
 
+#: seconds after discovery before a device's param snapshot is first
+#: checked for identity holes: the discovery-triggered full dump (~80
+#: params) plus retransmission slack must have had time to land, or the
+#: refill would race its own trigger and duplicate the dump
+REFILL_INITIAL_DELAY = 15.0
+
+#: minimum spacing between identity-refill retry rounds, in seconds; in
+#: passive mode the (longer) hello interval paces the rounds instead
+REFILL_MIN_INTERVAL = 10.0
+
+#: targeted re-request rounds before the refill gives up on a device
+#: that never answers, until it is rediscovered
+REFILL_MAX_ATTEMPTS = 5
+
+#: spacing between successive targeted read requests of one refill
+#: round, in seconds. The firmware paces its own param dump (a few
+#: values per tick) because the management TX queue cannot absorb a
+#: burst of replies; an unpaced read burst would recreate the very
+#: response loss the refill exists to repair.
+REFILL_READ_SPACING = 0.01
+
+#: upper bound on the anchor-table size considered by the refill (the
+#: firmware caps UWB_AN_COUNT at 8; a corrupt count must not fan out
+#: into an unbounded burst of read requests)
+REFILL_MAX_ANCHOR_TABLE = 16
+
+#: identity params a tag must carry for its cell geometry to render
+#: (see :func:`_has_cell_geometry`)
+TAG_IDENTITY_PARAMS = (
+    "ORIGIN_LAT_E7",
+    "ORIGIN_LON_E7",
+    "ORIGIN_ALT_MM",
+    "UWB_AN_COUNT",
+)
+
 #: how long an accepted sleep/wake transaction's outcome overrides
 #: contradicting heartbeats, in seconds. The firmware acks the SLEEP write
 #: before its power task cuts over, so in-flight pre-transition heartbeats
@@ -265,6 +300,18 @@ class RtlsExtension(Extension):
         #: pruned on device loss: a woken device reboots off the network
         #: (lost + rediscovered) and the pin must span that window.
         self._sleep_pins: dict[int, tuple[bool, float]] = {}
+        #: identity-param refill bookkeeping per device: system_id ->
+        #: {"attempts", "next", "started"}. Seeded on discovery; the
+        #: periodic poll re-requests identity params the discovery dump
+        #: lost (rtls startup: ~14 boards dump ~80 params at once over
+        #: UDP), and the entry is dropped once the snapshot is complete
+        #: or the attempt cap is reached — until the next rediscovery
+        self._refill: dict[int, dict[str, Any]] = {}
+        #: spacing between refill retry rounds; recomputed in run() from
+        #: the presence config (the hello interval paces passive mode)
+        self._refill_interval = max(
+            DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL
+        )
         #: lazy proxy of the mavlink extension's API (``None`` when the
         #: extension module is unavailable); source of the UAV source
         #: addresses the tag<->drone association joins against
@@ -310,6 +357,7 @@ class RtlsExtension(Extension):
         self._management_port = port
         heartbeat_interval, device_timeout = _presence_config(configuration)
         self._device_timeout = device_timeout
+        self._refill_interval = max(heartbeat_interval, REFILL_MIN_INTERVAL)
 
         dialect = load_dialect()
         self._protocol = protocol = RtlsProtocol(
@@ -417,6 +465,11 @@ class RtlsExtension(Extension):
             # source addresses (DHCP churn, UAVs appearing/disappearing);
             # a change pushes the (throttled) device list
             await self._poll_uav_map(now)
+
+            # re-request identity params a lossy discovery dump left out
+            # of a device's snapshot (backed off, capped; see
+            # _poll_param_refill)
+            await self._poll_param_refill(now)
 
             # trailing-edge flush: a complete stats update that arrived inside
             # the throttle window is cached but not yet broadcast; push it once
@@ -554,6 +607,15 @@ class RtlsExtension(Extension):
                         ),
                         now,
                     )
+                # (re)arm the identity-param refill: the dump requested
+                # below is lossy under the all-boards-at-once startup
+                # burst, so the snapshot is re-checked for holes once the
+                # dump has had time to land (rediscovery resets the cap)
+                self._refill[event.system_id] = {
+                    "attempts": 0,
+                    "next": now + REFILL_INITIAL_DELAY,
+                    "started": False,
+                }
                 request = self._protocol.request_param_list(event.system_id)
                 if request is not None:
                     await self._send(*request)
@@ -583,6 +645,9 @@ class RtlsExtension(Extension):
                 # change an anchor's MAC/role; resync the anchor beacons
                 self._sync_anchor_beacons_for_system(event.system_id)
                 self._refresh_anchor_cells()
+                # a reply to a refill round may have just plugged the last
+                # hole: finish promptly instead of on the next poll round
+                self._check_refill_completion(event.system_id)
             self._dispatch_event(event)
 
     def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
@@ -1195,6 +1260,7 @@ class RtlsExtension(Extension):
         synchronous, so it cannot broadcast itself)."""
         self._prune_stats(event.system_id)
         self._prune_pos(event.system_id)
+        self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
         self._adv.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
@@ -1324,6 +1390,139 @@ class RtlsExtension(Extension):
         re-render the tag<->drone pairing without polling."""
         if self._refresh_uav_map():
             await self._on_inf_change(now)
+
+    # ---- identity-param snapshot refill ----
+
+    async def _poll_param_refill(self, now: float) -> None:
+        """One pass of the identity-param refill: for every device whose
+        refill round is due, re-request exactly the role-relevant identity
+        params still missing from its snapshot (the startup all-boards
+        dump loses datagrams; without this a device keeps a generic name
+        and missing anchor beacons until it reboots).
+
+        Rounds are paced by the refill interval (the hello cadence in
+        passive mode) and capped at ``REFILL_MAX_ATTEMPTS``; a device
+        whose snapshot is complete — including the complete-but-unmatched
+        anchor case — sheds its refill entry and is never polled again
+        until rediscovery."""
+        if self._protocol is None or not self._refill:
+            return
+        for system_id, state in list(self._refill.items()):
+            if now < state["next"]:
+                continue
+            device = self._protocol.devices.get(system_id)
+            if device is None:
+                self._refill.pop(system_id, None)
+                continue
+            missing = self._missing_identity_params(device)
+            if not missing:
+                self._finish_refill(system_id, state, "complete")
+                continue
+            if state["attempts"] >= REFILL_MAX_ATTEMPTS:
+                self._finish_refill(
+                    system_id,
+                    state,
+                    f"gave up after {state['attempts']} attempts "
+                    f"({len(missing)} params still missing)",
+                )
+                continue
+            if not state["started"]:
+                state["started"] = True
+                if self.log:
+                    self.log.info(
+                        f"rtls: sysid {system_id} param snapshot is "
+                        f"missing {len(missing)} identity params after "
+                        f"the dump; re-requesting"
+                    )
+            state["attempts"] += 1
+            state["next"] = now + self._refill_interval
+            if "UWB_ROLE" in missing:
+                # the device cannot be classified at all (UWB_ROLE lost
+                # with the dump, or a legacy tag that genuinely lacks it
+                # and is only recognized once its snapshot is
+                # count-complete): targeted reads cannot enumerate holes
+                # whose names were never listed, so re-request the full,
+                # firmware-paced dump instead
+                request = self._protocol.request_param_list(system_id)
+                if request is not None:
+                    await self._send(*request)
+            elif self._nursery is not None:
+                # the paced reads sleep between datagrams; run them off
+                # the receive loop so a large round cannot stall
+                # heartbeat consumption into false device expiry
+                self._nursery.start_soon(
+                    self._send_refill_reads, system_id, missing
+                )
+            else:
+                await self._send_refill_reads(system_id, missing)
+
+    async def _send_refill_reads(
+        self, system_id: int, names: list[str]
+    ) -> None:
+        """Send one targeted PARAM_EXT_REQUEST_READ per name, paced: each
+        read is answered immediately by the firmware, whose management TX
+        queue cannot absorb a burst of replies (the reason its own dump
+        paces itself) — blasting the whole list at once would recreate
+        the very loss the refill exists to repair. Stops early when the
+        device (or the protocol) goes away mid-round."""
+        for offset, name in enumerate(names):
+            if offset:
+                await trio.sleep(REFILL_READ_SPACING)
+            protocol = self._protocol
+            if protocol is None:
+                return
+            request = protocol.request_param_read(system_id, name)
+            if request is None:
+                return
+            await self._send(*request)
+
+    def _check_refill_completion(self, system_id: int) -> None:
+        """Finish an in-progress refill as soon as a param reply plugs the
+        last hole (called from the ``param_value`` seam), so completion is
+        logged and further rounds stop without waiting a whole interval.
+        Snapshots still inside the initial post-discovery window (refill
+        not started) are left alone — the dump is still streaming in."""
+        state = self._refill.get(system_id)
+        if state is None or not state["started"] or self._protocol is None:
+            return
+        device = self._protocol.devices.get(system_id)
+        if device is not None and not self._missing_identity_params(device):
+            self._finish_refill(system_id, state, "complete")
+
+    def _finish_refill(
+        self, system_id: int, state: dict[str, Any], outcome: str
+    ) -> None:
+        self._refill.pop(system_id, None)
+        if not state["started"]:
+            return  # snapshot was complete all along: nothing to log
+        if self.log:
+            self.log.info(
+                f"rtls: identity param refill for sysid {system_id} {outcome}"
+            )
+        # a completed refill usually changes the device's derived name /
+        # cell; mark the device list dirty so clients need not wait for
+        # the slow INF refresh
+        self._inf_pending = True
+
+    def _missing_identity_params(self, device) -> list[str]:
+        """The role-relevant identity params missing from a device's
+        snapshot (see :func:`_missing_identity_param_names`); the role is
+        resolved like :meth:`_device_json` does, preferring the fresher
+        state advertisement over the param cache."""
+        if (
+            device.param_count is not None
+            and len(device.params) >= device.param_count
+        ):
+            # the snapshot is count-complete, so the dump lost nothing:
+            # an identity param absent from it is genuinely absent on the
+            # device and must not be re-polled
+            return []
+        params = _decoded_device_params(device)
+        role = (
+            self._adv.get(device.system_id, {}).get("role")
+            or role_from_params(params)
+        )
+        return _missing_identity_param_names(params, role)
 
     # ---- client message handlers ----
 
@@ -2129,6 +2328,66 @@ def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def _missing_identity_param_names(
+    params: dict[str, Any], role: str | None
+) -> list[str]:
+    """The identity params a device's snapshot must gain before its name
+    (anchor A-index) or cell geometry (tag) can resolve — an empty list
+    when nothing needs re-requesting.
+
+    Missing means absent from the snapshot, never present-but-mismatched:
+    an anchor with a complete MAC table that simply does not contain its
+    own UWB_MAC yields an empty list (a real configuration state that must
+    not be re-polled forever)."""
+    if role in ("anchor-initiator", "anchor-responder"):
+        if _anchor_index_for_device(params) is not None:
+            return []  # A-index already resolves
+        missing = [
+            name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params
+        ]
+        missing.extend(_missing_anchor_table_names(params, ("MAC",)))
+        return missing
+    if role == "tag":
+        missing = [name for name in TAG_IDENTITY_PARAMS if name not in params]
+        # cell_from_params() also needs every counted anchor's NED triple
+        # (and the MAC drives the beacon's live/active matching); a hole
+        # there keeps the whole cell — hence the map beacons — unrendered
+        missing.extend(
+            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC"))
+        )
+        return missing
+    if role is None and "UWB_ROLE" not in params:
+        # the device cannot be classified (no advertisement, UWB_ROLE
+        # lost with the dump — or genuinely absent on a legacy tag, the
+        # _cell_source_role compatibility bridge, which is recognized
+        # only once the snapshot is count-complete). The marker makes the
+        # poll re-request the whole dump: holes whose names were never
+        # listed cannot be enumerated by targeted reads.
+        return ["UWB_ROLE"]
+    return []
+
+
+def _missing_anchor_table_names(
+    params: dict[str, Any], suffixes: tuple[str, ...]
+) -> list[str]:
+    """The absent ``UWB_AN{i}_{suffix}`` names for every anchor index the
+    snapshot's ``UWB_AN_COUNT`` declares — empty when the count itself is
+    absent (it is requested first) or undecodable."""
+    if "UWB_AN_COUNT" not in params:
+        return []
+    try:
+        count = int(params["UWB_AN_COUNT"])
+    except (TypeError, ValueError):
+        return []
+    count = max(0, min(count, REFILL_MAX_ANCHOR_TABLE))
+    return [
+        name
+        for index in range(count)
+        for name in (f"UWB_AN{index}_{suffix}" for suffix in suffixes)
+        if name not in params
+    ]
 
 
 def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
