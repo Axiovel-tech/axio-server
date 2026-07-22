@@ -150,6 +150,23 @@ DEFAULT_DEVICE_TIMEOUT = 6.0
 DEFAULT_HELLO_INTERVAL = 60.0
 DEFAULT_PASSIVE_DEVICE_TIMEOUT = 30.0
 
+#: heartbeat system_status values the sleep latch derives from (STANDBY =
+#: sleeping, ACTIVE = awake); numeric MAVLink enum values mirrored here --
+#: like rtlslink.protocol mirrors them -- so the optimistic sleep/wake
+#: update needs neither the dialect module nor a post-sleep SDK pin
+MAV_STATE_STANDBY = 3
+MAV_STATE_ACTIVE = 4
+
+#: how long an accepted sleep/wake transaction's outcome overrides
+#: contradicting heartbeats, in seconds. The firmware acks the SLEEP write
+#: before its power task cuts over, so in-flight pre-transition heartbeats
+#: -- and, for a wake, the whole reboot-off-the-network window plus
+#: rediscovery -- would otherwise revert the optimistic state right after
+#: the push and recreate the stale-state bug (control#16). A heartbeat
+#: CONFIRMING the expected state clears the pin early; past the deadline
+#: the device's own reports win again.
+SLEEP_PIN_TIMEOUT = 30.0
+
 
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
@@ -231,6 +248,23 @@ class RtlsExtension(Extension):
         #: ``firmwareVersion``/``role``/``uptimeMs``); fresher than the
         #: param cache, pruned on device loss
         self._adv: dict[int, dict[str, Any]] = {}
+        #: last-known sleep latch per device: system_id -> (sleeping, stamp)
+        #: where the stamp is the monotonic time of the heartbeat (or
+        #: authoritative sleep/wake transaction) that reported it; drives
+        #: the X-RTLS-INF push on an ACTIVE<->STANDBY flip and the
+        #: staleness cutoff in :meth:`_device_json`
+        self._sleeping: dict[int, tuple[bool, float]] = {}
+        #: device-liveness timeout from the presence config, mirrored here
+        #: as the sleep-latch staleness cutoff
+        self._device_timeout = DEFAULT_DEVICE_TIMEOUT
+        #: authoritative sleep-state pins from accepted sleep/wake
+        #: transactions: system_id -> (expected_sleeping, deadline); while
+        #: pinned, contradicting heartbeats are overridden (see
+        #: :meth:`_pinned_sleeping`). Deadlines are on the same monotonic
+        #: clock the protocol loop feeds datagrams with. Deliberately NOT
+        #: pruned on device loss: a woken device reboots off the network
+        #: (lost + rediscovered) and the pin must span that window.
+        self._sleep_pins: dict[int, tuple[bool, float]] = {}
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -258,6 +292,7 @@ class RtlsExtension(Extension):
         self._passive = bool(configuration.get("passive", False))
         self._management_port = port
         heartbeat_interval, device_timeout = _presence_config(configuration)
+        self._device_timeout = device_timeout
 
         dialect = load_dialect()
         self._protocol = protocol = RtlsProtocol(
@@ -344,6 +379,8 @@ class RtlsExtension(Extension):
                 self._adv_sock.close()
                 self._adv_sock = None
             self._adv.clear()
+            self._sleeping.clear()
+            self._sleep_pins.clear()
             self._beacon_api = None
             self._clear_anchor_beacons()
 
@@ -478,12 +515,34 @@ class RtlsExtension(Extension):
                         f"rtls: device sysid {event.system_id} discovered "
                         f"at {event.data['address'][0]}"
                     )
+                # seed the sleep latch so the first ACTIVE<->STANDBY flip
+                # after discovery is recognized as a transition; the pin
+                # filter covers a wake-rebooted device rediscovered off a
+                # stale pre-transition heartbeat. This must happen BEFORE
+                # the first await below: feed() already installed the raw
+                # heartbeat state on the device, so a concurrent X-RTLS-INF
+                # query at an await checkpoint would otherwise observe the
+                # contradictory state before the pin re-asserts it.
+                if "sleeping" in event.data:
+                    self._sleeping[event.system_id] = (
+                        self._pinned_sleeping(
+                            event.system_id, bool(event.data["sleeping"]), now
+                        ),
+                        now,
+                    )
                 request = self._protocol.request_param_list(event.system_id)
                 if request is not None:
                     await self._send(*request)
                 # push the new device list so clients that only listen (the
                 # GUI queries X-RTLS-INF once) see the device appear
                 await self._on_inf_change(now)
+            elif event.kind == "heartbeat":
+                # heartbeats (including the sanitized state advertisements)
+                # re-latch the device's sleep state; a flip must reach
+                # clients now, not on the 10 s slow INF refresh
+                await self._track_sleeping(
+                    event.system_id, event.data.get("sleeping"), now
+                )
             elif event.kind == "stats":
                 # health telemetry arrives unsolicited; cache the latest
                 # snapshot and broadcast it (throttled) so live GCS clients
@@ -514,6 +573,66 @@ class RtlsExtension(Extension):
             float(distance_m),
             now,
         )
+
+    async def _track_sleeping(
+        self, system_id: int, sleeping: Optional[bool], now: float
+    ) -> None:
+        """A heartbeat reported a device's sleep state: refresh the latch
+        stamp and, when the state flipped since the last report, push the
+        (throttled) X-RTLS-INF broadcast -- an ACTIVE<->STANDBY transition
+        alone would otherwise only surface on the 10 s slow refresh, and a
+        tag that slept inside that window renders green for its whole
+        remainder."""
+        if sleeping is None:
+            return
+        sleeping = self._pinned_sleeping(system_id, bool(sleeping), now)
+        previous = self._sleeping.get(system_id)
+        self._sleeping[system_id] = (sleeping, now)
+        if previous is not None and previous[0] != sleeping:
+            await self._on_inf_change(now)
+
+    def _pinned_sleeping(self, system_id: int, sleeping: bool, now: float) -> bool:
+        """Filter a heartbeat-reported sleep state through the transaction
+        pin: while an accepted sleep/wake transaction's expected state is
+        pinned, a CONTRADICTING report is overridden -- the firmware acks
+        the SLEEP write before its power task cuts over, so an in-flight
+        pre-transition heartbeat would otherwise revert the optimistic
+        state right after the push. A CONFIRMING report, or the pin's
+        deadline passing, clears the pin and resumes normal tracking (a
+        device that never confirms is believed again after the deadline).
+
+        Returns the effective state to track/report."""
+        pin = self._sleep_pins.get(system_id)
+        if pin is None:
+            return sleeping
+        expected, deadline = pin
+        if now >= deadline or sleeping == expected:
+            del self._sleep_pins[system_id]
+            return sleeping
+        # contradicting report inside the window: hold the expected state,
+        # re-asserting the device's own latch (the SDK re-latched the wire
+        # value before this event reached us)
+        self._set_device_system_status(system_id, expected)
+        return expected
+
+    def _mark_sleeping(self, system_id: int, sleeping: bool) -> None:
+        """Optimistically overwrite a device's passive sleep latch after an
+        authoritative sleep/wake transaction: the last-heartbeat latch
+        predates the outcome (a woken device even reboots off the network
+        for a few seconds before its first ACTIVE heartbeat), so the
+        device's ``system_status`` is set to what the transaction just
+        established -- and pinned, so a contradicting in-flight heartbeat
+        cannot revert it until the device confirms or the pin expires."""
+        now = time.monotonic()
+        self._sleeping[system_id] = (sleeping, now)
+        self._sleep_pins[system_id] = (sleeping, now + SLEEP_PIN_TIMEOUT)
+        self._set_device_system_status(system_id, sleeping)
+
+    def _set_device_system_status(self, system_id: int, sleeping: bool) -> None:
+        device = self._protocol.devices.get(system_id) if self._protocol else None
+        # hasattr: tolerate an SDK that predates sleep mode
+        if device is not None and hasattr(device, "system_status"):
+            device.system_status = MAV_STATE_STANDBY if sleeping else MAV_STATE_ACTIVE
 
     def _dispatch_event(self, event: ProtocolEvent) -> None:
         for channel in list(self._watchers):
@@ -704,6 +823,14 @@ class RtlsExtension(Extension):
                     "detail": f"parameter write rejected (code {ack['result']})",
                 }
             if not sleeping:
+                # Optimistic wake: the ack is authoritative, but the
+                # passive sleep latch still holds the pre-wake STANDBY
+                # heartbeat and the device is about to reboot off the
+                # network for seconds -- flip the latch to ACTIVE and push
+                # the device list, so clients see the state the server
+                # just established instead of the stale latch.
+                self._mark_sleeping(system_id, False)
+                await self._on_inf_change(time.monotonic())
                 return {
                     "requested": False,
                     "accepted": True,
@@ -728,6 +855,12 @@ class RtlsExtension(Extension):
                     "(device state unknown)",
                 }
         asleep = bool(state["value"])
+        if asleep:
+            # mirror-optimism for a verified sleep: the readback confirmed
+            # the device is asleep, so re-latch STANDBY and push before its
+            # next (possibly missed) STANDBY heartbeat does
+            self._mark_sleeping(system_id, True)
+            await self._on_inf_change(time.monotonic())
         return {
             "requested": True,
             "accepted": asleep,
@@ -1040,6 +1173,9 @@ class RtlsExtension(Extension):
         self._prune_pos(event.system_id)
         self._twr.pop(event.system_id, None)
         self._adv.pop(event.system_id, None)
+        self._sleeping.pop(event.system_id, None)
+        # _sleep_pins deliberately survives loss: a woken device reboots off
+        # the network (lost + rediscovered) inside its pin window
         if self._show_clock is not None:
             self._show_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
@@ -1465,9 +1601,18 @@ class RtlsExtension(Extension):
             or firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
-            # getattr: tolerate an SDK that predates sleep mode
-            "sleeping": bool(getattr(device, "sleeping", False)),
         }
+        # The sleep flag is a passive latch of the last heartbeat's
+        # MAV_STATE; when the device has stayed alive past the device
+        # timeout without a heartbeat re-latching it (possible in passive
+        # mode, where ANY traffic refreshes liveness) the latched value is
+        # a guess -- omit the key so clients render "unknown" instead of a
+        # stale definite state. Both stamps come from the feed clock, so
+        # the comparison is immune to the query-time clock.
+        latch = self._sleeping.get(device.system_id)
+        if latch is None or device.last_seen - latch[1] <= self._device_timeout:
+            # getattr: tolerate an SDK that predates sleep mode
+            body["sleeping"] = bool(getattr(device, "sleeping", False))
         if "uptimeMs" in adv:
             body["uptimeMs"] = adv["uptimeMs"]
         if role is not None:

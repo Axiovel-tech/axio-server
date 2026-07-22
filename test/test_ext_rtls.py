@@ -38,6 +38,7 @@ from rtlslink.protocol import (
 )
 
 from flockwave.server.ext.rtls.extension import (
+    SLEEP_PIN_TIMEOUT,
     RtlsExtension,
     _configured_addresses,
     _load_advertisement_parser,
@@ -870,6 +871,13 @@ async def test_sleep_accepted(extension, device, builder, hub, autojump_clock):
     assert entry["sleeping"] is True
     assert device.sleeping is True
 
+    # mirror-optimism: the verified sleep is reported by X-RTLS-INF right
+    # away, without waiting for the next STANDBY heartbeat to re-latch it
+    inf = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert inf.body["status"][str(DEVICE_SYSID)]["sleeping"] is True
+
     # the device now advertises STANDBY; the next heartbeat marks the
     # cached device and X-RTLS-INF reports it
     await discover(extension, device)
@@ -916,6 +924,163 @@ async def test_sleep_wake(extension, device, builder, hub, autojump_clock):
         "detail": "awake",
     }
     assert device.sleeping is False
+
+
+@requires_sleep_sdk
+async def test_wake_optimistically_reports_awake(
+    extension, device, builder, hub, autojump_clock
+):
+    """An accepted wake must flip the server-side sleep latch immediately:
+    the device's last heartbeat predates the wake (STANDBY) and on hardware
+    it reboots off the network for seconds before its first ACTIVE
+    heartbeat -- without the optimistic update every X-RTLS-INF in that
+    window shows the woken drone asleep (control issue #16, cause 3)."""
+    # the device is discovered asleep: its heartbeat latches STANDBY
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert cached.sleeping is True
+
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": False},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+    assert response.body["result"][str(DEVICE_SYSID)]["accepted"] is True
+
+    # no post-wake heartbeat has arrived, yet the server already reports
+    # the state it just established...
+    assert cached.sleeping is False
+    inf = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert inf.body["status"][str(DEVICE_SYSID)]["sleeping"] is False
+
+    # ...and pushes it: the wake marked the device list dirty (or already
+    # broadcast on the leading edge), so by the time the protocol loop's
+    # flush runs, the latest pushed list reports the device awake -- the
+    # discovery push above still said asleep
+    await extension._flush_pending_inf(now=time.monotonic() + 10.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) >= 2
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["sleeping"] is False
+
+
+async def _wake_asleep_device(extension, device, builder, hub):
+    """Discover the FakeDevice asleep, then run an accepted wake through
+    the X-RTLS-SLEEP handler (shared setup of the sleep-pin tests)."""
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": False},
+    )
+    response = await extension._handle_RTLS_SLEEP(message, None, hub)
+    assert response.body["result"][str(DEVICE_SYSID)]["accepted"] is True
+
+
+@requires_sleep_sdk
+async def test_wake_pin_overrides_late_standby_heartbeat(
+    extension, device, builder, hub, autojump_clock
+):
+    """A contradicting heartbeat right after an accepted wake must not
+    revert the optimistic state: the firmware acks SLEEP=0 before its
+    power task cuts over, so a pre-transition STANDBY heartbeat can still
+    be in flight -- believing it would push 'asleep' back to clients and
+    recreate the stale-state bug the optimism exists to fix."""
+    await _wake_asleep_device(extension, device, builder, hub)
+    pushes = len(_inf_broadcasts(extension))
+
+    # the late pre-transition STANDBY heartbeat arrives...
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(extension, device, now=time.monotonic())
+
+    # ...and is overridden: nothing was pushed for it, and both the query
+    # and the eventually flushed push still report the wake outcome
+    assert len(_inf_broadcasts(extension)) == pushes
+    inf = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert inf.body["status"][str(DEVICE_SYSID)]["sleeping"] is False
+    await extension._flush_pending_inf(now=time.monotonic() + 10.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["sleeping"] is False
+
+
+@requires_sleep_sdk
+async def test_wake_pin_cleared_by_confirming_heartbeat(
+    extension, device, builder, hub, autojump_clock
+):
+    await _wake_asleep_device(extension, device, builder, hub)
+    assert DEVICE_SYSID in extension._sleep_pins
+
+    # the post-reboot ACTIVE heartbeat confirms the wake and clears the
+    # pin without a duplicate push (the state did not change)
+    await _feed_heartbeat(extension, device, now=time.monotonic())
+    assert DEVICE_SYSID not in extension._sleep_pins
+
+    # normal tracking has resumed: a later STANDBY flip is believed,
+    # pushed, and reported again
+    pushes = len(_inf_broadcasts(extension))
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(extension, device, now=time.monotonic() + 5.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == pushes + 1
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["sleeping"] is True
+
+
+@requires_sleep_sdk
+async def test_wake_pin_expires(extension, device, builder, hub, autojump_clock):
+    await _wake_asleep_device(extension, device, builder, hub)
+    assert DEVICE_SYSID in extension._sleep_pins
+
+    # the device never confirmed the wake; past the pin deadline its own
+    # STANDBY reports win again (truth over stale optimism)
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(
+        extension, device, now=time.monotonic() + SLEEP_PIN_TIMEOUT + 1.0
+    )
+    assert DEVICE_SYSID not in extension._sleep_pins
+    inf = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert inf.body["status"][str(DEVICE_SYSID)]["sleeping"] is True
+
+
+@requires_sleep_sdk
+async def test_wake_pin_covers_rediscovery_checkpoint(
+    extension, device, builder, hub, autojump_clock
+):
+    """The wake reboot drops the device off the network (lost, latch
+    pruned) and it may be rediscovered off a stale pre-transition STANDBY
+    heartbeat. feed() installs that raw state on the device BEFORE the
+    discovery handler runs, and the handler awaits the param-list send --
+    so the pin seed/re-assert must run before that await, or a concurrent
+    X-RTLS-INF query at the checkpoint briefly answers 'asleep'."""
+    await _wake_asleep_device(extension, device, builder, hub)
+    for event in extension._protocol.expire(time.monotonic() + 1000.0):
+        extension._handle_lost(event)
+    assert DEVICE_SYSID not in extension._protocol.devices
+    assert DEVICE_SYSID in extension._sleep_pins  # the pin survives loss
+
+    # emulate the concurrent query at the handler's await checkpoint: the
+    # stubbed transport (which never replies, like a mid-reboot device)
+    # queries INF from inside the param-list send
+    seen = []
+
+    async def send_and_query(payload, address):
+        inf = await extension._handle_RTLS_INF(
+            make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+        )
+        seen.append(inf.body["status"][str(DEVICE_SYSID)].get("sleeping"))
+
+    extension._send = send_and_query
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(extension, device, now=time.monotonic() + 5.0)
+
+    # the query saw the pinned wake outcome, never the stale STANDBY
+    assert seen == [False]
+    assert DEVICE_SYSID in extension._sleep_pins  # contradiction: pin holds
 
 
 async def test_sleep_multi_device_reports_unknown(
@@ -1308,6 +1473,62 @@ async def test_inf_no_rebroadcast_without_devices(extension, device):
     # stays quiet until the next transition
     await extension._flush_pending_inf(now=2000.0)
     assert len(_inf_broadcasts(extension)) == 2
+
+
+@requires_sleep_sdk
+async def test_inf_broadcast_on_sleeping_flip(extension, device):
+    """An ACTIVE<->STANDBY heartbeat transition must push X-RTLS-INF
+    (throttled) instead of waiting for the 10 s slow refresh -- a tag that
+    slept inside the refresh window otherwise renders green (control
+    issue #16, cause 1)."""
+    # discovery broadcasts the list once (device awake)
+    await _feed_heartbeat(extension, device, now=0.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # a heartbeat without a state change pushes nothing new
+    await _feed_heartbeat(extension, device, now=2.0)
+    assert len(_inf_broadcasts(extension)) == 1
+
+    # the device falls asleep (STANDBY heartbeat): pushed right away
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(extension, device, now=4.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 2
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["sleeping"] is True
+
+    # further STANDBY heartbeats stay quiet...
+    await _feed_heartbeat(extension, device, now=6.0)
+    assert len(_inf_broadcasts(extension)) == 2
+
+    # ...and the wake transition pushes again
+    device.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
+    await _feed_heartbeat(extension, device, now=8.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == 3
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["sleeping"] is False
+
+
+@requires_sleep_sdk
+async def test_inf_sleeping_omitted_when_latch_stale(extension, device):
+    """The sleep latch has no staleness of its own; when a device stays
+    alive past the device timeout without a heartbeat re-latching it (any
+    traffic refreshes liveness in passive mode), X-RTLS-INF must omit the
+    flag -- clients render the absence as unknown -- instead of reporting
+    the stale latched state as definite."""
+    await _feed_heartbeat(extension, device, now=0.0)
+    status = extension._inf_status(now=1.0)
+    assert status[str(DEVICE_SYSID)]["sleeping"] is False
+
+    # heartbeats go silent while other traffic keeps the device alive
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    cached.last_seen = 100.0
+    status = extension._inf_status(now=100.0)
+    assert "sleeping" not in status[str(DEVICE_SYSID)]
+
+    # a fresh heartbeat restores the definite report
+    await _feed_heartbeat(extension, device, now=100.0)
+    status = extension._inf_status(now=100.5)
+    assert status[str(DEVICE_SYSID)]["sleeping"] is False
 
 
 # ---- X-RTLS-STATS health telemetry --------------------------------------

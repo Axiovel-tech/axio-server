@@ -270,7 +270,19 @@ plus a site-level `anchors` list:
   the motors/flight controller, ELRS receiver and UWB module cut; WiFi
   and this management link still up). Derived from the device's
   heartbeat (`MAV_STATE_STANDBY`), so it is live even though sleep is
-  commanded through the `SLEEP` parameter.
+  commanded through the `SLEEP` parameter. **Omitted** when the device
+  has stayed alive past the device timeout without a heartbeat
+  re-latching the state (possible in passive mode, where any traffic
+  refreshes liveness) — the latched value is then a guess, and a UI
+  should render the absence as "unknown". An `X-RTLS-INF` notification
+  is pushed (throttled) whenever a device's `sleeping` flips, and an
+  accepted sleep/wake transaction updates the flag optimistically —
+  a woken device reads `sleeping: false` immediately, even though it
+  reboots off the network for a few seconds before its first `ACTIVE`
+  heartbeat. The transaction's outcome is pinned for up to 30 s:
+  contradicting in-flight heartbeats (the firmware acks the `SLEEP`
+  write before its power task cuts over) are overridden until a
+  heartbeat confirms the new state or the pin expires.
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
   `"disabled"`, from the latest state advertisement or the device's
   `UWB_ROLE` parameter; absent when the device exposes neither.
@@ -298,10 +310,11 @@ Devices that miss their liveness timeout disappear from the map.
 
 The server also **broadcasts** `X-RTLS-INF` notifications with the same
 body shape (no `refs` member, since they are not responses) whenever a
-device is discovered or lost — throttled to at most one per second,
-with transitions inside the window coalesced into one trailing-edge
-notification — and every 10 s without transitions so `age` values keep
-refreshing. Each notification carries the **full** current status map;
+device is discovered or lost or its `sleeping` state changes (from a
+heartbeat flip or an accepted sleep/wake transaction) — throttled to at
+most one per second, with transitions inside the window coalesced into
+one trailing-edge notification — and every 10 s without transitions so
+`age` values keep refreshing. Each notification carries the **full** current status map;
 clients should replace their device list wholesale rather than merge.
 
 ### X-RTLS-PARAM-LIST — full parameter list
