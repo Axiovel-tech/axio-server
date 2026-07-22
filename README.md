@@ -33,13 +33,6 @@ for the rtls-link UWB indoor positioning system:
   the id `mtc`, fed by a network LTC stream (one `HH:MM:SS:FF` timecode
   per UDP datagram, port 5005 by default), so a show can be scheduled on
   and follow the master timecode of a larger production.
-- **RC start reflection** in the `mavlink` extension — on a fleet with a
-  shared show clock (GPS, or the UWB-timebase synthetic GPS pin), the
-  first drone that reports an RC-initiated start time is treated as the
-  observer of the RC flip, and that one absolute start time is scheduled
-  for the whole fleet (the start method switches to AUTO so it is visible
-  and revocable in the GCS). Enabled by default; disable with
-  `rc_start_reflection: false` in the `mavlink` extension configuration.
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
 reference configuration for indoor shows. The MAVLink ingest convention for

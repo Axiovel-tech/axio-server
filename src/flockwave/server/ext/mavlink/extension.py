@@ -26,7 +26,6 @@ from .errors import InvalidSigningKeyError
 from .led_lights import LEDLightConfigurationSignalDispatcher
 from .network import MAVLinkNetwork
 from .packets import create_rc_override_packet
-from .rc_start import RCStartReflector
 from .rssi import RSSIMode
 from .rtk import RTKCorrectionPacketSignalManager
 from .takeoff import ScheduledTakeoffSignalDispatcher
@@ -297,14 +296,6 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     nursery.start_soon(
                         check_uavs_alive, uavs, status_summary_signal, self.log
                     )
-
-                    # Reflect an RC-initiated show start (one drone's
-                    # DRONE_SHOW_START aux schedule) into a fleet-wide
-                    # scheduled start so every drone fires on the SAME
-                    # shared-clock instant (see rc_start.py). Enabled by
-                    # default; disable with ``rc_start_reflection: false``.
-                    if bool(configuration.get("rc_start_reflection", True)):
-                        nursery.start_soon(self._run_rc_start_reflector, uavs)
             finally:
                 for uav in uavs:
                     app.object_registry.remove(uav)
@@ -461,26 +452,6 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                     self.log.warning(
                         f"Failed to enqueue RTK correction packet to network {name!r}"
                     )
-
-    async def _run_rc_start_reflector(self, uavs: list[MAVLinkUAV]) -> None:
-        """Periodically checks whether a drone reports an RC-initiated show
-        start and, when armed for it (start method RC + authorized + no
-        scheduled start yet), reflects the earliest reported start time into
-        the show configuration -- the regular scheduled-start machinery then
-        distributes the SAME instant to the whole fleet."""
-        from trio import sleep
-
-        show_api = self.app.import_api("show", ShowExtensionAPI)
-        reflector = RCStartReflector(
-            show_api.get_configuration, show_api.schedule_start, log=self.log
-        )
-        while True:
-            try:
-                reflector.check(uavs)
-            except Exception:
-                if self.log:
-                    self.log.exception("RC start reflector scan failed")
-            await sleep(1)
 
     def _on_show_clock_changed(self, sender) -> None:
         """Handler that is called when the show clock is started, stopped or
