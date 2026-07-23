@@ -3974,3 +3974,74 @@ async def test_refill_repairs_geometry_consistency_params(extension, device):
     assert "POS_YAW_DEG" in cached.params
     assert "UWB_AN1_BIAS_M" in cached.params
     assert DEVICE_SYSID not in extension._refill
+
+
+def add_stub_tag(extension, system_id, *, yaw=None, cell="default", an1_x=10.0):
+    """Cache-only tag with a full, count-complete geometry registry."""
+    tag = SimpleNamespace(
+        system_id=system_id,
+        address=("192.168.4.%d" % (system_id % 250), 3333),
+        last_seen=time.monotonic(),
+        params={},
+        param_types={},
+        param_count=None,
+    )
+    entries = [
+        ("UWB_ROLE", 1, "uint8"),
+        ("ORIGIN_LAT_E7", 413900000, "int32"),
+        ("ORIGIN_LON_E7", 21500000, "int32"),
+        ("ORIGIN_ALT_MM", 10000, "int32"),
+        ("CELL_ID", cell, "custom"),
+        ("UWB_AN_COUNT", 1, "uint8"),
+        ("UWB_AN0_X", an1_x, "real32"),
+        ("UWB_AN0_Y", -10.0, "real32"),
+        ("UWB_AN0_Z", 0.0, "real32"),
+        ("UWB_AN0_MAC", 1, "uint16"),
+    ]
+    if yaw is not None:
+        entries.append(("POS_YAW_DEG", yaw, "real32"))
+    for name, value, type_name in entries:
+        set_cached_param(tag, name, value, type_name)
+    tag.param_count = len(tag.params)
+    extension._protocol.devices[system_id] = tag
+    return tag
+
+
+async def test_majority_votes_within_one_cell_only(extension, builder, hub):
+    from flockwave.server.ext.rtls.geometry import _majority_reference
+
+    # one A-cell tag vs two consistent B-cell tags: B must not outvote A
+    add_stub_tag(extension, 50, cell="a", an1_x=10.0)
+    add_stub_tag(extension, 51, cell="b", an1_x=20.0)
+    add_stub_tag(extension, 52, cell="b", an1_x=20.0)
+    assert _majority_reference(extension, 50, 1e-4, "a") == 50
+
+
+async def test_majority_absent_optional_is_not_a_wildcard(
+    extension, builder, hub
+):
+    from flockwave.server.ext.rtls.geometry import _majority_reference
+
+    # the lowest-sysid tag LACKS POS_YAW_DEG; two tags carry yaw 30 and
+    # the (drifted) cell source carries yaw 0. Directional grouping used
+    # to let the yaw-less representative absorb everyone and elect the
+    # drifted source; the majority must be the yaw-30 pair.
+    add_stub_tag(extension, 40, yaw=None)
+    add_stub_tag(extension, 41, yaw=30.0)
+    add_stub_tag(extension, 42, yaw=30.0)
+    add_stub_tag(extension, 43, yaw=0.0)
+    assert _majority_reference(extension, 43, 1e-4, "default") == 41
+
+
+async def test_majority_elects_the_group_representative(
+    extension, builder, hub
+):
+    from flockwave.server.ext.rtls.geometry import _majority_reference
+
+    # chained tolerance: 0 and +0.9 and -0.9 all within tol=1 of the
+    # representative (0) but not of each other; the elected reference
+    # must be the representative, never a chained member
+    add_stub_tag(extension, 40, yaw=0.0)
+    add_stub_tag(extension, 41, yaw=0.9)
+    add_stub_tag(extension, 42, yaw=-0.9)
+    assert _majority_reference(extension, 41, 1.0, "default") == 40

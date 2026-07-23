@@ -277,21 +277,32 @@ def _device_role(ext: "RtlsExtension", device) -> Optional[str]:
 
 
 def _majority_reference(
-    ext: "RtlsExtension", cell_source: int, tolerance: float
+    ext: "RtlsExtension", cell_source: int, tolerance: float, cell_id: str
 ) -> int:
     """Picks the DEFAULT reference tag by majority vote over the live
-    tags' geometries: the largest group of mutually consistent tags wins,
-    and the odd ones out are presumed wrong. The cell source is only a
-    tie-breaker (its identity is "last tag whose params synced" — an
-    arbitrary choice that must never silently promote a drifted tag to
-    fleet-wide truth). Falls back to the cell source when no group is
-    strictly larger than the rest."""
+    tags of ONE cell: the largest group of mutually consistent tags
+    wins, and the odd ones out are presumed wrong. The cell source is
+    only a tie-breaker between equal-sized groups (its identity is
+    "last tag whose params synced" — an arbitrary choice that must never
+    silently promote a drifted tag to fleet-wide truth). Falls back to
+    the cell source when no candidates exist.
+
+    Group membership is SYMMETRIC (both diff directions must be clean),
+    so a representative that merely lacks an optional parameter cannot
+    act as a wildcard absorbing tags that disagree on it; and the
+    elected reference is always the group REPRESENTATIVE, so tolerance
+    chaining cannot elect a member that drifts from the rest of its own
+    group by up to twice the tolerance."""
     protocol = ext._require_protocol()
     candidates: list[tuple[int, dict[str, Any]]] = []
     for system_id, device in sorted(protocol.devices.items()):
         if _device_role(ext, device) != "tag":
             continue
         params = _decoded_device_params(device)
+        # votes come from ONE cell only: in a multi-cell deployment the
+        # other cell's tags must not outvote this cell's own geometry
+        if _cell_id_from_params(params) != cell_id:
+            continue
         if not _geometry_knowable(device, params):
             continue
         subset, missing = extract_geometry(params)
@@ -303,10 +314,9 @@ def _majority_reference(
     for system_id, subset in candidates:
         for group in groups:
             rep_subset = group[0][1]
-            g_missing, g_deltas = diff_geometry(
-                rep_subset, subset, tolerance=tolerance
-            )
-            if not g_missing and not g_deltas:
+            fwd = diff_geometry(rep_subset, subset, tolerance=tolerance)
+            rev = diff_geometry(subset, rep_subset, tolerance=tolerance)
+            if not any((*fwd, *rev)):
                 group.append((system_id, subset))
                 break
         else:
@@ -325,11 +335,7 @@ def _majority_reference(
                 group[0][0],
             )
         )
-    group = best[0]
-    for system_id, _ in group:
-        if system_id == cell_source:
-            return system_id
-    return group[0][0]
+    return best[0][0][0]
 
 
 def _resolve_reference(
@@ -357,15 +363,16 @@ def _resolve_reference(
         if cell is not None:
             if cell not in sources:
                 raise ValueError(f"No such cell: {cell!r}")
+            cell_key = cell
             reference = sources[cell]
         elif len(sources) == 1:
-            reference = next(iter(sources.values()))
+            cell_key, reference = next(iter(sources.items()))
         else:
             raise ValueError(
                 f"Multiple cells present ({', '.join(sorted(sources))}); "
                 "specify 'cell' or 'reference'"
             )
-        reference = _majority_reference(ext, reference, tolerance)
+        reference = _majority_reference(ext, reference, tolerance, cell_key)
     device = protocol.devices.get(reference)
     if device is None:
         raise ValueError(f"No such device: {reference}")
