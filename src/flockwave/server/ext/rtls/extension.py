@@ -924,13 +924,18 @@ class RtlsExtension(Extension):
                         # mirror the acknowledged value into the device
                         # cache so the anchor display reflects the
                         # server's own push without waiting for the
-                        # device to re-advertise it
-                        device.params[name] = event.data["value"]
-                        device.param_types[name] = param_type
-                        self._sync_anchor_beacons(
-                            device, _decoded_device_params(device)
-                        )
-                        self._refresh_anchor_cells()
+                        # device to re-advertise it — into the CURRENT
+                        # object: the device may have been expired and
+                        # rediscovered (a NEW object) at any await point
+                        # of this transaction
+                        live = protocol.devices.get(system_id)
+                        if live is not None:
+                            live.params[name] = event.data["value"]
+                            live.param_types[name] = param_type
+                            self._sync_anchor_beacons(
+                                live, _decoded_device_params(live)
+                            )
+                            self._refresh_anchor_cells()
                     return {
                         "value": decode_param_value(
                             event.data["value"], param_type

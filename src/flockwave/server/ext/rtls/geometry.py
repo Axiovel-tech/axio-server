@@ -550,6 +550,16 @@ async def _sync_one(
         entry["detail"] = aborted
         return entry
 
+    # re-resolve the device: a target lost and rediscovered mid-sync is
+    # a NEW object, and set_param mirrored the acks into that one —
+    # verifying (or rebooting) the detached pre-rediscovery object would
+    # flag phantom drift forever and never activate the geometry
+    device = protocol.devices.get(system_id)
+    if device is None:
+        entry["status"] = "error"
+        entry["detail"] = "device lost during the sync"
+        return entry
+
     if not failures:
         # Post-write verification before anything gets activated: the
         # param cache mirrors every device-side ack — ours AND any
@@ -625,6 +635,15 @@ async def run_sync(
         )
 
         async def run_one(system_id: int) -> None:
+            # pessimistic placeholder: if this worker is CANCELLED
+            # mid-flight it never returns, and the quarantine in the
+            # finally below must still treat the target as potentially
+            # mixed — it may have accepted writes already
+            devices[str(system_id)] = {
+                "status": "error",
+                "detail": "sync cancelled mid-flight",
+                "written": ["(unknown: cancelled)"],
+            }
             devices[str(system_id)] = await _sync_one(
                 ext,
                 ref_device,

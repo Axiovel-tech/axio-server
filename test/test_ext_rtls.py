@@ -3819,3 +3819,95 @@ async def test_geo_sync_quarantines_partial_source_of_another_cell(
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
     assert entry["status"] == "partial", entry
     assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
+
+
+async def test_geo_sync_cancellation_quarantines_touched_targets(
+    extension, device, dialect, autojump_clock
+):
+    from flockwave.server.ext.rtls.geometry import run_sync
+
+    # ref lives in cell "a"; the target sources its own cell "b" and
+    # stops acking after its first accepted write; the sync is then
+    # cancelled mid-write — cell "b" must not stay sourced by a target
+    # the cancelled sync already touched
+    add_rtls_cell_params(device)
+    set_fake_param(device, "CELL_ID", "a", "custom")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "CELL_ID", "b", "custom")
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
+
+    sets_seen = []
+    original_handle = second.handle
+
+    def stalling_handle(data):
+        parser = dialect.MAVLink(None)
+        for message in parser.parse_buffer(bytes(data)) or []:
+            if message.get_type() == "PARAM_EXT_SET":
+                sets_seen.append(message.param_id)
+                if len(sets_seen) > 1:
+                    return []  # device goes silent: the write blocks
+        return original_handle(data)
+
+    second.handle = stalling_handle
+
+    with trio.move_on_after(2):
+        await run_sync(
+            extension, reference=DEVICE_SYSID, reboot=False, timeout=30
+        )
+
+    assert len(sets_seen) > 1  # the sync WAS cancelled mid-write
+    assert extension._geo_sync_running is False
+    assert "b" not in extension._anchor_cell_sources
+
+
+async def test_geo_sync_survives_mid_sync_rediscovery(
+    extension, device, dialect, builder, hub
+):
+    # the target is lost + rediscovered mid-sync: acks mirror into the
+    # NEW device object, and the post-write verification must read that
+    # one — the detached old object would flag phantom drift forever
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    swapped = []
+    original_handle = second.handle
+
+    def swapping_handle(data):
+        if not swapped:
+            old = extension._protocol.devices[DEVICE_SYSID + 1]
+            clone = SimpleNamespace(
+                system_id=old.system_id,
+                address=old.address,
+                last_seen=old.last_seen,
+                params=dict(old.params),
+                param_types=dict(old.param_types),
+                param_count=old.param_count,
+            )
+            extension._protocol.devices[DEVICE_SYSID + 1] = clone
+            swapped.append(True)
+        return original_handle(data)
+
+    second.handle = swapping_handle
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced", entry
+    assert entry["rebooted"] is True
+    assert resets == [second.address[0]]
