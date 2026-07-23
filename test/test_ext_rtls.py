@@ -4460,3 +4460,116 @@ async def test_geo_fit_returns_an_apply_ready_payload(
     assert missing == [], missing
     assert payload["UWB_AN_COUNT"] == 4
     assert payload["ORIGIN_LAT_E7"] == 413900000
+
+
+async def test_geo_fit_handles_a_rotated_rectangle(
+    extension, device, dialect, builder, hub
+):
+    # the site rectangle is rotated 40 deg in the cell frame: corner
+    # assignment must happen in the rectangle's OWN frame, or the fit
+    # converges to a catastrophically wrong zero-residual layout
+    import math
+
+    angle = math.radians(40.0)
+
+    def rot(x, y):
+        return (
+            x * math.cos(angle) - y * math.sin(angle),
+            x * math.sin(angle) + y * math.cos(angle),
+        )
+    configured = {}
+    for mac, (x, y, z) in {
+        1: (-10.0, -8.0, 0.0),
+        2: (10.0, -8.0, 0.0),
+        3: (10.0, 8.0, -2.5),
+        4: (-10.0, 8.0, -2.5),
+    }.items():
+        rx, ry = rot(x, y)
+        configured[mac] = (rx, ry, z)
+    truth = dict(configured)
+    tx, ty, tz = truth[2]
+    truth[2] = (tx + 0.15, ty, tz)
+
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, mac in enumerate(sorted(configured)):
+        x, y, z = configured[mac]
+        set_fake_param(device, f"UWB_AN{index}_X", x, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Y", y, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Z", z, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", mac, "uint16")
+    for index, mac in enumerate(sorted(configured)):
+        add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
+    await discover(extension, device)
+
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    _feed_capture(extension, truth)
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    body = response.body
+    assert body["op"] == "fit", body
+    # the fit explains the ranges AND stays anchored to the rotated frame
+    assert body["relaxed"]["rmsM"] < 0.02, body["relaxed"]
+    moves = {m["mac"]: m for m in body["moves"]}
+    assert moves[2]["distM"] == max(m["distM"] for m in body["moves"]), moves
+    for mac in (1, 3, 4):
+        assert moves[mac]["distM"] < 0.08, moves
+
+
+async def test_geo_fit_preserves_intra_layer_heights(
+    extension, device, dialect, builder, hub
+):
+    # deliberate sub-layer-threshold height differences (0, 0.29 m) must
+    # survive the fit instead of being flattened to their mean
+    configured = {
+        1: (-10.0, -8.0, 0.0),
+        2: (10.0, -8.0, 0.29),
+        3: (10.0, 8.0, 0.0),
+        4: (-10.0, 8.0, 0.29),
+    }
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, mac in enumerate(sorted(configured)):
+        x, y, z = configured[mac]
+        set_fake_param(device, f"UWB_AN{index}_X", x, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Y", y, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Z", z, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", mac, "uint16")
+    for index, mac in enumerate(sorted(configured)):
+        add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
+    await discover(extension, device)
+
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    _feed_capture(extension, configured)  # truth == configured
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    rigid = {a["mac"]: a for a in response.body["rigid"]["anchors"]}
+    assert abs(rigid[2]["z"] - 0.29) < 0.05, rigid
+    assert abs(rigid[1]["z"] - 0.0) < 0.05, rigid
+
+
+async def test_geo_sync_out_of_range_payload_value_fails_cleanly(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    payload = {
+        "ORIGIN_LAT_E7": 10**30,  # cannot encode as int32
+        "ORIGIN_LON_E7": 21500000,
+        "ORIGIN_ALT_MM": 10000,
+        "UWB_AN_COUNT": 1,
+        "UWB_AN0_X": -10.0,
+        "UWB_AN0_Y": -10.0,
+        "UWB_AN0_Z": 0.0,
+        "UWB_AN0_MAC": 1,
+    }
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "sync", "geometry": payload, "reboot": False},
+    )
+    # a per-parameter failure, never a crash
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "partial", entry
+    assert "ORIGIN_LAT_E7" in entry["failures"], entry

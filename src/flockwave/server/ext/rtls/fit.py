@@ -196,37 +196,48 @@ def aggregate_capture(
 
 
 class _ShapeModel:
-    """The rectangular shape prior, derived from the CONFIGURED layout:
-    every anchor is assigned a plan-view corner (u, v ∈ {0, 1}) and a
-    layer (0 = low, 1 = high). Parameters: [W, L, z_low, (z_high),
-    (ox, oy)] — the layer-height and upper-layer-offset parameters exist
-    only when two layers exist."""
+    """The rectangular shape prior, derived from the CONFIGURED layout.
+
+    Corner assignment happens in the rectangle's OWN (principal-axis)
+    frame — global x/y extrema misassign corners as soon as the site is
+    rotated in the cell frame. Heights keep their per-anchor structure:
+    the model only solves a shared per-layer offset, never a uniform
+    height that would flatten deliberate differences.
+
+    Parameters: [W, L] plus, with two layers, [dz_high] (the change of
+    the upper layer's separation) and [ox, oy] (upper-layer plan
+    offset). The model is built in the principal frame; the caller
+    Kabsch-aligns the result back onto the configured layout, restoring
+    the rotation for free."""
 
     def __init__(self, anchors: list[dict[str, Any]]):
-        xs = [a["x"] for a in anchors]
-        ys = [a["y"] for a in anchors]
-        zs = [a["z"] for a in anchors]
-        x0, x1 = min(xs), max(xs)
-        y0, y1 = min(ys), max(ys)
-        if x1 - x0 < 0.5 or y1 - y0 < 0.5:
+        self.anchors = anchors
+        plan = np.array([[a["x"], a["y"]] for a in anchors], dtype=float)
+        self.plan_centroid = plan.mean(axis=0)
+        centered = plan - self.plan_centroid
+        # principal axes of the plan view: the rectangle's own frame
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        self.axes = vt  # rows: principal directions
+        local = centered @ self.axes.T
+        u0, u1 = local[:, 0].min(), local[:, 0].max()
+        v0, v1 = local[:, 1].min(), local[:, 1].max()
+        if u1 - u0 < 0.5 or v1 - v0 < 0.5:
             raise ValueError(
                 "configured anchor layout is not a rectangle (plan-view "
                 "extent below 0.5 m)"
             )
 
+        zs = [a["z"] for a in anchors]
         z_sorted = sorted(zs)
         self.two_layers = (z_sorted[-1] - z_sorted[0]) > LAYER_SPLIT_M
         z_mid = (z_sorted[0] + z_sorted[-1]) / 2.0
 
-        self.anchors = anchors
         self.assignment: list[tuple[int, int, int]] = []
         corners_used: set[tuple[int, int, int]] = set()
-        for anchor in anchors:
-            u = 0 if abs(anchor["x"] - x0) < abs(anchor["x"] - x1) else 1
-            v = 0 if abs(anchor["y"] - y0) < abs(anchor["y"] - y1) else 1
-            layer = (
-                1 if self.two_layers and anchor["z"] > z_mid else 0
-            )
+        for i, anchor in enumerate(anchors):
+            u = 0 if abs(local[i, 0] - u0) < abs(local[i, 0] - u1) else 1
+            v = 0 if abs(local[i, 1] - v0) < abs(local[i, 1] - v1) else 1
+            layer = 1 if self.two_layers and anchor["z"] > z_mid else 0
             key = (u, v, layer)
             if key in corners_used:
                 raise ValueError(
@@ -238,33 +249,26 @@ class _ShapeModel:
             corners_used.add(key)
             self.assignment.append(key)
 
-        low_zs = [
-            a["z"]
-            for a, key in zip(anchors, self.assignment)
-            if key[2] == 0
-        ]
-        high_zs = [
-            a["z"]
-            for a, key in zip(anchors, self.assignment)
-            if key[2] == 1
-        ]
-        theta = [x1 - x0, y1 - y0, statistics.mean(low_zs)]
+        #: per-anchor configured heights: kept as the base, so deliberate
+        #: intra-layer height differences survive the fit
+        self.base_z = np.array(zs, dtype=float)
+        theta = [u1 - u0, v1 - v0]
         if self.two_layers:
-            theta.append(statistics.mean(high_zs) if high_zs else theta[2])
+            theta.append(0.0)  # change of the upper layer's separation
             theta.extend([0.0, 0.0])  # upper-layer plan offset ox, oy
         self.theta0 = np.array(theta, dtype=float)
 
     def positions(self, theta: np.ndarray) -> np.ndarray:
-        width, length, z_low = theta[0], theta[1], theta[2]
+        width, length = theta[0], theta[1]
         if self.two_layers:
-            z_high, ox, oy = theta[3], theta[4], theta[5]
+            dz_high, ox, oy = theta[2], theta[3], theta[4]
         else:
-            z_high, ox, oy = z_low, 0.0, 0.0
+            dz_high, ox, oy = 0.0, 0.0, 0.0
         out = np.empty((len(self.assignment), 3), dtype=float)
         for i, (u, v, layer) in enumerate(self.assignment):
             out[i, 0] = u * width + (ox if layer else 0.0)
             out[i, 1] = v * length + (oy if layer else 0.0)
-            out[i, 2] = z_high if layer else z_low
+            out[i, 2] = self.base_z[i] + (dz_high if layer else 0.0)
         return out
 
 

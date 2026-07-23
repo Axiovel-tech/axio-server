@@ -764,9 +764,11 @@ each other continuously (TWR), so the standing geometry is measurable:
   - `relaxed`: every anchor freed inside ±`margin` (max 0.5 m) around
     the rigid solution, regularized toward it.
 
-  `moves` (relaxed − configured, per anchor) reads two ways: how far to
-  physically move each tripod, or — applied as-is — the best geometry
-  achievable without touching anything. `residuals` carries the
+  `moves` (relaxed − configured, per anchor) is each tripod's measured
+  STANDING OFFSET: positive `dxM` means it stands that far along +x of
+  its configured spot. To physically restore the surveyed layout, move
+  the tripod by the NEGATED vector; to fly with the tripods where they
+  stand, apply the relaxed geometry as-is. `residuals` carries the
   per-pair measured/predicted/residual table and `coverage` the pair
   matrix (a fit is NAKed below minimal coverage). Distances constrain
   only the shape, so the result is aligned back onto the configured

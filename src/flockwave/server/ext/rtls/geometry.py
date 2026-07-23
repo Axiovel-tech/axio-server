@@ -34,6 +34,7 @@ would activate a mixed geometry -- re-run the sync instead).
 from __future__ import annotations
 
 import re
+import struct
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -600,7 +601,9 @@ async def _sync_one(
             # same silence -- abort this device instead
             aborted = f"timeout while writing {name}"
             break
-        except (KeyError, ValueError) as ex:
+        except (KeyError, ValueError, struct.error) as ex:
+            # struct.error: an (explicit-geometry) value outside its wire
+            # type must fail THIS parameter, not crash the whole sync
             failures[name] = str(ex)
             continue
         if result["accepted"]:
