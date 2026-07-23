@@ -3776,3 +3776,46 @@ async def test_geo_sync_never_leaves_a_partial_target_as_cell_source(
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
     assert entry["status"] == "partial", entry
     assert "default" not in extension._anchor_cell_sources
+
+
+async def test_geo_anchor_reference_is_refused(extension, device, builder, hub):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    add_anchor_device(extension, 91, role=2, uwb_mac=1)
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": 91}
+    )
+    assert response.body["type"] == "ACK-NAK"
+    assert "not a tag" in response.body["reason"]
+
+
+async def test_geo_sync_quarantines_partial_source_of_another_cell(
+    extension, device, dialect, builder, hub
+):
+    # multi-cell: the target still sources cell "b" while being pulled
+    # into the reference's cell "a"; every write is rejected, so the
+    # target stays b's source with untouched-but-unverifiable geometry
+    # intent — the sync left it mixed-state, so b must not keep it as
+    # its truth even though the reference (of cell a) survived
+    add_rtls_cell_params(device)
+    set_fake_param(device, "CELL_ID", "a", "custom")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "CELL_ID", "b", "custom")
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
+
+    second.set_result = PARAM_ACK_FAILED
+    extension._geo_reset = lambda address: None
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "partial", entry
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}

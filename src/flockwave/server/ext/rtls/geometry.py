@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import trio
 from rtlslink import param_type_to_name
 
+from .cell_compat import cell_from_params
 from .extension import (
     DEFAULT_PARAM_TIMEOUT,
     _cell_id_from_params,
@@ -306,6 +307,14 @@ def _resolve_reference(
     device = protocol.devices.get(reference)
     if device is None:
         raise ValueError(f"No such device: {reference}")
+    role = _device_role(ext, device)
+    if role != "tag":
+        # geometry truth lives on tags; an anchor happening to carry the
+        # shared param names must not become the fleet-wide reference
+        raise ValueError(
+            f"Reference device {reference} is not a tag "
+            f"(role: {role or 'unknown'})"
+        )
     params = _decoded_device_params(device)
     if not _geometry_knowable(device, params):
         raise ValueError(
@@ -406,6 +415,31 @@ async def run_check(
 
 
 # ---- sync ----------------------------------------------------------------
+
+
+def _rehome_cell_or_drop(
+    ext: "RtlsExtension", cell_id: str, *, exclude: set[int]
+) -> None:
+    """Re-homes a cell onto some live tag advertising it — skipping the
+    ``exclude``d (mixed-geometry) devices — or drops the mapping when no
+    clean source exists."""
+    protocol = ext._require_protocol()
+    for device in protocol.devices.values():
+        if device.system_id in exclude:
+            continue
+        params = _decoded_device_params(device)
+        if _cell_source_role(device, params) != "tag":
+            continue
+        try:
+            cell = cell_from_params(
+                params, cell_id=_cell_id_from_params(params)
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cell.cell_id == cell_id:
+            ext._sync_anchor_beacons(device, params)
+            return
+    ext._drop_anchor_cell(cell_id)
 
 
 def _default_reset(address: str, timeout: float = RESET_TIMEOUT) -> None:
@@ -620,34 +654,23 @@ async def run_sync(
     live_ref = protocol.devices.get(ref_device.system_id)
     if live_ref is not None:
         ext._sync_anchor_beacons(live_ref, _decoded_device_params(live_ref))
-    else:
-        # the reference expired mid-sync and the refresh re-homed the
-        # cell onto SOME live tag — which must not be a device this very
-        # sync left PARTIAL (its cache holds mixed geometry, and as the
-        # default reference it would become the fleet's truth). Prefer a
-        # cleanly synced target; with none, drop the mapping so the next
-        # default-reference resolution fails loudly instead.
-        source = ext._anchor_cell_sources.get(cell_id)
-        if (
-            source is not None
-            and devices.get(str(source), {}).get("status") == "partial"
-        ):
-            clean = next(
-                (
-                    int(sid)
-                    for sid, entry in devices.items()
-                    if entry.get("status") == "synced"
-                    and int(sid) in protocol.devices
-                ),
-                None,
-            )
-            if clean is not None:
-                device = protocol.devices[clean]
-                ext._sync_anchor_beacons(
-                    device, _decoded_device_params(device)
-                )
-            else:
-                ext._drop_anchor_cell(cell_id)
+
+    # Quarantine: no cell — the reference's or any other — may stay
+    # sourced by a device this sync left with MIXED geometry (partial,
+    # or errored after accepted writes): as a cell source it would
+    # become that cell's rendered/default-reference truth. Re-home each
+    # such cell onto a clean tag, or drop the mapping so the next
+    # default-reference resolution fails loudly instead.
+    mixed = {
+        int(sid)
+        for sid, entry in devices.items()
+        if entry.get("status") == "partial"
+        or (entry.get("status") == "error" and entry.get("written"))
+    }
+    for mapped_cell in [
+        c for c, s in ext._anchor_cell_sources.items() if s in mixed
+    ]:
+        _rehome_cell_or_drop(ext, mapped_cell, exclude=mixed)
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the
