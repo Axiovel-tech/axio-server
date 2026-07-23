@@ -79,6 +79,14 @@ DEFAULT_SLEEP_SETTLE = 3.0
 #: upper bound for client-supplied transaction timeouts, in seconds
 MAX_PARAM_TIMEOUT = 60.0
 
+#: extra seconds a timed-out parameter write keeps holding its
+#: per-(device, name) lock to catch a LATE final ack. PARAM_EXT acks
+#: carry no transaction id, so an ack that straggles in after the
+#: timeout would otherwise be consumed by — and complete — the NEXT
+#: write of the same parameter; caught within the grace it is adopted
+#: as the (late) outcome of its own transaction instead
+LATE_ACK_GRACE = 1.0
+
 #: how often OTA progress notifications are broadcast at most, in seconds
 OTA_PROGRESS_INTERVAL = 0.5
 
@@ -856,55 +864,87 @@ class RtlsExtension(Extension):
             param_type = param_type_from_name(param_type)
 
         encoded = encode_param_value(value, param_type)
+
+        async def wait_for_final_ack(events):
+            while True:
+                event = await events.receive()
+                if (
+                    event.kind != "param_ack"
+                    or event.system_id != system_id
+                    or event.data["name"] != name
+                ):
+                    continue
+                if event.data["result"] == PARAM_ACK_IN_PROGRESS:
+                    continue  # final ack still to come
+                return event
+
         # Serialize writes of the same parameter of the same device:
         # PARAM_EXT acks carry no transaction id, so two overlapping
         # writes would each match the FIRST ack by (device, name) and
         # both report the first write's outcome as their own. The lock
         # spans send -> final ack, so the second write starts only after
         # the first one's ack has been consumed.
-        lock = self._param_write_locks.setdefault(
-            (system_id, name), trio.Lock()
-        )
-        async with lock:
-            with self._subscribed_events() as events:
-                request = protocol.set_param(
-                    system_id, name, encoded, param_type
-                )
-                if request is None:
-                    raise KeyError(system_id)
-                await self._send(*request)
+        key = (system_id, name)
+        lock = self._param_write_locks.setdefault(key, trio.Lock())
+        try:
+            async with lock:
+                with self._subscribed_events() as events:
+                    request = protocol.set_param(
+                        system_id, name, encoded, param_type
+                    )
+                    if request is None:
+                        raise KeyError(system_id)
+                    await self._send(*request)
 
-                with trio.fail_after(timeout):
-                    while True:
-                        event = await events.receive()
-                        if (
-                            event.kind != "param_ack"
-                            or event.system_id != system_id
-                            or event.data["name"] != name
-                        ):
-                            continue
-                        result = event.data["result"]
-                        if result == PARAM_ACK_IN_PROGRESS:
-                            continue  # final ack still to come
-                        if result == PARAM_ACK_ACCEPTED:
-                            # mirror the acknowledged value into the device
-                            # cache so the anchor display reflects the
-                            # server's own push without waiting for the
-                            # device to re-advertise it
-                            device.params[name] = event.data["value"]
-                            device.param_types[name] = param_type
-                            self._sync_anchor_beacons(
-                                device, _decoded_device_params(device)
-                            )
-                            self._refresh_anchor_cells()
-                        return {
-                            "value": decode_param_value(
-                                event.data["value"], param_type
-                            ),
-                            "type": param_type_to_name(param_type),
-                            "result": result,
-                            "accepted": result == PARAM_ACK_ACCEPTED,
-                        }
+                    try:
+                        with trio.fail_after(timeout):
+                            event = await wait_for_final_ack(events)
+                    except trio.TooSlowError:
+                        # keep holding the lock through a short drain:
+                        # a LATE final ack caught here is adopted as
+                        # this transaction's (late) outcome — released
+                        # immediately, it would complete the NEXT write
+                        # of the same parameter instead
+                        event = None
+                        with trio.move_on_after(LATE_ACK_GRACE):
+                            event = await wait_for_final_ack(events)
+                        if event is None:
+                            raise
+
+                    result = event.data["result"]
+                    if result == PARAM_ACK_ACCEPTED:
+                        # mirror the acknowledged value into the device
+                        # cache so the anchor display reflects the
+                        # server's own push without waiting for the
+                        # device to re-advertise it
+                        device.params[name] = event.data["value"]
+                        device.param_types[name] = param_type
+                        self._sync_anchor_beacons(
+                            device, _decoded_device_params(device)
+                        )
+                        self._refresh_anchor_cells()
+                    return {
+                        "value": decode_param_value(
+                            event.data["value"], param_type
+                        ),
+                        "type": param_type_to_name(param_type),
+                        "result": result,
+                        "accepted": result == PARAM_ACK_ACCEPTED,
+                    }
+        finally:
+            # prune the lock once nobody holds or awaits it: parameter
+            # names are client-supplied, so keeping every (device, name)
+            # entry forever would grow without bound. Safe under trio's
+            # cooperative scheduling: a task between setdefault and its
+            # acquire checkpoint cannot interleave here, so an unheld,
+            # waiter-less lock is truly unreferenced-for-serialization.
+            stats = lock.statistics()
+            if (
+                not stats.locked
+                and stats.tasks_waiting == 0
+                and self._param_write_locks.get(key) is lock
+            ):
+                self._param_write_locks.pop(key, None)
 
     async def set_sleep(
         self,
@@ -2086,9 +2126,17 @@ class RtlsExtension(Extension):
             # a geometry sync is rewriting TARGET tags: their accepted
             # writes must not steal the cell source (or the beacon
             # rendering) from the pinned reference mid-sync — a partially
-            # rewritten tag holds a mixed geometry
+            # rewritten tag holds a mixed geometry. The pin only holds
+            # while the pinned source is LIVE: refusing a re-home off a
+            # device that expired mid-sync would leave the cell mapped
+            # to a ghost.
             current = self._anchor_cell_sources.get(cell.cell_id)
-            if current is not None and current != device.system_id:
+            if (
+                current is not None
+                and current != device.system_id
+                and self._protocol is not None
+                and current in self._protocol.devices
+            ):
                 return
 
         self._anchor_cell_sources[cell.cell_id] = device.system_id

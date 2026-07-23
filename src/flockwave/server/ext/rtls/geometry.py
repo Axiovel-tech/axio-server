@@ -515,6 +515,23 @@ async def _sync_one(
         entry["status"] = "error"
         entry["detail"] = aborted
         return entry
+
+    if not failures:
+        # Post-write verification before anything gets activated: the
+        # param cache mirrors every device-side ack — ours AND any
+        # concurrent writer's (e.g. an interleaved X-RTLS-PARAM-SET) —
+        # so a final re-diff catches geometry that drifted between our
+        # writes. Anything caught here downgrades to partial and blocks
+        # the reboot below.
+        final_subset, _ = extract_geometry(_decoded_device_params(device))
+        drift_missing, drift = diff_geometry(
+            ref_subset, final_subset, tolerance=tolerance
+        )
+        for name in list(drift_missing) + list(drift):
+            failures[name] = (
+                "post-write verification: the value drifted during the "
+                "sync (concurrent writer?)"
+            )
     entry["status"] = "partial" if failures else "synced"
 
     if reboot:
@@ -591,10 +608,14 @@ async def run_sync(
         ext._geo_sync_running = False
 
     # While the latch was held, _sync_anchor_beacons refused to move the
-    # cell source off the reference; re-assert it now (belt and braces)
-    # — but only if the reference is still live: re-homing a cell onto a
-    # device that expired mid-sync would render its anchors from a stale
-    # object and break the next default-reference resolution.
+    # cell source off the reference — which also deferred legitimate
+    # bookkeeping (a target's CELL_ID re-home, cleanup after a source
+    # lost mid-sync). Heal all mappings now, then re-assert the
+    # reference as the source — but only if it is still live: re-homing
+    # a cell onto a device that expired mid-sync would render its
+    # anchors from a stale object and break the next default-reference
+    # resolution.
+    ext._refresh_anchor_cells()
     live_ref = ext._require_protocol().devices.get(ref_device.system_id)
     if live_ref is not None:
         ext._sync_anchor_beacons(live_ref, _decoded_device_params(live_ref))

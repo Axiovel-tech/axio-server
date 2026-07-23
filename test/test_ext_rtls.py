@@ -3628,3 +3628,115 @@ async def test_cell_source_pinned_while_sync_runs(extension, device, dialect):
     extension._geo_sync_running = False
     extension._sync_anchor_beacons(target, _decoded_device_params(target))
     assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 1
+
+
+async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
+    await discover(extension, device)
+
+    await extension.set_param(DEVICE_SYSID, "UWB_CH", 7)
+    assert extension._param_write_locks == {}
+
+    device.respond_to_set = False
+    with pytest.raises(trio.TooSlowError):
+        await extension.set_param(DEVICE_SYSID, "UWB_CH", 8, timeout=1)
+    assert extension._param_write_locks == {}
+
+
+async def test_cell_source_pin_yields_when_pinned_source_dies(
+    extension, device, dialect
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    devices = extension._get_devices()
+    ref = devices[DEVICE_SYSID]
+    target = devices[DEVICE_SYSID + 1]
+    from flockwave.server.ext.rtls.extension import _decoded_device_params
+
+    extension._sync_anchor_beacons(ref, _decoded_device_params(ref))
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
+
+    # the pinned source expires mid-sync: the pin must yield, or the
+    # cell would stay mapped to a ghost device
+    extension._geo_sync_running = True
+    del extension._protocol.devices[DEVICE_SYSID]
+    extension._sync_anchor_beacons(target, _decoded_device_params(target))
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 1
+
+
+async def test_geo_sync_detects_concurrent_drift(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    # a concurrent writer changes an ALREADY-SYNCED param mid-sync: the
+    # device pushes a param_value for UWB_AN0_X (written earlier in the
+    # sync order) while the server writes UWB_AN1_X
+    original_handle = second.handle
+
+    def drifting_handle(data):
+        out = original_handle(data)
+        parser = dialect.MAVLink(None)
+        for message in parser.parse_buffer(bytes(data)) or []:
+            if (
+                message.get_type() == "PARAM_EXT_SET"
+                and message.param_id == "UWB_AN1_X"
+            ):
+                set_fake_param(second, "UWB_AN0_X", 99.0, "real32")
+                index = list(second.params).index("UWB_AN0_X")
+                out.append(second._param_value("UWB_AN0_X", index))
+        return out
+
+    second.handle = drifting_handle
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "partial", entry
+    assert "post-write verification" in entry["failures"]["UWB_AN0_X"], entry
+    assert entry["rebooted"] is False  # a drifted geometry must not activate
+    assert resets == []
+
+
+async def test_geo_sync_heals_stale_cell_mappings(
+    extension, device, dialect, builder, hub
+):
+    # ref lives in cell "a", the target still carries cell label "b":
+    # after the sync (which rewrites CELL_ID too) the old "b" mapping
+    # must be gone — a stale entry would render a phantom cell with the
+    # new cell's geometry
+    add_rtls_cell_params(device)
+    set_fake_param(device, "CELL_ID", "a", "custom")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "CELL_ID", "b", "custom")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
+
+    extension._geo_reset = lambda address: None
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced", entry
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
