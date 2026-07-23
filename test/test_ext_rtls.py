@@ -3740,3 +3740,39 @@ async def test_geo_sync_heals_stale_cell_mappings(
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
     assert entry["status"] == "synced", entry
     assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
+
+
+async def test_geo_sync_never_leaves_a_partial_target_as_cell_source(
+    extension, device, dialect, builder, hub
+):
+    # the reference expires mid-sync and every target ends up partial:
+    # the cell mapping must be dropped, not re-homed onto a device whose
+    # cache holds mixed geometry (it would become the fleet's default
+    # reference truth)
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    second.set_result = PARAM_ACK_FAILED
+    original_handle = second.handle
+
+    def losing_handle(data):
+        # the reference drops off the network as the first write lands
+        extension._protocol.devices.pop(DEVICE_SYSID, None)
+        return original_handle(data)
+
+    second.handle = losing_handle
+    extension._geo_reset = lambda address: None
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "partial", entry
+    assert "default" not in extension._anchor_cell_sources

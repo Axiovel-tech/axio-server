@@ -722,6 +722,17 @@ so clients re-render the site anchors immediately. Requests that
 resolve no complete reference (no live tag with a full cell, unknown
 `reference`/`cell`) are NAKed.
 
+Concurrency: only one sync runs at a time (a second request is NAKed),
+parameter writes are serialized per (device, parameter) with a
+late-ack drain, and a post-write verification re-diff gates the
+reboot. Two windows remain that the PARAM_EXT wire protocol cannot
+close (acks carry no transaction id, and verify-then-reboot cannot be
+atomic): an ack straggling in more than `timeout` + 1 s late may be
+attributed to a subsequent write of the same parameter, and a
+parameter written by a third party in the instant between verification
+and reset is only caught by the next `check`. UIs should therefore
+re-run `check` after every sync — which also covers both windows.
+
 ### Notes for control-UI developers
 
 - The server treats `X-`-prefixed messages as experimental: they skip

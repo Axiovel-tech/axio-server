@@ -616,9 +616,38 @@ async def run_sync(
     # anchors from a stale object and break the next default-reference
     # resolution.
     ext._refresh_anchor_cells()
-    live_ref = ext._require_protocol().devices.get(ref_device.system_id)
+    protocol = ext._require_protocol()
+    live_ref = protocol.devices.get(ref_device.system_id)
     if live_ref is not None:
         ext._sync_anchor_beacons(live_ref, _decoded_device_params(live_ref))
+    else:
+        # the reference expired mid-sync and the refresh re-homed the
+        # cell onto SOME live tag — which must not be a device this very
+        # sync left PARTIAL (its cache holds mixed geometry, and as the
+        # default reference it would become the fleet's truth). Prefer a
+        # cleanly synced target; with none, drop the mapping so the next
+        # default-reference resolution fails loudly instead.
+        source = ext._anchor_cell_sources.get(cell_id)
+        if (
+            source is not None
+            and devices.get(str(source), {}).get("status") == "partial"
+        ):
+            clean = next(
+                (
+                    int(sid)
+                    for sid, entry in devices.items()
+                    if entry.get("status") == "synced"
+                    and int(sid) in protocol.devices
+                ),
+                None,
+            )
+            if clean is not None:
+                device = protocol.devices[clean]
+                ext._sync_anchor_beacons(
+                    device, _decoded_device_params(device)
+                )
+            else:
+                ext._drop_anchor_cell(cell_id)
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the
