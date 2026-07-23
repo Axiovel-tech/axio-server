@@ -253,6 +253,10 @@ class RtlsExtension(Extension):
         #: the source off the pinned reference while targets are being
         #: rewritten (see :meth:`_sync_anchor_beacons`)
         self._geo_sync_running = False
+        #: True while an X-RTLS-VERIFY run is in flight; a second
+        #: concurrent run is refused (fleet-wide MAVLink param reads
+        #: must not be hammered)
+        self._verify_running = False
         #: per-(system id, name) write serialization: PARAM_EXT acks
         #: carry no transaction id — they are matched by device + name
         #: only — so two overlapping writes of the same parameter could
@@ -463,6 +467,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
                         "X-RTLS-GEO": self._handle_RTLS_GEO,
+                        "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -1972,6 +1977,21 @@ class RtlsExtension(Extension):
             body=result, in_response_to=message
         )
 
+    async def _handle_RTLS_VERIFY(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        # Lazy import: verify.py imports helpers from this module.
+        from .verify import run_verify
+
+        in_depth = bool(message.body.get("inDepth", False))
+        try:
+            result = await run_verify(self, in_depth=in_depth)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        return hub.create_response_or_notification(
+            body=result, in_response_to=message
+        )
+
     # ---- helpers / exports ----
 
     def _warn_no_app(self) -> None:
@@ -2601,6 +2621,11 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # Battery voltage is optional because only newer boards can measure it
         # while the flight-controller rail is off.
         body["batteryVoltage"] = round(float(data["vbat"]), 3)
+    if "clkok" in data:
+        # cluster-clock sync freshness: the fleet-verify clock rule and the
+        # UI both need it; previously only the show-clock pin manager
+        # consumed it internally
+        body["clockSyncOk"] = bool(data["clkok"])
     return body
 
 

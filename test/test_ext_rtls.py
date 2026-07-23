@@ -4045,3 +4045,165 @@ async def test_majority_elects_the_group_representative(
     add_stub_tag(extension, 41, yaw=0.9)
     add_stub_tag(extension, 42, yaw=-0.9)
     assert _majority_reference(extension, 41, 1.0, "default") == 40
+# ---- X-RTLS-VERIFY ------------------------------------------------------
+
+
+class StubUAV:
+    def __init__(self, params):
+        self._params = params
+
+    async def get_parameter(self, name, fetch=False):
+        if name not in self._params:
+            raise KeyError(name)
+        return self._params[name]
+
+
+def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
+    """Two consistent wire tags paired to two stub drones with healthy
+    solver stats; returns the second tag for perturbation."""
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+
+    defaults = {"EK3_SRC1_YAW": 9.0, "EK3_SRC_VC_YAW": 40.0}
+    uavs = {
+        "05": StubUAV(dict(drone_params or defaults)),
+        "06": StubUAV(dict(defaults)),
+    }
+    extension.app.find_uav_by_id = lambda uav_id: uavs.get(uav_id)
+    extension.app.object_registry = SimpleNamespace(
+        ids_by_type=lambda _type: list(uavs)
+    )
+    extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
+    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
+        extension._stats[sysid] = {
+            "id": sysid,
+            "solveRateHz": 12.5,
+            "solvePct": 97.0,
+            "fixAgeMs": 80,
+            "clockPpm": 1.2,
+            "anchorMask": 0b1111,
+            "clockSyncOk": True,
+        }
+    return second
+
+
+async def verify_message(extension, builder, hub, body=None):
+    message = make_message(builder, {"type": "X-RTLS-VERIFY", **(body or {})})
+    return await extension._handle_RTLS_VERIFY(message, None, hub)
+
+
+async def test_verify_passes_on_a_healthy_fleet(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await verify_message(extension, builder, hub)
+
+    body = response.body
+    assert body["type"] == "X-RTLS-VERIFY"
+    assert body["passed"] is True, body["rules"]
+    statuses = {rule["id"]: rule["status"] for rule in body["rules"]}
+    assert statuses == {
+        "geometry": "pass",
+        "firmware": "pass",
+        "pairing": "pass",
+        "yaw-source": "pass",
+        "uwb": "pass",
+        "params": "skipped",
+    }
+
+
+async def test_verify_flags_wrong_yaw_source(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(
+        extension,
+        device,
+        dialect,
+        drone_params={"EK3_SRC1_YAW": 1.0, "EK3_SRC_VC_YAW": 40.0},
+    )
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await verify_message(extension, builder, hub)
+
+    body = response.body
+    assert body["passed"] is False
+    rule = next(r for r in body["rules"] if r["id"] == "yaw-source")
+    assert rule["status"] == "fail"
+    assert "virtual compass" in rule["detail"]
+    assert rule["devices"]["05"]["yawSource"] == 1.0
+
+
+async def test_verify_flags_geometry_drift_and_missing_stats(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    del extension._stats[DEVICE_SYSID + 1]  # and one tag went silent
+
+    response = await verify_message(extension, builder, hub)
+
+    body = response.body
+    assert body["passed"] is False
+    by_id = {rule["id"]: rule for rule in body["rules"]}
+    assert by_id["geometry"]["status"] == "fail"
+    assert by_id["uwb"]["status"] == "fail"
+    assert "no telemetry" in by_id["uwb"]["detail"]
+
+
+async def test_verify_in_depth_reports_param_diffs_as_warnings(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    # give both drones the full in-depth set; one WPNAV_SPEED differs
+    from flockwave.server.ext.rtls.verify import IN_DEPTH_PARAMS
+
+    base = dict.fromkeys(IN_DEPTH_PARAMS, 1.0)
+    base.update({"EK3_SRC1_YAW": 9.0, "EK3_SRC_VC_YAW": 40.0})
+    drone_a = dict(base)
+    drone_b = dict(base)
+    drone_b["WPNAV_SPEED"] = 2.0
+    extension.app.find_uav_by_id = lambda uav_id: {
+        "05": StubUAV(drone_a),
+        "06": StubUAV(drone_b),
+    }.get(uav_id)
+
+    response = await verify_message(extension, builder, hub, {"inDepth": True})
+
+    body = response.body
+    rule = next(r for r in body["rules"] if r["id"] == "params")
+    assert rule["status"] == "fail"
+    assert rule["severity"] == "warning"
+    assert "WPNAV_SPEED" in rule["diffs"]
+    # warnings never block the flight verdict
+    assert body["passed"] is True, body["rules"]
+
+
+async def test_verify_concurrent_run_is_refused(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    extension._verify_running = True
+    response = await verify_message(extension, builder, hub)
+    assert response.body["type"] == "ACK-NAK"
+    assert "in progress" in response.body["reason"]
