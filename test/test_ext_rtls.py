@@ -3911,3 +3911,35 @@ async def test_geo_sync_survives_mid_sync_rediscovery(
     assert entry["status"] == "synced", entry
     assert entry["rebooted"] is True
     assert resets == [second.address[0]]
+
+
+async def test_geo_default_reference_is_the_majority_geometry(
+    extension, device, dialect, builder, hub
+):
+    # three tags; the LAST-discovered one (the cell source, by last-writer
+    # bookkeeping) carries drifted geometry. The default reference must be
+    # the majority geometry — never the drifted cell source, or one Sync
+    # click would propagate the wrong geometry to the whole fleet.
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
+    set_fake_param(third, "UWB_AN1_X", 10.5, "real32")
+    set_fake_param(third, "ORIGIN_ALT_MM", 20000, "int32")
+    wire_devices(extension, device, second, third)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await extension._process_datagram(
+        third.heartbeat(), third.address, time.monotonic()
+    )
+    # the drifted tag is the current cell source (discovered last)
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 2
+
+    response = await geo_message(extension, builder, hub, {"op": "check"})
+
+    body = response.body
+    assert body["reference"] in (DEVICE_SYSID, DEVICE_SYSID + 1), body
+    assert body["consistent"] is False
+    entry = body["devices"][str(DEVICE_SYSID + 2)]
+    assert entry["status"] == "mismatch"

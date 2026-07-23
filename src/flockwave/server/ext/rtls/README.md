@@ -646,8 +646,11 @@ the ones that do not.
   `UWB_AN_COUNT` last, so a half-synced registry never declares a
   window onto a half-written table.
 
-The reference is the tag currently sourcing the cell geometry (the same
-one the site `anchors` list renders from); pass `reference` (a system
+The default reference is chosen by MAJORITY VOTE over the live tags'
+geometries: the largest group of mutually consistent tags wins and the
+odd ones out are presumed wrong (the cell source only breaks ties — its
+identity is "last tag whose params synced", which must never silently
+promote a drifted tag to fleet-wide truth). Pass `reference` (a system
 id) to override it, or `cell` to pick among multiple cells. Optional
 members: `ids` (target system ids; default = every other live tag),
 `tolerance` (float comparison tolerance in the parameter's own unit,

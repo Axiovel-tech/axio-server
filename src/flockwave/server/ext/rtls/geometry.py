@@ -276,12 +276,73 @@ def _device_role(ext: "RtlsExtension", device) -> Optional[str]:
     return _cell_source_role(device, _decoded_device_params(device))
 
 
+def _majority_reference(
+    ext: "RtlsExtension", cell_source: int, tolerance: float
+) -> int:
+    """Picks the DEFAULT reference tag by majority vote over the live
+    tags' geometries: the largest group of mutually consistent tags wins,
+    and the odd ones out are presumed wrong. The cell source is only a
+    tie-breaker (its identity is "last tag whose params synced" — an
+    arbitrary choice that must never silently promote a drifted tag to
+    fleet-wide truth). Falls back to the cell source when no group is
+    strictly larger than the rest."""
+    protocol = ext._require_protocol()
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for system_id, device in sorted(protocol.devices.items()):
+        if _device_role(ext, device) != "tag":
+            continue
+        params = _decoded_device_params(device)
+        if not _geometry_knowable(device, params):
+            continue
+        subset, missing = extract_geometry(params)
+        if missing:
+            continue
+        candidates.append((system_id, subset))
+
+    groups: list[list[tuple[int, dict[str, Any]]]] = []
+    for system_id, subset in candidates:
+        for group in groups:
+            rep_subset = group[0][1]
+            g_missing, g_deltas = diff_geometry(
+                rep_subset, subset, tolerance=tolerance
+            )
+            if not g_missing and not g_deltas:
+                group.append((system_id, subset))
+                break
+        else:
+            groups.append([(system_id, subset)])
+
+    if not groups:
+        return cell_source
+    best_size = max(len(group) for group in groups)
+    best = [group for group in groups if len(group) == best_size]
+    if len(best) > 1:
+        # tied groups: prefer the one holding the cell source, else the
+        # one with the lowest system id, for determinism
+        best.sort(
+            key=lambda group: (
+                0 if any(sid == cell_source for sid, _ in group) else 1,
+                group[0][0],
+            )
+        )
+    group = best[0]
+    for system_id, _ in group:
+        if system_id == cell_source:
+            return system_id
+    return group[0][0]
+
+
 def _resolve_reference(
-    ext: "RtlsExtension", reference: Optional[int], cell: Optional[str]
+    ext: "RtlsExtension",
+    reference: Optional[int],
+    cell: Optional[str],
+    *,
+    tolerance: float = DEFAULT_FLOAT_TOLERANCE,
 ) -> tuple[Any, dict[str, Any], str]:
     """Resolves the reference tag whose geometry is the truth to compare
     and sync against: an explicit ``reference`` system id wins; otherwise
-    the tag currently sourcing the (single, or ``cell``-selected) cell.
+    the MAJORITY geometry among the live tags of the (single, or
+    ``cell``-selected) cell, with the cell source as tie-breaker.
 
     Returns ``(device, geometry_subset, cell_id)``; raises ValueError
     with a client-presentable reason when no complete reference exists."""
@@ -304,6 +365,7 @@ def _resolve_reference(
                 f"Multiple cells present ({', '.join(sorted(sources))}); "
                 "specify 'cell' or 'reference'"
             )
+        reference = _majority_reference(ext, reference, tolerance)
     device = protocol.devices.get(reference)
     if device is None:
         raise ValueError(f"No such device: {reference}")
@@ -359,7 +421,9 @@ async def run_check(
     """Diffs the geometry of the target tags against the reference tag;
     returns the X-RTLS-GEO ``check`` response body. Raises ValueError
     when no (complete) reference resolves."""
-    ref_device, ref_subset, cell_id = _resolve_reference(ext, reference, cell)
+    ref_device, ref_subset, cell_id = _resolve_reference(
+        ext, reference, cell, tolerance=tolerance
+    )
     protocol = ext._require_protocol()
 
     devices: dict[str, dict[str, Any]] = {}
@@ -631,7 +695,7 @@ async def run_sync(
     devices: dict[str, dict[str, Any]] = {}
     try:
         ref_device, ref_subset, cell_id = _resolve_reference(
-            ext, reference, cell
+            ext, reference, cell, tolerance=tolerance
         )
 
         async def run_one(system_id: int) -> None:
