@@ -231,6 +231,9 @@ class RtlsExtension(Extension):
         self._last_inf_broadcast: Optional[float] = None
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
+        #: test hook for the geometry-sync device reset; ``None`` means
+        #: "use the SMP os-reset" (see geometry._default_reset)
+        self._geo_reset = None
         #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
         #: anchor-beacon registration (config ``register_beacons: false`` or no
         #: beacon extension loaded)
@@ -434,6 +437,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
+                        "X-RTLS-GEO": self._handle_RTLS_GEO,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -1826,6 +1830,63 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
+    async def _handle_RTLS_GEO(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        # Lazy import: geometry.py imports helpers from this module, so
+        # importing it at module load would be a cycle.
+        from .geometry import DEFAULT_FLOAT_TOLERANCE, run_check, run_sync
+
+        body = message.body
+        op = body.get("op")
+        if op not in ("check", "sync"):
+            return hub.reject(
+                message,
+                reason=f"Invalid op: {op!r} (expected 'check' or 'sync')",
+            )
+        try:
+            reference = _get_optional_device_id(body, "reference")
+            ids = _get_optional_device_ids(body)
+            cell = body.get("cell")
+            if cell is not None and not isinstance(cell, str):
+                raise ValueError(f"Invalid cell: {cell!r}")
+            tolerance = body.get("tolerance", DEFAULT_FLOAT_TOLERANCE)
+            try:
+                tolerance = float(tolerance)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid tolerance: {tolerance!r}") from None
+            if not 0 <= tolerance <= 1:
+                raise ValueError("Tolerance must be between 0 and 1")
+            timeout = _get_timeout(message, DEFAULT_PARAM_TIMEOUT)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+
+        try:
+            if op == "check":
+                result = await run_check(
+                    self,
+                    reference=reference,
+                    cell=cell,
+                    ids=ids,
+                    tolerance=tolerance,
+                )
+            else:
+                result = await run_sync(
+                    self,
+                    reference=reference,
+                    cell=cell,
+                    ids=ids,
+                    tolerance=tolerance,
+                    reboot=bool(body.get("reboot", True)),
+                    timeout=timeout,
+                )
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+
+        return hub.create_response_or_notification(
+            body=result, in_response_to=message
+        )
+
     # ---- helpers / exports ----
 
     def _warn_no_app(self) -> None:
@@ -2473,6 +2534,43 @@ def _get_device_id(message: "FlockwaveMessage") -> int:
         return int(value)
     except (TypeError, ValueError):
         raise ValueError(f"Invalid device ID: {value!r}") from None
+
+
+def _get_optional_device_id(body: dict, key: str) -> Optional[int]:
+    """An optional device system id under ``key`` of a message body:
+    ``None`` when absent, the id as int otherwise (numeric strings are
+    accepted, like everywhere else in this API)."""
+    value = body.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is an int subclass: JSON `true` would otherwise pass as 1
+        raise ValueError(f"Invalid device ID in {key!r}: {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid device ID in {key!r}: {value!r}") from None
+
+
+def _get_optional_device_ids(body: dict) -> Optional[list[int]]:
+    """The optional ``ids`` list of a message body, validated like the
+    sleep handler validates its targets; ``None`` when absent."""
+    ids = body.get("ids")
+    if ids is None:
+        return None
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or len(ids) > 256
+        or not all(
+            # bool is an int subclass: JSON `true` would otherwise pass
+            # and target sysid 1
+            isinstance(i, int) and not isinstance(i, bool) and 1 <= i <= 255
+            for i in ids
+        )
+    ):
+        raise ValueError("Invalid device ids ('ids' must be a list of system ids)")
+    return ids
 
 
 def _get_param_name(message: "FlockwaveMessage") -> str:

@@ -3092,3 +3092,349 @@ async def test_inf_site_anchor_list_carries_ned(extension, device, builder, hub)
         "east": 10.0,
         "down": -4.8,
     }
+
+
+# ---- X-RTLS-GEO ---------------------------------------------------------
+
+
+def wire_devices(extension, *devices):
+    """Fake transport routing by address, for tests that talk to more
+    than one scripted device at once."""
+    table = {d.address: d for d in devices}
+
+    async def fake_send(payload, address):
+        target = table.get(tuple(address))
+        if target is None:
+            return
+        for reply in target.handle(payload):
+            await extension._process_datagram(
+                reply, target.address, time.monotonic()
+            )
+
+    extension._send = fake_send
+
+
+def make_second_tag(dialect, *, system_id=DEVICE_SYSID + 1):
+    second = FakeDevice(dialect, system_id=system_id)
+    second.address = ("192.168.4.%d" % (system_id % 250), 3333)
+    add_rtls_cell_params(second)
+    return second
+
+
+async def geo_message(extension, builder, hub, body):
+    message = make_message(builder, {"type": "X-RTLS-GEO", **body})
+    return await extension._handle_RTLS_GEO(message, None, hub)
+
+
+async def test_geo_check_consistent(extension, device, dialect, builder, hub):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+
+    body = response.body
+    assert body["type"] == "X-RTLS-GEO"
+    assert body["op"] == "check"
+    assert body["reference"] == DEVICE_SYSID
+    assert body["cell"] == "default"
+    assert body["consistent"] is True
+    assert body["devices"][str(DEVICE_SYSID + 1)] == {"status": "consistent"}
+
+
+async def test_geo_check_reports_deltas_and_missing(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")  # a moved anchor
+    # no POS_YAW_DEG on the second tag at all
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+
+    body = response.body
+    assert body["consistent"] is False
+    entry = body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "mismatch"
+    assert entry["deltas"]["UWB_AN1_X"] == {"expected": 10.0, "actual": 10.5}
+    assert entry["missing"] == ["POS_YAW_DEG"]
+
+
+async def test_geo_check_float_tolerance(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
+    second = make_second_tag(dialect)
+    # representation noise well under the default 1e-4 tolerance
+    set_fake_param(second, "POS_YAW_DEG", 90.00003, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+
+    assert response.body["consistent"] is True
+
+
+async def test_geo_check_incomplete_target(extension, device, builder, hub):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    # a cache-only tag whose snapshot never gained the origin params or
+    # the anchor table (the count itself matches, so nothing mismatches)
+    stub = add_anchor_device(extension, 77, role=1, uwb_mac=254)
+    set_cached_param(stub, "UWB_AN_COUNT", 2, "uint8")
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"]["77"]
+    assert entry["status"] == "incomplete"
+    assert "ORIGIN_LAT_E7" in entry["missing"]
+    assert response.body["consistent"] is False
+
+
+async def test_geo_check_without_any_reference_is_rejected(
+    extension, builder, hub
+):
+    response = await geo_message(extension, builder, hub, {"op": "check"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "reference" in response.body["reason"]
+
+
+async def test_geo_invalid_op_is_rejected(extension, builder, hub):
+    response = await geo_message(extension, builder, hub, {"op": "fit"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "op" in response.body["reason"]
+
+
+async def test_geo_non_tag_target_is_an_error_entry(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    add_anchor_device(extension, 90, role=2, uwb_mac=1)
+
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "check", "reference": DEVICE_SYSID, "ids": [90]},
+    )
+
+    entry = response.body["devices"]["90"]
+    assert entry["status"] == "error"
+    assert "Not a tag" in entry["detail"]
+
+
+async def test_geo_sync_writes_reboots_and_converges(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "POS_YAW_DEG", 0.0, "real32")
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    set_fake_param(second, "ORIGIN_ALT_MM", 20000, "int32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced"
+    assert entry["failures"] == {}
+    assert set(entry["written"]) == {"POS_YAW_DEG", "UWB_AN1_X", "ORIGIN_ALT_MM"}
+    assert "ORIGIN_LAT_E7" in entry["skipped"]
+    assert entry["rebooted"] is True
+    assert resets == [second.address[0]]
+
+    # the device-side wire store converged to the reference geometry
+    assert struct.unpack("<f", second.params["UWB_AN1_X"][0][:4])[0] == 10.0
+    assert struct.unpack("<i", second.params["ORIGIN_ALT_MM"][0][:4])[0] == 10000
+
+    check = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+    assert check.body["consistent"] is True
+
+
+async def test_geo_sync_count_is_written_last(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN_COUNT", 1, "uint8")
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    writes = []
+    original_handle = second.handle
+
+    def recording_handle(data):
+        for message in dialect.MAVLink(None).parse_buffer(bytes(data)) or []:
+            if message.get_type() == "PARAM_EXT_SET":
+                writes.append(message.param_id)
+        return original_handle(data)
+
+    second.handle = recording_handle
+    extension._geo_reset = lambda address: None
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced"
+    # a partially synced registry must never declare a window onto a
+    # half-written anchor table: the count trails every other write
+    assert writes[-1] == "UWB_AN_COUNT"
+    assert "UWB_AN1_X" in writes[:-1]
+
+
+async def test_geo_sync_rejected_write_means_partial_and_no_reboot(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    second.set_result = PARAM_ACK_FAILED
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "partial"
+    assert "UWB_AN1_X" in entry["failures"]
+    assert "rejected by device" in entry["failures"]["UWB_AN1_X"]
+    assert entry["rebooted"] is False
+    assert "writes failed" in entry["rebootDetail"]
+    assert resets == []
+
+
+async def test_geo_sync_no_changes_needed_skips_reboot(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced"
+    assert entry["written"] == []
+    assert entry["rebooted"] is False
+    assert "no changes" in entry["rebootDetail"]
+    assert resets == []
+
+
+async def test_geo_sync_reboot_false_skips_reset(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    resets = []
+    extension._geo_reset = resets.append
+
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "sync", "reference": DEVICE_SYSID, "reboot": False},
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "synced"
+    assert "rebooted" not in entry
+    assert resets == []
+
+
+async def test_geo_sync_timeout_aborts_that_device_only(
+    extension, device, dialect, builder, hub, autojump_clock
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
+    set_fake_param(third, "UWB_AN1_X", 11.5, "real32")
+    third.respond_to_set = False
+    wire_devices(extension, device, second, third)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await extension._process_datagram(
+        third.heartbeat(), third.address, time.monotonic()
+    )
+
+    extension._geo_reset = lambda address: None
+
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "sync", "reference": DEVICE_SYSID, "timeout": 1},
+    )
+
+    healthy = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert healthy["status"] == "synced"
+    silent = response.body["devices"][str(DEVICE_SYSID + 2)]
+    assert silent["status"] == "error"
+    assert "timeout" in silent["detail"]
