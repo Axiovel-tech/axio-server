@@ -888,6 +888,14 @@ class RtlsExtension(Extension):
         lock = self._param_write_locks.setdefault(key, trio.Lock())
         try:
             async with lock:
+                # re-resolve the device: while this write queued behind
+                # the lock, the device may have been lost and
+                # rediscovered under the same system id — mirroring the
+                # ack into the pre-lock object would leave the LIVE
+                # cache stale
+                device = protocol.devices.get(system_id)
+                if device is None:
+                    raise KeyError(system_id)
                 with self._subscribed_events() as events:
                     request = protocol.set_param(
                         system_id, name, encoded, param_type

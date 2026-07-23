@@ -617,12 +617,12 @@ async def run_sync(
     if ext._geo_sync_running:
         raise ValueError("A geometry sync is already in progress")
     ext._geo_sync_running = True
+    ref_device = None
+    devices: dict[str, dict[str, Any]] = {}
     try:
         ref_device, ref_subset, cell_id = _resolve_reference(
             ext, reference, cell
         )
-
-        devices: dict[str, dict[str, Any]] = {}
 
         async def run_one(system_id: int) -> None:
             devices[str(system_id)] = await _sync_one(
@@ -639,38 +639,44 @@ async def run_sync(
             for system_id in _target_ids(ext, ids, ref_device.system_id):
                 nursery.start_soon(run_one, system_id)
     finally:
+        # The healing below runs in the finally — synchronous code only,
+        # so it is cancellation-safe — because a cancelled or crashed
+        # sync must not leave the bookkeeping the pin deferred unhealed.
         ext._geo_sync_running = False
+        if ref_device is not None:
+            # While the latch was held, _sync_anchor_beacons refused to
+            # move the cell source off the reference — which also
+            # deferred legitimate bookkeeping (a target's CELL_ID
+            # re-home, cleanup after a source lost mid-sync). Heal all
+            # mappings, then re-assert the reference as the source — but
+            # only if it is still live: re-homing a cell onto a device
+            # that expired mid-sync would render its anchors from a
+            # stale object and break default-reference resolution.
+            ext._refresh_anchor_cells()
+            protocol = ext._require_protocol()
+            live_ref = protocol.devices.get(ref_device.system_id)
+            if live_ref is not None:
+                ext._sync_anchor_beacons(
+                    live_ref, _decoded_device_params(live_ref)
+                )
 
-    # While the latch was held, _sync_anchor_beacons refused to move the
-    # cell source off the reference — which also deferred legitimate
-    # bookkeeping (a target's CELL_ID re-home, cleanup after a source
-    # lost mid-sync). Heal all mappings now, then re-assert the
-    # reference as the source — but only if it is still live: re-homing
-    # a cell onto a device that expired mid-sync would render its
-    # anchors from a stale object and break the next default-reference
-    # resolution.
-    ext._refresh_anchor_cells()
-    protocol = ext._require_protocol()
-    live_ref = protocol.devices.get(ref_device.system_id)
-    if live_ref is not None:
-        ext._sync_anchor_beacons(live_ref, _decoded_device_params(live_ref))
-
-    # Quarantine: no cell — the reference's or any other — may stay
-    # sourced by a device this sync left with MIXED geometry (partial,
-    # or errored after accepted writes): as a cell source it would
-    # become that cell's rendered/default-reference truth. Re-home each
-    # such cell onto a clean tag, or drop the mapping so the next
-    # default-reference resolution fails loudly instead.
-    mixed = {
-        int(sid)
-        for sid, entry in devices.items()
-        if entry.get("status") == "partial"
-        or (entry.get("status") == "error" and entry.get("written"))
-    }
-    for mapped_cell in [
-        c for c, s in ext._anchor_cell_sources.items() if s in mixed
-    ]:
-        _rehome_cell_or_drop(ext, mapped_cell, exclude=mixed)
+            # Quarantine: no cell — the reference's or any other — may
+            # stay sourced by a device this sync left with MIXED
+            # geometry (partial, or errored after accepted writes): as a
+            # cell source it would become that cell's rendered/
+            # default-reference truth. Re-home each such cell onto a
+            # clean tag, or drop the mapping so the next default-
+            # reference resolution fails loudly instead.
+            mixed = {
+                int(sid)
+                for sid, entry in devices.items()
+                if entry.get("status") == "partial"
+                or (entry.get("status") == "error" and entry.get("written"))
+            }
+            for mapped_cell in [
+                c for c, s in ext._anchor_cell_sources.items() if s in mixed
+            ]:
+                _rehome_cell_or_drop(ext, mapped_cell, exclude=mixed)
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the

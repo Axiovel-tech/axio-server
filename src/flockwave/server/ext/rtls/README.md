@@ -730,8 +730,13 @@ close (acks carry no transaction id, and verify-then-reboot cannot be
 atomic): an ack straggling in more than `timeout` + 1 s late may be
 attributed to a subsequent write of the same parameter, and a
 parameter written by a third party in the instant between verification
-and reset is only caught by the next `check`. UIs should therefore
-re-run `check` after every sync — which also covers both windows.
+and reset is only caught by the next `check`. A device reported
+`partial`/`error` may hold mixed persistent geometry until a re-run
+converges it (its cells are re-homed away from it right after the
+sync, but it stays eligible again later). None of these windows is
+silent: the next `check` reports the fleet inconsistent. UIs should
+therefore re-run `check` after every sync, and re-run `sync` until
+every device reports `synced`.
 
 ### Notes for control-UI developers
 
