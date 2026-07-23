@@ -192,12 +192,18 @@ REFILL_READ_SPACING = 0.01
 REFILL_MAX_ANCHOR_TABLE = 16
 
 #: identity params a tag must carry for its cell geometry to render
-#: (see :func:`_has_cell_geometry`)
+#: (see :func:`_has_cell_geometry`) — plus the geometry-consistency
+#: params: X-RTLS-GEO refuses to trust a snapshot whose optional
+#: geometry params may be dump-loss holes, so the refill must repair
+#: those holes too. A name genuinely absent from an older registry
+#: costs the capped retry rounds and is then left alone.
 TAG_IDENTITY_PARAMS = (
     "ORIGIN_LAT_E7",
     "ORIGIN_LON_E7",
     "ORIGIN_ALT_MM",
     "UWB_AN_COUNT",
+    "POS_YAW_DEG",
+    "CELL_ID",
 )
 
 #: how long an accepted sleep/wake transaction's outcome overrides
@@ -2536,7 +2542,9 @@ def _missing_identity_param_names(
         # (and the MAC drives the beacon's live/active matching); a hole
         # there keeps the whole cell — hence the map beacons — unrendered
         missing.extend(
-            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC"))
+            _missing_anchor_table_names(
+                params, ("X", "Y", "Z", "MAC", "BIAS_M")
+            )
         )
         return missing
     if role is None and "UWB_ROLE" not in params:

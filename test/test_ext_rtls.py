@@ -738,8 +738,15 @@ async def test_refill_restores_tag_cell_and_beacons(extension, device):
         time.monotonic() + REFILL_INITIAL_DELAY + 1
     )
 
+    # CELL_ID and POS_YAW_DEG are geometry-consistency identity params
+    # now; this fake registry has neither, so the first round requests
+    # them (fruitlessly) too — and once the answered reads make the
+    # snapshot count-complete again, absence is authoritative and the
+    # refill entry is dropped as before
     assert sorted(device.read_requests) == [
+        "CELL_ID",
         "ORIGIN_LAT_E7",
+        "POS_YAW_DEG",
         "UWB_AN1_MAC",
         "UWB_AN1_X",
     ]
@@ -3943,3 +3950,27 @@ async def test_geo_default_reference_is_the_majority_geometry(
     assert body["consistent"] is False
     entry = body["devices"][str(DEVICE_SYSID + 2)]
     assert entry["status"] == "mismatch"
+
+
+async def test_refill_repairs_geometry_consistency_params(extension, device):
+    # a dump-loss hole in an OPTIONAL geometry param (POS_YAW_DEG, CELL_ID,
+    # a bias) kept X-RTLS-GEO reporting the tag 'incomplete' forever: the
+    # knowability gate refuses to trust the omission and the refill never
+    # repaired non-identity holes. These params are identity now.
+    add_rtls_cell_params(device)
+    set_fake_param(device, "POS_YAW_DEG", 30.0, "real32")
+    set_fake_param(device, "CELL_ID", "default", "custom")
+    device.drop_from_list = {"POS_YAW_DEG", "UWB_AN1_BIAS_M"}
+    await discover(extension, device)
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert "POS_YAW_DEG" not in cached.params
+
+    device.read_requests.clear()
+    await extension._poll_param_refill(
+        time.monotonic() + REFILL_INITIAL_DELAY + 1
+    )
+
+    assert sorted(device.read_requests) == ["POS_YAW_DEG", "UWB_AN1_BIAS_M"]
+    assert "POS_YAW_DEG" in cached.params
+    assert "UWB_AN1_BIAS_M" in cached.params
+    assert DEVICE_SYSID not in extension._refill
