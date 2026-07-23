@@ -3438,3 +3438,98 @@ async def test_geo_sync_timeout_aborts_that_device_only(
     silent = response.body["devices"][str(DEVICE_SYSID + 2)]
     assert silent["status"] == "error"
     assert "timeout" in silent["detail"]
+
+
+async def test_geo_concurrent_sync_is_refused(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    extension._geo_sync_running = True
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+    assert response.body["type"] == "ACK-NAK"
+    assert "in progress" in response.body["reason"]
+
+    # and the latch is released once a real sync finishes
+    extension._geo_sync_running = False
+    extension._geo_reset = lambda address: None
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+    assert response.body["type"] == "X-RTLS-GEO"
+    assert extension._geo_sync_running is False
+
+
+async def test_geo_incomplete_reference_snapshot_is_refused(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    # simulate a lossy dump: the registry claims more params than cached
+    extension._get_devices()[DEVICE_SYSID].param_count = 99
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+    assert response.body["type"] == "ACK-NAK"
+    assert "snapshot incomplete" in response.body["reason"]
+
+
+async def test_geo_incomplete_target_snapshot_is_flagged(
+    extension, device, builder, hub
+):
+    # a lossy-dump hole in an OPTIONAL param must not read as "consistent"
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    stub = add_anchor_device(extension, 78, role=1, uwb_mac=254)
+    stub.param_count = 99
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+    entry = response.body["devices"]["78"]
+    assert entry["status"] == "incomplete"
+    assert "snapshot incomplete" in entry["detail"]
+
+
+async def test_cell_id_change_rehomes_the_source(extension, device):
+    add_rtls_cell_params(device)
+    set_fake_param(device, "CELL_ID", "a", "custom")
+    await discover(extension, device)
+    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
+
+    await extension.set_param(DEVICE_SYSID, "CELL_ID", "b")
+
+    # the old cell id must not keep pointing at the re-homed device
+    # (it would render a phantom cell with the new cell's geometry)
+    assert extension._anchor_cell_sources == {"b": DEVICE_SYSID}
+
+
+async def test_geo_sync_reasserts_the_reference_as_cell_source(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    extension._geo_reset = lambda address: None
+    await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    # the target's accepted writes made IT the cell source mid-sync; the
+    # sync must hand the role back to the reference at the end
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID

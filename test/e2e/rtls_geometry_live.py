@@ -48,9 +48,10 @@ import trio
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from rtlslink import encode_param_value, param_type_from_name  # noqa: E402
+
 from flockwave.server.ext.rtls.extension import RtlsExtension  # noqa: E402
 from flockwave.server.ext.rtls.geometry import run_check, run_sync  # noqa: E402
-from rtlslink import encode_param_value, param_type_from_name  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("e2e")

@@ -214,6 +214,28 @@ def diff_geometry(
 # ---- reference / target resolution --------------------------------------
 
 
+def _snapshot_complete(device) -> bool:
+    """Whether the server-side param snapshot of a device is
+    count-complete. An INCOMPLETE snapshot cannot be trusted for
+    geometry comparisons: an optional parameter (``POS_YAW_DEG``,
+    ``CELL_ID``, biases) missing from it may be a lossy-dump hole rather
+    than genuinely absent from the registry — and the refill poller only
+    repairs identity params, so such a hole can persist. Treating the
+    omission as "not configured" would silently narrow the check and
+    report a false ``consistent``."""
+    return (
+        device.param_count is not None
+        and len(device.params) >= device.param_count
+    )
+
+
+def _snapshot_detail(device) -> str:
+    return (
+        f"parameter snapshot incomplete "
+        f"({len(device.params)}/{device.param_count or '?'} params known)"
+    )
+
+
 def _device_role(ext: "RtlsExtension", device) -> Optional[str]:
     """A device's role for targeting purposes: the (fresher) state
     advertisement wins, then the parameter registry -- including the
@@ -256,6 +278,11 @@ def _resolve_reference(
     device = protocol.devices.get(reference)
     if device is None:
         raise ValueError(f"No such device: {reference}")
+    if not _snapshot_complete(device):
+        raise ValueError(
+            f"Reference device {reference}: {_snapshot_detail(device)}; "
+            "retry once discovery/refill has finished"
+        )
     params = _decoded_device_params(device)
     subset, missing = extract_geometry(params)
     if missing:
@@ -312,6 +339,14 @@ async def run_check(
             devices[str(system_id)] = {
                 "status": "error",
                 "detail": f"Not a tag (role: {role or 'unknown'})",
+            }
+            continue
+        if not _snapshot_complete(device):
+            # an optional-param omission in a partial snapshot may be a
+            # lossy-dump hole; comparing would risk a false "consistent"
+            devices[str(system_id)] = {
+                "status": "incomplete",
+                "detail": _snapshot_detail(device),
             }
             continue
         subset, _ = extract_geometry(_decoded_device_params(device))
@@ -484,25 +519,42 @@ async def run_sync(
     per-parameter acks, one device's failure never cancels another),
     reboots the fully rewritten devices when ``reboot`` is set, and
     returns the X-RTLS-GEO ``sync`` response body. Raises ValueError
-    when no (complete) reference resolves."""
-    ref_device, ref_subset, cell_id = _resolve_reference(ext, reference, cell)
-
-    devices: dict[str, dict[str, Any]] = {}
-
-    async def run_one(system_id: int) -> None:
-        devices[str(system_id)] = await _sync_one(
-            ext,
-            ref_device,
-            ref_subset,
-            system_id,
-            tolerance=tolerance,
-            reboot=reboot,
-            timeout=timeout,
+    when no (complete) reference resolves, or when another sync is
+    already running (two interleaved syncs would race their PARAM_EXT
+    acks per device — matching is by device + name only — and could
+    reboot a device the other sync is still writing)."""
+    if ext._geo_sync_running:
+        raise ValueError("A geometry sync is already in progress")
+    ext._geo_sync_running = True
+    try:
+        ref_device, ref_subset, cell_id = _resolve_reference(
+            ext, reference, cell
         )
 
-    async with trio.open_nursery() as nursery:
-        for system_id in _target_ids(ext, ids, ref_device.system_id):
-            nursery.start_soon(run_one, system_id)
+        devices: dict[str, dict[str, Any]] = {}
+
+        async def run_one(system_id: int) -> None:
+            devices[str(system_id)] = await _sync_one(
+                ext,
+                ref_device,
+                ref_subset,
+                system_id,
+                tolerance=tolerance,
+                reboot=reboot,
+                timeout=timeout,
+            )
+
+        async with trio.open_nursery() as nursery:
+            for system_id in _target_ids(ext, ids, ref_device.system_id):
+                nursery.start_soon(run_one, system_id)
+    finally:
+        ext._geo_sync_running = False
+
+    # every accepted write re-ran the cell-source bookkeeping for its
+    # TARGET, so the last-synced tag ended up as the cell source — and
+    # after a partial sync that could make a mixed-geometry tag the
+    # DEFAULT reference of the next check/sync. Re-assert the reference.
+    ext._sync_anchor_beacons(ref_device, _decoded_device_params(ref_device))
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the

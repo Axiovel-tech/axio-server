@@ -234,6 +234,10 @@ class RtlsExtension(Extension):
         #: test hook for the geometry-sync device reset; ``None`` means
         #: "use the SMP os-reset" (see geometry._default_reset)
         self._geo_reset = None
+        #: True while an X-RTLS-GEO sync runs; a second concurrent sync
+        #: is refused (interleaved writes to the same device would race
+        #: their PARAM_EXT acks, which are matched by device + name only)
+        self._geo_sync_running = False
         #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
         #: anchor-beacon registration (config ``register_beacons: false`` or no
         #: beacon extension loaded)
@@ -2057,6 +2061,12 @@ class RtlsExtension(Extension):
             return
 
         self._anchor_cell_sources[cell.cell_id] = device.system_id
+        # a CELL_ID change re-homes the device: without this, the old
+        # cell id would keep pointing at it and render a phantom cell
+        # with the NEW cell's geometry
+        self._drop_stale_anchor_cells_for_source(
+            device.system_id, keep_cell_id=cell.cell_id
+        )
 
         if self._beacon_api is None:
             return
@@ -2092,6 +2102,24 @@ class RtlsExtension(Extension):
     def _drop_anchor_cells_for_source(self, system_id: int) -> None:
         for cell_id, source in list(self._anchor_cell_sources.items()):
             if source != system_id:
+                continue
+            replacement = self._find_anchor_cell_source(cell_id)
+            if replacement is None:
+                self._drop_anchor_cell(cell_id)
+            else:
+                device, params = replacement
+                self._sync_anchor_beacons(device, params)
+
+    def _drop_stale_anchor_cells_for_source(
+        self, system_id: int, *, keep_cell_id: str
+    ) -> None:
+        """Drops (or re-homes onto another live tag) every cell mapping
+        this device sources under a cell id OTHER than ``keep_cell_id``
+        — its current one. The recursion through ``_sync_anchor_beacons``
+        terminates: a replacement source found for a cell id advertises
+        exactly that cell id, so its own resync keeps it."""
+        for cell_id, source in list(self._anchor_cell_sources.items()):
+            if source != system_id or cell_id == keep_cell_id:
                 continue
             replacement = self._find_anchor_cell_source(cell_id)
             if replacement is None:
