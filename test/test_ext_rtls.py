@@ -3997,7 +3997,162 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     assert rule["status"] == "pass", rule
 
 
-# ---- X-RTLS-GEO capture / fit -------------------------------------------
+# ---- X-RTLS-GEO rolling-summary fit -------------------------------------
+
+
+def _setup_anchor_calibration_fleet(extension, device):
+    """Install one tag cell and the eight four-tripod anchor identities."""
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 8, "uint8")
+    positions = (
+        (0.0, 0.0, 0.0),
+        (20.0, 0.0, 0.0),
+        (0.0, 16.0, 0.0),
+        (20.0, 16.0, 0.0),
+        (0.0, 0.0, -2.5),
+        (20.0, 0.0, -2.5),
+        (0.0, 16.0, -2.5),
+        (20.0, 16.0, -2.5),
+    )
+    for index, position in enumerate(positions):
+        for axis, value in zip("XYZ", position, strict=True):
+            set_fake_param(device, f"UWB_AN{index}_{axis}", value, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", index + 1, "uint16")
+        set_fake_param(device, f"UWB_AN{index}_BIAS_M", 0.0, "real32")
+        add_anchor_device(
+            extension,
+            70 + index,
+            role=2 if index == 0 else 3,
+            uwb_mac=index + 1,
+        )
+    return positions
+
+
+def _rolling_summary(positions, *, sequence=1, count=80):
+    return {
+        "version": 1,
+        "sequence": sequence,
+        "validMask": 0xFE,
+        "timeBootMs": 1000 * sequence,
+        "ranges": [
+            {
+                "peerMac": index + 1,
+                "distanceM": sum(value * value for value in positions[index])
+                ** 0.5,
+                "madM": 0.005,
+                "count": count,
+            }
+            for index in range(1, 8)
+        ],
+    }
+
+
+async def _fit_after_summary(extension, builder, hub, body, summary):
+    """Start the request first, then emit a generation like the 1 Hz device."""
+    from flockwave.server.ext.rtls.fit import on_twr_summary
+
+    response = {}
+
+    async def request():
+        message = make_message(builder, {"type": "X-RTLS-GEO", **body})
+        response["value"] = await extension._handle_RTLS_GEO(message, None, hub)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(request)
+        await trio.testing.wait_all_tasks_blocked()
+        on_twr_summary(extension, 70, summary, time.monotonic())
+    return response["value"]
+
+
+async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
+    extension, device, builder, hub
+):
+    positions = _setup_anchor_calibration_fleet(extension, device)
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+
+    response = await _fit_after_summary(
+        extension,
+        builder,
+        hub,
+        {"op": "fit", "mode": "strict"},
+        _rolling_summary(positions),
+    )
+
+    body = response.body
+    assert body["selectedModel"] == "strict"
+    assert body["summary"]["sequence"] == 1
+    assert body["summary"]["validMask"] == 0xFE
+    assert body["strict"]["accepted"]
+    assert body["strict"]["parameters"]["lengthM"] == 20.0
+    assert body["applyGeometry"]["POS_YAW_DEG"] == 0.0
+    assert body["applyGeometry"]["UWB_AN0_X"] == 0.0
+    assert body["applyGeometry"]["UWB_AN7_Z"] == -2.5
+
+
+async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
+    extension, device, builder, hub
+):
+    from flockwave.server.ext.rtls.fit import on_twr_summary
+
+    positions = _setup_anchor_calibration_fleet(extension, device)
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+    strict = await _fit_after_summary(
+        extension,
+        builder,
+        hub,
+        {"op": "fit", "mode": "strict"},
+        _rolling_summary(positions, sequence=7),
+    )
+    assert strict.body["summary"]["sequence"] == 7
+
+    # New telemetry may arrive, but the opt-in refined fit compares the exact
+    # snapshot the operator reviewed.
+    on_twr_summary(
+        extension,
+        70,
+        _rolling_summary(positions, sequence=8),
+        time.monotonic(),
+    )
+    message = make_message(
+        builder,
+        {
+            "type": "X-RTLS-GEO",
+            "op": "fit",
+            "mode": "refined",
+            "summarySequence": 7,
+        },
+    )
+    response = await extension._handle_RTLS_GEO(message, None, hub)
+
+    assert response.body["summary"]["sequence"] == 7
+    assert response.body["refined"]["model"] == "refined"
+    assert response.body["selectedModel"] is None
+    assert response.body["comparison"]["meaningfulImprovement"] is False
+    assert response.body["applyGeometry"] is None
+
+
+async def test_geo_fit_rejects_a_low_quality_summary_actionably(
+    extension, device, builder, hub
+):
+    positions = _setup_anchor_calibration_fleet(extension, device)
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+
+    response = await _fit_after_summary(
+        extension,
+        builder,
+        hub,
+        {"op": "fit", "mode": "strict"},
+        _rolling_summary(positions, count=5),
+    )
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "insufficient samples" in response.body["reason"]
+
+
+# ---- superseded full-mesh capture tests ---------------------------------
 
 
 def _true_positions():

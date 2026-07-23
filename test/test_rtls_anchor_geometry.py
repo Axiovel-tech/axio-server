@@ -1,0 +1,107 @@
+"""Focused tests for the pure four-tripod fit models."""
+
+from math import cos, radians, sin
+
+from flockwave.server.ext.rtls.anchor_geometry import (
+    RangeObservation,
+    fit_refined,
+    fit_strict,
+)
+
+
+def _observations(positions, *, mad=0.008, count=80):
+    return [
+        RangeObservation(
+            anchor_index=index,
+            peer_mac=0x1000 + index,
+            distance_m=sum(value * value for value in positions[index]) ** 0.5,
+            mad_m=mad,
+            count=count,
+        )
+        for index in range(1, 8)
+    ]
+
+
+def _strict_positions(length=20.0, width=16.0, height=2.5):
+    return [
+        (0.0, 0.0, 0.0),
+        (length, 0.0, 0.0),
+        (0.0, width, 0.0),
+        (length, width, 0.0),
+        (0.0, 0.0, -height),
+        (length, 0.0, -height),
+        (0.0, width, -height),
+        (length, width, -height),
+    ]
+
+
+def _refined_positions(
+    bottom_length=20.0,
+    bottom_width=16.0,
+    top_length=20.2,
+    top_width=16.2,
+    height=2.5,
+    angle_deg=92.0,
+):
+    c, s = cos(radians(angle_deg)), sin(radians(angle_deg))
+    return [
+        (0.0, 0.0, 0.0),
+        (bottom_length, 0.0, 0.0),
+        (bottom_width * c, bottom_width * s, 0.0),
+        (bottom_length + bottom_width * c, bottom_width * s, 0.0),
+        (0.0, 0.0, -height),
+        (top_length, 0.0, -height),
+        (top_width * c, top_width * s, -height),
+        (top_length + top_width * c, top_width * s, -height),
+    ]
+
+
+def test_strict_fit_recovers_absolute_canonical_geometry():
+    result = fit_strict(_observations(_strict_positions()))
+
+    assert result.accepted
+    assert abs(result.parameters["lengthM"] - 20.0) < 1e-3
+    assert abs(result.parameters["widthM"] - 16.0) < 1e-3
+    assert abs(result.parameters["heightM"] - 2.5) < 1e-3
+    assert result.anchors[0] == {"index": 0, "x": 0.0, "y": 0.0, "z": 0.0}
+    assert result.anchors[7]["z"] == -2.5
+
+
+def test_refined_fit_explains_small_real_installation_deformation():
+    observations = _observations(_refined_positions(), mad=0.005)
+    strict = fit_strict(observations)
+    refined = fit_refined(observations, strict=strict)
+
+    assert refined.accepted, refined.reasons
+    assert refined.rms_m < strict.rms_m
+    assert abs(refined.parameters["topLengthM"] - 20.2) < 0.08
+    assert abs(refined.parameters["topWidthM"] - 16.2) < 0.08
+    assert abs(refined.parameters["angleDeg"] - 92.0) < 0.5
+    assert refined.anchors[0]["x"] == 0.0
+    assert refined.anchors[4]["x"] == 0.0
+
+
+def test_refined_fit_does_not_claim_an_unneeded_improvement():
+    observations = _observations(_strict_positions())
+    strict = fit_strict(observations)
+    refined = fit_refined(observations, strict=strict)
+
+    assert strict.accepted
+    assert not refined.accepted
+    assert "noise floor" in refined.reasons[0]
+
+
+def test_inconsistent_spoke_is_rejected_instead_of_hidden():
+    observations = _observations(_strict_positions())
+    observations[-1] = RangeObservation(
+        anchor_index=7,
+        peer_mac=observations[-1].peer_mac,
+        distance_m=observations[-1].distance_m + 1.0,
+        mad_m=0.005,
+        count=80,
+    )
+
+    result = fit_strict(observations)
+
+    assert not result.accepted
+    assert "worst spoke residual" in result.reasons[0]
