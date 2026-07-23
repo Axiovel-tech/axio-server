@@ -63,8 +63,8 @@ def test_strict_fit_recovers_absolute_canonical_geometry():
     assert abs(result.parameters["lengthM"] - 20.0) < 1e-3
     assert abs(result.parameters["widthM"] - 16.0) < 1e-3
     assert abs(result.parameters["heightM"] - 2.5) < 1e-3
-    assert result.anchors[0] == {"index": 0, "x": 0.0, "y": 0.0, "z": 0.0}
-    assert result.anchors[7]["z"] == -2.5
+    assert result.anchors[0] == {"index": 0, "xM": 0.0, "yM": 0.0, "zM": 0.0}
+    assert result.anchors[7]["zM"] == -2.5
 
 
 def test_refined_fit_explains_small_real_installation_deformation():
@@ -77,8 +77,8 @@ def test_refined_fit_explains_small_real_installation_deformation():
     assert abs(refined.parameters["topLengthM"] - 20.2) < 0.08
     assert abs(refined.parameters["topWidthM"] - 16.2) < 0.08
     assert abs(refined.parameters["angleDeg"] - 92.0) < 0.5
-    assert refined.anchors[0]["x"] == 0.0
-    assert refined.anchors[4]["x"] == 0.0
+    assert refined.anchors[0]["xM"] == 0.0
+    assert refined.anchors[4]["xM"] == 0.0
 
 
 def test_refined_fit_does_not_claim_an_unneeded_improvement():
@@ -105,3 +105,46 @@ def test_inconsistent_spoke_is_rejected_instead_of_hidden():
 
     assert not result.accepted
     assert "worst spoke residual" in result.reasons[0]
+
+
+def test_strict_fit_recovers_dimensions_through_noise_and_an_outlier():
+    """Deterministic per-spoke noise plus one biased spoke: the Huber loss
+    must keep the dimension estimates on the tape-measured truth."""
+    positions = _strict_positions()
+    noise = (0.012, -0.009, 0.011, -0.007, 0.008, -0.012, 0.010)
+    observations = [
+        RangeObservation(
+            anchor_index=index,
+            peer_mac=0x1000 + index,
+            distance_m=sum(v * v for v in positions[index]) ** 0.5
+            + noise[index - 1]
+            + (0.4 if index == 3 else 0.0),  # one multipath-biased spoke
+            mad_m=0.010 if index != 3 else 0.080,
+            count=80 if index != 3 else 25,
+        )
+        for index in range(1, 8)
+    ]
+
+    result = fit_strict(observations)
+
+    # the biased diagonal fails the residual gate, so the result is not
+    # offered for application -- but the estimate itself must stay sane
+    assert abs(result.parameters["lengthM"] - 20.0) < 0.05
+    assert abs(result.parameters["widthM"] - 16.0) < 0.05
+    assert abs(result.parameters["heightM"] - 2.5) < 0.05
+    assert not result.accepted
+    assert any("residual" in reason for reason in result.reasons)
+
+
+def test_excessive_deformation_is_rejected_not_hidden():
+    """A 6-degree corner skew is outside the refined model's safety bounds:
+    neither model may accept it, and the refined fit must not fabricate an
+    in-bounds explanation that passes the residual gate."""
+    observations = _observations(_refined_positions(angle_deg=96.0), mad=0.005)
+
+    strict = fit_strict(observations)
+    refined = fit_refined(observations, strict=strict)
+
+    assert not strict.accepted
+    assert not refined.accepted
+    assert abs(refined.parameters["angleDeg"] - 90.0) <= 5.0 + 1e-6

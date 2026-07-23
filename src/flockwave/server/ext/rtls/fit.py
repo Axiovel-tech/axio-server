@@ -31,6 +31,9 @@ SUMMARY_PROTOCOL_VERSION = 1
 SUMMARY_FRESHNESS_S = 2.5
 SUMMARY_WAIT_TIMEOUT_S = 3.0
 MIN_SAMPLES_PER_PAIR = 20
+#: UWB_ROLE wire value of the DL-TDoA / inter-anchor TWR initiator (A0);
+#: mirrors ``rtls_link::uwb::role_anchor_initiator`` in the firmware.
+ROLE_ANCHOR_INITIATOR = 2
 
 
 @dataclass(frozen=True)
@@ -147,7 +150,7 @@ def _find_a0(ext: "RtlsExtension", a0_mac: int) -> int:
             mac = int(params.get("UWB_MAC", -1))
         except (TypeError, ValueError):
             continue
-        if role == 2 and mac == a0_mac:
+        if role == ROLE_ANCHOR_INITIATOR and mac == a0_mac:
             candidates.append(system_id)
     if not candidates:
         raise ValueError(
@@ -264,9 +267,9 @@ def _apply_geometry(
     for anchor in anchors:
         index = anchor["index"]
         position = positions[index]
-        payload[f"UWB_AN{index}_X"] = position["x"]
-        payload[f"UWB_AN{index}_Y"] = position["y"]
-        payload[f"UWB_AN{index}_Z"] = position["z"]
+        payload[f"UWB_AN{index}_X"] = position["xM"]
+        payload[f"UWB_AN{index}_Y"] = position["yM"]
+        payload[f"UWB_AN{index}_Z"] = position["zM"]
         payload[f"UWB_AN{index}_MAC"] = anchor["mac"]
         bias_name = f"UWB_AN{index}_BIAS_M"
         if bias_name in reference:

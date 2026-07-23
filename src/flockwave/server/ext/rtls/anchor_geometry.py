@@ -250,9 +250,9 @@ def _finish(
     anchors = tuple(
         {
             "index": index,
-            "x": round(float(position[0]), 5),
-            "y": round(float(position[1]), 5),
-            "z": round(float(position[2]), 5),
+            "xM": round(float(position[0]), 5),
+            "yM": round(float(position[1]), 5),
+            "zM": round(float(position[2]), 5),
         }
         for index, position in enumerate(positions)
     )
@@ -401,9 +401,17 @@ def fit_refined(
             f"the {noise_floor:.3f} m measurement noise floor"
         )
 
+    # A parameter that reaches its safety bound means the installation
+    # deviates more than the refined model permits: the remaining degrees
+    # of freedom would silently absorb the excess, so this rejects instead
+    # of warning ("rejected instead of hidden" in the agreement).
     angle_deg = degrees(theta[5])
     if abs(abs(angle_deg - 90.0) - REFINED_ANGLE_LIMIT_DEG) < 0.25:
-        warnings.append("corner angle is close to its safety bound")
+        reasons.append(
+            f"corner angle {angle_deg:.2f}° reached the "
+            f"±{REFINED_ANGLE_LIMIT_DEG:.0f}° safety bound; the installation "
+            "deviates more than the refined model permits"
+        )
     for label, bottom, top in (
         ("length", theta[0], theta[2]),
         ("width", theta[1], theta[3]),
@@ -413,7 +421,10 @@ def fit_refined(
             REFINED_DIMENSION_DELTA_RATIO * bottom,
         )
         if abs(top - bottom) >= 0.9 * limit:
-            warnings.append(f"upper/lower {label} difference is close to its bound")
+            reasons.append(
+                f"upper/lower {label} difference {abs(top - bottom):.3f} m "
+                f"reached its {limit:.3f} m safety bound"
+            )
 
     return _finish(
         "refined",
