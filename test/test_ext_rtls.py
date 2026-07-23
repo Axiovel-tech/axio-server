@@ -4440,3 +4440,23 @@ async def test_geo_sync_incomplete_explicit_geometry_is_rejected(
     )
     assert response.body["type"] == "ACK-NAK"
     assert "incomplete" in response.body["reason"]
+
+
+async def test_geo_fit_returns_an_apply_ready_payload(
+    extension, device, dialect, builder, hub
+):
+    configured, truth = _setup_fit_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    _feed_capture(extension, truth)
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    payload = response.body["applyGeometry"]
+
+    # complete enough to feed straight back into op=sync
+    from flockwave.server.ext.rtls.geometry import extract_geometry
+
+    subset, missing = extract_geometry(payload)
+    assert missing == [], missing
+    assert payload["UWB_AN_COUNT"] == 4
+    assert payload["ORIGIN_LAT_E7"] == 413900000

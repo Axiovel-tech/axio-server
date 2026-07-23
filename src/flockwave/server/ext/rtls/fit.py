@@ -482,9 +482,34 @@ def run_fit(
             }
         )
 
+    # apply-ready payload: the reference's scalar params + the relaxed
+    # anchor table — exactly what the sync op's explicit `geometry`
+    # payload expects, so the client never assembles geometry itself
+    apply_geometry: dict[str, Any] = {
+        name: ref_subset[name]
+        for name in (
+            "ORIGIN_LAT_E7",
+            "ORIGIN_LON_E7",
+            "ORIGIN_ALT_MM",
+            "POS_YAW_DEG",
+            "CELL_ID",
+            "UWB_AN_COUNT",
+        )
+        if name in ref_subset
+    }
+    for i, a in enumerate(anchors):
+        apply_geometry[f"UWB_AN{a['index']}_X"] = round(float(relaxed[i, 0]), 4)
+        apply_geometry[f"UWB_AN{a['index']}_Y"] = round(float(relaxed[i, 1]), 4)
+        apply_geometry[f"UWB_AN{a['index']}_Z"] = round(float(relaxed[i, 2]), 4)
+        apply_geometry[f"UWB_AN{a['index']}_MAC"] = a["mac"]
+        bias = ref_subset.get(f"UWB_AN{a['index']}_BIAS_M")
+        if bias is not None:
+            apply_geometry[f"UWB_AN{a['index']}_BIAS_M"] = bias
+
     return {
         "type": "X-RTLS-GEO",
         "op": "fit",
+        "applyGeometry": apply_geometry,
         "cell": cell_id,
         "coverage": {
             "pairsMeasured": len(usable),
