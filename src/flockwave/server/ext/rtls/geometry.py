@@ -216,23 +216,51 @@ def diff_geometry(
 
 def _snapshot_complete(device) -> bool:
     """Whether the server-side param snapshot of a device is
-    count-complete. An INCOMPLETE snapshot cannot be trusted for
-    geometry comparisons: an optional parameter (``POS_YAW_DEG``,
-    ``CELL_ID``, biases) missing from it may be a lossy-dump hole rather
-    than genuinely absent from the registry — and the refill poller only
-    repairs identity params, so such a hole can persist. Treating the
-    omission as "not configured" would silently narrow the check and
-    report a false ``consistent``."""
+    count-complete."""
     return (
         device.param_count is not None
         and len(device.params) >= device.param_count
     )
 
 
+def _geometry_fully_present(params: Mapping[str, Any]) -> bool:
+    """Whether EVERY geometry parameter — required and optional alike —
+    is present in a snapshot, table included."""
+    if not all(name in params for name, _, _ in SCALAR_PARAMS):
+        return False
+    try:
+        count = int(params["UWB_AN_COUNT"])
+    except (TypeError, ValueError):
+        return False
+    if not 0 <= count <= MAX_ANCHORS:
+        return False
+    return all(
+        f"UWB_AN{index}_{suffix}" in params
+        for index in range(count)
+        for suffix, _, _ in ANCHOR_SUFFIXES
+    )
+
+
+def _geometry_knowable(device, params: Mapping[str, Any]) -> bool:
+    """Whether a device's geometry can be trusted from its snapshot.
+
+    A count-complete snapshot is authoritative: whatever is absent from
+    it is genuinely absent from the registry. An INCOMPLETE snapshot is
+    still usable when every geometry parameter — optional ones included
+    — happens to be present; but an optional name (``POS_YAW_DEG``,
+    ``CELL_ID``, biases) missing from a partial snapshot may be a
+    lossy-dump hole rather than genuinely absent, and the refill poller
+    only repairs identity params, so such a hole can persist. Treating
+    that omission as "not configured" would silently narrow the check
+    and report a false ``consistent`` — refuse instead."""
+    return _snapshot_complete(device) or _geometry_fully_present(params)
+
+
 def _snapshot_detail(device) -> str:
     return (
         f"parameter snapshot incomplete "
-        f"({len(device.params)}/{device.param_count or '?'} params known)"
+        f"({len(device.params)}/{device.param_count or '?'} params known) "
+        "and the geometry cannot be fully resolved from it"
     )
 
 
@@ -278,12 +306,12 @@ def _resolve_reference(
     device = protocol.devices.get(reference)
     if device is None:
         raise ValueError(f"No such device: {reference}")
-    if not _snapshot_complete(device):
+    params = _decoded_device_params(device)
+    if not _geometry_knowable(device, params):
         raise ValueError(
             f"Reference device {reference}: {_snapshot_detail(device)}; "
             "retry once discovery/refill has finished"
         )
-    params = _decoded_device_params(device)
     subset, missing = extract_geometry(params)
     if missing:
         raise ValueError(
@@ -341,7 +369,8 @@ async def run_check(
                 "detail": f"Not a tag (role: {role or 'unknown'})",
             }
             continue
-        if not _snapshot_complete(device):
+        params = _decoded_device_params(device)
+        if not _geometry_knowable(device, params):
             # an optional-param omission in a partial snapshot may be a
             # lossy-dump hole; comparing would risk a false "consistent"
             devices[str(system_id)] = {
@@ -349,7 +378,7 @@ async def run_check(
                 "detail": _snapshot_detail(device),
             }
             continue
-        subset, _ = extract_geometry(_decoded_device_params(device))
+        subset, _ = extract_geometry(params)
         missing, deltas = diff_geometry(ref_subset, subset, tolerance=tolerance)
         if deltas:
             status = "mismatch"
@@ -434,6 +463,17 @@ async def _sync_one(
             name, value, target_subset[name], tolerance
         ):
             skipped.append(name)
+            continue
+        if name == "UWB_AN_COUNT" and failures:
+            # the count trails every other write so that a partially
+            # synced registry never declares a window onto a mixed
+            # table — which means it must ALSO be withheld when any
+            # earlier write failed, or the next reboot would activate
+            # exactly that mixed window
+            failures[name] = (
+                "withheld: earlier writes failed (writing the count "
+                "would declare a window onto a mixed anchor table)"
+            )
             continue
         # the target's own cached type wins; a cache hole falls back to
         # the reference tag's type (same firmware family), so a lossy
@@ -550,11 +590,14 @@ async def run_sync(
     finally:
         ext._geo_sync_running = False
 
-    # every accepted write re-ran the cell-source bookkeeping for its
-    # TARGET, so the last-synced tag ended up as the cell source — and
-    # after a partial sync that could make a mixed-geometry tag the
-    # DEFAULT reference of the next check/sync. Re-assert the reference.
-    ext._sync_anchor_beacons(ref_device, _decoded_device_params(ref_device))
+    # While the latch was held, _sync_anchor_beacons refused to move the
+    # cell source off the reference; re-assert it now (belt and braces)
+    # — but only if the reference is still live: re-homing a cell onto a
+    # device that expired mid-sync would render its anchors from a stale
+    # object and break the next default-reference resolution.
+    live_ref = ext._require_protocol().devices.get(ref_device.system_id)
+    if live_ref is not None:
+        ext._sync_anchor_beacons(live_ref, _decoded_device_params(live_ref))
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the

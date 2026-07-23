@@ -3533,3 +3533,98 @@ async def test_geo_sync_reasserts_the_reference_as_cell_source(
     # the target's accepted writes made IT the cell source mid-sync; the
     # sync must hand the role back to the reference at the end
     assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
+
+
+async def test_geo_sync_withholds_count_after_failed_writes(
+    extension, device, dialect, builder, hub
+):
+    # ref count 2, target count 1: the count write is due — but earlier
+    # rejected table writes must withhold it, or the next reboot would
+    # activate a window onto a mixed anchor table
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN_COUNT", 1, "uint8")
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    second.set_result = PARAM_ACK_FAILED
+    writes = []
+    original_handle = second.handle
+
+    def recording_handle(data):
+        for message in dialect.MAVLink(None).parse_buffer(bytes(data)) or []:
+            if message.get_type() == "PARAM_EXT_SET":
+                writes.append(message.param_id)
+        return original_handle(data)
+
+    second.handle = recording_handle
+    extension._geo_reset = lambda address: None
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+    )
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "partial"
+    assert entry["failures"]["UWB_AN_COUNT"].startswith("withheld"), entry
+    assert "UWB_AN_COUNT" not in writes  # never even sent to the device
+
+
+async def test_geo_incomplete_snapshot_with_full_geometry_is_accepted(
+    extension, device, dialect, builder, hub
+):
+    # a lossy dump that only lost NON-geometry params must not block the
+    # check: with every geometry param (optional ones included) cached,
+    # the comparison is fully determined
+    add_rtls_cell_params(device)
+    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
+    set_fake_param(device, "CELL_ID", "default", "custom")
+    second = make_second_tag(dialect)
+    set_fake_param(second, "POS_YAW_DEG", 90.0, "real32")
+    set_fake_param(second, "CELL_ID", "default", "custom")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
+        extension._get_devices()[sysid].param_count = 99
+
+    response = await geo_message(
+        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+    )
+
+    assert response.body["type"] == "X-RTLS-GEO", response.body
+    assert response.body["consistent"] is True, response.body
+
+
+async def test_cell_source_pinned_while_sync_runs(extension, device, dialect):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    devices = extension._get_devices()
+    ref = devices[DEVICE_SYSID]
+    target = devices[DEVICE_SYSID + 1]
+    from flockwave.server.ext.rtls.extension import _decoded_device_params
+
+    extension._sync_anchor_beacons(ref, _decoded_device_params(ref))
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
+
+    # mid-sync, a target's accepted write must not steal the source
+    extension._geo_sync_running = True
+    extension._sync_anchor_beacons(target, _decoded_device_params(target))
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
+
+    # outside a sync the normal last-writer bookkeeping applies again
+    extension._geo_sync_running = False
+    extension._sync_anchor_beacons(target, _decoded_device_params(target))
+    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 1

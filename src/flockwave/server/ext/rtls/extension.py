@@ -235,9 +235,16 @@ class RtlsExtension(Extension):
         #: "use the SMP os-reset" (see geometry._default_reset)
         self._geo_reset = None
         #: True while an X-RTLS-GEO sync runs; a second concurrent sync
-        #: is refused (interleaved writes to the same device would race
-        #: their PARAM_EXT acks, which are matched by device + name only)
+        #: is refused, and the cell-source bookkeeping refuses to move
+        #: the source off the pinned reference while targets are being
+        #: rewritten (see :meth:`_sync_anchor_beacons`)
         self._geo_sync_running = False
+        #: per-(system id, name) write serialization: PARAM_EXT acks
+        #: carry no transaction id — they are matched by device + name
+        #: only — so two overlapping writes of the same parameter could
+        #: each consume the FIRST ack and both report the first write's
+        #: outcome as their own
+        self._param_write_locks: dict[tuple[int, str], trio.Lock] = {}
         #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
         #: anchor-beacon registration (config ``register_beacons: false`` or no
         #: beacon extension loaded)
@@ -849,40 +856,55 @@ class RtlsExtension(Extension):
             param_type = param_type_from_name(param_type)
 
         encoded = encode_param_value(value, param_type)
-        with self._subscribed_events() as events:
-            request = protocol.set_param(system_id, name, encoded, param_type)
-            if request is None:
-                raise KeyError(system_id)
-            await self._send(*request)
+        # Serialize writes of the same parameter of the same device:
+        # PARAM_EXT acks carry no transaction id, so two overlapping
+        # writes would each match the FIRST ack by (device, name) and
+        # both report the first write's outcome as their own. The lock
+        # spans send -> final ack, so the second write starts only after
+        # the first one's ack has been consumed.
+        lock = self._param_write_locks.setdefault(
+            (system_id, name), trio.Lock()
+        )
+        async with lock:
+            with self._subscribed_events() as events:
+                request = protocol.set_param(
+                    system_id, name, encoded, param_type
+                )
+                if request is None:
+                    raise KeyError(system_id)
+                await self._send(*request)
 
-            with trio.fail_after(timeout):
-                while True:
-                    event = await events.receive()
-                    if (
-                        event.kind != "param_ack"
-                        or event.system_id != system_id
-                        or event.data["name"] != name
-                    ):
-                        continue
-                    result = event.data["result"]
-                    if result == PARAM_ACK_IN_PROGRESS:
-                        continue  # final ack still to come
-                    if result == PARAM_ACK_ACCEPTED:
-                        # mirror the acknowledged value into the device cache so
-                        # the anchor display reflects the server's own push
-                        # without waiting for the device to re-advertise it
-                        device.params[name] = event.data["value"]
-                        device.param_types[name] = param_type
-                        self._sync_anchor_beacons(
-                            device, _decoded_device_params(device)
-                        )
-                        self._refresh_anchor_cells()
-                    return {
-                        "value": decode_param_value(event.data["value"], param_type),
-                        "type": param_type_to_name(param_type),
-                        "result": result,
-                        "accepted": result == PARAM_ACK_ACCEPTED,
-                    }
+                with trio.fail_after(timeout):
+                    while True:
+                        event = await events.receive()
+                        if (
+                            event.kind != "param_ack"
+                            or event.system_id != system_id
+                            or event.data["name"] != name
+                        ):
+                            continue
+                        result = event.data["result"]
+                        if result == PARAM_ACK_IN_PROGRESS:
+                            continue  # final ack still to come
+                        if result == PARAM_ACK_ACCEPTED:
+                            # mirror the acknowledged value into the device
+                            # cache so the anchor display reflects the
+                            # server's own push without waiting for the
+                            # device to re-advertise it
+                            device.params[name] = event.data["value"]
+                            device.param_types[name] = param_type
+                            self._sync_anchor_beacons(
+                                device, _decoded_device_params(device)
+                            )
+                            self._refresh_anchor_cells()
+                        return {
+                            "value": decode_param_value(
+                                event.data["value"], param_type
+                            ),
+                            "type": param_type_to_name(param_type),
+                            "result": result,
+                            "accepted": result == PARAM_ACK_ACCEPTED,
+                        }
 
     async def set_sleep(
         self,
@@ -2059,6 +2081,15 @@ class RtlsExtension(Extension):
             cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
         except (KeyError, TypeError, ValueError):
             return
+
+        if self._geo_sync_running:
+            # a geometry sync is rewriting TARGET tags: their accepted
+            # writes must not steal the cell source (or the beacon
+            # rendering) from the pinned reference mid-sync — a partially
+            # rewritten tag holds a mixed geometry
+            current = self._anchor_cell_sources.get(cell.cell_id)
+            if current is not None and current != device.system_id:
+                return
 
         self._anchor_cell_sources[cell.cell_id] = device.system_id
         # a CELL_ID change re-homes the device: without this, the old
