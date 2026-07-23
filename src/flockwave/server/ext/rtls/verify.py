@@ -29,6 +29,7 @@ isolation — one unreachable drone never fails the whole run.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
@@ -53,6 +54,11 @@ VC_YAW_PARAM = "EK3_SRC_VC_YAW"
 #: solve-quality thresholds of the uwb rule
 MIN_SOLVE_PCT = 80.0
 MAX_FIX_AGE_MS = 5000
+
+#: a stats snapshot older than this many seconds is STALE: the stream
+#: went silent (even if heartbeats continue) and the tag cannot be
+#: certified as solving on it
+STATS_FRESH_S = 10.0
 
 #: cross-drone consistency set of the in-depth pass. Values are compared
 #: with a small relative tolerance; every difference is a WARNING, never
@@ -124,6 +130,19 @@ async def _read_uav_param(
 def _values_agree(values: list[float]) -> bool:
     lo, hi = min(values), max(values)
     return hi - lo <= PARAM_RELATIVE_TOLERANCE * max(1.0, abs(hi), abs(lo))
+
+
+def _angles_agree(values: list[float]) -> bool:
+    """Wrapped-angle agreement: 0 and 360 are the same yaw (ArduPilot
+    applies wrap_360 to the virtual-compass yaw)."""
+    if len(values) < 2:
+        return True
+    reference = values[0] % 360.0
+    for value in values[1:]:
+        diff = abs((value % 360.0) - reference)
+        if min(diff, 360.0 - diff) > 1e-6 * 360.0:
+            return False
+    return True
 
 
 def _geometry_rule(geometry: Optional[dict[str, Any]], error: str) -> dict:
@@ -317,7 +336,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
     vc_values = [
         entry["vcYaw"] for entry in per_drone.values() if "vcYaw" in entry
     ]
-    if len(vc_values) > 1 and not _values_agree(vc_values):
+    if len(vc_values) > 1 and not _angles_agree(vc_values):
         problems.append(
             f"{VC_YAW_PARAM} differs across the fleet "
             f"({min(vc_values):g} .. {max(vc_values):g})"
@@ -350,6 +369,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
 
 def _uwb_rule(ext: "RtlsExtension") -> dict[str, Any]:
     protocol = ext._require_protocol()
+    now = time.monotonic()
     errors: list[str] = []
     warnings: list[str] = []
     for system_id, device in sorted(protocol.devices.items()):
@@ -360,6 +380,13 @@ def _uwb_rule(ext: "RtlsExtension") -> dict[str, Any]:
         stats = ext._stats.get(system_id)
         if not stats:
             errors.append(f"tag {system_id}: no telemetry")
+            continue
+        stats_age = now - ext._stats_at.get(system_id, float("-inf"))
+        if stats_age > STATS_FRESH_S:
+            errors.append(
+                f"tag {system_id}: telemetry went silent "
+                f"({stats_age:.0f} s ago)"
+            )
             continue
         if float(stats.get("solveRateHz", 0.0)) <= 0.0:
             errors.append(f"tag {system_id}: not solving")

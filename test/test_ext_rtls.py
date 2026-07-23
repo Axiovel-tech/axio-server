@@ -4085,6 +4085,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "anchorMask": 0b1111,
             "clockSyncOk": True,
         }
+        extension._stats_at[sysid] = time.monotonic()
     return second
 
 
@@ -4207,3 +4208,45 @@ async def test_verify_concurrent_run_is_refused(
     response = await verify_message(extension, builder, hub)
     assert response.body["type"] == "ACK-NAK"
     assert "in progress" in response.body["reason"]
+
+
+async def test_verify_flags_silent_telemetry_as_stale(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    now = time.monotonic()
+    extension._stats_at[DEVICE_SYSID] = now
+    extension._stats_at[DEVICE_SYSID + 1] = now - 60  # stream went silent
+
+    response = await verify_message(extension, builder, hub)
+
+    rule = next(r for r in response.body["rules"] if r["id"] == "uwb")
+    assert rule["status"] == "fail"
+    assert "silent" in rule["detail"]
+
+
+async def test_verify_vc_yaw_is_a_wrapped_angle(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    now = time.monotonic()
+    extension._stats_at[DEVICE_SYSID] = now
+    extension._stats_at[DEVICE_SYSID + 1] = now
+    # 0 and 360 are the same yaw: must NOT fail the fleet
+    extension.app.find_uav_by_id = lambda uav_id: {
+        "05": StubUAV({"EK3_SRC1_YAW": 9.0, "EK3_SRC_VC_YAW": 0.0}),
+        "06": StubUAV({"EK3_SRC1_YAW": 9.0, "EK3_SRC_VC_YAW": 360.0}),
+    }.get(uav_id)
+
+    response = await verify_message(extension, builder, hub)
+
+    rule = next(r for r in response.body["rules"] if r["id"] == "yaw-source")
+    assert rule["status"] == "pass", rule

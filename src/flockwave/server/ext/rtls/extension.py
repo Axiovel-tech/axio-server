@@ -229,6 +229,10 @@ class RtlsExtension(Extension):
         self._ota_jobs: dict[int, dict[str, Any]] = {}
         #: latest health-telemetry snapshot per device (server body shape)
         self._stats: dict[int, dict[str, Any]] = {}
+        #: feed-clock harvest time of each stats snapshot: consumers that
+        #: judge "is this tag healthy NOW" (fleet verify) must not trust
+        #: an indefinitely cached snapshot from a stream that went silent
+        self._stats_at: dict[int, float] = {}
         #: monotonic timestamp of the last stats broadcast per device, for
         #: the broadcast throttle
         self._last_stats_broadcast: dict[int, float] = {}
@@ -1183,6 +1187,7 @@ class RtlsExtension(Extension):
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
+        self._stats_at[system_id] = now
         # the show-clock pin rides the same stats feed: fresh cluster time
         # (clkok) mints/verifies the pin and unpinned devices get a push
         if self._show_clock is not None and self._nursery is not None:
@@ -1370,6 +1375,7 @@ class RtlsExtension(Extension):
     def _prune_stats(self, system_id: int) -> None:
         """Drop all cached stats state for a device (e.g. on ``lost``)."""
         self._stats.pop(system_id, None)
+        self._stats_at.pop(system_id, None)
         self._last_stats_broadcast.pop(system_id, None)
         self._last_stats_sent.pop(system_id, None)
 
