@@ -71,6 +71,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   `X-RTLS-GEO` check/sync operations (see below).
 - `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
   below).
+- `fit.py` — TWR capture + the rectangular geometry fit behind the
+  `X-RTLS-GEO` capture/fit ops (see below).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
   NED table, NED->global) for SDK pins that predate them; the
   `rtlslink` implementations are used when present.
@@ -742,6 +744,42 @@ sync, but it stays eligible again later). None of these windows is
 silent: the next `check` reports the fleet inconsistent. UIs should
 therefore re-run `check` after every sync, and re-run `sync` until
 every device reports `synced`.
+
+### X-RTLS-GEO capture / fit — measure the anchors' true geometry
+
+Tripods go up in roughly the surveyed spots; "roughly" is centimeters
+of error the UWB solver bakes into every position. The anchors range
+each other continuously (TWR), so the standing geometry is measurable:
+
+- `{"op": "capture", "duration": 20}` (re)starts a TWR collection
+  window (seconds, max 120); `{"op": "capture-status"}` reports
+  progress (pairs heard, per-pair sample counts);
+- `{"op": "fit", "margin": 0.1}` aggregates the window (median + MAD
+  outlier rejection per pair) and solves against the cell's RECTANGULAR
+  shape prior — the plan-view rectangle with one or two height layers
+  derived from the configured layout. Two solutions come back:
+
+  - `rigid`: the best geometry keeping the assumed shape (width,
+    length, layer heights, upper-layer offset optimized);
+  - `relaxed`: every anchor freed inside ±`margin` (max 0.5 m) around
+    the rigid solution, regularized toward it.
+
+  `moves` (relaxed − configured, per anchor) reads two ways: how far to
+  physically move each tripod, or — applied as-is — the best geometry
+  achievable without touching anything. `residuals` carries the
+  per-pair measured/predicted/residual table and `coverage` the pair
+  matrix (a fit is NAKed below minimal coverage). Distances constrain
+  only the shape, so the result is aligned back onto the configured
+  layout (plan-view Kabsch + mean height): the operator's frame stays
+  put.
+
+To APPLY a fit result, pass its geometry to the sync op as an explicit
+payload — it is validated and written to EVERY tag (the former
+reference included), with the same verified-write/reboot semantics:
+
+```json
+{"type": "X-RTLS-GEO", "op": "sync", "geometry": {"ORIGIN_LAT_E7": 413900000, "...": "..."}, "reboot": true}
+```
 
 ### X-RTLS-VERIFY — fleet pre-flight verification
 

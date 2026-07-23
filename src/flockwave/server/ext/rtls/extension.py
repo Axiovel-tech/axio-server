@@ -261,6 +261,9 @@ class RtlsExtension(Extension):
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
         self._verify_running = False
+        #: running TWR capture window for the geometry fit (see fit.py);
+        #: ``None`` when no capture is active
+        self._geo_capture: Optional[dict[str, Any]] = None
         #: per-(system id, name) write serialization: PARAM_EXT acks
         #: carry no transaction id — they are matched by device + name
         #: only — so two overlapping writes of the same parameter could
@@ -700,6 +703,14 @@ class RtlsExtension(Extension):
             float(distance_m),
             now,
         )
+        if self._geo_capture is not None:
+            # feed the running geometry-fit capture window (lazy import:
+            # fit.py imports helpers from this module)
+            from .fit import on_twr_sample
+
+            on_twr_sample(
+                self, system_id, int(peer_mac), float(distance_m), now
+            )
 
     async def _track_sleeping(
         self, system_id: int, sleeping: Optional[bool], now: float
@@ -1935,10 +1946,40 @@ class RtlsExtension(Extension):
 
         body = message.body
         op = body.get("op")
+        if op in ("capture", "capture-status", "fit"):
+            from .fit import run_capture, run_capture_status, run_fit
+
+            try:
+                if op == "capture":
+                    duration = body.get("duration", 20.0)
+                    try:
+                        duration = float(duration)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Invalid duration: {duration!r}"
+                        ) from None
+                    result = run_capture(self, duration, time.monotonic())
+                elif op == "capture-status":
+                    result = run_capture_status(self, time.monotonic())
+                else:
+                    margin = body.get("margin", 0.1)
+                    try:
+                        margin = float(margin)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            f"Invalid margin: {margin!r}"
+                        ) from None
+                    result = run_fit(self, margin=margin)
+            except ValueError as ex:
+                return hub.reject(message, reason=str(ex))
+            return hub.create_response_or_notification(
+                body=result, in_response_to=message
+            )
         if op not in ("check", "sync"):
             return hub.reject(
                 message,
-                reason=f"Invalid op: {op!r} (expected 'check' or 'sync')",
+                reason=f"Invalid op: {op!r} (expected 'check', 'sync', "
+                "'capture', 'capture-status' or 'fit')",
             )
         try:
             reference = _get_optional_device_id(body, "reference")
@@ -1967,11 +2008,19 @@ class RtlsExtension(Extension):
                     tolerance=tolerance,
                 )
             else:
+                geometry = body.get("geometry")
+                if geometry is not None and not isinstance(geometry, dict):
+                    return hub.reject(
+                        message,
+                        reason="'geometry' must be an object of "
+                        "parameter name -> value",
+                    )
                 result = await run_sync(
                     self,
                     reference=reference,
                     cell=cell,
                     ids=ids,
+                    geometry=geometry,
                     tolerance=tolerance,
                     reboot=bool(body.get("reboot", True)),
                     timeout=timeout,

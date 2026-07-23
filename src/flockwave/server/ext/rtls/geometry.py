@@ -683,6 +683,7 @@ async def run_sync(
     reference: Optional[int] = None,
     cell: Optional[str] = None,
     ids: Optional[list[int]] = None,
+    geometry: Optional[Mapping[str, Any]] = None,
     tolerance: float = DEFAULT_FLOAT_TOLERANCE,
     reboot: bool = True,
     timeout: float = DEFAULT_PARAM_TIMEOUT,
@@ -690,20 +691,44 @@ async def run_sync(
     """Writes the reference tag's geometry to the target tags (verified
     per-parameter acks, one device's failure never cancels another),
     reboots the fully rewritten devices when ``reboot`` is set, and
-    returns the X-RTLS-GEO ``sync`` response body. Raises ValueError
-    when no (complete) reference resolves, or when another sync is
-    already running (two interleaved syncs would race their PARAM_EXT
-    acks per device — matching is by device + name only — and could
-    reboot a device the other sync is still writing)."""
+    returns the X-RTLS-GEO ``sync`` response body.
+
+    With an explicit ``geometry`` payload (the apply path of the fit),
+    that geometry — not a reference tag's — is written to EVERY target
+    tag, the former reference included.
+
+    Raises ValueError when no (complete) reference resolves, the
+    explicit geometry is incomplete, or another sync is already running
+    (two interleaved syncs would race their PARAM_EXT acks per device —
+    matching is by device + name only — and could reboot a device the
+    other sync is still writing)."""
     if ext._geo_sync_running:
         raise ValueError("A geometry sync is already in progress")
     ext._geo_sync_running = True
     ref_device = None
     devices: dict[str, dict[str, Any]] = {}
     try:
-        ref_device, ref_subset, cell_id = _resolve_reference(
-            ext, reference, cell, tolerance=tolerance
-        )
+        if geometry is not None:
+            # the fit's apply path: validate the payload as a geometry
+            # subset; a reference tag is still resolved, but ONLY as the
+            # param-type fallback for cache holes — its geometry is not
+            # the truth here and it is a sync TARGET like everyone else
+            ref_subset, payload_missing = extract_geometry(geometry)
+            if payload_missing:
+                raise ValueError(
+                    "explicit geometry payload is incomplete (missing "
+                    + ", ".join(payload_missing)
+                    + ")"
+                )
+            ref_device, _, cell_id = _resolve_reference(
+                ext, reference, cell, tolerance=tolerance
+            )
+            exclude_id = -1  # nobody is exempt: every tag gets the payload
+        else:
+            ref_device, ref_subset, cell_id = _resolve_reference(
+                ext, reference, cell, tolerance=tolerance
+            )
+            exclude_id = ref_device.system_id
 
         async def run_one(system_id: int) -> None:
             # pessimistic placeholder: if this worker is CANCELLED
@@ -726,7 +751,7 @@ async def run_sync(
             )
 
         async with trio.open_nursery() as nursery:
-            for system_id in _target_ids(ext, ids, ref_device.system_id):
+            for system_id in _target_ids(ext, ids, exclude_id):
                 nursery.start_soon(run_one, system_id)
     finally:
         # The healing below runs in the finally — synchronous code only,
@@ -776,7 +801,8 @@ async def run_sync(
     return {
         "type": "X-RTLS-GEO",
         "op": "sync",
-        "reference": ref_device.system_id,
+        # with an explicit payload no tag was the truth; reference is null
+        "reference": None if geometry is not None else ref_device.system_id,
         "cell": cell_id,
         "devices": devices,
     }

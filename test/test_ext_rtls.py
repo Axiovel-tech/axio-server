@@ -3229,7 +3229,7 @@ async def test_geo_check_without_any_reference_is_rejected(
 
 
 async def test_geo_invalid_op_is_rejected(extension, builder, hub):
-    response = await geo_message(extension, builder, hub, {"op": "fit"})
+    response = await geo_message(extension, builder, hub, {"op": "explode"})
     assert response.body["type"] == "ACK-NAK"
     assert "op" in response.body["reason"]
 
@@ -4250,3 +4250,193 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
 
     rule = next(r for r in response.body["rules"] if r["id"] == "yaw-source")
     assert rule["status"] == "pass", rule
+
+
+# ---- X-RTLS-GEO capture / fit -------------------------------------------
+
+
+def _true_positions():
+    """Ground-truth anchor positions of the fit tests: a 20 x 16 m
+    rectangle with two height layers — and anchor MAC 2 standing 0.18 m
+    off its configured spot along +x."""
+    configured = {
+        1: (-10.0, -8.0, 0.0),
+        2: (10.0, -8.0, 0.0),
+        3: (10.0, 8.0, -2.5),
+        4: (-10.0, 8.0, -2.5),
+    }
+    truth = dict(configured)
+    truth[2] = (10.18, -8.0, 0.0)
+    return configured, truth
+
+
+def _feed_capture(extension, truth, *, noise=0.0, rounds=8):
+    """Feeds pairwise TWR samples derived from the ground-truth positions
+    into the running capture window (deterministic pseudo-noise)."""
+    from flockwave.server.ext.rtls.fit import on_twr_sample
+
+    sysid_of_mac = {1: 71, 2: 72, 3: 73, 4: 74}
+    macs = sorted(truth)
+    k = 0
+    for _round in range(rounds):
+        for i, mac_a in enumerate(macs):
+            for mac_b in macs[i + 1 :]:
+                ax, ay, az = truth[mac_a]
+                bx, by, bz = truth[mac_b]
+                d = ((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2) ** 0.5
+                jitter = noise * (((k * 2654435761) % 1000) / 1000 - 0.5) * 2
+                k += 1
+                on_twr_sample(
+                    extension, sysid_of_mac[mac_a], mac_b, d + jitter, 0.0
+                )
+
+
+def _setup_fit_fleet(extension, device, dialect):
+    """One wire tag carrying the configured cell + four cache-only anchor
+    devices (so the capture can map sysid -> UWB_MAC)."""
+    configured, truth = _true_positions()
+    add_rtls_cell_params(device)
+    # replace the stock 2-anchor cell with the 4-anchor test cell
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, mac in enumerate(sorted(configured)):
+        x, y, z = configured[mac]
+        set_fake_param(device, f"UWB_AN{index}_X", x, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Y", y, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Z", z, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", mac, "uint16")
+        set_fake_param(device, f"UWB_AN{index}_BIAS_M", 0.0, "real32")
+    for index, mac in enumerate(sorted(configured)):
+        add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
+    return configured, truth
+
+
+async def geo_fit_message(extension, builder, hub, body):
+    message = make_message(builder, {"type": "X-RTLS-GEO", **body})
+    return await extension._handle_RTLS_GEO(message, None, hub)
+
+
+async def test_geo_capture_and_fit_recovers_a_moved_anchor(
+    extension, device, dialect, builder, hub
+):
+    configured, truth = _setup_fit_fleet(extension, device, dialect)
+    await discover(extension, device)
+
+    response = await geo_fit_message(
+        extension, builder, hub, {"op": "capture", "duration": 30}
+    )
+    assert response.body["op"] == "capture-status"
+    assert response.body["running"] is True
+
+    _feed_capture(extension, truth, noise=0.02)
+
+    status = await geo_fit_message(extension, builder, hub, {"op": "capture-status"})
+    assert status.body["pairs"] == 6
+    assert status.body["samplesPerPairMin"] >= 8
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    body = response.body
+    assert body["op"] == "fit"
+    assert body["coverage"]["pairsMeasured"] == 6
+    assert body["coverage"]["missingPairs"] == []
+
+    # the relaxed fit localizes the moved anchor: MAC 2 moved ~0.18 m,
+    # the others stayed within a few centimeters
+    moves = {m["mac"]: m for m in body["moves"]}
+    assert moves[2]["distM"] > 0.10, moves
+    assert moves[2]["distM"] < 0.30, moves
+    for mac in (1, 3, 4):
+        assert moves[mac]["distM"] < 0.08, moves
+    # and the fit explains the measurements well
+    assert body["relaxed"]["rmsM"] < 0.05, body["relaxed"]
+
+
+async def test_geo_fit_without_capture_is_rejected(
+    extension, device, dialect, builder, hub
+):
+    _setup_fit_fleet(extension, device, dialect)
+    await discover(extension, device)
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "capture" in response.body["reason"]
+
+
+async def test_geo_fit_reports_missing_coverage(
+    extension, device, dialect, builder, hub
+):
+    configured, truth = _setup_fit_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    # only anchor 71 (MAC 1) reports ranges: 3 of 6 pairs
+    from flockwave.server.ext.rtls.fit import on_twr_sample
+
+    for mac_b in (2, 3, 4):
+        ax, ay, az = truth[1]
+        bx, by, bz = truth[mac_b]
+        d = ((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2) ** 0.5
+        for _ in range(5):
+            on_twr_sample(extension, 71, mac_b, d, 0.0)
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "coverage" in response.body["reason"]
+
+
+async def test_geo_sync_explicit_geometry_targets_every_tag(
+    extension, device, dialect, builder, hub
+):
+    # the fit's apply path: an explicit geometry payload is written to
+    # EVERY tag — the former reference included
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    payload = {
+        "ORIGIN_LAT_E7": 413900000,
+        "ORIGIN_LON_E7": 21500000,
+        "ORIGIN_ALT_MM": 10000,
+        "UWB_AN_COUNT": 2,
+        "UWB_AN0_X": -10.05,
+        "UWB_AN0_Y": -10.0,
+        "UWB_AN0_Z": 0.0,
+        "UWB_AN0_MAC": 1,
+        "UWB_AN1_X": 10.07,
+        "UWB_AN1_Y": 10.0,
+        "UWB_AN1_Z": -4.8,
+        "UWB_AN1_MAC": 2,
+    }
+    extension._geo_reset = lambda address: None
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "sync", "geometry": payload, "reboot": False},
+    )
+
+    body = response.body
+    assert body["reference"] is None
+    assert set(body["devices"]) == {str(DEVICE_SYSID), str(DEVICE_SYSID + 1)}
+    for entry in body["devices"].values():
+        assert entry["status"] == "synced", entry
+        assert "UWB_AN0_X" in entry["written"], entry
+    assert struct.unpack("<f", device.params["UWB_AN0_X"][0][:4])[0] == (
+        struct.unpack("<f", struct.pack("<f", -10.05))[0]
+    )
+
+
+async def test_geo_sync_incomplete_explicit_geometry_is_rejected(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    response = await geo_message(
+        extension,
+        builder,
+        hub,
+        {"op": "sync", "geometry": {"UWB_AN_COUNT": 2}},
+    )
+    assert response.body["type"] == "ACK-NAK"
+    assert "incomplete" in response.body["reason"]
