@@ -215,48 +215,78 @@ class _ShapeModel:
         plan = np.array([[a["x"], a["y"]] for a in anchors], dtype=float)
         self.plan_centroid = plan.mean(axis=0)
         centered = plan - self.plan_centroid
-        # principal axes of the plan view: the rectangle's own frame
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        self.axes = vt  # rows: principal directions
-        local = centered @ self.axes.T
-        u0, u1 = local[:, 0].min(), local[:, 0].max()
-        v0, v1 = local[:, 1].min(), local[:, 1].max()
-        if u1 - u0 < 0.5 or v1 - v0 < 0.5:
-            raise ValueError(
-                "configured anchor layout is not a rectangle (plan-view "
-                "extent below 0.5 m)"
-            )
 
         zs = [a["z"] for a in anchors]
         z_sorted = sorted(zs)
         self.two_layers = (z_sorted[-1] - z_sorted[0]) > LAYER_SPLIT_M
         z_mid = (z_sorted[0] + z_sorted[-1]) / 2.0
+        layers = [
+            1 if self.two_layers and a["z"] > z_mid else 0 for a in anchors
+        ]
 
-        self.assignment: list[tuple[int, int, int]] = []
-        corners_used: set[tuple[int, int, int]] = set()
-        for i, anchor in enumerate(anchors):
-            u = 0 if abs(local[i, 0] - u0) < abs(local[i, 0] - u1) else 1
-            v = 0 if abs(local[i, 1] - v0) < abs(local[i, 1] - v1) else 1
-            layer = 1 if self.two_layers and anchor["z"] > z_mid else 0
-            key = (u, v, layer)
-            if key in corners_used:
-                raise ValueError(
-                    "configured anchor layout does not resolve to distinct "
-                    "rectangle corners (two anchors share corner "
-                    f"u={u}, v={v}, layer={layer}) — the rectangular shape "
-                    "prior cannot describe this site"
-                )
-            corners_used.add(key)
-            self.assignment.append(key)
+        # principal axes of the plan view give the rectangle's own frame —
+        # but a SQUARE layout is PCA-degenerate: any tiny asymmetry (e.g.
+        # a small upper-layer offset) can steer the axes 45° off and
+        # collapse the corner assignment. Try the PCA axes plus their
+        # ±45° rotations and keep the valid assignment that the anchors
+        # fit best.
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        base = float(np.arctan2(vt[0, 1], vt[0, 0]))
+        best = None
+        for delta in (0.0, np.pi / 4, -np.pi / 4):
+            angle = base + delta
+            axes = np.array(
+                [
+                    [np.cos(angle), np.sin(angle)],
+                    [-np.sin(angle), np.cos(angle)],
+                ]
+            )
+            candidate = self._attempt_assignment(centered, layers, axes)
+            if candidate is not None and (
+                best is None or candidate[0] < best[0]
+            ):
+                best = candidate
+        if best is None:
+            raise ValueError(
+                "configured anchor layout does not resolve to distinct "
+                "rectangle corners — the rectangular shape prior cannot "
+                "describe this site"
+            )
+        _, self.axes, self.assignment, extent_u, extent_v = best
 
         #: per-anchor configured heights: kept as the base, so deliberate
         #: intra-layer height differences survive the fit
         self.base_z = np.array(zs, dtype=float)
-        theta = [u1 - u0, v1 - v0]
+        theta = [extent_u, extent_v]
         if self.two_layers:
             theta.append(0.0)  # change of the upper layer's separation
             theta.extend([0.0, 0.0])  # upper-layer plan offset ox, oy
         self.theta0 = np.array(theta, dtype=float)
+
+    @staticmethod
+    def _attempt_assignment(centered, layers, axes):
+        """Tries one candidate frame; returns ``(fit_error, axes,
+        assignment, extent_u, extent_v)`` or ``None`` when the anchors do
+        not resolve to distinct rectangle corners in it."""
+        local = centered @ axes.T
+        u0, u1 = local[:, 0].min(), local[:, 0].max()
+        v0, v1 = local[:, 1].min(), local[:, 1].max()
+        if u1 - u0 < 0.5 or v1 - v0 < 0.5:
+            return None
+        assignment = []
+        corners_used = set()
+        error = 0.0
+        for i, layer in enumerate(layers):
+            u = 0 if abs(local[i, 0] - u0) < abs(local[i, 0] - u1) else 1
+            v = 0 if abs(local[i, 1] - v0) < abs(local[i, 1] - v1) else 1
+            key = (u, v, layer)
+            if key in corners_used:
+                return None
+            corners_used.add(key)
+            assignment.append(key)
+            corner = np.array([u1 if u else u0, v1 if v else v0])
+            error += float(np.sum((local[i] - corner) ** 2))
+        return (error, axes, assignment, u1 - u0, v1 - v0)
 
     def positions(self, theta: np.ndarray) -> np.ndarray:
         width, length = theta[0], theta[1]

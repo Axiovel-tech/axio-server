@@ -4573,3 +4573,35 @@ async def test_geo_sync_out_of_range_payload_value_fails_cleanly(
     entry = response.body["devices"][str(DEVICE_SYSID)]
     assert entry["status"] == "partial", entry
     assert "ORIGIN_LAT_E7" in entry["failures"], entry
+
+
+async def test_geo_fit_handles_a_square_two_layer_site(
+    extension, device, dialect, builder, hub
+):
+    # a perfectly SQUARE plan view is PCA-degenerate: a small diagonal
+    # upper-layer offset used to steer the principal axes 45 deg off and
+    # collapse the corner assignment into a NAK for a valid layout
+    configured = {
+        1: (-10.0, -10.0, 0.0),
+        2: (10.0, -10.0, 0.0),
+        3: (10.07, 10.07, -2.5),
+        4: (-9.93, 10.07, -2.5),
+    }
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, mac in enumerate(sorted(configured)):
+        x, y, z = configured[mac]
+        set_fake_param(device, f"UWB_AN{index}_X", x, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Y", y, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Z", z, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", mac, "uint16")
+    for index, mac in enumerate(sorted(configured)):
+        add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
+    await discover(extension, device)
+
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    _feed_capture(extension, configured)
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    assert response.body["type"] == "X-RTLS-GEO", response.body
+    assert response.body["relaxed"]["rmsM"] < 0.02, response.body["relaxed"]
