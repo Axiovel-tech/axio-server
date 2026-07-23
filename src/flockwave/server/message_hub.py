@@ -12,12 +12,13 @@ from inspect import isawaitable
 from itertools import chain
 from logging import Logger
 from time import monotonic
-from typing import Any, Generic, TypeVar, overload
+from typing import Any, ClassVar, Generic, TypeVar, overload
 
 from flockwave.concurrency import AsyncBundler
 from flockwave.connections import ConnectionState
 from trio import (
     BrokenResourceError,
+    CapacityLimiter,
     ClosedResourceError,
     Event,
     MemoryReceiveChannel,
@@ -774,24 +775,39 @@ class MessageHub:
             body["reason"] = reason
         return self._message_builder.create_response_to(message, body)
 
+    #: Maximum number of in-flight message-sending tasks. The pump below must
+    #: stop draining the queue when a slow client suspends this many sends;
+    #: only a full queue makes ``enqueue_broadcast_message()`` drop excess
+    #: telemetry instead of the hub accumulating suspended tasks without
+    #: bound (observed as multi-GiB growth under a backlogged GUI client).
+    MAX_CONCURRENT_SENDS: ClassVar[int] = 32
+
     async def run(self) -> None:
         """Runs the message hub in an infinite loop. This method should be
         launched in a Trio nursery.
         """
+        limiter = CapacityLimiter(self.MAX_CONCURRENT_SENDS)
         async with open_nursery() as nursery, self._queue_rx:
             async for request in self._queue_rx:
-                if request.to:
-                    nursery.start_soon(
-                        self._send_message,
-                        request.message,
-                        request.to,
-                        request.in_response_to,
-                        request.notify_sent,
-                    )
-                else:
-                    nursery.start_soon(
-                        self._broadcast_message, request.message, request.notify_sent
-                    )
+                token = object()
+                await limiter.acquire_on_behalf_of(token)
+                nursery.start_soon(self._process_request, request, limiter, token)
+
+    async def _process_request(
+        self, request: Request, limiter: CapacityLimiter, token: object
+    ) -> None:
+        try:
+            if request.to:
+                await self._send_message(
+                    request.message,
+                    request.to,
+                    request.in_response_to,
+                    request.notify_sent,
+                )
+            else:
+                await self._broadcast_message(request.message, request.notify_sent)
+        finally:
+            limiter.release_on_behalf_of(token)
 
     async def send_message(
         self,
