@@ -17,7 +17,10 @@ so the geometry that the anchors actually stand in is measurable:
      layer heights, upper-layer offset), yielding the best geometry
      that keeps the assumed shape;
   2. the RELAXED fit frees every anchor coordinate inside a small box
-     around the rigid solution, regularized toward it.
+     around the CONFIGURED position, regularized toward it — "the
+     smallest deviation from the survey that explains the ranges", so
+     one moved tripod cannot smear phantom suggestions onto its
+     neighbors through the shape parameters.
 
   One solve, two readings: ``relaxed - rigid`` per anchor is the "move
   this tripod" suggestion; the relaxed positions are the best geometry
@@ -42,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import numpy as np
 
 from .extension import _decoded_device_params
-from .geometry import _resolve_reference
+from .geometry import get_canonical
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -68,10 +71,10 @@ MAD_K = 3.0
 RELAX_MARGIN_DEFAULT_M = 0.10
 RELAX_MARGIN_MAX_M = 0.50
 
-#: regularization weight pulling relaxed coordinates toward the rigid
-#: shape (in residual units per meter of deviation): small enough that a
-#: real measurement wins, large enough that unconstrained directions
-#: (e.g. a poorly-covered anchor) stay put
+#: regularization weight pulling relaxed coordinates toward the
+#: CONFIGURED survey (in residual units per meter of deviation): small
+#: enough that a real measurement wins, large enough that unconstrained
+#: directions (e.g. a poorly-covered anchor) stay put
 RELAX_REGULARIZATION = 0.05
 
 #: two anchors are on the same layer when their configured heights are
@@ -402,7 +405,7 @@ def run_fit(
             "(and check that the anchors hear each other)"
         )
 
-    _, ref_subset, cell_id = _resolve_reference(ext, None, None)
+    ref_subset, cell_id = get_canonical(ext, None)
     count = int(ref_subset["UWB_AN_COUNT"])
     anchors = []
     for index in range(count):
@@ -454,7 +457,11 @@ def run_fit(
     rigid_r = _pair_residuals(rigid_aligned, index_of_mac, usable)
     rigid_rms = float(np.sqrt(np.mean(rigid_r**2))) if rigid_r.size else 0.0
 
-    flat0 = rigid_aligned.reshape(-1)
+    # box + regularization around the CONFIGURED survey, not the rigid
+    # solution: the rigid shape absorbs part of a single moved anchor
+    # into its parameters, and boxing around it would smear that anchor's
+    # offset onto its (actually unmoved) neighbors as phantom suggestions
+    flat0 = configured.reshape(-1)
     lower = flat0 - margin
     upper = flat0 + margin
 

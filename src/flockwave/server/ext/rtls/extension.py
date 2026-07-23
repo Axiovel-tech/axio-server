@@ -264,6 +264,11 @@ class RtlsExtension(Extension):
         #: running TWR capture window for the geometry fit (see fit.py);
         #: ``None`` when no capture is active
         self._geo_capture: Optional[dict[str, Any]] = None
+        #: lazily loaded canonical-geometry store (see geometry.py);
+        #: ``None`` = not loaded yet
+        self._geo_canonical: Optional[dict[str, Any]] = None
+        #: test seam: overrides the canonical store's file path
+        self._geo_store_path = None
         #: per-(system id, name) write serialization: PARAM_EXT acks
         #: carry no transaction id — they are matched by device + name
         #: only — so two overlapping writes of the same parameter could
@@ -1942,7 +1947,12 @@ class RtlsExtension(Extension):
     ):
         # Lazy import: geometry.py imports helpers from this module, so
         # importing it at module load would be a cycle.
-        from .geometry import DEFAULT_FLOAT_TOLERANCE, run_check, run_sync
+        from .geometry import (
+            DEFAULT_FLOAT_TOLERANCE,
+            run_adopt,
+            run_check,
+            run_sync,
+        )
 
         body = message.body
         op = body.get("op")
@@ -1975,11 +1985,11 @@ class RtlsExtension(Extension):
             return hub.create_response_or_notification(
                 body=result, in_response_to=message
             )
-        if op not in ("check", "sync"):
+        if op not in ("adopt", "check", "sync"):
             return hub.reject(
                 message,
-                reason=f"Invalid op: {op!r} (expected 'check', 'sync', "
-                "'capture', 'capture-status' or 'fit')",
+                reason=f"Invalid op: {op!r} (expected 'adopt', 'check', "
+                "'sync', 'capture', 'capture-status' or 'fit')",
             )
         try:
             reference = _get_optional_device_id(body, "reference")
@@ -1999,13 +2009,13 @@ class RtlsExtension(Extension):
             return hub.reject(message, reason=str(ex))
 
         try:
-            if op == "check":
+            if op == "adopt":
+                result = await run_adopt(
+                    self, reference=reference, tolerance=tolerance
+                )
+            elif op == "check":
                 result = await run_check(
-                    self,
-                    reference=reference,
-                    cell=cell,
-                    ids=ids,
-                    tolerance=tolerance,
+                    self, cell=cell, ids=ids, tolerance=tolerance
                 )
             else:
                 geometry = body.get("geometry")
@@ -2017,7 +2027,6 @@ class RtlsExtension(Extension):
                     )
                 result = await run_sync(
                     self,
-                    reference=reference,
                     cell=cell,
                     ids=ids,
                     geometry=geometry,
@@ -2215,23 +2224,6 @@ class RtlsExtension(Extension):
             cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
         except (KeyError, TypeError, ValueError):
             return
-
-        if self._geo_sync_running:
-            # a geometry sync is rewriting TARGET tags: their accepted
-            # writes must not steal the cell source (or the beacon
-            # rendering) from the pinned reference mid-sync — a partially
-            # rewritten tag holds a mixed geometry. The pin only holds
-            # while the pinned source is LIVE: refusing a re-home off a
-            # device that expired mid-sync would leave the cell mapped
-            # to a ghost.
-            current = self._anchor_cell_sources.get(cell.cell_id)
-            if (
-                current is not None
-                and current != device.system_id
-                and self._protocol is not None
-                and current in self._protocol.devices
-            ):
-                return
 
         self._anchor_cell_sources[cell.cell_id] = device.system_id
         # a CELL_ID change re-homes the device: without this, the old

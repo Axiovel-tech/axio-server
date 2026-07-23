@@ -3133,6 +3133,16 @@ async def geo_message(extension, builder, hub, body):
     return await extension._handle_RTLS_GEO(message, None, hub)
 
 
+async def adopt_from(extension, builder, hub, sysid=DEVICE_SYSID):
+    """Adopts a tag's geometry as the canonical one (the bootstrap step
+    of the server-owned-truth model)."""
+    response = await geo_message(
+        extension, builder, hub, {"op": "adopt", "reference": sysid}
+    )
+    assert response.body["type"] == "X-RTLS-GEO", response.body
+    return response
+
+
 async def test_geo_check_consistent(extension, device, dialect, builder, hub):
     add_rtls_cell_params(device)
     second = make_second_tag(dialect)
@@ -3141,17 +3151,19 @@ async def test_geo_check_consistent(extension, device, dialect, builder, hub):
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
 
     body = response.body
     assert body["type"] == "X-RTLS-GEO"
     assert body["op"] == "check"
-    assert body["reference"] == DEVICE_SYSID
     assert body["cell"] == "default"
     assert body["consistent"] is True
+    # EVERY tag is a target now, the adopted one included
+    assert body["devices"][str(DEVICE_SYSID)] == {"status": "consistent"}
     assert body["devices"][str(DEVICE_SYSID + 1)] == {"status": "consistent"}
 
 
@@ -3168,9 +3180,10 @@ async def test_geo_check_reports_deltas_and_missing(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
 
     body = response.body
@@ -3194,9 +3207,10 @@ async def test_geo_check_float_tolerance(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
 
     assert response.body["consistent"] is True
@@ -3205,13 +3219,14 @@ async def test_geo_check_float_tolerance(
 async def test_geo_check_incomplete_target(extension, device, builder, hub):
     add_rtls_cell_params(device)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
     # a cache-only tag whose snapshot never gained the origin params or
     # the anchor table (the count itself matches, so nothing mismatches)
     stub = add_anchor_device(extension, 77, role=1, uwb_mac=254)
     set_cached_param(stub, "UWB_AN_COUNT", 2, "uint8")
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
 
     entry = response.body["devices"]["77"]
@@ -3220,12 +3235,12 @@ async def test_geo_check_incomplete_target(extension, device, builder, hub):
     assert response.body["consistent"] is False
 
 
-async def test_geo_check_without_any_reference_is_rejected(
+async def test_geo_check_without_canonical_geometry_is_rejected(
     extension, builder, hub
 ):
     response = await geo_message(extension, builder, hub, {"op": "check"})
     assert response.body["type"] == "ACK-NAK"
-    assert "reference" in response.body["reason"]
+    assert "canonical" in response.body["reason"]
 
 
 async def test_geo_invalid_op_is_rejected(extension, builder, hub):
@@ -3239,13 +3254,14 @@ async def test_geo_non_tag_target_is_an_error_entry(
 ):
     add_rtls_cell_params(device)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
     add_anchor_device(extension, 90, role=2, uwb_mac=1)
 
     response = await geo_message(
         extension,
         builder,
         hub,
-        {"op": "check", "reference": DEVICE_SYSID, "ids": [90]},
+        {"op": "check", "ids": [90]},
     )
 
     entry = response.body["devices"]["90"]
@@ -3267,12 +3283,13 @@ async def test_geo_sync_writes_reboots_and_converges(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     resets = []
     extension._geo_reset = resets.append
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3288,7 +3305,7 @@ async def test_geo_sync_writes_reboots_and_converges(
     assert struct.unpack("<i", second.params["ORIGIN_ALT_MM"][0][:4])[0] == 10000
 
     check = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
     assert check.body["consistent"] is True
 
@@ -3305,6 +3322,7 @@ async def test_geo_sync_count_is_written_last(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     writes = []
     original_handle = second.handle
@@ -3319,7 +3337,7 @@ async def test_geo_sync_count_is_written_last(
     extension._geo_reset = lambda address: None
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3341,13 +3359,14 @@ async def test_geo_sync_rejected_write_means_partial_and_no_reboot(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     second.set_result = PARAM_ACK_FAILED
     resets = []
     extension._geo_reset = resets.append
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3369,12 +3388,13 @@ async def test_geo_sync_no_changes_needed_skips_reboot(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     resets = []
     extension._geo_reset = resets.append
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3396,6 +3416,7 @@ async def test_geo_sync_reboot_false_skips_reset(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     resets = []
     extension._geo_reset = resets.append
@@ -3404,7 +3425,7 @@ async def test_geo_sync_reboot_false_skips_reset(
         extension,
         builder,
         hub,
-        {"op": "sync", "reference": DEVICE_SYSID, "reboot": False},
+        {"op": "sync", "reboot": False},
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3427,6 +3448,7 @@ async def test_geo_sync_timeout_aborts_that_device_only(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     await extension._process_datagram(
         third.heartbeat(), third.address, time.monotonic()
     )
@@ -3437,7 +3459,7 @@ async def test_geo_sync_timeout_aborts_that_device_only(
         extension,
         builder,
         hub,
-        {"op": "sync", "reference": DEVICE_SYSID, "timeout": 1},
+        {"op": "sync", "timeout": 1},
     )
 
     healthy = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3457,10 +3479,11 @@ async def test_geo_concurrent_sync_is_refused(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     extension._geo_sync_running = True
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
     assert response.body["type"] == "ACK-NAK"
     assert "in progress" in response.body["reason"]
@@ -3469,13 +3492,13 @@ async def test_geo_concurrent_sync_is_refused(
     extension._geo_sync_running = False
     extension._geo_reset = lambda address: None
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
     assert response.body["type"] == "X-RTLS-GEO"
     assert extension._geo_sync_running is False
 
 
-async def test_geo_incomplete_reference_snapshot_is_refused(
+async def test_geo_adopt_refuses_an_incomplete_snapshot(
     extension, device, builder, hub
 ):
     add_rtls_cell_params(device)
@@ -3484,7 +3507,7 @@ async def test_geo_incomplete_reference_snapshot_is_refused(
     extension._get_devices()[DEVICE_SYSID].param_count = 99
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "adopt", "reference": DEVICE_SYSID}
     )
     assert response.body["type"] == "ACK-NAK"
     assert "snapshot incomplete" in response.body["reason"]
@@ -3496,11 +3519,12 @@ async def test_geo_incomplete_target_snapshot_is_flagged(
     # a lossy-dump hole in an OPTIONAL param must not read as "consistent"
     add_rtls_cell_params(device)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
     stub = add_anchor_device(extension, 78, role=1, uwb_mac=254)
     stub.param_count = 99
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
     entry = response.body["devices"]["78"]
     assert entry["status"] == "incomplete"
@@ -3520,28 +3544,6 @@ async def test_cell_id_change_rehomes_the_source(extension, device):
     assert extension._anchor_cell_sources == {"b": DEVICE_SYSID}
 
 
-async def test_geo_sync_reasserts_the_reference_as_cell_source(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    extension._geo_reset = lambda address: None
-    await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
-    )
-
-    # the target's accepted writes made IT the cell source mid-sync; the
-    # sync must hand the role back to the reference at the end
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
-
-
 async def test_geo_sync_withholds_count_after_failed_writes(
     extension, device, dialect, builder, hub
 ):
@@ -3557,6 +3559,7 @@ async def test_geo_sync_withholds_count_after_failed_writes(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     second.set_result = PARAM_ACK_FAILED
     writes = []
@@ -3572,7 +3575,7 @@ async def test_geo_sync_withholds_count_after_failed_writes(
     extension._geo_reset = lambda address: None
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3598,43 +3601,16 @@ async def test_geo_incomplete_snapshot_with_full_geometry_is_accepted(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
         extension._get_devices()[sysid].param_count = 99
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "check"}
     )
 
     assert response.body["type"] == "X-RTLS-GEO", response.body
     assert response.body["consistent"] is True, response.body
-
-
-async def test_cell_source_pinned_while_sync_runs(extension, device, dialect):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    devices = extension._get_devices()
-    ref = devices[DEVICE_SYSID]
-    target = devices[DEVICE_SYSID + 1]
-    from flockwave.server.ext.rtls.extension import _decoded_device_params
-
-    extension._sync_anchor_beacons(ref, _decoded_device_params(ref))
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
-
-    # mid-sync, a target's accepted write must not steal the source
-    extension._geo_sync_running = True
-    extension._sync_anchor_beacons(target, _decoded_device_params(target))
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
-
-    # outside a sync the normal last-writer bookkeeping applies again
-    extension._geo_sync_running = False
-    extension._sync_anchor_beacons(target, _decoded_device_params(target))
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 1
 
 
 async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
@@ -3649,33 +3625,6 @@ async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
     assert extension._param_write_locks == {}
 
 
-async def test_cell_source_pin_yields_when_pinned_source_dies(
-    extension, device, dialect
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    devices = extension._get_devices()
-    ref = devices[DEVICE_SYSID]
-    target = devices[DEVICE_SYSID + 1]
-    from flockwave.server.ext.rtls.extension import _decoded_device_params
-
-    extension._sync_anchor_beacons(ref, _decoded_device_params(ref))
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
-
-    # the pinned source expires mid-sync: the pin must yield, or the
-    # cell would stay mapped to a ghost device
-    extension._geo_sync_running = True
-    del extension._protocol.devices[DEVICE_SYSID]
-    extension._sync_anchor_beacons(target, _decoded_device_params(target))
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 1
-
-
 async def test_geo_sync_detects_concurrent_drift(
     extension, device, dialect, builder, hub
 ):
@@ -3687,6 +3636,7 @@ async def test_geo_sync_detects_concurrent_drift(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     # a concurrent writer changes an ALREADY-SYNCED param mid-sync: the
     # device pushes a param_value for UWB_AN0_X (written earlier in the
@@ -3711,7 +3661,7 @@ async def test_geo_sync_detects_concurrent_drift(
     extension._geo_reset = resets.append
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
@@ -3721,156 +3671,16 @@ async def test_geo_sync_detects_concurrent_drift(
     assert resets == []
 
 
-async def test_geo_sync_heals_stale_cell_mappings(
-    extension, device, dialect, builder, hub
-):
-    # ref lives in cell "a", the target still carries cell label "b":
-    # after the sync (which rewrites CELL_ID too) the old "b" mapping
-    # must be gone — a stale entry would render a phantom cell with the
-    # new cell's geometry
-    add_rtls_cell_params(device)
-    set_fake_param(device, "CELL_ID", "a", "custom")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "CELL_ID", "b", "custom")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
-
-    extension._geo_reset = lambda address: None
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced", entry
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
-
-
-async def test_geo_sync_never_leaves_a_partial_target_as_cell_source(
-    extension, device, dialect, builder, hub
-):
-    # the reference expires mid-sync and every target ends up partial:
-    # the cell mapping must be dropped, not re-homed onto a device whose
-    # cache holds mixed geometry (it would become the fleet's default
-    # reference truth)
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    second.set_result = PARAM_ACK_FAILED
-    original_handle = second.handle
-
-    def losing_handle(data):
-        # the reference drops off the network as the first write lands
-        extension._protocol.devices.pop(DEVICE_SYSID, None)
-        return original_handle(data)
-
-    second.handle = losing_handle
-    extension._geo_reset = lambda address: None
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "partial", entry
-    assert "default" not in extension._anchor_cell_sources
-
-
-async def test_geo_anchor_reference_is_refused(extension, device, builder, hub):
+async def test_geo_adopt_refuses_an_anchor(extension, device, builder, hub):
     add_rtls_cell_params(device)
     await discover(extension, device)
     add_anchor_device(extension, 91, role=2, uwb_mac=1)
 
     response = await geo_message(
-        extension, builder, hub, {"op": "check", "reference": 91}
+        extension, builder, hub, {"op": "adopt", "reference": 91}
     )
     assert response.body["type"] == "ACK-NAK"
     assert "not a tag" in response.body["reason"]
-
-
-async def test_geo_sync_quarantines_partial_source_of_another_cell(
-    extension, device, dialect, builder, hub
-):
-    # multi-cell: the target still sources cell "b" while being pulled
-    # into the reference's cell "a"; every write is rejected, so the
-    # target stays b's source with untouched-but-unverifiable geometry
-    # intent — the sync left it mixed-state, so b must not keep it as
-    # its truth even though the reference (of cell a) survived
-    add_rtls_cell_params(device)
-    set_fake_param(device, "CELL_ID", "a", "custom")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "CELL_ID", "b", "custom")
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
-
-    second.set_result = PARAM_ACK_FAILED
-    extension._geo_reset = lambda address: None
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "partial", entry
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
-
-
-async def test_geo_sync_cancellation_quarantines_touched_targets(
-    extension, device, dialect, autojump_clock
-):
-    from flockwave.server.ext.rtls.geometry import run_sync
-
-    # ref lives in cell "a"; the target sources its own cell "b" and
-    # stops acking after its first accepted write; the sync is then
-    # cancelled mid-write — cell "b" must not stay sourced by a target
-    # the cancelled sync already touched
-    add_rtls_cell_params(device)
-    set_fake_param(device, "CELL_ID", "a", "custom")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "CELL_ID", "b", "custom")
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID, "b": DEVICE_SYSID + 1}
-
-    sets_seen = []
-    original_handle = second.handle
-
-    def stalling_handle(data):
-        parser = dialect.MAVLink(None)
-        for message in parser.parse_buffer(bytes(data)) or []:
-            if message.get_type() == "PARAM_EXT_SET":
-                sets_seen.append(message.param_id)
-                if len(sets_seen) > 1:
-                    return []  # device goes silent: the write blocks
-        return original_handle(data)
-
-    second.handle = stalling_handle
-
-    with trio.move_on_after(2):
-        await run_sync(
-            extension, reference=DEVICE_SYSID, reboot=False, timeout=30
-        )
-
-    assert len(sets_seen) > 1  # the sync WAS cancelled mid-write
-    assert extension._geo_sync_running is False
-    assert "b" not in extension._anchor_cell_sources
 
 
 async def test_geo_sync_survives_mid_sync_rediscovery(
@@ -3887,6 +3697,7 @@ async def test_geo_sync_survives_mid_sync_rediscovery(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     swapped = []
     original_handle = second.handle
@@ -3911,45 +3722,13 @@ async def test_geo_sync_survives_mid_sync_rediscovery(
     extension._geo_reset = resets.append
 
     response = await geo_message(
-        extension, builder, hub, {"op": "sync", "reference": DEVICE_SYSID}
+        extension, builder, hub, {"op": "sync"}
     )
 
     entry = response.body["devices"][str(DEVICE_SYSID + 1)]
     assert entry["status"] == "synced", entry
     assert entry["rebooted"] is True
     assert resets == [second.address[0]]
-
-
-async def test_geo_default_reference_is_the_majority_geometry(
-    extension, device, dialect, builder, hub
-):
-    # three tags; the LAST-discovered one (the cell source, by last-writer
-    # bookkeeping) carries drifted geometry. The default reference must be
-    # the majority geometry — never the drifted cell source, or one Sync
-    # click would propagate the wrong geometry to the whole fleet.
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
-    set_fake_param(third, "UWB_AN1_X", 10.5, "real32")
-    set_fake_param(third, "ORIGIN_ALT_MM", 20000, "int32")
-    wire_devices(extension, device, second, third)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await extension._process_datagram(
-        third.heartbeat(), third.address, time.monotonic()
-    )
-    # the drifted tag is the current cell source (discovered last)
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID + 2
-
-    response = await geo_message(extension, builder, hub, {"op": "check"})
-
-    body = response.body
-    assert body["reference"] in (DEVICE_SYSID, DEVICE_SYSID + 1), body
-    assert body["consistent"] is False
-    entry = body["devices"][str(DEVICE_SYSID + 2)]
-    assert entry["status"] == "mismatch"
 
 
 async def test_refill_repairs_geometry_consistency_params(extension, device):
@@ -4007,47 +3786,6 @@ def add_stub_tag(extension, system_id, *, yaw=None, cell="default", an1_x=10.0):
     return tag
 
 
-async def test_majority_votes_within_one_cell_only(extension, builder, hub):
-    from flockwave.server.ext.rtls.geometry import _majority_reference
-
-    # one A-cell tag vs two consistent B-cell tags: B must not outvote A
-    add_stub_tag(extension, 50, cell="a", an1_x=10.0)
-    add_stub_tag(extension, 51, cell="b", an1_x=20.0)
-    add_stub_tag(extension, 52, cell="b", an1_x=20.0)
-    assert _majority_reference(extension, 50, 1e-4, "a") == 50
-
-
-async def test_majority_absent_optional_is_not_a_wildcard(
-    extension, builder, hub
-):
-    from flockwave.server.ext.rtls.geometry import _majority_reference
-
-    # the lowest-sysid tag LACKS POS_YAW_DEG; two tags carry yaw 30 and
-    # the (drifted) cell source carries yaw 0. Directional grouping used
-    # to let the yaw-less representative absorb everyone and elect the
-    # drifted source; the majority must be the yaw-30 pair.
-    add_stub_tag(extension, 40, yaw=None)
-    add_stub_tag(extension, 41, yaw=30.0)
-    add_stub_tag(extension, 42, yaw=30.0)
-    add_stub_tag(extension, 43, yaw=0.0)
-    assert _majority_reference(extension, 43, 1e-4, "default") == 41
-
-
-async def test_majority_elects_the_group_representative(
-    extension, builder, hub
-):
-    from flockwave.server.ext.rtls.geometry import _majority_reference
-
-    # chained tolerance: 0 and +0.9 and -0.9 all within tol=1 of the
-    # representative (0) but not of each other; the elected reference
-    # must be the representative, never a chained member
-    add_stub_tag(extension, 40, yaw=0.0)
-    add_stub_tag(extension, 41, yaw=0.9)
-    add_stub_tag(extension, 42, yaw=-0.9)
-    assert _majority_reference(extension, 41, 1.0, "default") == 40
-# ---- X-RTLS-VERIFY ------------------------------------------------------
-
-
 class StubUAV:
     def __init__(self, params):
         self._params = params
@@ -4102,6 +3840,7 @@ async def test_verify_passes_on_a_healthy_fleet(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     response = await verify_message(extension, builder, hub)
 
@@ -4132,6 +3871,7 @@ async def test_verify_flags_wrong_yaw_source(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     response = await verify_message(extension, builder, hub)
 
@@ -4152,6 +3892,7 @@ async def test_verify_flags_geometry_drift_and_missing_stats(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     del extension._stats[DEVICE_SYSID + 1]  # and one tag went silent
 
     response = await verify_message(extension, builder, hub)
@@ -4172,6 +3913,7 @@ async def test_verify_in_depth_reports_param_diffs_as_warnings(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     # give both drones the full in-depth set; one WPNAV_SPEED differs
     from flockwave.server.ext.rtls.verify import IN_DEPTH_PARAMS
 
@@ -4204,6 +3946,7 @@ async def test_verify_concurrent_run_is_refused(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     extension._verify_running = True
     response = await verify_message(extension, builder, hub)
     assert response.body["type"] == "ACK-NAK"
@@ -4218,6 +3961,7 @@ async def test_verify_flags_silent_telemetry_as_stale(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now - 60  # stream went silent
@@ -4237,6 +3981,7 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now
@@ -4320,6 +4065,7 @@ async def test_geo_capture_and_fit_recovers_a_moved_anchor(
 ):
     configured, truth = _setup_fit_fleet(extension, device, dialect)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
 
     response = await geo_fit_message(
         extension, builder, hub, {"op": "capture", "duration": 30}
@@ -4365,6 +4111,7 @@ async def test_geo_fit_reports_missing_coverage(
 ):
     configured, truth = _setup_fit_fleet(extension, device, dialect)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
     await geo_fit_message(extension, builder, hub, {"op": "capture"})
     # only anchor 71 (MAC 1) reports ranges: 3 of 6 pairs
     from flockwave.server.ext.rtls.fit import on_twr_sample
@@ -4393,6 +4140,7 @@ async def test_geo_sync_explicit_geometry_targets_every_tag(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    await adopt_from(extension, builder, hub)
 
     payload = {
         "ORIGIN_LAT_E7": 413900000,
@@ -4417,7 +4165,6 @@ async def test_geo_sync_explicit_geometry_targets_every_tag(
     )
 
     body = response.body
-    assert body["reference"] is None
     assert set(body["devices"]) == {str(DEVICE_SYSID), str(DEVICE_SYSID + 1)}
     for entry in body["devices"].values():
         assert entry["status"] == "synced", entry
@@ -4447,6 +4194,7 @@ async def test_geo_fit_returns_an_apply_ready_payload(
 ):
     configured, truth = _setup_fit_fleet(extension, device, dialect)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
     await geo_fit_message(extension, builder, hub, {"op": "capture"})
     _feed_capture(extension, truth)
 
@@ -4501,6 +4249,7 @@ async def test_geo_fit_handles_a_rotated_rectangle(
     for index, mac in enumerate(sorted(configured)):
         add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
 
     await geo_fit_message(extension, builder, hub, {"op": "capture"})
     _feed_capture(extension, truth)
@@ -4538,6 +4287,7 @@ async def test_geo_fit_preserves_intra_layer_heights(
     for index, mac in enumerate(sorted(configured)):
         add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
 
     await geo_fit_message(extension, builder, hub, {"op": "capture"})
     _feed_capture(extension, configured)  # truth == configured
@@ -4598,6 +4348,7 @@ async def test_geo_fit_handles_a_square_two_layer_site(
     for index, mac in enumerate(sorted(configured)):
         add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
     await discover(extension, device)
+    await adopt_from(extension, builder, hub)
 
     await geo_fit_message(extension, builder, hub, {"op": "capture"})
     _feed_capture(extension, configured)
@@ -4605,3 +4356,169 @@ async def test_geo_fit_handles_a_square_two_layer_site(
     response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
     assert response.body["type"] == "X-RTLS-GEO", response.body
     assert response.body["relaxed"]["rmsM"] < 0.02, response.body["relaxed"]
+
+
+def _eight_anchor_site():
+    """The real deployment shape: 8 anchors as two stacked/offset
+    rectangles (4 corners each), 28 rangeable pairs. Anchor MAC 6 (upper
+    layer) stands 0.15 m off along -y."""
+    configured = {
+        1: (-10.0, -8.0, 0.0),
+        2: (10.0, -8.0, 0.0),
+        3: (10.0, 8.0, 0.0),
+        4: (-10.0, 8.0, 0.0),
+        5: (-9.7, -7.7, -2.6),
+        6: (9.7, -7.7, -2.6),
+        7: (9.7, 7.7, -2.6),
+        8: (-9.7, 7.7, -2.6),
+    }
+    truth = dict(configured)
+    x, y, z = truth[6]
+    truth[6] = (x, y - 0.15, z)
+    return configured, truth
+
+
+async def test_geo_fit_eight_anchor_two_rectangles(
+    extension, device, dialect, builder, hub
+):
+    # the shape the feature was specified for: two coplanar rectangular
+    # planes with an offset, 8 anchors, 28 pairs
+    configured, truth = _eight_anchor_site()
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 8, "uint8")
+    for index, mac in enumerate(sorted(configured)):
+        x, y, z = configured[mac]
+        set_fake_param(device, f"UWB_AN{index}_X", x, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Y", y, "real32")
+        set_fake_param(device, f"UWB_AN{index}_Z", z, "real32")
+        set_fake_param(device, f"UWB_AN{index}_MAC", mac, "uint16")
+    sysid_of_mac = {}
+    for index, mac in enumerate(sorted(configured)):
+        add_anchor_device(extension, 71 + index, role=3, uwb_mac=mac)
+        sysid_of_mac[mac] = 71 + index
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+
+    await geo_fit_message(extension, builder, hub, {"op": "capture"})
+    from flockwave.server.ext.rtls.fit import on_twr_sample
+
+    macs = sorted(truth)
+    k = 0
+    for _round in range(6):
+        for i, mac_a in enumerate(macs):
+            for mac_b in macs[i + 1 :]:
+                ax, ay, az = truth[mac_a]
+                bx, by, bz = truth[mac_b]
+                d = ((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2) ** 0.5
+                jitter = 0.02 * (((k * 2654435761) % 1000) / 1000 - 0.5) * 2
+                k += 1
+                on_twr_sample(
+                    extension, sysid_of_mac[mac_a], mac_b, d + jitter, 0.0
+                )
+
+    status = await geo_fit_message(
+        extension, builder, hub, {"op": "capture-status"}
+    )
+    assert status.body["pairs"] == 28, status.body
+
+    response = await geo_fit_message(extension, builder, hub, {"op": "fit"})
+    body = response.body
+    assert body["coverage"]["pairsMeasured"] == 28
+    assert body["coverage"]["pairsExpected"] == 28
+    moves = {m["mac"]: m for m in body["moves"]}
+    # the moved upper-layer anchor is localized: it carries the largest
+    # offset by a clear margin (the gauge spreads part of any single
+    # anchor's move across the frame, so the others are small, not zero)
+    ranked = sorted(
+        (m["distM"] for m in body["moves"]), reverse=True
+    )
+    assert moves[6]["distM"] == ranked[0], moves
+    assert moves[6]["distM"] > 0.09, moves
+    assert moves[6]["distM"] > 1.2 * ranked[1], moves
+    for mac in (1, 2, 3, 4, 5, 7, 8):
+        assert moves[mac]["distM"] < 0.08, moves
+    assert body["relaxed"]["rmsM"] < 0.04, body["relaxed"]
+    # and the apply payload carries the full 8-anchor table
+    assert body["applyGeometry"]["UWB_AN_COUNT"] == 8
+
+
+async def test_geo_adopt_unanimous_fleet_needs_no_reference(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await geo_message(extension, builder, hub, {"op": "adopt"})
+    assert response.body["type"] == "X-RTLS-GEO", response.body
+    assert response.body["op"] == "adopt"
+
+    check = await geo_message(extension, builder, hub, {"op": "check"})
+    assert check.body["consistent"] is True
+
+
+async def test_geo_adopt_refuses_a_disagreeing_fleet(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+
+    response = await geo_message(extension, builder, hub, {"op": "adopt"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "disagrees" in response.body["reason"]
+    # explicit adoption still works — the operator names the truth
+    response = await geo_message(
+        extension, builder, hub, {"op": "adopt", "reference": DEVICE_SYSID}
+    )
+    assert response.body["type"] == "X-RTLS-GEO"
+
+
+async def test_geo_canonical_geometry_persists(
+    extension, device, builder, hub, dialect, tmp_path
+):
+    extension._geo_store_path = tmp_path / "geometry.json"
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+    assert (tmp_path / "geometry.json").exists()
+
+    # a fresh extension instance (server restart) reads the same store
+    second_ext = RtlsExtension()
+    second_ext._protocol = RtlsProtocol(dialect, targets=[device.address])
+    second_ext.app = StubApp()
+
+    async def fake_send(payload, address):
+        for reply in device.handle(payload):
+            await second_ext._process_datagram(
+                reply, device.address, time.monotonic()
+            )
+
+    second_ext._send = fake_send
+    second_ext._geo_store_path = tmp_path / "geometry.json"
+    await second_ext._process_datagram(
+        device.heartbeat(), device.address, time.monotonic()
+    )
+    message = make_message(builder, {"type": "X-RTLS-GEO", "op": "check"})
+    response = await second_ext._handle_RTLS_GEO(message, None, hub)
+    assert response.body["type"] == "X-RTLS-GEO", response.body
+    assert response.body["consistent"] is True
+
+
+async def test_geo_sync_without_canonical_is_rejected(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    response = await geo_message(extension, builder, hub, {"op": "sync"})
+    assert response.body["type"] == "ACK-NAK"
+    assert "canonical" in response.body["reason"]

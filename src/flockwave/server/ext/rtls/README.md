@@ -626,7 +626,7 @@ a complete estimate, keyed by system id (as string):
 
 Estimates of a device that drops off the network are pruned with it.
 
-### X-RTLS-GEO — cell-geometry consistency check / sync
+### X-RTLS-GEO — canonical cell geometry: adopt / check / sync
 
 Every drone's tag carries its own copy of the cell geometry
 (`ORIGIN_LAT_E7/LON_E7/ALT_MM`, `POS_YAW_DEG`, `CELL_ID`,
@@ -650,12 +650,15 @@ the ones that do not.
   `UWB_AN_COUNT` last, so a half-synced registry never declares a
   window onto a half-written table.
 
-The default reference is chosen by MAJORITY VOTE over the live tags'
-geometries: the largest group of mutually consistent tags wins and the
-odd ones out are presumed wrong (the cell source only breaks ties — its
-identity is "last tag whose params synced", which must never silently
-promote a drifted tag to fleet-wide truth). Pass `reference` (a system
-id) to override it, or `cell` to pick among multiple cells. Optional
+THE SERVER OWNS THE TRUTH: each cell's canonical geometry is a
+persisted document (`geometry.json` in the extension's data dir).
+Bootstrap it once with **`op: "adopt"`** — with a `reference` system id
+the named tag's geometry is taken verbatim; without one the fleet must
+be unanimous, so a drifted tag can never be adopted by accident. From
+then on `check` diffs EVERY live tag against the canonical geometry and
+`sync` distributes it; a calibration fit updates it through the sync
+op's explicit `geometry` payload. Pass `cell` to pick among multiple
+stored cells. Optional
 members: `ids` (target system ids; default = every other live tag),
 `tolerance` (float comparison tolerance in the parameter's own unit,
 default `1e-4`), `timeout` (per parameter transaction, as usual). Both
