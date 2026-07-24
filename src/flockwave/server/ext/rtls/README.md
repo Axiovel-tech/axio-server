@@ -67,6 +67,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   message handlers documented below.
 - `show_clock.py` — the cluster->GPS show-clock pin manager (see
   below).
+- `geometry.py` — cell-geometry consistency across the tag fleet: the
+  `X-RTLS-GEO` check/sync operations (see below).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
   NED table, NED->global) for SDK pins that predate them; the
   `rtlslink` implementations are used when present.
@@ -619,6 +621,125 @@ a complete estimate, keyed by system id (as string):
   can be older. Clients should fade/flag entries whose updates stop.
 
 Estimates of a device that drops off the network are pruned with it.
+
+### X-RTLS-GEO — cell-geometry consistency check / sync
+
+Every drone's tag carries its own copy of the cell geometry
+(`ORIGIN_LAT_E7/LON_E7/ALT_MM`, `POS_YAW_DEG`, `CELL_ID`,
+`UWB_AN_COUNT` and the `UWB_AN{i}_X/Y/Z/MAC/BIAS_M` anchor table); tags
+that disagree position their drones in different frames. This message
+answers the daily pre-flight question "do my drones agree?" and repairs
+the ones that do not.
+
+`op` selects the operation:
+
+- **`check`** diffs the geometry of every live tag (or the tags in
+  `ids`) against a *reference* tag and reports per-device verdicts;
+- **`sync`** writes the reference geometry to the target tags (verified
+  per-parameter acks; one device's failure never affects another), then
+  **reboots** each fully rewritten tag over MCUmgr/SMP — the same
+  management surface OTA uses — so the new geometry takes effect (the
+  firmware reads the anchor table at startup). Pass `"reboot": false`
+  to skip the reset. A device whose writes partially failed is reported
+  `partial` and deliberately NOT rebooted (that would activate a mixed
+  geometry — re-run the sync). Writes order the anchor table first and
+  `UWB_AN_COUNT` last, so a half-synced registry never declares a
+  window onto a half-written table.
+
+The default reference is chosen by MAJORITY VOTE over the live tags'
+geometries: the largest group of mutually consistent tags wins and the
+odd ones out are presumed wrong (the cell source only breaks ties — its
+identity is "last tag whose params synced", which must never silently
+promote a drifted tag to fleet-wide truth). Pass `reference` (a system
+id) to override it, or `cell` to pick among multiple cells. Optional
+members: `ids` (target system ids; default = every other live tag),
+`tolerance` (float comparison tolerance in the parameter's own unit,
+default `1e-4`), `timeout` (per parameter transaction, as usual). Both
+operations compare against the server's parameter cache (kept fresh by
+discovery, the refill poller and the server's own writes); `sync`'s
+device-side acks re-verify reality where it matters.
+
+Request:
+
+```json
+{"type": "X-RTLS-GEO", "op": "check"}
+```
+
+Response — one entry per target (the reference is never a target),
+keyed by system id; `status` is `consistent`, `mismatch` (with
+`deltas`), `incomplete` (with `missing`) or `error` (with `detail`):
+
+```json
+{
+  "type": "X-RTLS-GEO",
+  "op": "check",
+  "reference": 42,
+  "cell": "default",
+  "consistent": false,
+  "devices": {
+    "43": {
+      "status": "mismatch",
+      "deltas": {"UWB_AN1_X": {"expected": 10.0, "actual": 10.5}}
+    },
+    "44": {"status": "consistent"}
+  }
+}
+```
+
+Sync request / response:
+
+```json
+{"type": "X-RTLS-GEO", "op": "sync", "reference": 42, "reboot": true}
+```
+
+```json
+{
+  "type": "X-RTLS-GEO",
+  "op": "sync",
+  "reference": 42,
+  "cell": "default",
+  "devices": {
+    "43": {
+      "status": "synced",
+      "written": ["UWB_AN1_X"],
+      "skipped": ["ORIGIN_LAT_E7", "..."],
+      "failures": {},
+      "rebooted": true
+    }
+  }
+}
+```
+
+- `status` — `synced` (all needed writes accepted), `partial` (some
+  writes failed; see `failures`) or `error` (device stopped answering;
+  see `detail`).
+- `written` / `skipped` — parameters written vs. already consistent.
+- `failures` — parameter name → human-readable failure (device-side
+  rejections carry the ack code and the value the device applied).
+- `rebooted` — present only when `reboot` was requested; `false` comes
+  with a `rebootDetail` explaining why (writes failed, nothing to
+  write, smpclient missing, or the reset itself failed).
+
+A sync that changed anything also pushes an `X-RTLS-INF` notification,
+so clients re-render the site anchors immediately. Requests that
+resolve no complete reference (no live tag with a full cell, unknown
+`reference`/`cell`) are NAKed.
+
+Concurrency: only one sync runs at a time (a second request is NAKed),
+parameter writes are serialized per (device, parameter) with a
+late-ack drain, and a post-write verification re-diff gates the
+reboot. Two windows remain that the PARAM_EXT wire protocol cannot
+close (acks carry no transaction id, and verify-then-reboot cannot be
+atomic): an ack straggling in more than `timeout` + 1 s late may be
+attributed to a subsequent write of the same parameter, and a
+parameter written by a third party in the instant between verification
+and reset is only caught by the next `check`. A device reported
+`partial`/`error` may hold mixed persistent geometry until a re-run
+converges it (its cells are re-homed away from it right after the
+sync, but it stays eligible again later). None of these windows is
+silent: the next `check` reports the fleet inconsistent. UIs should
+therefore re-run `check` after every sync, and re-run `sync` until
+every device reports `synced`.
 
 ### Notes for control-UI developers
 

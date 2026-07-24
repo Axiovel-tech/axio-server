@@ -79,6 +79,14 @@ DEFAULT_SLEEP_SETTLE = 3.0
 #: upper bound for client-supplied transaction timeouts, in seconds
 MAX_PARAM_TIMEOUT = 60.0
 
+#: extra seconds a timed-out parameter write keeps holding its
+#: per-(device, name) lock to catch a LATE final ack. PARAM_EXT acks
+#: carry no transaction id, so an ack that straggles in after the
+#: timeout would otherwise be consumed by — and complete — the NEXT
+#: write of the same parameter; caught within the grace it is adopted
+#: as the (late) outcome of its own transaction instead
+LATE_ACK_GRACE = 1.0
+
 #: how often OTA progress notifications are broadcast at most, in seconds
 OTA_PROGRESS_INTERVAL = 0.5
 
@@ -184,12 +192,18 @@ REFILL_READ_SPACING = 0.01
 REFILL_MAX_ANCHOR_TABLE = 16
 
 #: identity params a tag must carry for its cell geometry to render
-#: (see :func:`_has_cell_geometry`)
+#: (see :func:`_has_cell_geometry`) — plus the geometry-consistency
+#: params: X-RTLS-GEO refuses to trust a snapshot whose optional
+#: geometry params may be dump-loss holes, so the refill must repair
+#: those holes too. A name genuinely absent from an older registry
+#: costs the capped retry rounds and is then left alone.
 TAG_IDENTITY_PARAMS = (
     "ORIGIN_LAT_E7",
     "ORIGIN_LON_E7",
     "ORIGIN_ALT_MM",
     "UWB_AN_COUNT",
+    "POS_YAW_DEG",
+    "CELL_ID",
 )
 
 #: how long an accepted sleep/wake transaction's outcome overrides
@@ -231,6 +245,20 @@ class RtlsExtension(Extension):
         self._last_inf_broadcast: Optional[float] = None
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
+        #: test hook for the geometry-sync device reset; ``None`` means
+        #: "use the SMP os-reset" (see geometry._default_reset)
+        self._geo_reset = None
+        #: True while an X-RTLS-GEO sync runs; a second concurrent sync
+        #: is refused, and the cell-source bookkeeping refuses to move
+        #: the source off the pinned reference while targets are being
+        #: rewritten (see :meth:`_sync_anchor_beacons`)
+        self._geo_sync_running = False
+        #: per-(system id, name) write serialization: PARAM_EXT acks
+        #: carry no transaction id — they are matched by device + name
+        #: only — so two overlapping writes of the same parameter could
+        #: each consume the FIRST ack and both report the first write's
+        #: outcome as their own
+        self._param_write_locks: dict[tuple[int, str], trio.Lock] = {}
         #: beacon-registry API (``app.import_api("beacon")``); ``None`` disables
         #: anchor-beacon registration (config ``register_beacons: false`` or no
         #: beacon extension loaded)
@@ -434,6 +462,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
+                        "X-RTLS-GEO": self._handle_RTLS_GEO,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -841,40 +870,100 @@ class RtlsExtension(Extension):
             param_type = param_type_from_name(param_type)
 
         encoded = encode_param_value(value, param_type)
-        with self._subscribed_events() as events:
-            request = protocol.set_param(system_id, name, encoded, param_type)
-            if request is None:
-                raise KeyError(system_id)
-            await self._send(*request)
 
-            with trio.fail_after(timeout):
-                while True:
-                    event = await events.receive()
-                    if (
-                        event.kind != "param_ack"
-                        or event.system_id != system_id
-                        or event.data["name"] != name
-                    ):
-                        continue
+        async def wait_for_final_ack(events):
+            while True:
+                event = await events.receive()
+                if (
+                    event.kind != "param_ack"
+                    or event.system_id != system_id
+                    or event.data["name"] != name
+                ):
+                    continue
+                if event.data["result"] == PARAM_ACK_IN_PROGRESS:
+                    continue  # final ack still to come
+                return event
+
+        # Serialize writes of the same parameter of the same device:
+        # PARAM_EXT acks carry no transaction id, so two overlapping
+        # writes would each match the FIRST ack by (device, name) and
+        # both report the first write's outcome as their own. The lock
+        # spans send -> final ack, so the second write starts only after
+        # the first one's ack has been consumed.
+        key = (system_id, name)
+        lock = self._param_write_locks.setdefault(key, trio.Lock())
+        try:
+            async with lock:
+                # re-resolve the device: while this write queued behind
+                # the lock, the device may have been lost and
+                # rediscovered under the same system id — mirroring the
+                # ack into the pre-lock object would leave the LIVE
+                # cache stale
+                device = protocol.devices.get(system_id)
+                if device is None:
+                    raise KeyError(system_id)
+                with self._subscribed_events() as events:
+                    request = protocol.set_param(
+                        system_id, name, encoded, param_type
+                    )
+                    if request is None:
+                        raise KeyError(system_id)
+                    await self._send(*request)
+
+                    try:
+                        with trio.fail_after(timeout):
+                            event = await wait_for_final_ack(events)
+                    except trio.TooSlowError:
+                        # keep holding the lock through a short drain:
+                        # a LATE final ack caught here is adopted as
+                        # this transaction's (late) outcome — released
+                        # immediately, it would complete the NEXT write
+                        # of the same parameter instead
+                        event = None
+                        with trio.move_on_after(LATE_ACK_GRACE):
+                            event = await wait_for_final_ack(events)
+                        if event is None:
+                            raise
+
                     result = event.data["result"]
-                    if result == PARAM_ACK_IN_PROGRESS:
-                        continue  # final ack still to come
                     if result == PARAM_ACK_ACCEPTED:
-                        # mirror the acknowledged value into the device cache so
-                        # the anchor display reflects the server's own push
-                        # without waiting for the device to re-advertise it
-                        device.params[name] = event.data["value"]
-                        device.param_types[name] = param_type
-                        self._sync_anchor_beacons(
-                            device, _decoded_device_params(device)
-                        )
-                        self._refresh_anchor_cells()
+                        # mirror the acknowledged value into the device
+                        # cache so the anchor display reflects the
+                        # server's own push without waiting for the
+                        # device to re-advertise it — into the CURRENT
+                        # object: the device may have been expired and
+                        # rediscovered (a NEW object) at any await point
+                        # of this transaction
+                        live = protocol.devices.get(system_id)
+                        if live is not None:
+                            live.params[name] = event.data["value"]
+                            live.param_types[name] = param_type
+                            self._sync_anchor_beacons(
+                                live, _decoded_device_params(live)
+                            )
+                            self._refresh_anchor_cells()
                     return {
-                        "value": decode_param_value(event.data["value"], param_type),
+                        "value": decode_param_value(
+                            event.data["value"], param_type
+                        ),
                         "type": param_type_to_name(param_type),
                         "result": result,
                         "accepted": result == PARAM_ACK_ACCEPTED,
                     }
+        finally:
+            # prune the lock once nobody holds or awaits it: parameter
+            # names are client-supplied, so keeping every (device, name)
+            # entry forever would grow without bound. Safe under trio's
+            # cooperative scheduling: a task between setdefault and its
+            # acquire checkpoint cannot interleave here, so an unheld,
+            # waiter-less lock is truly unreferenced-for-serialization.
+            stats = lock.statistics()
+            if (
+                not stats.locked
+                and stats.tasks_waiting == 0
+                and self._param_write_locks.get(key) is lock
+            ):
+                self._param_write_locks.pop(key, None)
 
     async def set_sleep(
         self,
@@ -1826,6 +1915,63 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
+    async def _handle_RTLS_GEO(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        # Lazy import: geometry.py imports helpers from this module, so
+        # importing it at module load would be a cycle.
+        from .geometry import DEFAULT_FLOAT_TOLERANCE, run_check, run_sync
+
+        body = message.body
+        op = body.get("op")
+        if op not in ("check", "sync"):
+            return hub.reject(
+                message,
+                reason=f"Invalid op: {op!r} (expected 'check' or 'sync')",
+            )
+        try:
+            reference = _get_optional_device_id(body, "reference")
+            ids = _get_optional_device_ids(body)
+            cell = body.get("cell")
+            if cell is not None and not isinstance(cell, str):
+                raise ValueError(f"Invalid cell: {cell!r}")
+            tolerance = body.get("tolerance", DEFAULT_FLOAT_TOLERANCE)
+            try:
+                tolerance = float(tolerance)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid tolerance: {tolerance!r}") from None
+            if not 0 <= tolerance <= 1:
+                raise ValueError("Tolerance must be between 0 and 1")
+            timeout = _get_timeout(message, DEFAULT_PARAM_TIMEOUT)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+
+        try:
+            if op == "check":
+                result = await run_check(
+                    self,
+                    reference=reference,
+                    cell=cell,
+                    ids=ids,
+                    tolerance=tolerance,
+                )
+            else:
+                result = await run_sync(
+                    self,
+                    reference=reference,
+                    cell=cell,
+                    ids=ids,
+                    tolerance=tolerance,
+                    reboot=bool(body.get("reboot", True)),
+                    timeout=timeout,
+                )
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+
+        return hub.create_response_or_notification(
+            body=result, in_response_to=message
+        )
+
     # ---- helpers / exports ----
 
     def _warn_no_app(self) -> None:
@@ -1995,7 +2141,30 @@ class RtlsExtension(Extension):
         except (KeyError, TypeError, ValueError):
             return
 
+        if self._geo_sync_running:
+            # a geometry sync is rewriting TARGET tags: their accepted
+            # writes must not steal the cell source (or the beacon
+            # rendering) from the pinned reference mid-sync — a partially
+            # rewritten tag holds a mixed geometry. The pin only holds
+            # while the pinned source is LIVE: refusing a re-home off a
+            # device that expired mid-sync would leave the cell mapped
+            # to a ghost.
+            current = self._anchor_cell_sources.get(cell.cell_id)
+            if (
+                current is not None
+                and current != device.system_id
+                and self._protocol is not None
+                and current in self._protocol.devices
+            ):
+                return
+
         self._anchor_cell_sources[cell.cell_id] = device.system_id
+        # a CELL_ID change re-homes the device: without this, the old
+        # cell id would keep pointing at it and render a phantom cell
+        # with the NEW cell's geometry
+        self._drop_stale_anchor_cells_for_source(
+            device.system_id, keep_cell_id=cell.cell_id
+        )
 
         if self._beacon_api is None:
             return
@@ -2031,6 +2200,24 @@ class RtlsExtension(Extension):
     def _drop_anchor_cells_for_source(self, system_id: int) -> None:
         for cell_id, source in list(self._anchor_cell_sources.items()):
             if source != system_id:
+                continue
+            replacement = self._find_anchor_cell_source(cell_id)
+            if replacement is None:
+                self._drop_anchor_cell(cell_id)
+            else:
+                device, params = replacement
+                self._sync_anchor_beacons(device, params)
+
+    def _drop_stale_anchor_cells_for_source(
+        self, system_id: int, *, keep_cell_id: str
+    ) -> None:
+        """Drops (or re-homes onto another live tag) every cell mapping
+        this device sources under a cell id OTHER than ``keep_cell_id``
+        — its current one. The recursion through ``_sync_anchor_beacons``
+        terminates: a replacement source found for a cell id advertises
+        exactly that cell id, so its own resync keeps it."""
+        for cell_id, source in list(self._anchor_cell_sources.items()):
+            if source != system_id or cell_id == keep_cell_id:
                 continue
             replacement = self._find_anchor_cell_source(cell_id)
             if replacement is None:
@@ -2355,7 +2542,9 @@ def _missing_identity_param_names(
         # (and the MAC drives the beacon's live/active matching); a hole
         # there keeps the whole cell — hence the map beacons — unrendered
         missing.extend(
-            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC"))
+            _missing_anchor_table_names(
+                params, ("X", "Y", "Z", "MAC", "BIAS_M")
+            )
         )
         return missing
     if role is None and "UWB_ROLE" not in params:
@@ -2473,6 +2662,43 @@ def _get_device_id(message: "FlockwaveMessage") -> int:
         return int(value)
     except (TypeError, ValueError):
         raise ValueError(f"Invalid device ID: {value!r}") from None
+
+
+def _get_optional_device_id(body: dict, key: str) -> Optional[int]:
+    """An optional device system id under ``key`` of a message body:
+    ``None`` when absent, the id as int otherwise (numeric strings are
+    accepted, like everywhere else in this API)."""
+    value = body.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is an int subclass: JSON `true` would otherwise pass as 1
+        raise ValueError(f"Invalid device ID in {key!r}: {value!r}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid device ID in {key!r}: {value!r}") from None
+
+
+def _get_optional_device_ids(body: dict) -> Optional[list[int]]:
+    """The optional ``ids`` list of a message body, validated like the
+    sleep handler validates its targets; ``None`` when absent."""
+    ids = body.get("ids")
+    if ids is None:
+        return None
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or len(ids) > 256
+        or not all(
+            # bool is an int subclass: JSON `true` would otherwise pass
+            # and target sysid 1
+            isinstance(i, int) and not isinstance(i, bool) and 1 <= i <= 255
+            for i in ids
+        )
+    ):
+        raise ValueError("Invalid device ids ('ids' must be a list of system ids)")
+    return ids
 
 
 def _get_param_name(message: "FlockwaveMessage") -> str:
