@@ -18,7 +18,14 @@ This module answers that with two operations over one message type:
   new geometry takes effect -- the firmware reads the anchor table at
   startup.
 
-Both operations read from the server's parameter cache (filled on
+THE SERVER OWNS THE TRUTH: the canonical geometry of each cell is a
+persisted document (``geometry.json`` in the extension's data dir),
+adopted once from a known-good tag (or written by the fit) and diffed/
+distributed from then on. Deriving truth from the fleet itself --
+"whatever most tags happen to carry" -- was the root of a whole class
+of consistency machinery this design deletes.
+
+Device state is read from the server's parameter cache (filled on
 discovery, kept fresh by the refill poller and by the server's own
 writes -- the server is the only writer on the management channel);
 ``sync``'s device-side acks re-verify reality where it matters.
@@ -33,7 +40,9 @@ would activate a mixed geometry -- re-run the sync instead).
 
 from __future__ import annotations
 
+import json
 import re
+import struct
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -276,127 +285,161 @@ def _device_role(ext: "RtlsExtension", device) -> Optional[str]:
     return _cell_source_role(device, _decoded_device_params(device))
 
 
-def _majority_reference(
-    ext: "RtlsExtension", cell_source: int, tolerance: float, cell_id: str
-) -> int:
-    """Picks the DEFAULT reference tag by majority vote over the live
-    tags of ONE cell: the largest group of mutually consistent tags
-    wins, and the odd ones out are presumed wrong. The cell source is
-    only a tie-breaker between equal-sized groups (its identity is
-    "last tag whose params synced" — an arbitrary choice that must never
-    silently promote a drifted tag to fleet-wide truth). Falls back to
-    the cell source when no candidates exist.
-
-    Group membership is SYMMETRIC (both diff directions must be clean),
-    so a representative that merely lacks an optional parameter cannot
-    act as a wildcard absorbing tags that disagree on it; and the
-    elected reference is always the group REPRESENTATIVE, so tolerance
-    chaining cannot elect a member that drifts from the rest of its own
-    group by up to twice the tolerance."""
-    protocol = ext._require_protocol()
-    candidates: list[tuple[int, dict[str, Any]]] = []
-    for system_id, device in sorted(protocol.devices.items()):
-        if _device_role(ext, device) != "tag":
-            continue
-        params = _decoded_device_params(device)
-        # votes come from ONE cell only: in a multi-cell deployment the
-        # other cell's tags must not outvote this cell's own geometry
-        if _cell_id_from_params(params) != cell_id:
-            continue
-        if not _geometry_knowable(device, params):
-            continue
-        subset, missing = extract_geometry(params)
-        if missing:
-            continue
-        candidates.append((system_id, subset))
-
-    groups: list[list[tuple[int, dict[str, Any]]]] = []
-    for system_id, subset in candidates:
-        for group in groups:
-            rep_subset = group[0][1]
-            fwd = diff_geometry(rep_subset, subset, tolerance=tolerance)
-            rev = diff_geometry(subset, rep_subset, tolerance=tolerance)
-            if not any((*fwd, *rev)):
-                group.append((system_id, subset))
-                break
-        else:
-            groups.append([(system_id, subset)])
-
-    if not groups:
-        return cell_source
-    best_size = max(len(group) for group in groups)
-    best = [group for group in groups if len(group) == best_size]
-    if len(best) > 1:
-        # tied groups: prefer the one holding the cell source, else the
-        # one with the lowest system id, for determinism
-        best.sort(
-            key=lambda group: (
-                0 if any(sid == cell_source for sid, _ in group) else 1,
-                group[0][0],
-            )
-        )
-    return best[0][0][0]
+def _store_path(ext: "RtlsExtension"):
+    """Path of the canonical-geometry store; ``None`` when the extension
+    runs without an app data dir (bare test harness) -- the store is
+    then in-memory only."""
+    if ext._geo_store_path is not None:
+        return ext._geo_store_path
+    try:
+        return ext.get_data_dir() / "geometry.json"
+    except Exception:  # noqa: BLE001 -- harness without app dirs
+        return None
 
 
-def _resolve_reference(
-    ext: "RtlsExtension",
-    reference: Optional[int],
-    cell: Optional[str],
-    *,
-    tolerance: float = DEFAULT_FLOAT_TOLERANCE,
-) -> tuple[Any, dict[str, Any], str]:
-    """Resolves the reference tag whose geometry is the truth to compare
-    and sync against: an explicit ``reference`` system id wins; otherwise
-    the MAJORITY geometry among the live tags of the (single, or
-    ``cell``-selected) cell, with the cell source as tie-breaker.
+def _load_store(ext: "RtlsExtension") -> dict[str, dict[str, Any]]:
+    if ext._geo_canonical is None:
+        ext._geo_canonical = {}
+        path = _store_path(ext)
+        if path is not None and path.exists():
+            try:
+                data = json.loads(path.read_text())
+                if isinstance(data, dict):
+                    ext._geo_canonical = {
+                        str(cell): dict(subset)
+                        for cell, subset in data.items()
+                        if isinstance(subset, dict)
+                    }
+            except (OSError, ValueError):
+                pass  # a corrupt store must not take the ops down
+    return ext._geo_canonical
 
-    Returns ``(device, geometry_subset, cell_id)``; raises ValueError
-    with a client-presentable reason when no complete reference exists."""
-    protocol = ext._require_protocol()
-    if reference is None:
-        sources = ext._anchor_cell_sources
-        if not sources:
-            raise ValueError(
-                "No cell geometry source available (no live tag advertises "
-                "a complete cell); specify 'reference'"
-            )
-        if cell is not None:
-            if cell not in sources:
-                raise ValueError(f"No such cell: {cell!r}")
-            cell_key = cell
-            reference = sources[cell]
-        elif len(sources) == 1:
-            cell_key, reference = next(iter(sources.items()))
-        else:
-            raise ValueError(
-                f"Multiple cells present ({', '.join(sorted(sources))}); "
-                "specify 'cell' or 'reference'"
-            )
-        reference = _majority_reference(ext, reference, tolerance, cell_key)
-    device = protocol.devices.get(reference)
-    if device is None:
-        raise ValueError(f"No such device: {reference}")
-    role = _device_role(ext, device)
-    if role != "tag":
-        # geometry truth lives on tags; an anchor happening to carry the
-        # shared param names must not become the fleet-wide reference
+
+def _save_store(ext: "RtlsExtension") -> None:
+    path = _store_path(ext)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(ext._geo_canonical or {}, indent=2))
+        tmp.replace(path)
+    except OSError:
+        pass  # persistence is best-effort; the in-memory copy still rules
+
+
+def get_canonical(ext: "RtlsExtension", cell):
+    """The canonical geometry of a cell as ``(subset, cell_id)``. With
+    ``cell`` omitted the single stored cell is used; raises ValueError
+    (client-presentable) when the store is empty or ambiguous."""
+    store = _load_store(ext)
+    if not store:
         raise ValueError(
-            f"Reference device {reference} is not a tag "
-            f"(role: {role or 'unknown'})"
+            "no canonical geometry yet — adopt one from a tag "
+            "(op 'adopt') or run a calibration fit"
         )
-    params = _decoded_device_params(device)
-    if not _geometry_knowable(device, params):
-        raise ValueError(
-            f"Reference device {reference}: {_snapshot_detail(device)}; "
-            "retry once discovery/refill has finished"
-        )
-    subset, missing = extract_geometry(params)
+    if cell is None:
+        if len(store) > 1:
+            raise ValueError(
+                f"multiple cells stored ({', '.join(sorted(store))}); "
+                "specify 'cell'"
+            )
+        cell = next(iter(store))
+    if cell not in store:
+        raise ValueError(f"No canonical geometry for cell {cell!r}")
+    subset, missing = extract_geometry(store[cell])
     if missing:
         raise ValueError(
-            f"Geometry of reference device {reference} is incomplete "
-            f"(missing {', '.join(missing)})"
+            f"stored canonical geometry of cell {cell!r} is incomplete "
+            f"(missing {', '.join(missing)}) — re-adopt it"
         )
-    return device, subset, _cell_id_from_params(params)
+    return subset, cell
+
+
+def set_canonical(ext: "RtlsExtension", subset):
+    """Validates and stores a geometry subset as the canonical geometry
+    of its cell (from its ``CELL_ID``, default cell otherwise)."""
+    validated, missing = extract_geometry(subset)
+    if missing:
+        raise ValueError(
+            "geometry is incomplete (missing " + ", ".join(missing) + ")"
+        )
+    cell = _cell_id_from_params(validated)
+    store = _load_store(ext)
+    store[cell] = dict(validated)
+    _save_store(ext)
+    return validated, cell
+
+
+async def run_adopt(
+    ext: "RtlsExtension",
+    *,
+    reference: Optional[int] = None,
+    tolerance: float = DEFAULT_FLOAT_TOLERANCE,
+) -> dict[str, Any]:
+    """Adopts a tag's geometry as the canonical one. With an explicit
+    ``reference`` that tag's geometry is taken verbatim; without one the
+    fleet must be unanimous (every live tag mutually consistent), so a
+    drifted tag can never be adopted by accident."""
+    protocol = ext._require_protocol()
+    if reference is not None:
+        device = protocol.devices.get(reference)
+        if device is None:
+            raise ValueError(f"No such device: {reference}")
+        if _device_role(ext, device) != "tag":
+            raise ValueError(f"Device {reference} is not a tag")
+        params = _decoded_device_params(device)
+        if not _geometry_knowable(device, params):
+            raise ValueError(f"Device {reference}: {_snapshot_detail(device)}")
+        subset, missing = extract_geometry(params)
+        if missing:
+            raise ValueError(
+                f"Geometry of device {reference} is incomplete "
+                f"(missing {', '.join(missing)})"
+            )
+    else:
+        candidates = []
+        for system_id, device in sorted(protocol.devices.items()):
+            if _device_role(ext, device) != "tag":
+                continue
+            params = _decoded_device_params(device)
+            if not _geometry_knowable(device, params):
+                continue
+            candidate, missing = extract_geometry(params)
+            if not missing:
+                candidates.append((system_id, candidate))
+        if not candidates:
+            raise ValueError("no live tag carries a complete geometry to adopt")
+        reference, subset = candidates[0]
+        for system_id, other in candidates[1:]:
+            fwd = diff_geometry(subset, other, tolerance=tolerance)
+            rev = diff_geometry(other, subset, tolerance=tolerance)
+            if any((*fwd, *rev)):
+                raise ValueError(
+                    f"the fleet disagrees (tag {system_id} differs from "
+                    f"tag {reference}) — adopt explicitly with 'reference'"
+                )
+
+    validated, cell = set_canonical(ext, subset)
+    return {
+        "type": "X-RTLS-GEO",
+        "op": "adopt",
+        "cell": cell,
+        "reference": reference,
+        "paramCount": len(validated),
+    }
+
+
+def _fallback_param_type(ext: "RtlsExtension", name: str):
+    """The raw wire type of a parameter, from ANY live device that has it
+    cached — the tags run the same firmware family, so the type is
+    fleet-wide."""
+    protocol = ext._require_protocol()
+    for device in protocol.devices.values():
+        raw = device.param_types.get(name)
+        if raw is not None:
+            return raw
+    return None
 
 
 def _target_ids(
@@ -420,21 +463,18 @@ def _target_ids(
 async def run_check(
     ext: "RtlsExtension",
     *,
-    reference: Optional[int] = None,
     cell: Optional[str] = None,
     ids: Optional[list[int]] = None,
     tolerance: float = DEFAULT_FLOAT_TOLERANCE,
 ) -> dict[str, Any]:
-    """Diffs the geometry of the target tags against the reference tag;
-    returns the X-RTLS-GEO ``check`` response body. Raises ValueError
-    when no (complete) reference resolves."""
-    ref_device, ref_subset, cell_id = _resolve_reference(
-        ext, reference, cell, tolerance=tolerance
-    )
+    """Diffs the geometry of EVERY live tag against the canonical
+    geometry; returns the X-RTLS-GEO ``check`` response body. Raises
+    ValueError when no canonical geometry is stored yet."""
+    ref_subset, cell_id = get_canonical(ext, cell)
     protocol = ext._require_protocol()
 
     devices: dict[str, dict[str, Any]] = {}
-    for system_id in _target_ids(ext, ids, ref_device.system_id):
+    for system_id in _target_ids(ext, ids, -1):
         device = protocol.devices.get(system_id)
         if device is None:
             devices[str(system_id)] = {
@@ -476,7 +516,6 @@ async def run_check(
     return {
         "type": "X-RTLS-GEO",
         "op": "check",
-        "reference": ref_device.system_id,
         "cell": cell_id,
         "consistent": all(
             entry["status"] == "consistent" for entry in devices.values()
@@ -534,7 +573,6 @@ def _default_reset(address: str, timeout: float = RESET_TIMEOUT) -> None:
 
 async def _sync_one(
     ext: "RtlsExtension",
-    ref_device,
     ref_subset: Mapping[str, Any],
     system_id: int,
     *,
@@ -581,11 +619,11 @@ async def _sync_one(
             )
             continue
         # the target's own cached type wins; a cache hole falls back to
-        # the reference tag's type (same firmware family), so a lossy
-        # dump cannot block the repair of the very hole it caused
+        # any live tag that knows the type (same firmware family), so a
+        # lossy dump cannot block the repair of the very hole it caused
         param_type: Optional[str] = None
         if name not in device.param_types:
-            raw_type = ref_device.param_types.get(name)
+            raw_type = _fallback_param_type(ext, name)
             if raw_type is None:
                 failures[name] = "parameter type unknown"
                 continue
@@ -600,7 +638,9 @@ async def _sync_one(
             # same silence -- abort this device instead
             aborted = f"timeout while writing {name}"
             break
-        except (KeyError, ValueError) as ex:
+        except (KeyError, ValueError, struct.error) as ex:
+            # struct.error: an (explicit-geometry) value outside its wire
+            # type must fail THIS parameter, not crash the whole sync
             failures[name] = str(ex)
             continue
         if result["accepted"]:
@@ -680,44 +720,36 @@ async def _sync_one(
 async def run_sync(
     ext: "RtlsExtension",
     *,
-    reference: Optional[int] = None,
     cell: Optional[str] = None,
     ids: Optional[list[int]] = None,
+    geometry=None,
     tolerance: float = DEFAULT_FLOAT_TOLERANCE,
     reboot: bool = True,
     timeout: float = DEFAULT_PARAM_TIMEOUT,
 ) -> dict[str, Any]:
-    """Writes the reference tag's geometry to the target tags (verified
-    per-parameter acks, one device's failure never cancels another),
-    reboots the fully rewritten devices when ``reboot`` is set, and
-    returns the X-RTLS-GEO ``sync`` response body. Raises ValueError
-    when no (complete) reference resolves, or when another sync is
-    already running (two interleaved syncs would race their PARAM_EXT
-    acks per device — matching is by device + name only — and could
-    reboot a device the other sync is still writing)."""
+    """Writes the canonical geometry to every (or the selected) tag with
+    verified per-parameter acks — one device's failure never cancels
+    another — and reboots the fully rewritten tags when ``reboot`` is
+    set. An explicit ``geometry`` payload (the fit's apply path) is
+    validated, STORED as the new canonical geometry, then distributed
+    the same way. Raises ValueError when no canonical geometry exists,
+    the payload is incomplete, or another sync is already running (two
+    interleaved syncs would race their PARAM_EXT acks per device —
+    matching is by device + name only — and could reboot a device the
+    other sync is still writing)."""
     if ext._geo_sync_running:
         raise ValueError("A geometry sync is already in progress")
     ext._geo_sync_running = True
-    ref_device = None
     devices: dict[str, dict[str, Any]] = {}
     try:
-        ref_device, ref_subset, cell_id = _resolve_reference(
-            ext, reference, cell, tolerance=tolerance
-        )
+        if geometry is not None:
+            ref_subset, cell_id = set_canonical(ext, geometry)
+        else:
+            ref_subset, cell_id = get_canonical(ext, cell)
 
         async def run_one(system_id: int) -> None:
-            # pessimistic placeholder: if this worker is CANCELLED
-            # mid-flight it never returns, and the quarantine in the
-            # finally below must still treat the target as potentially
-            # mixed — it may have accepted writes already
-            devices[str(system_id)] = {
-                "status": "error",
-                "detail": "sync cancelled mid-flight",
-                "written": ["(unknown: cancelled)"],
-            }
             devices[str(system_id)] = await _sync_one(
                 ext,
-                ref_device,
                 ref_subset,
                 system_id,
                 tolerance=tolerance,
@@ -726,47 +758,10 @@ async def run_sync(
             )
 
         async with trio.open_nursery() as nursery:
-            for system_id in _target_ids(ext, ids, ref_device.system_id):
+            for system_id in _target_ids(ext, ids, -1):
                 nursery.start_soon(run_one, system_id)
     finally:
-        # The healing below runs in the finally — synchronous code only,
-        # so it is cancellation-safe — because a cancelled or crashed
-        # sync must not leave the bookkeeping the pin deferred unhealed.
         ext._geo_sync_running = False
-        if ref_device is not None:
-            # While the latch was held, _sync_anchor_beacons refused to
-            # move the cell source off the reference — which also
-            # deferred legitimate bookkeeping (a target's CELL_ID
-            # re-home, cleanup after a source lost mid-sync). Heal all
-            # mappings, then re-assert the reference as the source — but
-            # only if it is still live: re-homing a cell onto a device
-            # that expired mid-sync would render its anchors from a
-            # stale object and break default-reference resolution.
-            ext._refresh_anchor_cells()
-            protocol = ext._require_protocol()
-            live_ref = protocol.devices.get(ref_device.system_id)
-            if live_ref is not None:
-                ext._sync_anchor_beacons(
-                    live_ref, _decoded_device_params(live_ref)
-                )
-
-            # Quarantine: no cell — the reference's or any other — may
-            # stay sourced by a device this sync left with MIXED
-            # geometry (partial, or errored after accepted writes): as a
-            # cell source it would become that cell's rendered/
-            # default-reference truth. Re-home each such cell onto a
-            # clean tag, or drop the mapping so the next default-
-            # reference resolution fails loudly instead.
-            mixed = {
-                int(sid)
-                for sid, entry in devices.items()
-                if entry.get("status") == "partial"
-                or (entry.get("status") == "error" and entry.get("written"))
-            }
-            for mapped_cell in [
-                c for c, s in ext._anchor_cell_sources.items() if s in mixed
-            ]:
-                _rehome_cell_or_drop(ext, mapped_cell, exclude=mixed)
 
     if any(entry.get("written") for entry in devices.values()):
         # geometry changed: push the device list so clients re-render the
@@ -776,7 +771,6 @@ async def run_sync(
     return {
         "type": "X-RTLS-GEO",
         "op": "sync",
-        "reference": ref_device.system_id,
         "cell": cell_id,
         "devices": devices,
     }

@@ -165,8 +165,7 @@ def _geometry_rule(geometry: Optional[dict[str, Any]], error: str) -> dict:
             "Cell geometry consistency",
             "error",
             "fail",
-            f"{len(drifted)} tag(s) disagree with the majority geometry "
-            f"of reference tag {geometry['reference']}: "
+            f"{len(drifted)} tag(s) disagree with the canonical geometry: "
             f"{', '.join(sorted(drifted))} — run a geometry sync",
         )
     return _rule(
@@ -174,7 +173,7 @@ def _geometry_rule(geometry: Optional[dict[str, Any]], error: str) -> dict:
         "Cell geometry consistency",
         "error",
         "pass",
-        f"every tag matches reference tag {geometry['reference']}",
+        "every tag matches the canonical geometry",
     )
 
 
