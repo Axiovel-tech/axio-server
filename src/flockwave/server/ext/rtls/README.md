@@ -20,14 +20,15 @@ clients through the server's message hub:
   re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
   debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
   `X-RTLS-INF`. The same stats feed drives the cluster->GPS show-clock
-  pin distribution (see below), and A0's rolling TWR summaries feed the
-  anchor-geometry fit (see `X-RTLS-GEO fit`).
+  pin distribution (see below), and the responders' rolling TWR summaries
+  feed the anchor-geometry fit (see `X-RTLS-GEO fit`).
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
   `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
   Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
   revert — so the recovery path is health-check + re-upload of the
-  previous artifact. `smpclient` is an optional dependency of the SDK
-  (`rtls-link[ota]`); without it, starting an OTA job fails at runtime.
+  previous artifact. `smpclient` is an optional dependency of the SDK and
+  the server installs the SDK's `ota` extra because OTA and geometry-sync
+  reboot are first-class RTLS operations.
 
 ## Firmware requirements
 

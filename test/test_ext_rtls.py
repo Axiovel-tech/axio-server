@@ -2217,6 +2217,46 @@ async def test_show_clock_repin_on_cluster_restart(extension, device):
     assert (week, tow) == (second_pin.week, second_pin.tow_ms)
 
 
+async def test_show_clock_ignores_repeated_accumulated_snapshot(
+    extension, device, monkeypatch
+):
+    """Other NAMED_VALUE_FLOAT fields repeat the cached clkh/clks pair.
+    A parameter transaction can delay the next clock field beyond the restart
+    tolerance; that stale snapshot must not trigger a false re-pin."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    now = [1_752_000_000.0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+    )
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    first_pin = extension._show_clock.pin
+    assert first_pin is not None
+
+    # The pin writes can occupy the management channel for longer than the
+    # five-second restart tolerance. The SDK still emits accumulated snapshots
+    # for non-clock stats, carrying the old clkh/clks pair.
+    now[0] += 6.0
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, CLUSTER_STATS, now=6.0)
+    assert extension._show_clock.pin is first_pin
+
+    # A genuinely new sample is still evaluated and agrees with the pin.
+    advanced = dict(CLUSTER_STATS, clks=126.5)
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await _feed_stats(extension, device, advanced, now=6.0)
+    extension._nursery = None
+    assert extension._show_clock.pin is first_pin
+
+
 async def test_show_clock_lost_device_repinned_on_return(extension, device):
     """A lost device is dropped from the pinned set, so its next fresh
     stats snapshot after rediscovery pushes the pin again (it may have

@@ -51,7 +51,7 @@ dependencies = [
   "fastjsonschema>=2.21.1,<3.0.0",
   "orjson>=3.10.18,<4.0.0",
   "numpy>=2.2.6",
-  "rtls-link @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@71fa5bc527bf08f7ef69b2f97376e996a7cc126a#subdirectory=py",
+  "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@38f121b23d5f7d1bf7161f197e4ffe8524b298c9#subdirectory=py",
 ]
 
 [project.scripts]
