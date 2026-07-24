@@ -384,6 +384,7 @@ async def run_fit(
     ext: "RtlsExtension",
     *,
     mode: str,
+    cell: str | None = None,
     capture_id: int | None = None,
     timeout: float = SUMMARY_WAIT_TIMEOUT_S,
 ) -> dict[str, Any]:
@@ -393,7 +394,7 @@ async def run_fit(
     timeout = max(0.1, min(float(timeout), SUMMARY_WAIT_TIMEOUT_S))
 
     if mode == "strict":
-        reference, cell = get_canonical(ext, None)
+        reference, cell = get_canonical(ext, cell)
         anchors = _configured_anchors(reference)
         devices = _resolve_anchor_devices(ext, anchors)
         requested_at = time.monotonic()

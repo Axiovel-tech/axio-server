@@ -1991,9 +1991,13 @@ class RtlsExtension(Extension):
                     timeout = float(timeout)
                 except (TypeError, ValueError):
                     raise ValueError(f"Invalid timeout: {timeout!r}") from None
+                cell = body.get("cell")
+                if cell is not None and not isinstance(cell, str):
+                    raise ValueError(f"Invalid cell: {cell!r}")
                 result = await run_fit(
                     self,
                     mode=mode,
+                    cell=cell,
                     capture_id=capture_id,
                     timeout=timeout,
                 )

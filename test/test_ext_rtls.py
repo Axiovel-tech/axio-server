@@ -4174,6 +4174,30 @@ async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
     assert abs(body["applyGeometry"]["UWB_AN7_Z"] + 2.5) < 1e-3
 
 
+async def test_geo_strict_fit_honors_explicit_cell_with_multiple_stored_cells(
+    extension, device, builder, hub
+):
+    positions = _setup_anchor_calibration_fleet(extension, device)
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+    extension._geo_canonical["other"] = {
+        **extension._geo_canonical["default"],
+        "CELL_ID": "other",
+    }
+
+    response = await _fit_after_summary(
+        extension,
+        builder,
+        hub,
+        {"op": "fit", "mode": "strict", "cell": "default"},
+        _rolling_summary(positions),
+    )
+
+    assert response.body["type"] == "X-RTLS-GEO"
+    assert response.body["cell"] == "default"
+    assert response.body["selectedModel"] == "strict"
+
+
 async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
     extension, device, builder, hub
 ):
