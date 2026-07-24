@@ -20,13 +20,15 @@ clients through the server's message hub:
   re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
   debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
   `X-RTLS-INF`. The same stats feed drives the cluster->GPS show-clock
-  pin distribution (see below).
+  pin distribution (see below), and the responders' rolling TWR summaries
+  feed the anchor-geometry fit (see `X-RTLS-GEO fit`).
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
   `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
   Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
   revert — so the recovery path is health-check + re-upload of the
-  previous artifact. `smpclient` is an optional dependency of the SDK
-  (`rtls-link[ota]`); without it, starting an OTA job fails at runtime.
+  previous artifact. `smpclient` is an optional dependency of the SDK and
+  the server installs the SDK's `ota` extra because OTA and geometry-sync
+  reboot are first-class RTLS operations.
 
 ## Firmware requirements
 
@@ -71,8 +73,10 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   `X-RTLS-GEO` check/sync operations (see below).
 - `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
   below).
-- `fit.py` — TWR capture + the rectangular geometry fit behind the
-  `X-RTLS-GEO` capture/fit ops (see below).
+- `fit.py` — the per-responder rolling-TWR cache, distributed calibration
+  capture and `X-RTLS-GEO` fit op (see below).
+- `anchor_geometry.py` — the pure strict/refined four-tripod geometry
+  models behind the fit (no MAVLink, devices or server state).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
   NED table, NED->global) for SDK pins that predate them; the
   `rtlslink` implementations are used when present.
@@ -748,43 +752,146 @@ silent: the next `check` reports the fleet inconsistent. UIs should
 therefore re-run `check` after every sync, and re-run `sync` until
 every device reports `synced`.
 
-### X-RTLS-GEO capture / fit — measure the anchors' true geometry
+### X-RTLS-GEO fit — measure the anchors' true geometry
 
 Tripods go up in roughly the surveyed spots; "roughly" is centimeters
-of error the UWB solver bakes into every position. The anchors range
-each other continuously (TWR), so the standing geometry is measurable:
+of error the UWB solver bakes into every position. The standing
+geometry is measured from the ranging the responders do anyway — the
+server only selects a fresh, bounded-skew set of rolling windows.
 
-- `{"op": "capture", "duration": 20}` (re)starts a TWR collection
-  window (seconds, max 120); `{"op": "capture-status"}` reports
-  progress (pairs heard, per-pair sample counts);
-- `{"op": "fit", "margin": 0.1}` aggregates the window (median + MAD
-  outlier rejection per pair) and solves against the cell's RECTANGULAR
-  shape prior — the plan-view rectangle with one or two height layers
-  derived from the configured layout. Two solutions come back:
+**Responder rolling summaries (rtls-link summary protocol v1).** On the
+SR250, each DL-TDoA responder measures its range to the A0 initiator;
+A0 receives no corresponding per-responder measurements. Each A1–A7
+responder therefore keeps its own 2 s rolling window and publishes a
+robust aggregate at 1 Hz on the management channel, as **one bundled
+datagram** of NAMED_VALUE_FLOAT frames that all carry that device
+generation's `time_boot_ms`. A0 and sources that cannot summarize
+publish nothing.
 
-  - `rigid`: the best geometry keeping the assumed shape (width,
-    length, layer heights, upper-layer offset optimized);
-  - `relaxed`: every anchor freed inside ±`margin` (max 0.5 m) around
-    the rigid solution, regularized toward it.
+| field | meaning |
+| --- | --- |
+| `trcap` | summary protocol version (currently 1) |
+| `trseq` | generation sequence, 24-bit wrap-around |
+| `trmask` | one bit per valid peer slot (a responder normally reports only bit 0 for A0) |
+| `twrXXXX` | filtered range to peer MAC `XXXX`, meters — median of the window's inliers (median ± 3×MAD gate) |
+| `twmXXXX` | the window's MAD, meters |
+| `twnXXXX` | inlier sample count (a peer needs ≥ 20 to be published at all) |
 
-  `moves` (relaxed − configured, per anchor) is each tripod's measured
-  STANDING OFFSET: positive `dxM` means it stands that far along +x of
-  its configured spot. To physically restore the surveyed layout, move
-  the tripod by the NEGATED vector; to fly with the tripods where they
-  stand, apply the relaxed geometry as-is. `residuals` carries the
-  per-pair measured/predicted/residual table and `coverage` the pair
-  matrix (a fit is NAKed below minimal coverage). Distances constrain
-  only the shape, so the result is aligned back onto the configured
-  layout (plan-view Kabsch + mean height): the operator's frame stays
-  put.
+`XXXX` is the peer MAC as exactly four lowercase hex digits. The
+`rtlslink` SDK reassembles coherent generations — the three header
+fields plus a complete range/MAD/count triple for every masked slot,
+all stamped with the same `time_boot_ms` — and emits one `twr_summary`
+event per device generation; frames from different generations are never
+combined. The extension caches the newest coherent summary per system
+id.
 
-To APPLY a fit result, pass its geometry to the sync op as an explicit
-payload — it is validated and written to EVERY tag (the former
-reference included), with the same verified-write/reboot semantics:
+**Fitting.** `{"op": "fit", "mode": "strict"}` fits the newest
+measurement:
+
+- resolves the canonical cell geometry (the single stored cell; the
+  four-tripod fit requires exactly 8 configured anchors) and maps every
+  configured MAC to one unique online device with the expected role;
+- waits up to `timeout` seconds (default and cap 4) for one responder
+  summary per A1–A7 that is **fresher than the request** and whose
+  server receipt timestamps are within 1.5 s;
+- validates every source independently: protocol version 1, exactly one
+  A0 peer range (`trmask=0x01`), and at least 20 samples — violations
+  NAK naming the offending responder;
+- combines the seven spokes into a server-owned calibration capture,
+  runs the strict model, and **pins** that exact capture + result.
+
+`{"op": "fit", "mode": "refined", "captureId": 4711}` re-fits exactly
+the pinned capture (`captureId` must match; anything else, or refining
+before any strict fit, NAKs). The refined pass never consumes new
+telemetry, so the strict and refined verdicts always describe the same
+seven device generations. Firmware `trseq` and `time_boot_ms` remain
+per-device provenance and are never compared across device clocks.
+
+Both models place the anchors in canonical A0-origin NED coordinates:
+A0 at the origin, A0→A1 along +X, `POS_YAW_DEG` 0; slots A0–A3 are the
+lower plane, A4–A7 the upper one (upper anchors get negative `zM`).
+
+- `strict` — two congruent, perpendicular rectangles; parameters
+  `lengthM`, `widthM`, `heightM`.
+- `refined` — aligned upper/lower parallelograms sharing one corner
+  angle; parameters `bottomLengthM`, `bottomWidthM`, `topLengthM`,
+  `topWidthM`, `heightM`, `angleDeg`. Hard safety bounds: the angle
+  within ±5° of 90°, upper−lower length/width differences within
+  max(0.25 m, 2 % of the lower dimension).
+
+A model whose worst spoke residual exceeds 0.15 m is rejected
+(`accepted: false`, human-readable `reasons`). `refined` is
+additionally accepted only when its RMS improvement over `strict`
+exceeds the measurement noise floor (median of the spokes' MAD, at
+least 1 cm) AND no parameter reached a safety bound — a bound-riding
+fit means the installation deviates more than the refined model
+permits, and is rejected instead of hidden.
+
+Explicit NON-GOALS: per-anchor move suggestions, free per-anchor XYZ
+fitting, full pairwise-mesh capture and independent per-plane skew.
+Seven A0-star radii cannot identify any of them.
+
+Response — `refined` is `null` on a strict-only run; `comparison`
+(refined runs only) restates the acceptance arithmetic
+(`rmsImprovementM`, `noiseFloorM`, `meaningfulImprovement`);
+`selectedModel` names the requested model when it was accepted, else
+`null`; `applyGeometry` is a ready-to-sync geometry payload (origin,
+`CELL_ID`, MACs and biases copied from the canonical geometry,
+`POS_YAW_DEG` forced to 0, fitted `xM`/`yM`/`zM` as the anchor table)
+or `null` when the selected model was rejected:
+
+```json
+{
+  "type": "X-RTLS-GEO",
+  "op": "fit",
+  "mode": "strict",
+  "cell": "default",
+  "summary": {
+    "systemId": 70,
+    "version": 1,
+    "sequence": 4711,
+    "timeBootMs": 123456,
+    "validMask": 254,
+    "ageMs": 180,
+    "ranges": [
+      {"anchorIndex": 1, "peerMac": 2, "distanceM": 20.001, "madM": 0.012, "count": 57},
+      "..."
+    ]
+  },
+  "strict": {
+    "model": "strict",
+    "accepted": true,
+    "parameters": {"lengthM": 20.003, "widthM": 15.001, "heightM": 2.499},
+    "anchors": [{"index": 0, "xM": 0.0, "yM": 0.0, "zM": 0.0}, "..."],
+    "rmsM": 0.011,
+    "weightedObjective": 0.000123,
+    "residuals": [
+      {"anchorIndex": 1, "peerMac": 2, "measuredM": 20.001, "predictedM": 20.003,
+       "residualM": 0.002, "madM": 0.012, "count": 57, "weight": 1.0},
+      "..."
+    ],
+    "reasons": [],
+    "warnings": []
+  },
+  "refined": null,
+  "selectedModel": "strict",
+  "applyGeometry": {"ORIGIN_LAT_E7": 413900000, "POS_YAW_DEG": 0.0, "...": "..."}
+}
+```
+
+To APPLY a fit result, pass its `applyGeometry` to the sync op as an
+explicit payload — it is validated and written to EVERY tag (the
+former reference included), with the same verified-write/reboot
+semantics:
 
 ```json
 {"type": "X-RTLS-GEO", "op": "sync", "geometry": {"ORIGIN_LAT_E7": 413900000, "...": "..."}, "reboot": true}
 ```
+
+Firmware/SDK dependency: the fit needs A0 firmware that speaks the
+rolling-summary protocol (v1) and an `rtls-link` SDK new enough to
+emit the `twr_summary` event; without them a strict fit NAKs after the
+wait with "no rolling TWR summary arrived from A0".
 
 ### X-RTLS-VERIFY — fleet pre-flight verification
 
@@ -802,16 +909,20 @@ set (EKF sources, VISO, WPNAV, LOIT, position/attitude controllers,
 IMU filters) from every paired drone and reports cross-drone
 differences — always as warnings: deliberate per-drone tuning exists.
 
+Pass the same explicit `cell` used by geometry check/sync so a server
+holding more than one canonical installation never guesses which geometry
+to certify:
+
 ```json
-{"type": "X-RTLS-VERIFY", "inDepth": false}
+{"type": "X-RTLS-VERIFY", "cell": "bench-4", "inDepth": false}
 ```
 
 Response: `rules` (each with `id`, `label`, `severity`
 (`error`/`warning`), `status` (`pass`/`fail`/`skipped`), a
 human-readable `detail` and rule-specific extras), `passed` (no
-error-severity rule failed) and the embedded `geometry` check body for
-UI reuse. Concurrent runs are NAKed; expect the in-depth pass to take
-a few seconds per fleet (live MAVLink parameter reads).
+error-severity rule failed), the resolved `cell`, and the embedded
+`geometry` check body for UI reuse. Concurrent runs are NAKed; expect the
+in-depth pass to take a few seconds per fleet (live MAVLink parameter reads).
 
 ### Notes for control-UI developers
 

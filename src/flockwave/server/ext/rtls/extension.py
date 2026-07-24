@@ -261,9 +261,17 @@ class RtlsExtension(Extension):
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
         self._verify_running = False
-        #: running TWR capture window for the geometry fit (see fit.py);
-        #: ``None`` when no capture is active
-        self._geo_capture: Optional[dict[str, Any]] = None
+        #: complete rolling TWR summaries keyed by reporting system ID.
+        #: Scalar ``twr`` events remain in ``_twr`` for X-RTLS-INF only;
+        #: calibration consumes these capability-gated coherent generations.
+        self._twr_summaries: dict[int, Any] = {}
+        #: edge-triggered wakeup for fit requests waiting for a generation
+        self._twr_summary_changed = trio.Event()
+        #: strict fit + exact summary pinned for an optional refined fit
+        self._geo_fit_session = None
+        #: Process-local identifier for a distributed calibration capture.
+        #: A restart clears the pinned session, so persistence is unnecessary.
+        self._next_geo_capture_id = 1
         #: lazily loaded canonical-geometry store (see geometry.py);
         #: ``None`` = not loaded yet
         self._geo_canonical: Optional[dict[str, Any]] = None
@@ -686,6 +694,14 @@ class RtlsExtension(Extension):
                 # from the wire name); cache it per peer with a harvest stamp so
                 # X-RTLS-INF can report its age.
                 self._on_twr(event.system_id, event.data, now)
+            elif event.kind == "twr_summary":
+                # The SDK emits this only after it has assembled a coherent
+                # capability/header plus complete range/quality/count triples
+                # from one device generation. Calibration later combines one
+                # A0 spoke from each responder.
+                from .fit import on_twr_summary
+
+                on_twr_summary(self, event.system_id, event.data, now)
             elif event.kind == "param_value":
                 # a freshly learned parameter may complete a tag's cell or
                 # change an anchor's MAC/role; resync the anchor beacons
@@ -708,14 +724,6 @@ class RtlsExtension(Extension):
             float(distance_m),
             now,
         )
-        if self._geo_capture is not None:
-            # feed the running geometry-fit capture window (lazy import:
-            # fit.py imports helpers from this module)
-            from .fit import on_twr_sample
-
-            on_twr_sample(
-                self, system_id, int(peer_mac), float(distance_m), now
-            )
 
     async def _track_sleeping(
         self, system_id: int, sleeping: Optional[bool], now: float
@@ -1377,6 +1385,13 @@ class RtlsExtension(Extension):
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
+        self._twr_summaries.pop(event.system_id, None)
+        if (
+            self._geo_fit_session is not None
+            and event.system_id
+            in self._geo_fit_session.capture.participant_system_ids
+        ):
+            self._geo_fit_session = None
         self._adv.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
@@ -1956,30 +1971,36 @@ class RtlsExtension(Extension):
 
         body = message.body
         op = body.get("op")
-        if op in ("capture", "capture-status", "fit"):
-            from .fit import run_capture, run_capture_status, run_fit
+        if op == "fit":
+            from .fit import SUMMARY_WAIT_TIMEOUT_S, run_fit
 
             try:
-                if op == "capture":
-                    duration = body.get("duration", 20.0)
+                mode = body.get("mode", "strict")
+                if not isinstance(mode, str):
+                    raise ValueError(f"Invalid fit mode: {mode!r}")
+                capture_id = body.get("captureId")
+                if capture_id is not None:
                     try:
-                        duration = float(duration)
+                        capture_id = int(capture_id)
                     except (TypeError, ValueError):
                         raise ValueError(
-                            f"Invalid duration: {duration!r}"
+                            f"Invalid captureId: {capture_id!r}"
                         ) from None
-                    result = run_capture(self, duration, time.monotonic())
-                elif op == "capture-status":
-                    result = run_capture_status(self, time.monotonic())
-                else:
-                    margin = body.get("margin", 0.1)
-                    try:
-                        margin = float(margin)
-                    except (TypeError, ValueError):
-                        raise ValueError(
-                            f"Invalid margin: {margin!r}"
-                        ) from None
-                    result = run_fit(self, margin=margin)
+                timeout = body.get("timeout", SUMMARY_WAIT_TIMEOUT_S)
+                try:
+                    timeout = float(timeout)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Invalid timeout: {timeout!r}") from None
+                cell = body.get("cell")
+                if cell is not None and not isinstance(cell, str):
+                    raise ValueError(f"Invalid cell: {cell!r}")
+                result = await run_fit(
+                    self,
+                    mode=mode,
+                    cell=cell,
+                    capture_id=capture_id,
+                    timeout=timeout,
+                )
             except ValueError as ex:
                 return hub.reject(message, reason=str(ex))
             return hub.create_response_or_notification(
@@ -1989,7 +2010,7 @@ class RtlsExtension(Extension):
             return hub.reject(
                 message,
                 reason=f"Invalid op: {op!r} (expected 'adopt', 'check', "
-                "'sync', 'capture', 'capture-status' or 'fit')",
+                "'sync' or 'fit')",
             )
         try:
             reference = _get_optional_device_id(body, "reference")
@@ -2049,7 +2070,10 @@ class RtlsExtension(Extension):
 
         in_depth = bool(message.body.get("inDepth", False))
         try:
-            result = await run_verify(self, in_depth=in_depth)
+            cell = message.body.get("cell")
+            if cell is not None and not isinstance(cell, str):
+                raise ValueError(f"Invalid cell: {cell!r}")
+            result = await run_verify(self, cell=cell, in_depth=in_depth)
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
         return hub.create_response_or_notification(

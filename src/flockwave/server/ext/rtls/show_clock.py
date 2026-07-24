@@ -123,6 +123,12 @@ class ShowClockPinManager:
     def __init__(self, ext: "RtlsExtension"):
         self._ext = ext
         self._pin: Optional[GpsPin] = None
+        #: Last distinct cluster-clock sample evaluated per device. The SDK
+        #: emits an accumulated stats snapshot for every individual
+        #: NAMED_VALUE_FLOAT frame, so the same clkh/clks pair is repeated
+        #: while the other fields in the cycle arrive (and while parameter
+        #: writes temporarily delay the next clock frame).
+        self._last_cluster_seconds: dict[int, float] = {}
         #: devices whose LAST push completed with every write accepted
         self._pinned: set[int] = set()
         #: devices with a push currently in flight (dedup guard)
@@ -134,12 +140,14 @@ class ShowClockPinManager:
 
     def reset(self) -> None:
         self._pin = None
+        self._last_cluster_seconds.clear()
         self._pinned.clear()
         self._in_flight.clear()
 
     def forget_device(self, system_id: int) -> None:
         """A lost device must be re-pinned when it returns (it may have
         rebooted with default params)."""
+        self._last_cluster_seconds.pop(system_id, None)
         self._pinned.discard(system_id)
 
     def on_stats(self, system_id: int, data: dict[str, Any], nursery) -> None:
@@ -152,6 +160,9 @@ class ShowClockPinManager:
         if clkh is None or clks is None:
             return
         cluster_seconds = float(clkh) + float(clks)
+        if self._last_cluster_seconds.get(system_id) == cluster_seconds:
+            return
+        self._last_cluster_seconds[system_id] = cluster_seconds
         now_unix = time.time()
 
         if self._pin is not None:

@@ -51,7 +51,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rtlslink import encode_param_value, param_type_from_name  # noqa: E402
 
 from flockwave.server.ext.rtls.extension import RtlsExtension  # noqa: E402
-from flockwave.server.ext.rtls.geometry import run_check, run_sync  # noqa: E402
+from flockwave.server.ext.rtls.geometry import (  # noqa: E402
+    run_adopt,
+    run_check,
+    run_sync,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("e2e")
@@ -217,17 +221,17 @@ async def _drive(binary: str) -> None:
                     _make_reference(time.monotonic())
                 )
 
-                # 3. the factory-fresh tag must disagree with the reference
-                report = await run_check(ext, reference=REFERENCE_SYSID)
+                # 3. adopt the synthetic reference as the canonical
+                # geometry, then the factory-fresh tag must disagree
+                await run_adopt(ext, reference=REFERENCE_SYSID)
+                report = await run_check(ext)
                 entry = report["devices"][str(sysid)]
                 assert report["consistent"] is False, report
                 assert entry["status"] in ("mismatch", "incomplete"), entry
                 log.info("pre-sync check: %s", entry["status"])
 
                 # 4. sync: every write must be acked by the real firmware
-                result = await run_sync(
-                    ext, reference=REFERENCE_SYSID, reboot=False
-                )
+                result = await run_sync(ext, reboot=False)
                 entry = result["devices"][str(sysid)]
                 assert entry["status"] == "synced", entry
                 assert not entry["failures"], entry
@@ -240,13 +244,13 @@ async def _drive(binary: str) -> None:
                 )
 
                 # 5. the tag must now agree (server-cache view)
-                report = await run_check(ext, reference=REFERENCE_SYSID)
+                report = await run_check(ext)
                 assert report["consistent"] is True, report
 
                 # 6. and it must STILL agree when the cache is rebuilt
                 # from the live device (device truth, not server optimism)
                 await _relist(ext, sysid)
-                report = await run_check(ext, reference=REFERENCE_SYSID)
+                report = await run_check(ext)
                 assert report["consistent"] is True, report
                 log.info("post-sync check from a fresh device dump: consistent")
 
@@ -258,7 +262,7 @@ async def _drive(binary: str) -> None:
                 proc = _boot(binary, flash_dir, "tag")
                 await _wait_discovery(ext)
                 await _relist(ext, sysid)
-                report = await run_check(ext, reference=REFERENCE_SYSID)
+                report = await run_check(ext)
                 assert report["consistent"] is True, report
                 log.info("post-reboot check: geometry persisted")
 

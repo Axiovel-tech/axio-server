@@ -1,574 +1,460 @@
-"""TWR capture + rectangular geometry fit (X-RTLS-GEO capture/fit).
-
-The daily anchor-setup problem: tripods go up in roughly the surveyed
-spots, but "roughly" is centimeters of error the UWB solver then bakes
-into every position. The anchors continuously range each other (TWR),
-so the geometry that the anchors actually stand in is measurable:
-
-- ``capture`` collects a window of inter-anchor TWR samples (the
-  steady-state harvest keeps only the latest value per pair; a fit
-  needs a robust aggregate over many);
-- ``fit`` aggregates the window (median + MAD outlier rejection per
-  pair), then solves two least-squares problems against the cell's
-  RECTANGULAR shape prior — the site is two stacked/offset rectangles
-  (or one rectangle with per-anchor heights):
-
-  1. the RIGID fit optimizes only the shape parameters (width, length,
-     layer heights, upper-layer offset), yielding the best geometry
-     that keeps the assumed shape;
-  2. the RELAXED fit frees every anchor coordinate inside a small box
-     around the CONFIGURED position, regularized toward it — "the
-     smallest deviation from the survey that explains the ranges", so
-     one moved tripod cannot smear phantom suggestions onto its
-     neighbors through the shape parameters.
-
-  One solve, two readings: ``relaxed - rigid`` per anchor is the "move
-  this tripod" suggestion; the relaxed positions are the best geometry
-  achievable WITHOUT moving anything (write it with the sync op's
-  explicit ``geometry`` payload).
-
-Distances constrain only the SHAPE, never the frame, so the fitted
-shape is aligned back onto the configured layout (2-D Kabsch over the
-plan view plus a mean height shift): the operator's cell frame — and
-everything referencing it — stays put.
-
-Solvers are plain numpy Levenberg–Marquardt with numerical Jacobians:
-six shape parameters (or 3N ≤ 24 relaxed coordinates) against ≤ 28
-pair measurements need no scipy dependency on a show machine.
-"""
+"""Distributed rolling-summary calibration for ``X-RTLS-GEO fit``."""
 
 from __future__ import annotations
 
-import statistics
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+import time
+from dataclasses import dataclass
+from statistics import median
+from typing import TYPE_CHECKING, Any, Sequence
 
-import numpy as np
+import trio
 
+from .anchor_geometry import (
+    FitResult,
+    RangeObservation,
+    fit_refined,
+    fit_strict,
+)
 from .extension import _decoded_device_params
 from .geometry import get_canonical
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
 
-__all__ = ("run_capture", "run_capture_status", "run_fit", "on_twr_sample")
+__all__ = (
+    "DeviceTwrSummary",
+    "on_twr_summary",
+    "run_fit",
+)
 
-#: capture window bounds, seconds
-CAPTURE_DEFAULT_S = 20.0
-CAPTURE_MAX_S = 120.0
+SUMMARY_PROTOCOL_VERSION = 1
+SUMMARY_FRESHNESS_S = 2.5
+SUMMARY_WAIT_TIMEOUT_S = 4.0
+MAX_CAPTURE_SKEW_S = 1.5
+MIN_SAMPLES_PER_PAIR = 20
 
-#: per-pair sample cap: at the firmware's ranging cadence a runaway
-#: capture must not grow without bound
-MAX_SAMPLES_PER_PAIR = 4096
-
-#: minimum aggregated samples for a pair to count as measured
-MIN_SAMPLES_PER_PAIR = 3
-
-#: samples farther than this many (scaled) MADs from the median are dropped
-MAD_K = 3.0
-
-#: default / maximum half-width of the relaxed fit's box around the rigid
-#: solution, meters
-RELAX_MARGIN_DEFAULT_M = 0.10
-RELAX_MARGIN_MAX_M = 0.50
-
-#: regularization weight pulling relaxed coordinates toward the
-#: CONFIGURED survey (in residual units per meter of deviation): small
-#: enough that a real measurement wins, large enough that unconstrained
-#: directions (e.g. a poorly-covered anchor) stay put
-RELAX_REGULARIZATION = 0.05
-
-#: two anchors are on the same layer when their configured heights are
-#: within this many meters
-LAYER_SPLIT_M = 0.30
-
-#: Levenberg–Marquardt iteration cap and convergence threshold
-LM_MAX_ITERATIONS = 60
-LM_TOLERANCE = 1e-10
+# UWB_ROLE wire values; mirrored from rtls_link::uwb::params.
+ROLE_ANCHOR_INITIATOR = 2
+ROLE_ANCHOR_RESPONDER = 3
 
 
-# ---- capture -------------------------------------------------------------
+@dataclass(frozen=True)
+class _Anchor:
+    index: int
+    mac: int
 
 
-def on_twr_sample(
-    ext: "RtlsExtension",
-    system_id: int,
-    peer_mac: int,
-    distance_m: float,
-    now: float,
-) -> None:
-    """Appends one TWR sample to the running capture window (no-op when
-    no capture is active). Called from the extension's TWR event hook."""
-    capture = ext._geo_capture
-    if capture is None or now > capture["until"]:
-        return
-    samples = capture["samples"].setdefault((system_id, peer_mac), [])
-    if len(samples) < MAX_SAMPLES_PER_PAIR:
-        samples.append(float(distance_m))
+@dataclass(frozen=True)
+class _TwrRange:
+    peer_mac: int
+    distance_m: float
+    mad_m: float
+    count: int
 
 
-def run_capture(ext: "RtlsExtension", duration: float, now: float) -> dict:
-    """(Re)starts a TWR capture window; returns the capture status body.
-    Restarting is deliberate: a stale half-window from an earlier session
-    must not leak into a new fit."""
-    duration = max(1.0, min(float(duration), CAPTURE_MAX_S))
-    ext._geo_capture = {
-        "started": now,
-        "until": now + duration,
-        "samples": {},
-    }
-    return run_capture_status(ext, now)
+@dataclass(frozen=True)
+class DeviceTwrSummary:
+    """One complete rolling generation emitted by one responder."""
+
+    system_id: int
+    version: int
+    sequence: int
+    valid_mask: int
+    time_boot_ms: int
+    ranges: tuple[_TwrRange, ...]
+    received_at: float
 
 
-def run_capture_status(ext: "RtlsExtension", now: float) -> dict:
-    capture = ext._geo_capture
-    if capture is None:
-        return {
-            "type": "X-RTLS-GEO",
-            "op": "capture-status",
-            "running": False,
-        }
-    samples = capture["samples"]
-    counts = [len(v) for v in samples.values()]
-    return {
-        "type": "X-RTLS-GEO",
-        "op": "capture-status",
-        "running": now < capture["until"],
-        "elapsed": round(max(0.0, now - capture["started"]), 1),
-        "duration": round(capture["until"] - capture["started"], 1),
-        "pairs": len(samples),
-        "samplesTotal": int(sum(counts)),
-        "samplesPerPairMin": int(min(counts)) if counts else 0,
-    }
+@dataclass(frozen=True)
+class _CaptureSource:
+    anchor: _Anchor
+    summary: DeviceTwrSummary
 
 
-def _robust_aggregate(samples: list[float]) -> Optional[dict[str, Any]]:
-    """Median + MAD outlier rejection over one pair's samples; ``None``
-    when too few samples survive."""
-    if len(samples) < MIN_SAMPLES_PER_PAIR:
-        return None
-    median = statistics.median(samples)
-    mad = statistics.median([abs(s - median) for s in samples])
-    scale = max(1.4826 * mad, 0.005)  # never let MAD=0 nuke everything
-    kept = [s for s in samples if abs(s - median) <= MAD_K * scale]
-    if len(kept) < MIN_SAMPLES_PER_PAIR:
-        return None
-    return {
-        "distanceM": statistics.median(kept),
-        "madM": mad,
-        "count": len(kept),
-        "dropped": len(samples) - len(kept),
-    }
+@dataclass(frozen=True)
+class _CalibrationCapture:
+    capture_id: int
+    sources: tuple[_CaptureSource, ...]
+    observations: tuple[RangeObservation, ...]
+    participant_system_ids: frozenset[int]
 
 
-def _mac_of(ext: "RtlsExtension", system_id: int) -> Optional[int]:
-    device = ext._require_protocol().devices.get(system_id)
-    if device is None:
-        return None
-    mac = _decoded_device_params(device).get("UWB_MAC")
+@dataclass(frozen=True)
+class _FitSession:
+    capture: _CalibrationCapture
+    strict: FitResult
+    reference: dict[str, Any]
+    cell: str
+
+
+def _parse_summary(
+    system_id: int, data: dict[str, Any], now: float
+) -> DeviceTwrSummary | None:
+    """Validate the SDK's coherent per-device ``twr_summary`` event."""
     try:
-        return int(mac) if mac is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def aggregate_capture(
-    ext: "RtlsExtension",
-) -> dict[tuple[int, int], dict[str, Any]]:
-    """Aggregates the capture window into canonical per-MAC-pair
-    measurements: (min_mac, max_mac) -> {distanceM, madM, count, dropped}.
-    Both directions of a pair merge into one measurement."""
-    capture = ext._geo_capture
-    if capture is None:
-        return {}
-    by_pair: dict[tuple[int, int], list[float]] = {}
-    for (system_id, peer_mac), samples in capture["samples"].items():
-        own_mac = _mac_of(ext, system_id)
-        if own_mac is None or own_mac == peer_mac:
-            continue
-        key = (min(own_mac, peer_mac), max(own_mac, peer_mac))
-        by_pair.setdefault(key, []).extend(samples)
-    out: dict[tuple[int, int], dict[str, Any]] = {}
-    for key, samples in by_pair.items():
-        aggregated = _robust_aggregate(samples)
-        if aggregated is not None:
-            out[key] = aggregated
-    return out
-
-
-# ---- shape model ---------------------------------------------------------
-
-
-class _ShapeModel:
-    """The rectangular shape prior, derived from the CONFIGURED layout.
-
-    Corner assignment happens in the rectangle's OWN (principal-axis)
-    frame — global x/y extrema misassign corners as soon as the site is
-    rotated in the cell frame. Heights keep their per-anchor structure:
-    the model only solves a shared per-layer offset, never a uniform
-    height that would flatten deliberate differences.
-
-    Parameters: [W, L] plus, with two layers, [dz_high] (the change of
-    the upper layer's separation) and [ox, oy] (upper-layer plan
-    offset). The model is built in the principal frame; the caller
-    Kabsch-aligns the result back onto the configured layout, restoring
-    the rotation for free."""
-
-    def __init__(self, anchors: list[dict[str, Any]]):
-        self.anchors = anchors
-        plan = np.array([[a["x"], a["y"]] for a in anchors], dtype=float)
-        self.plan_centroid = plan.mean(axis=0)
-        centered = plan - self.plan_centroid
-
-        zs = [a["z"] for a in anchors]
-        z_sorted = sorted(zs)
-        self.two_layers = (z_sorted[-1] - z_sorted[0]) > LAYER_SPLIT_M
-        z_mid = (z_sorted[0] + z_sorted[-1]) / 2.0
-        layers = [
-            1 if self.two_layers and a["z"] > z_mid else 0 for a in anchors
-        ]
-
-        # principal axes of the plan view give the rectangle's own frame —
-        # but a SQUARE layout is PCA-degenerate: any tiny asymmetry (e.g.
-        # a small upper-layer offset) can steer the axes 45° off and
-        # collapse the corner assignment. Try the PCA axes plus their
-        # ±45° rotations and keep the valid assignment that the anchors
-        # fit best.
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        base = float(np.arctan2(vt[0, 1], vt[0, 0]))
-        best = None
-        for delta in (0.0, np.pi / 4, -np.pi / 4):
-            angle = base + delta
-            axes = np.array(
-                [
-                    [np.cos(angle), np.sin(angle)],
-                    [-np.sin(angle), np.cos(angle)],
-                ]
-            )
-            candidate = self._attempt_assignment(centered, layers, axes)
-            if candidate is not None and (
-                best is None or candidate[0] < best[0]
-            ):
-                best = candidate
-        if best is None:
-            raise ValueError(
-                "configured anchor layout does not resolve to distinct "
-                "rectangle corners — the rectangular shape prior cannot "
-                "describe this site"
-            )
-        _, self.axes, self.assignment, extent_u, extent_v = best
-
-        #: per-anchor configured heights: kept as the base, so deliberate
-        #: intra-layer height differences survive the fit
-        self.base_z = np.array(zs, dtype=float)
-        theta = [extent_u, extent_v]
-        if self.two_layers:
-            theta.append(0.0)  # change of the upper layer's separation
-            theta.extend([0.0, 0.0])  # upper-layer plan offset ox, oy
-        self.theta0 = np.array(theta, dtype=float)
-
-    @staticmethod
-    def _attempt_assignment(centered, layers, axes):
-        """Tries one candidate frame; returns ``(fit_error, axes,
-        assignment, extent_u, extent_v)`` or ``None`` when the anchors do
-        not resolve to distinct rectangle corners in it."""
-        local = centered @ axes.T
-        u0, u1 = local[:, 0].min(), local[:, 0].max()
-        v0, v1 = local[:, 1].min(), local[:, 1].max()
-        if u1 - u0 < 0.5 or v1 - v0 < 0.5:
+        version = int(data["version"])
+        sequence = int(data["sequence"])
+        valid_mask = int(data["validMask"])
+        time_boot_ms = int(data["timeBootMs"])
+        raw_ranges = data["ranges"]
+        if (
+            version <= 0
+            or sequence < 0
+            or valid_mask < 0
+            or time_boot_ms < 0
+            or not isinstance(raw_ranges, Sequence)
+        ):
             return None
-        assignment = []
-        corners_used = set()
-        error = 0.0
-        for i, layer in enumerate(layers):
-            u = 0 if abs(local[i, 0] - u0) < abs(local[i, 0] - u1) else 1
-            v = 0 if abs(local[i, 1] - v0) < abs(local[i, 1] - v1) else 1
-            key = (u, v, layer)
-            if key in corners_used:
-                return None
-            corners_used.add(key)
-            assignment.append(key)
-            corner = np.array([u1 if u else u0, v1 if v else v0])
-            error += float(np.sum((local[i] - corner) ** 2))
-        return (error, axes, assignment, u1 - u0, v1 - v0)
-
-    def positions(self, theta: np.ndarray) -> np.ndarray:
-        width, length = theta[0], theta[1]
-        if self.two_layers:
-            dz_high, ox, oy = theta[2], theta[3], theta[4]
-        else:
-            dz_high, ox, oy = 0.0, 0.0, 0.0
-        out = np.empty((len(self.assignment), 3), dtype=float)
-        for i, (u, v, layer) in enumerate(self.assignment):
-            out[i, 0] = u * width + (ox if layer else 0.0)
-            out[i, 1] = v * length + (oy if layer else 0.0)
-            out[i, 2] = self.base_z[i] + (dz_high if layer else 0.0)
-        return out
+        ranges = tuple(
+            _TwrRange(
+                peer_mac=int(item["peerMac"]),
+                distance_m=float(item["distanceM"]),
+                mad_m=float(item["madM"]),
+                count=int(item["count"]),
+            )
+            for item in raw_ranges
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if len({item.peer_mac for item in ranges}) != len(ranges) or any(
+        item.distance_m <= 0 or item.mad_m < 0 or item.count <= 0 for item in ranges
+    ):
+        return None
+    return DeviceTwrSummary(
+        system_id=system_id,
+        version=version,
+        sequence=sequence,
+        valid_mask=valid_mask,
+        time_boot_ms=time_boot_ms,
+        ranges=ranges,
+        received_at=now,
+    )
 
 
-def _kabsch_align(
-    fitted: np.ndarray, reference: np.ndarray
-) -> np.ndarray:
-    """Aligns the fitted positions onto the reference layout with a
-    plan-view rotation + translation and a mean height shift (distances
-    carry no frame, so the operator's frame must be restored)."""
-    f_xy = fitted[:, :2]
-    r_xy = reference[:, :2]
-    f_c = f_xy - f_xy.mean(axis=0)
-    r_c = r_xy - r_xy.mean(axis=0)
-    h = f_c.T @ r_c
-    u, _, vt = np.linalg.svd(h)
-    d = np.sign(np.linalg.det(vt.T @ u.T))
-    rot = vt.T @ np.diag([1.0, d]) @ u.T
-    aligned = fitted.copy()
-    aligned[:, :2] = (rot @ f_c.T).T + r_xy.mean(axis=0)
-    aligned[:, 2] += reference[:, 2].mean() - fitted[:, 2].mean()
-    return aligned
+def on_twr_summary(
+    ext: "RtlsExtension", system_id: int, data: dict[str, Any], now: float
+) -> None:
+    """Cache one SDK-validated generation and wake capture waiters."""
+    summary = _parse_summary(system_id, data, now)
+    if summary is None:
+        return
+    previous = ext._twr_summaries.get(system_id)
+    if (
+        previous is not None
+        and previous.sequence == summary.sequence
+        and previous.time_boot_ms == summary.time_boot_ms
+    ):
+        return
+    ext._twr_summaries[system_id] = summary
+    changed = ext._twr_summary_changed
+    ext._twr_summary_changed = trio.Event()
+    changed.set()
 
 
-def _levenberg_marquardt(
-    residual_fn, theta0: np.ndarray, *, bounds=None
-) -> np.ndarray:
-    """Tiny LM with numerical Jacobians and optional box clamping —
-    six-ish parameters against ≤ 28 residuals need nothing bigger."""
-    theta = theta0.astype(float).copy()
-    lam = 1e-3
-    cost = float(np.sum(residual_fn(theta) ** 2))
-    for _ in range(LM_MAX_ITERATIONS):
-        r = residual_fn(theta)
-        jac = np.empty((r.size, theta.size))
-        for j in range(theta.size):
-            step = max(1e-6, 1e-6 * abs(theta[j]))
-            probe = theta.copy()
-            probe[j] += step
-            jac[:, j] = (residual_fn(probe) - r) / step
-        jtj = jac.T @ jac
-        jtr = jac.T @ r
-        improved = False
-        for _ in range(8):
-            try:
-                delta = np.linalg.solve(
-                    jtj + lam * np.diag(np.maximum(np.diag(jtj), 1e-12)),
-                    -jtr,
-                )
-            except np.linalg.LinAlgError:
-                lam *= 10
-                continue
-            candidate = theta + delta
-            if bounds is not None:
-                candidate = np.clip(candidate, bounds[0], bounds[1])
-            c = float(np.sum(residual_fn(candidate) ** 2))
-            if c < cost:
-                theta, cost = candidate, c
-                lam = max(lam / 10, 1e-9)
-                improved = True
-                break
-            lam *= 10
-        if not improved or float(np.linalg.norm(delta)) < LM_TOLERANCE:
-            break
-    return theta
+def _configured_anchors(reference: dict[str, Any]) -> tuple[_Anchor, ...]:
+    count = int(reference["UWB_AN_COUNT"])
+    if count != 8:
+        raise ValueError(
+            f"four-tripod calibration requires exactly 8 anchors ({count} configured)"
+        )
+    anchors = tuple(
+        _Anchor(index=index, mac=int(reference[f"UWB_AN{index}_MAC"]))
+        for index in range(count)
+    )
+    macs = [anchor.mac for anchor in anchors]
+    if any(mac in (0, 0xFFFF) for mac in macs) or len(set(macs)) != len(macs):
+        raise ValueError(
+            "the canonical anchor table contains invalid or duplicate MACs"
+        )
+    return anchors
 
 
-# ---- fit -----------------------------------------------------------------
-
-
-def _pair_residuals(
-    positions: np.ndarray,
-    index_of_mac: Mapping[int, int],
-    measurements: Mapping[tuple[int, int], dict[str, Any]],
-) -> np.ndarray:
-    out = []
-    for (mac_a, mac_b), m in sorted(measurements.items()):
-        ia = index_of_mac.get(mac_a)
-        ib = index_of_mac.get(mac_b)
-        if ia is None or ib is None:
+def _resolve_anchor_devices(
+    ext: "RtlsExtension", anchors: Sequence[_Anchor]
+) -> dict[int, int]:
+    """Map each configured anchor slot to one unique online device."""
+    claims: dict[int, list[tuple[int, int]]] = {}
+    for system_id, device in ext._require_protocol().devices.items():
+        params = _decoded_device_params(device)
+        try:
+            role = int(params.get("UWB_ROLE", -1))
+            mac = int(params.get("UWB_MAC", -1))
+        except (TypeError, ValueError):
             continue
-        predicted = float(np.linalg.norm(positions[ia] - positions[ib]))
-        out.append(predicted - m["distanceM"])
-    return np.array(out, dtype=float)
+        claims.setdefault(mac, []).append((system_id, role))
+
+    resolved: dict[int, int] = {}
+    for anchor in anchors:
+        candidates = claims.get(anchor.mac, ())
+        if not candidates:
+            raise ValueError(
+                f"A{anchor.index} is not online or its UWB MAC/role is not known"
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"multiple online devices claim the configured A{anchor.index} MAC"
+            )
+        system_id, role = candidates[0]
+        expected_role = (
+            ROLE_ANCHOR_INITIATOR if anchor.index == 0 else ROLE_ANCHOR_RESPONDER
+        )
+        if role != expected_role:
+            expected_name = "initiator" if anchor.index == 0 else "responder"
+            raise ValueError(
+                f"A{anchor.index} has UWB role {role}; expected {expected_name}"
+            )
+        resolved[anchor.index] = system_id
+    return resolved
 
 
-def run_fit(
+async def _wait_for_responder_summaries(
     ext: "RtlsExtension",
+    responder_system_ids: dict[int, int],
     *,
-    margin: float = RELAX_MARGIN_DEFAULT_M,
+    newer_than: float,
+    timeout: float,
+) -> tuple[DeviceTwrSummary, ...]:
+    """Collect one post-request generation per responder with bounded skew."""
+    deadline = time.monotonic() + timeout
+    latest: dict[int, DeviceTwrSummary] = {}
+    skew_s: float | None = None
+
+    while True:
+        changed = ext._twr_summary_changed
+        now = time.monotonic()
+        latest = {
+            index: summary
+            for index, system_id in responder_system_ids.items()
+            if (summary := ext._twr_summaries.get(system_id)) is not None
+            and summary.received_at >= newer_than
+            and now - summary.received_at <= SUMMARY_FRESHNESS_S
+        }
+        if len(latest) == len(responder_system_ids):
+            stamps = [summary.received_at for summary in latest.values()]
+            skew_s = max(stamps) - min(stamps)
+            if skew_s <= MAX_CAPTURE_SKEW_S:
+                return tuple(latest[index] for index in sorted(latest))
+
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+        with trio.move_on_after(remaining) as scope:
+            await changed.wait()
+        if scope.cancelled_caught:
+            break
+
+    missing = sorted(set(responder_system_ids) - set(latest))
+    if missing:
+        raise ValueError(
+            "no fresh rolling TWR summary from "
+            + ", ".join(f"A{index}" for index in missing)
+            + f" within {timeout:.1f} seconds"
+        )
+    assert skew_s is not None
+    raise ValueError(
+        f"responder summary skew is {skew_s:.2f} seconds; "
+        f"maximum is {MAX_CAPTURE_SKEW_S:.2f} seconds"
+    )
+
+
+def _resolve_observations(
+    summaries: Sequence[DeviceTwrSummary],
+    anchors: Sequence[_Anchor],
+) -> tuple[tuple[_CaptureSource, ...], tuple[RangeObservation, ...]]:
+    """Validate seven responder-owned A0 spokes and normalize for the solver."""
+    a0 = anchors[0]
+    sources: list[_CaptureSource] = []
+    observations: list[RangeObservation] = []
+
+    for anchor, summary in zip(anchors[1:], summaries, strict=True):
+        if summary.version != SUMMARY_PROTOCOL_VERSION:
+            raise ValueError(
+                f"A{anchor.index} rolling-summary protocol version "
+                f"{summary.version} is unsupported"
+            )
+        if summary.valid_mask != 0x01:
+            raise ValueError(
+                f"A{anchor.index} summary has peer mask "
+                f"0x{summary.valid_mask:02x}; expected only A0"
+            )
+        if len(summary.ranges) != 1 or summary.ranges[0].peer_mac != a0.mac:
+            raise ValueError(
+                f"A{anchor.index} summary does not contain exactly its A0 range"
+            )
+        measured = summary.ranges[0]
+        if measured.count < MIN_SAMPLES_PER_PAIR:
+            raise ValueError(
+                f"A{anchor.index} summary has {measured.count} samples; "
+                f"minimum is {MIN_SAMPLES_PER_PAIR}"
+            )
+        sources.append(_CaptureSource(anchor=anchor, summary=summary))
+        observations.append(
+            RangeObservation(
+                anchor_index=anchor.index,
+                peer_mac=anchor.mac,
+                distance_m=measured.distance_m,
+                mad_m=measured.mad_m,
+                count=measured.count,
+            )
+        )
+
+    return tuple(sources), tuple(observations)
+
+
+def _new_capture(
+    ext: "RtlsExtension",
+    sources: tuple[_CaptureSource, ...],
+    observations: tuple[RangeObservation, ...],
+    participant_system_ids: frozenset[int],
+) -> _CalibrationCapture:
+    capture = _CalibrationCapture(
+        capture_id=ext._next_geo_capture_id,
+        sources=sources,
+        observations=observations,
+        participant_system_ids=participant_system_ids,
+    )
+    ext._next_geo_capture_id += 1
+    return capture
+
+
+def _apply_geometry(
+    reference: dict[str, Any],
+    anchors: Sequence[_Anchor],
+    result: FitResult,
 ) -> dict[str, Any]:
-    """Aggregates the capture window and runs the rigid + relaxed fits
-    against the current (majority-reference) cell geometry. Raises
-    ValueError with a client-presentable reason when the capture or the
-    layout cannot support a fit."""
-    margin = max(0.01, min(float(margin), RELAX_MARGIN_MAX_M))
-
-    measurements = aggregate_capture(ext)
-    if not measurements:
-        raise ValueError(
-            "no usable TWR measurements captured — run a capture first "
-            "(and check that the anchors hear each other)"
-        )
-
-    ref_subset, cell_id = get_canonical(ext, None)
-    count = int(ref_subset["UWB_AN_COUNT"])
-    anchors = []
-    for index in range(count):
-        anchors.append(
-            {
-                "index": index,
-                "mac": int(ref_subset[f"UWB_AN{index}_MAC"]),
-                "x": float(ref_subset[f"UWB_AN{index}_X"]),
-                "y": float(ref_subset[f"UWB_AN{index}_Y"]),
-                "z": float(ref_subset[f"UWB_AN{index}_Z"]),
-            }
-        )
-    if len(anchors) < 4:
-        raise ValueError(
-            f"the rectangular fit needs at least 4 anchors ({len(anchors)} "
-            "configured)"
-        )
-    index_of_mac = {a["mac"]: i for i, a in enumerate(anchors)}
-
-    macs = set(index_of_mac)
-    usable = {
-        pair: m
-        for pair, m in measurements.items()
-        if pair[0] in macs and pair[1] in macs
-    }
-    expected_pairs = len(anchors) * (len(anchors) - 1) // 2
-    missing_pairs = [
-        [a["mac"], b["mac"]]
-        for i, a in enumerate(anchors)
-        for b in anchors[i + 1 :]
-        if (min(a["mac"], b["mac"]), max(a["mac"], b["mac"])) not in usable
-    ]
-    if len(usable) < len(anchors):
-        raise ValueError(
-            f"only {len(usable)} of {expected_pairs} anchor pairs were "
-            "measured — not enough ranging coverage for a fit"
-        )
-
-    configured = np.array(
-        [[a["x"], a["y"], a["z"]] for a in anchors], dtype=float
-    )
-    model = _ShapeModel(anchors)
-
-    def rigid_residuals(theta: np.ndarray) -> np.ndarray:
-        return _pair_residuals(model.positions(theta), index_of_mac, usable)
-
-    theta = _levenberg_marquardt(rigid_residuals, model.theta0)
-    rigid_aligned = _kabsch_align(model.positions(theta), configured)
-    rigid_r = _pair_residuals(rigid_aligned, index_of_mac, usable)
-    rigid_rms = float(np.sqrt(np.mean(rigid_r**2))) if rigid_r.size else 0.0
-
-    # box + regularization around the CONFIGURED survey, not the rigid
-    # solution: the rigid shape absorbs part of a single moved anchor
-    # into its parameters, and boxing around it would smear that anchor's
-    # offset onto its (actually unmoved) neighbors as phantom suggestions
-    flat0 = configured.reshape(-1)
-    lower = flat0 - margin
-    upper = flat0 + margin
-
-    def relaxed_residuals(flat: np.ndarray) -> np.ndarray:
-        positions = flat.reshape(-1, 3)
-        pair_r = _pair_residuals(positions, index_of_mac, usable)
-        reg = RELAX_REGULARIZATION * (flat - flat0)
-        return np.concatenate([pair_r, reg])
-
-    relaxed_flat = _levenberg_marquardt(
-        relaxed_residuals, flat0, bounds=(lower, upper)
-    )
-    relaxed = relaxed_flat.reshape(-1, 3)
-    relaxed_r = _pair_residuals(relaxed, index_of_mac, usable)
-    relaxed_rms = (
-        float(np.sqrt(np.mean(relaxed_r**2))) if relaxed_r.size else 0.0
-    )
-
-    def anchor_list(positions: np.ndarray) -> list[dict[str, Any]]:
-        return [
-            {
-                "index": a["index"],
-                "mac": a["mac"],
-                "x": round(float(positions[i, 0]), 4),
-                "y": round(float(positions[i, 1]), 4),
-                "z": round(float(positions[i, 2]), 4),
-            }
-            for i, a in enumerate(anchors)
-        ]
-
-    residual_rows = []
-    for (mac_a, mac_b), m in sorted(usable.items()):
-        ia, ib = index_of_mac[mac_a], index_of_mac[mac_b]
-        predicted = float(np.linalg.norm(relaxed[ia] - relaxed[ib]))
-        residual_rows.append(
-            {
-                "macA": mac_a,
-                "macB": mac_b,
-                "measuredM": round(m["distanceM"], 4),
-                "predictedM": round(predicted, 4),
-                "residualM": round(predicted - m["distanceM"], 4),
-                "samples": m["count"],
-                "dropped": m["dropped"],
-            }
-        )
-
-    moves = []
-    for i, a in enumerate(anchors):
-        delta = relaxed[i] - configured[i]
-        dist = float(np.linalg.norm(delta))
-        moves.append(
-            {
-                "index": a["index"],
-                "mac": a["mac"],
-                "dxM": round(float(delta[0]), 4),
-                "dyM": round(float(delta[1]), 4),
-                "dzM": round(float(delta[2]), 4),
-                "distM": round(dist, 4),
-            }
-        )
-
-    # apply-ready payload: the reference's scalar params + the relaxed
-    # anchor table — exactly what the sync op's explicit `geometry`
-    # payload expects, so the client never assembles geometry itself
-    apply_geometry: dict[str, Any] = {
-        name: ref_subset[name]
+    payload = {
+        name: reference[name]
         for name in (
             "ORIGIN_LAT_E7",
             "ORIGIN_LON_E7",
             "ORIGIN_ALT_MM",
-            "POS_YAW_DEG",
             "CELL_ID",
             "UWB_AN_COUNT",
         )
-        if name in ref_subset
+        if name in reference
     }
-    for i, a in enumerate(anchors):
-        apply_geometry[f"UWB_AN{a['index']}_X"] = round(float(relaxed[i, 0]), 4)
-        apply_geometry[f"UWB_AN{a['index']}_Y"] = round(float(relaxed[i, 1]), 4)
-        apply_geometry[f"UWB_AN{a['index']}_Z"] = round(float(relaxed[i, 2]), 4)
-        apply_geometry[f"UWB_AN{a['index']}_MAC"] = a["mac"]
-        bias = ref_subset.get(f"UWB_AN{a['index']}_BIAS_M")
-        if bias is not None:
-            apply_geometry[f"UWB_AN{a['index']}_BIAS_M"] = bias
+    payload["POS_YAW_DEG"] = 0.0
+    positions = {int(item["index"]): item for item in result.anchors}
+    for anchor in anchors:
+        position = positions[anchor.index]
+        payload[f"UWB_AN{anchor.index}_X"] = position["xM"]
+        payload[f"UWB_AN{anchor.index}_Y"] = position["yM"]
+        payload[f"UWB_AN{anchor.index}_Z"] = position["zM"]
+        payload[f"UWB_AN{anchor.index}_MAC"] = anchor.mac
+        bias_name = f"UWB_AN{anchor.index}_BIAS_M"
+        if bias_name in reference:
+            payload[bias_name] = reference[bias_name]
+    return payload
 
+
+def _capture_json(capture: _CalibrationCapture) -> dict[str, Any]:
+    now = time.monotonic()
+    stamps = [source.summary.received_at for source in capture.sources]
     return {
+        "captureId": capture.capture_id,
+        "version": SUMMARY_PROTOCOL_VERSION,
+        "validMask": 0xFE,
+        "ageMs": round(max(now - stamp for stamp in stamps) * 1000),
+        "maxSkewMs": round((max(stamps) - min(stamps)) * 1000),
+        "sources": [
+            {
+                "anchorIndex": source.anchor.index,
+                "anchorMac": source.anchor.mac,
+                "systemId": source.summary.system_id,
+                "sequence": source.summary.sequence,
+                "timeBootMs": source.summary.time_boot_ms,
+                "ageMs": round(max(0.0, now - source.summary.received_at) * 1000),
+            }
+            for source in capture.sources
+        ],
+        "ranges": [
+            {
+                "anchorIndex": item.anchor_index,
+                "peerMac": item.peer_mac,
+                "distanceM": round(item.distance_m, 5),
+                "madM": round(item.mad_m, 5),
+                "count": item.count,
+            }
+            for item in capture.observations
+        ],
+    }
+
+
+async def run_fit(
+    ext: "RtlsExtension",
+    *,
+    mode: str,
+    cell: str | None = None,
+    capture_id: int | None = None,
+    timeout: float = SUMMARY_WAIT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Run a strict fit on a distributed capture or refine the pinned one."""
+    if mode not in ("strict", "refined"):
+        raise ValueError(f"Invalid fit mode: {mode!r} (expected strict or refined)")
+    timeout = max(0.1, min(float(timeout), SUMMARY_WAIT_TIMEOUT_S))
+
+    if mode == "strict":
+        reference, cell = get_canonical(ext, cell)
+        anchors = _configured_anchors(reference)
+        devices = _resolve_anchor_devices(ext, anchors)
+        requested_at = time.monotonic()
+        summaries = await _wait_for_responder_summaries(
+            ext,
+            {index: devices[index] for index in range(1, len(anchors))},
+            newer_than=requested_at,
+            timeout=timeout,
+        )
+        sources, observations = _resolve_observations(summaries, anchors)
+        capture = _new_capture(
+            ext,
+            sources,
+            observations,
+            participant_system_ids=frozenset(devices.values()),
+        )
+        strict = fit_strict(observations)
+        session = _FitSession(capture, strict, reference, cell)
+        ext._geo_fit_session = session
+        refined = None
+    else:
+        session = ext._geo_fit_session
+        if session is None:
+            raise ValueError("run a strict fit first to pin a calibration capture")
+        if capture_id is None:
+            raise ValueError("captureId is required for a refined fit")
+        if int(capture_id) != session.capture.capture_id:
+            raise ValueError(
+                "the requested capture is no longer the pinned calibration snapshot"
+            )
+        capture = session.capture
+        observations = capture.observations
+        strict = session.strict
+        reference, cell = session.reference, session.cell
+        anchors = _configured_anchors(reference)
+        refined = fit_refined(observations, strict=strict)
+
+    selected = strict if mode == "strict" else refined
+    assert selected is not None
+    selected_model = selected.model if selected.accepted else None
+    payload = (
+        _apply_geometry(reference, anchors, selected) if selected.accepted else None
+    )
+    body: dict[str, Any] = {
         "type": "X-RTLS-GEO",
         "op": "fit",
-        "applyGeometry": apply_geometry,
-        "cell": cell_id,
-        "coverage": {
-            "pairsMeasured": len(usable),
-            "pairsExpected": expected_pairs,
-            "missingPairs": missing_pairs,
-        },
-        "rigid": {
-            "anchors": anchor_list(rigid_aligned),
-            "rmsM": round(rigid_rms, 4),
-        },
-        "relaxed": {
-            "anchors": anchor_list(relaxed),
-            "rmsM": round(relaxed_rms, 4),
-            "marginM": margin,
-        },
-        # relaxed - CONFIGURED: how far each tripod stands from where the
-        # measurements say it is; also exactly the "move this tripod"
-        # suggestion (or, applied as-is, the no-move geometry)
-        "moves": moves,
-        "residuals": residual_rows,
+        "mode": mode,
+        "cell": cell,
+        "summary": _capture_json(capture),
+        "strict": strict.json(),
+        "refined": refined.json() if refined is not None else None,
+        "selectedModel": selected_model,
+        "applyGeometry": payload,
     }
+    if refined is not None:
+        noise_floor = max(0.01, float(median(item.mad_m for item in observations)))
+        improvement = strict.rms_m - refined.rms_m
+        body["comparison"] = {
+            "rmsImprovementM": round(improvement, 5),
+            "noiseFloorM": round(noise_floor, 5),
+            "meaningfulImprovement": improvement > noise_floor,
+        }
+    return body
