@@ -244,6 +244,10 @@ def _pairing_rule(ext: "RtlsExtension") -> dict[str, Any]:
         total_uavs = None
 
     problems = []
+    if not online_tags:
+        problems.append("no online tags")
+    if total_uavs == 0 or (total_uavs is None and not ext._uav_map):
+        problems.append("no drones are known")
     if unpaired:
         problems.append(
             f"tag(s) {', '.join(map(str, unpaired))} are not associated "
@@ -258,14 +262,14 @@ def _pairing_rule(ext: "RtlsExtension") -> dict[str, Any]:
         return _rule(
             "pairing",
             "Tag ↔ drone pairing",
-            "warning",
+            "error",
             "fail",
             "; ".join(problems),
         )
     return _rule(
         "pairing",
         "Tag ↔ drone pairing",
-        "warning",
+        "error",
         "pass",
         f"{len(ext._uav_map)} tag(s) paired"
         + (f", {total_uavs} drone(s) known" if total_uavs is not None else ""),
@@ -288,8 +292,9 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
     async def read_one(tag_sysid: int, uav_id: str) -> None:
         entry: dict[str, Any] = {"tag": tag_sysid}
         uav = None
+        app = ext.app
         try:
-            uav = ext.app.find_uav_by_id(uav_id)
+            uav = app.find_uav_by_id(uav_id) if app is not None else None
         except Exception:  # noqa: BLE001
             uav = None
         if uav is None:
@@ -442,8 +447,9 @@ async def _in_depth_rule(ext: "RtlsExtension") -> dict[str, Any]:
     unreadable: dict[str, list[str]] = {}
 
     async def read_all(uav_id: str) -> None:
+        app = ext.app
         try:
-            uav = ext.app.find_uav_by_id(uav_id)
+            uav = app.find_uav_by_id(uav_id) if app is not None else None
         except Exception:  # noqa: BLE001
             uav = None
         if uav is None:
@@ -451,7 +457,7 @@ async def _in_depth_rule(ext: "RtlsExtension") -> dict[str, Any]:
             return
         for name in IN_DEPTH_PARAMS:
             value, error = await _read_uav_param(uav, name)
-            if error is None:
+            if error is None and value is not None:
                 values.setdefault(name, {})[uav_id] = value
             else:
                 unreadable.setdefault(uav_id, []).append(name)

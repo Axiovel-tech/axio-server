@@ -1,6 +1,6 @@
 """Live end-to-end check of the X-RTLS-GEO anchor-geometry calibration
 against REAL rtls-link firmware (native_sim): eight anchors on a known
-two-rectangle four-tripod geometry feed the A0 rolling TWR summaries,
+two-rectangle four-tripod geometry feed responder-owned A0 TWR summaries,
 and the server-side fit must recover the true dimensions.
 
 Not collected by pytest (no ``test_`` prefix): it boots nine real
@@ -44,8 +44,9 @@ Sequence:
     plus one tag image (no SITL);
 2.  run the server RtlsExtension against all nine devices, wait for
     discovery + count-complete param snapshots;
-3.  wait for coherent ``twr_summary`` events from A0 (trcap == 1) and
-    assert the ~1 Hz cadence with all seven spokes at count >= 20;
+3.  wait for coherent ``twr_summary`` events from A1..A7 (trcap == 1),
+    assert that each carries only its A0 spoke at ~1 Hz with count >= 20,
+    and assert that A0 publishes none;
 4.  adopt the real tag's geometry as the canonical one (it carries the
     8-anchor MAC table the fit resolves spokes against);
 5.  ``run_fit(mode='strict')`` -> accepted, lengthM/widthM/heightM
@@ -53,16 +54,15 @@ Sequence:
     per-sample sigma; the robust per-pair medians of >= 20 samples
     leave well under 0.05 m of aggregate error), applyGeometry present
     with UWB_AN7_Z ~= -2 and POS_YAW_DEG == 0;
-6.  ``run_fit(mode='refined', summary_sequence=<pinned>)`` -> reuses
-    the pinned summary and reports no meaningful improvement (the
+6.  ``run_fit(mode='refined', capture_id=<pinned>)`` -> reuses the
+    pinned distributed capture and reports no meaningful improvement (the
     nominal build has no construction error);
 7.  apply: ``run_sync`` of the strict applyGeometry to the real tag
     (reboot off: native_sim has no SMP reset surface) -> every write
     acked -> ``run_check`` consistent, also after a fresh re-list from
     the device (device truth, not server-cache optimism);
-8.  negative: SIGTERM one responder anchor, wait for its spoke to age
-    out of A0's 2 s rolling window, then a strict fit must fail naming
-    the missing anchor slot;
+8.  negative: SIGTERM one responder anchor, wait for it to be declared
+    lost, then a strict fit must fail naming the missing anchor slot;
 9.  tear the whole stack down (the runner only ever signals PIDs whose
     /proc cmdline matches this run's firmware+flash).
 """
@@ -132,11 +132,11 @@ TRUE_POSITIONS = (
 #: per-spoke error is ~0.01 m; 0.05 m is a comfortable bound
 DIM_TOLERANCE_M = 0.05
 
-#: rolling-summary contract mirrored from the firmware: 1 Hz publish
-#: cadence, >= 20 samples per spoke, all-seven-responders valid mask
+#: rolling-summary contract mirrored from the firmware: each responder
+#: publishes one A0 spoke at 1 Hz with >= 20 samples and peer mask bit 0.
 SUMMARY_MIN_COUNT = 20
-SUMMARY_FULL_MASK = 0b1111_1110
-CADENCE_GENERATIONS = 6
+SUMMARY_A0_MASK = 0b0000_0001
+CADENCE_GENERATIONS = 3
 #: generous cadence bounds around the nominal 1 Hz: a concurrent
 #: twister/build matrix on this host can stall a 1 Hz tick briefly
 CADENCE_MIN_S = 0.5
@@ -192,9 +192,7 @@ def _scenario() -> SimScenario:
             slot=anchor.index,
             device=SimDevice(
                 name=f"anchor{anchor.index}",
-                role="anchor-initiator"
-                if anchor.index == 0
-                else "anchor-responder",
+                role="anchor-initiator" if anchor.index == 0 else "anchor-responder",
                 sysid=A0_SYSID + anchor.index,
                 uwb_mac=int(anchor.mac),
                 mgmt_port=MGMT_BASE + 1 + anchor.index,
@@ -253,55 +251,72 @@ async def _relist(ext: RtlsExtension, sysid: int) -> None:
 
 
 def _summary_complete(summary) -> bool:
-    """One coherent generation carrying all seven well-sampled spokes."""
+    """One coherent responder generation carrying one well-sampled A0 spoke."""
     macs = {item.peer_mac for item in summary.ranges}
     return (
         summary.version == 1  # trcap: rolling-summary protocol v1
-        and summary.valid_mask == SUMMARY_FULL_MASK
-        and macs == set(range(2, 9))  # A1..A7 MACs
+        and summary.valid_mask == SUMMARY_A0_MASK
+        and macs == {1}
         and all(item.count >= SUMMARY_MIN_COUNT for item in summary.ranges)
     )
 
 
 async def _observe_summaries(ext: RtlsExtension) -> None:
-    """Step 3: coherent summaries from A0 at ~1 Hz, seven spokes each."""
+    """Step 3: one coherent A0-spoke stream per responder at ~1 Hz."""
+    responder_sysids = range(A0_SYSID + 1, A0_SYSID + 8)
     # warm-up: the window needs >= 20 samples per pair before a spoke is
     # published at all, and nine freshly booted instances contend for CPU
     with trio.fail_after(120):
         while True:
-            summary = ext._twr_summaries.get(A0_SYSID)
-            if summary is not None and _summary_complete(summary):
+            if all(
+                (summary := ext._twr_summaries.get(system_id)) is not None
+                and _summary_complete(summary)
+                for system_id in responder_sysids
+            ):
                 break
             await trio.sleep(0.1)
+    assert A0_SYSID not in ext._twr_summaries, "A0 must not publish TWR summaries"
 
-    seen = [summary]
+    seen = {
+        system_id: [ext._twr_summaries[system_id]] for system_id in responder_sysids
+    }
     with trio.fail_after(30):
-        while len(seen) < CADENCE_GENERATIONS:
-            summary = ext._twr_summaries.get(A0_SYSID)
-            if summary is not None and summary.sequence != seen[-1].sequence:
-                seen.append(summary)
+        while any(
+            len(generations) < CADENCE_GENERATIONS for generations in seen.values()
+        ):
+            for system_id, generations in seen.items():
+                summary = ext._twr_summaries.get(system_id)
+                if summary is not None and summary.sequence != generations[-1].sequence:
+                    generations.append(summary)
             await trio.sleep(0.05)
 
-    for summary in seen:
-        assert _summary_complete(summary), (
-            f"incomplete generation {summary.sequence}: {summary.ranges}"
+    cadences = []
+    counts = []
+    for system_id, generations in seen.items():
+        for summary in generations:
+            assert _summary_complete(summary), (
+                f"sysid {system_id} incomplete generation "
+                f"{summary.sequence}: {summary.ranges}"
+            )
+        sequences = [summary.sequence for summary in generations]
+        assert sequences == sorted(sequences), sequences
+        intervals = [
+            later.received_at - earlier.received_at
+            for earlier, later in zip(generations, generations[1:])
+        ]
+        cadence = median(intervals)
+        assert CADENCE_MIN_S <= cadence <= CADENCE_MAX_S, (
+            f"sysid {system_id} cadence {cadence:.2f} s is not ~1 Hz "
+            f"(intervals {intervals})"
         )
-    sequences = [summary.sequence for summary in seen]
-    assert sequences == sorted(sequences), sequences
-    intervals = [
-        later.received_at - earlier.received_at
-        for earlier, later in zip(seen, seen[1:])
-    ]
-    cadence = median(intervals)
-    assert CADENCE_MIN_S <= cadence <= CADENCE_MAX_S, (
-        f"summary cadence {cadence:.2f} s is not ~1 Hz (intervals {intervals})"
-    )
-    counts = sorted(item.count for item in seen[-1].ranges)
+        cadences.append(cadence)
+        counts.append(generations[-1].ranges[0].count)
     log.info(
-        "A0 summaries: %d generations, median interval %.2f s, "
-        "spoke counts %s",
+        "responder summaries: %d streams x %d generations, "
+        "median interval %.2f s, spoke counts %s",
         len(seen),
-        cadence,
+        CADENCE_GENERATIONS,
+        median(cadences),
         counts,
     )
 
@@ -309,7 +324,7 @@ async def _observe_summaries(ext: RtlsExtension) -> None:
 async def _run_strict_fit(ext: RtlsExtension) -> dict:
     """One strict fit, retrying only a summary-freshness timeout (a
     concurrent build matrix can stall the 1 Hz publish tick past the
-    fit's 3 s wait); every other failure propagates untouched."""
+    fit wait); every other failure propagates untouched."""
     for attempt in range(3):
         try:
             return await run_fit(ext, mode="strict")
@@ -329,8 +344,8 @@ async def _checks(ext: RtlsExtension, manifest: dict) -> None:
         await _ensure_snapshot(ext, sysid)
     log.info("param snapshots complete")
 
-    # the A0-star precondition: the summary source is the initiator
-    # whose UWB_MAC is the table's UWB_AN0_MAC
+    # The configured A0 is still the unique initiator, but the responders
+    # own and publish the seven measurements.
     a0_params = _decoded_device_params(ext._get_devices()[A0_SYSID])
     assert int(a0_params["UWB_ROLE"]) == 2, a0_params.get("UWB_ROLE")
     assert int(a0_params["UWB_MAC"]) == 1, a0_params.get("UWB_MAC")
@@ -355,30 +370,37 @@ async def _checks(ext: RtlsExtension, manifest: dict) -> None:
         ("heightM", HEIGHT_M),
     ):
         assert abs(parameters[name] - expected) <= DIM_TOLERANCE_M, (
-            f"{name}={parameters[name]} is not within "
-            f"{DIM_TOLERANCE_M} m of {expected}"
+            f"{name}={parameters[name]} is not within {DIM_TOLERANCE_M} m of {expected}"
         )
     payload = fit["applyGeometry"]
     assert payload is not None, fit
     assert payload["POS_YAW_DEG"] == 0.0, payload
     assert abs(payload["UWB_AN7_Z"] + HEIGHT_M) <= DIM_TOLERANCE_M, payload
     log.info(
-        "strict fit accepted: lengthM=%.3f widthM=%.3f heightM=%.3f "
-        "rmsM=%.4f",
+        "strict fit accepted: lengthM=%.3f widthM=%.3f heightM=%.3f rmsM=%.4f",
         parameters["lengthM"],
         parameters["widthM"],
         parameters["heightM"],
         strict["rmsM"],
     )
 
-    # refined fit against the PINNED summary: the nominal build has no
+    # refined fit against the PINNED capture: the nominal build has no
     # construction error, so no meaningful improvement may be reported
-    sequence = fit["summary"]["sequence"]
-    refined = await run_fit(ext, mode="refined", summary_sequence=sequence)
-    assert refined["summary"]["sequence"] == sequence, refined["summary"]
-    assert (
-        refined["summary"]["timeBootMs"] == fit["summary"]["timeBootMs"]
-    ), "the refined fit must reuse the pinned summary generation"
+    capture_id = fit["summary"]["captureId"]
+    refined = await run_fit(ext, mode="refined", capture_id=capture_id)
+    assert refined["summary"]["captureId"] == capture_id, refined["summary"]
+
+    def provenance(source):
+        return (
+            source["anchorIndex"],
+            source["systemId"],
+            source["sequence"],
+            source["timeBootMs"],
+        )
+
+    assert [provenance(item) for item in refined["summary"]["sources"]] == [
+        provenance(item) for item in fit["summary"]["sources"]
+    ], "the refined fit must reuse the pinned device generations"
     comparison = refined["comparison"]
     assert comparison["meaningfulImprovement"] is False, comparison
     log.info("refined comparison: %s", comparison)
@@ -405,27 +427,20 @@ async def _checks(ext: RtlsExtension, manifest: dict) -> None:
 
     # negative: a dead responder must fail the fit BY NAME, not skew it
     victim = next(
-        process
-        for process in manifest["processes"]
-        if process["name"] == "anchor7"
+        process for process in manifest["processes"] if process["name"] == "anchor7"
     )
     os.killpg(int(victim["pid"]), signal.SIGTERM)
     log.info("killed anchor7 (pid %s)", victim["pid"])
     with trio.fail_after(60):
-        while True:
-            summary = ext._twr_summaries.get(A0_SYSID)
-            if summary is not None and all(
-                item.peer_mac != 8 for item in summary.ranges
-            ):
-                break  # the A7 spoke aged out of the 2 s rolling window
+        while A0_SYSID + 7 in ext._get_devices():
             await trio.sleep(0.2)
     try:
         await _run_strict_fit(ext)
     except ValueError as ex:
         nak = str(ex)
     else:
-        raise AssertionError("strict fit must refuse a 6-spoke summary")
-    assert "missing" in nak and "A7" in nak, nak
+        raise AssertionError("strict fit must refuse a missing responder")
+    assert "A7" in nak and "not online" in nak, nak
     log.info("missing-anchor NAK: %s", nak)
 
 

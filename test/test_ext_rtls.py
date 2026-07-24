@@ -3832,6 +3832,21 @@ async def verify_message(extension, builder, hub, body=None):
     return await extension._handle_RTLS_VERIFY(message, None, hub)
 
 
+async def test_verify_rejects_an_empty_fleet(extension, builder, hub):
+    extension.app.object_registry = SimpleNamespace(ids_by_type=lambda _type: [])
+
+    response = await verify_message(extension, builder, hub)
+
+    assert response.body["passed"] is False
+    pairing = next(
+        rule for rule in response.body["rules"] if rule["id"] == "pairing"
+    )
+    assert pairing["severity"] == "error"
+    assert pairing["status"] == "fail"
+    assert "no online tags" in pairing["detail"]
+    assert "no drones are known" in pairing["detail"]
+
+
 async def test_verify_passes_on_a_healthy_fleet(
     extension, device, dialect, builder, hub
 ):
@@ -4029,14 +4044,14 @@ def _setup_anchor_calibration_fleet(extension, device):
 
 
 def _rolling_summary(positions, *, sequence=1, count=80):
+    """Test description of the seven responder-owned A0 spokes."""
     return {
         "version": 1,
         "sequence": sequence,
-        "validMask": 0xFE,
         "timeBootMs": 1000 * sequence,
         "ranges": [
             {
-                "peerMac": index + 1,
+                "anchorIndex": index,
                 "distanceM": sum(value * value for value in positions[index])
                 ** 0.5,
                 "madM": 0.005,
@@ -4047,10 +4062,35 @@ def _rolling_summary(positions, *, sequence=1, count=80):
     }
 
 
-async def _fit_after_summary(extension, builder, hub, body, summary):
-    """Start the request first, then emit a generation like the 1 Hz device."""
+def _emit_responder_summaries(extension, summary):
+    """Emit one local A0-peer generation for every described responder."""
     from flockwave.server.ext.rtls.fit import on_twr_summary
 
+    for item in summary["ranges"]:
+        index = item["anchorIndex"]
+        on_twr_summary(
+            extension,
+            70 + index,
+            {
+                "version": summary["version"],
+                "sequence": summary["sequence"] + index,
+                "validMask": item.get("validMask", 0x01),
+                "timeBootMs": summary["timeBootMs"] + index,
+                "ranges": [
+                    {
+                        "peerMac": item.get("measuredPeerMac", 1),
+                        "distanceM": item["distanceM"],
+                        "madM": item["madM"],
+                        "count": item["count"],
+                    }
+                ],
+            },
+            time.monotonic(),
+        )
+
+
+async def _fit_after_summary(extension, builder, hub, body, summary):
+    """Start the request, then emit one generation from each responder."""
     response = {}
 
     async def request():
@@ -4060,7 +4100,7 @@ async def _fit_after_summary(extension, builder, hub, body, summary):
     async with trio.open_nursery() as nursery:
         nursery.start_soon(request)
         await trio.testing.wait_all_tasks_blocked()
-        on_twr_summary(extension, 70, summary, time.monotonic())
+        _emit_responder_summaries(extension, summary)
     return response["value"]
 
 
@@ -4081,8 +4121,9 @@ async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
 
     body = response.body
     assert body["selectedModel"] == "strict"
-    assert body["summary"]["sequence"] == 1
+    assert body["summary"]["captureId"] == 1
     assert body["summary"]["validMask"] == 0xFE
+    assert len(body["summary"]["sources"]) == 7
     assert body["strict"]["accepted"]
     # numeric recovery is proven to tolerance by the unit fit tests; here we
     # only confirm the integration wires a sane, apply-ready payload (exact
@@ -4096,8 +4137,6 @@ async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
 async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
     extension, device, builder, hub
 ):
-    from flockwave.server.ext.rtls.fit import on_twr_summary
-
     positions = _setup_anchor_calibration_fleet(extension, device)
     await discover(extension, device)
     await adopt_from(extension, builder, hub)
@@ -4108,15 +4147,12 @@ async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
         {"op": "fit", "mode": "strict"},
         _rolling_summary(positions, sequence=7),
     )
-    assert strict.body["summary"]["sequence"] == 7
+    capture_id = strict.body["summary"]["captureId"]
 
     # New telemetry may arrive, but the opt-in refined fit compares the exact
     # snapshot the operator reviewed.
-    on_twr_summary(
-        extension,
-        70,
-        _rolling_summary(positions, sequence=8),
-        time.monotonic(),
+    _emit_responder_summaries(
+        extension, _rolling_summary(positions, sequence=80)
     )
     message = make_message(
         builder,
@@ -4124,12 +4160,12 @@ async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
             "type": "X-RTLS-GEO",
             "op": "fit",
             "mode": "refined",
-            "summarySequence": 7,
+            "captureId": capture_id,
         },
     )
     response = await extension._handle_RTLS_GEO(message, None, hub)
 
-    assert response.body["summary"]["sequence"] == 7
+    assert response.body["summary"]["captureId"] == capture_id
     assert response.body["refined"]["model"] == "refined"
     assert response.body["selectedModel"] is None
     assert response.body["comparison"]["meaningfulImprovement"] is False
@@ -4152,7 +4188,7 @@ async def test_geo_fit_rejects_a_low_quality_summary_actionably(
     )
 
     assert response.body["type"] == "ACK-NAK"
-    assert "insufficient samples" in response.body["reason"]
+    assert "A1 summary has 5 samples" in response.body["reason"]
 
 
 async def test_geo_fit_times_out_actionably_without_any_summary(
@@ -4169,20 +4205,15 @@ async def test_geo_fit_times_out_actionably_without_any_summary(
     response = await extension._handle_RTLS_GEO(message, None, hub)
 
     assert response.body["type"] == "ACK-NAK"
-    # nothing was ever received: point at capability/telemetry, not freshness
-    assert "supports the feature" in response.body["reason"]
+    assert "no fresh rolling TWR summary from A1" in response.body["reason"]
 
 
 async def test_geo_fit_rejects_a_stale_summary(extension, device, builder, hub):
-    from flockwave.server.ext.rtls.fit import on_twr_summary
-
     positions = _setup_anchor_calibration_fleet(extension, device)
     await discover(extension, device)
     await adopt_from(extension, builder, hub)
-    # the summary predates the request: it must not satisfy the wait
-    on_twr_summary(
-        extension, 70, _rolling_summary(positions), time.monotonic()
-    )
+    # All responder summaries predate the request and must not satisfy it.
+    _emit_responder_summaries(extension, _rolling_summary(positions))
 
     message = make_message(
         builder,
@@ -4216,16 +4247,19 @@ async def test_geo_fit_names_the_missing_spokes(extension, device, builder, hub)
     await discover(extension, device)
     await adopt_from(extension, builder, hub)
 
-    # A7 (slot 7, MAC 8) dropped out of the generation
+    # A7 fails to publish after the request.
     summary = _rolling_summary(positions)
-    summary["validMask"] = 0x7E
     summary["ranges"] = summary["ranges"][:-1]
     response = await _fit_after_summary(
-        extension, builder, hub, {"op": "fit", "mode": "strict"}, summary
+        extension,
+        builder,
+        hub,
+        {"op": "fit", "mode": "strict", "timeout": 0.2},
+        summary,
     )
 
     assert response.body["type"] == "ACK-NAK"
-    assert "missing A7" in response.body["reason"]
+    assert "no fresh rolling TWR summary from A7" in response.body["reason"]
 
 
 async def test_geo_fit_rejects_summary_peers_outside_the_cell(
@@ -4235,16 +4269,15 @@ async def test_geo_fit_rejects_summary_peers_outside_the_cell(
     await discover(extension, device)
     await adopt_from(extension, builder, hub)
 
-    # seven coherent ranges, but one is a stranger MAC: the configured A5
-    # spoke is genuinely absent and must be reported as such
+    # A5 reports a peer other than A0.
     summary = _rolling_summary(positions)
-    summary["ranges"][4]["peerMac"] = 0x0063
+    summary["ranges"][4]["measuredPeerMac"] = 0x0063
     response = await _fit_after_summary(
         extension, builder, hub, {"op": "fit", "mode": "strict"}, summary
     )
 
     assert response.body["type"] == "ACK-NAK"
-    assert "missing A5" in response.body["reason"]
+    assert "A5 summary does not contain exactly its A0 range" in response.body["reason"]
 
 
 async def test_geo_fit_requires_the_four_tripod_anchor_count(
@@ -4278,10 +4311,29 @@ async def test_geo_fit_requires_one_unambiguous_initiator(
     response = await extension._handle_RTLS_GEO(message, None, hub)
 
     assert response.body["type"] == "ACK-NAK"
-    assert "multiple online initiators" in response.body["reason"]
+    assert "multiple online devices claim the configured A0 MAC" in response.body["reason"]
 
 
-async def test_geo_refined_fit_requires_the_pinned_sequence(
+async def test_geo_fit_rejects_a_responder_with_the_wrong_role(
+    extension, device, builder, hub
+):
+    _setup_anchor_calibration_fleet(extension, device)
+    # A5 has the configured MAC but claims to be another initiator. Accepting
+    # it would wait for telemetry that this role is deliberately unable to send.
+    set_cached_param(extension._protocol.devices[75], "UWB_ROLE", 2, "uint8")
+    await discover(extension, device)
+    await adopt_from(extension, builder, hub)
+
+    message = make_message(
+        builder, {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict"}
+    )
+    response = await extension._handle_RTLS_GEO(message, None, hub)
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "A5 has UWB role 2; expected responder" in response.body["reason"]
+
+
+async def test_geo_refined_fit_requires_the_pinned_capture(
     extension, device, builder, hub
 ):
     positions = _setup_anchor_calibration_fleet(extension, device)
@@ -4291,23 +4343,29 @@ async def test_geo_refined_fit_requires_the_pinned_sequence(
     # refined before any strict fit
     message = make_message(
         builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "summarySequence": 1},
+        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "captureId": 1},
     )
     response = await extension._handle_RTLS_GEO(message, None, hub)
     assert response.body["type"] == "ACK-NAK"
     assert "strict fit first" in response.body["reason"]
 
-    await _fit_after_summary(
+    strict = await _fit_after_summary(
         extension,
         builder,
         hub,
         {"op": "fit", "mode": "strict"},
         _rolling_summary(positions, sequence=3),
     )
+    capture_id = strict.body["summary"]["captureId"]
     # a stale GUI asking for a generation that is no longer pinned
     message = make_message(
         builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "summarySequence": 2},
+        {
+            "type": "X-RTLS-GEO",
+            "op": "fit",
+            "mode": "refined",
+            "captureId": capture_id + 1,
+        },
     )
     response = await extension._handle_RTLS_GEO(message, None, hub)
     assert response.body["type"] == "ACK-NAK"
@@ -4320,7 +4378,7 @@ async def test_geo_fit_session_dies_with_its_a0(extension, device, builder, hub)
     positions = _setup_anchor_calibration_fleet(extension, device)
     await discover(extension, device)
     await adopt_from(extension, builder, hub)
-    await _fit_after_summary(
+    strict = await _fit_after_summary(
         extension,
         builder,
         hub,
@@ -4328,6 +4386,7 @@ async def test_geo_fit_session_dies_with_its_a0(extension, device, builder, hub)
         _rolling_summary(positions),
     )
     assert extension._geo_fit_session is not None
+    capture_id = strict.body["summary"]["captureId"]
 
     extension._handle_lost(ProtocolEvent("lost", 70))
 
@@ -4335,7 +4394,12 @@ async def test_geo_fit_session_dies_with_its_a0(extension, device, builder, hub)
     assert 70 not in extension._twr_summaries
     message = make_message(
         builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "summarySequence": 1},
+        {
+            "type": "X-RTLS-GEO",
+            "op": "fit",
+            "mode": "refined",
+            "captureId": capture_id,
+        },
     )
     response = await extension._handle_RTLS_GEO(message, None, hub)
     assert response.body["type"] == "ACK-NAK"
@@ -4366,7 +4430,12 @@ async def test_geo_fit_exposes_only_the_constrained_models(
 
     message = make_message(
         builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "summarySequence": 1},
+        {
+            "type": "X-RTLS-GEO",
+            "op": "fit",
+            "mode": "refined",
+            "captureId": strict.body["summary"]["captureId"],
+        },
     )
     refined = await extension._handle_RTLS_GEO(message, None, hub)
     assert set(refined.body["refined"]["parameters"]) == {
@@ -4377,8 +4446,6 @@ async def test_geo_fit_exposes_only_the_constrained_models(
         "heightM",
         "angleDeg",
     }
-
-
 
 
 async def test_geo_adopt_unanimous_fleet_needs_no_reference(

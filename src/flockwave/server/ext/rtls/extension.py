@@ -269,6 +269,9 @@ class RtlsExtension(Extension):
         self._twr_summary_changed = trio.Event()
         #: strict fit + exact summary pinned for an optional refined fit
         self._geo_fit_session = None
+        #: Process-local identifier for a distributed calibration capture.
+        #: A restart clears the pinned session, so persistence is unnecessary.
+        self._next_geo_capture_id = 1
         #: lazily loaded canonical-geometry store (see geometry.py);
         #: ``None`` = not loaded yet
         self._geo_canonical: Optional[dict[str, Any]] = None
@@ -693,8 +696,9 @@ class RtlsExtension(Extension):
                 self._on_twr(event.system_id, event.data, now)
             elif event.kind == "twr_summary":
                 # The SDK emits this only after it has assembled a coherent
-                # capability/header + seven complete range/quality/count
-                # triples from one firmware generation.
+                # capability/header plus complete range/quality/count triples
+                # from one device generation. Calibration later combines one
+                # A0 spoke from each responder.
                 from .fit import on_twr_summary
 
                 on_twr_summary(self, event.system_id, event.data, now)
@@ -1384,7 +1388,8 @@ class RtlsExtension(Extension):
         self._twr_summaries.pop(event.system_id, None)
         if (
             self._geo_fit_session is not None
-            and self._geo_fit_session.summary.system_id == event.system_id
+            and event.system_id
+            in self._geo_fit_session.capture.participant_system_ids
         ):
             self._geo_fit_session = None
         self._adv.pop(event.system_id, None)
@@ -1967,21 +1972,21 @@ class RtlsExtension(Extension):
         body = message.body
         op = body.get("op")
         if op == "fit":
-            from .fit import run_fit
+            from .fit import SUMMARY_WAIT_TIMEOUT_S, run_fit
 
             try:
                 mode = body.get("mode", "strict")
                 if not isinstance(mode, str):
                     raise ValueError(f"Invalid fit mode: {mode!r}")
-                sequence = body.get("summarySequence")
-                if sequence is not None:
+                capture_id = body.get("captureId")
+                if capture_id is not None:
                     try:
-                        sequence = int(sequence)
+                        capture_id = int(capture_id)
                     except (TypeError, ValueError):
                         raise ValueError(
-                            f"Invalid summarySequence: {sequence!r}"
+                            f"Invalid captureId: {capture_id!r}"
                         ) from None
-                timeout = body.get("timeout", 3.0)
+                timeout = body.get("timeout", SUMMARY_WAIT_TIMEOUT_S)
                 try:
                     timeout = float(timeout)
                 except (TypeError, ValueError):
@@ -1989,7 +1994,7 @@ class RtlsExtension(Extension):
                 result = await run_fit(
                     self,
                     mode=mode,
-                    summary_sequence=sequence,
+                    capture_id=capture_id,
                     timeout=timeout,
                 )
             except ValueError as ex:

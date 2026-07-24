@@ -72,8 +72,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   `X-RTLS-GEO` check/sync operations (see below).
 - `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
   below).
-- `fit.py` — the A0 rolling-TWR-summary cache and the `X-RTLS-GEO`
-  fit op over it (see below).
+- `fit.py` — the per-responder rolling-TWR cache, distributed calibration
+  capture and `X-RTLS-GEO` fit op (see below).
 - `anchor_geometry.py` — the pure strict/refined four-tripod geometry
   models behind the fit (no MAVLink, devices or server state).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
@@ -755,23 +755,23 @@ every device reports `synced`.
 
 Tripods go up in roughly the surveyed spots; "roughly" is centimeters
 of error the UWB solver bakes into every position. The standing
-geometry is measured from the ranging A0 does anyway — the server
-never orchestrates a capture window.
+geometry is measured from the ranging the responders do anyway — the
+server only selects a fresh, bounded-skew set of rolling windows.
 
-**The A0 rolling summary (rtls-link summary protocol v1).** A0 — the
-sole DL-TDoA / inter-anchor TWR initiator — keeps a 2 s rolling window
-of TWR samples per peer anchor and publishes a robust aggregate at
-1 Hz on the management channel, as **one bundled datagram** of
-NAMED_VALUE_FLOAT frames that all carry the generation's device
-`time_boot_ms`. The feature is capability-gated in the firmware; a
-board that is not the A0 initiator (or whose ranging source cannot
-summarize) publishes nothing.
+**Responder rolling summaries (rtls-link summary protocol v1).** On the
+SR250, each DL-TDoA responder measures its range to the A0 initiator;
+A0 receives no corresponding per-responder measurements. Each A1–A7
+responder therefore keeps its own 2 s rolling window and publishes a
+robust aggregate at 1 Hz on the management channel, as **one bundled
+datagram** of NAMED_VALUE_FLOAT frames that all carry that device
+generation's `time_boot_ms`. A0 and sources that cannot summarize
+publish nothing.
 
 | field | meaning |
 | --- | --- |
 | `trcap` | summary protocol version (currently 1) |
 | `trseq` | generation sequence, 24-bit wrap-around |
-| `trmask` | one bit per valid anchor slot (bits 1..7; slot resolved from the peer MAC via A0's anchor table) |
+| `trmask` | one bit per valid peer slot (a responder normally reports only bit 0 for A0) |
 | `twrXXXX` | filtered range to peer MAC `XXXX`, meters — median of the window's inliers (median ± 3×MAD gate) |
 | `twmXXXX` | the window's MAD, meters |
 | `twnXXXX` | inlier sample count (a peer needs ≥ 20 to be published at all) |
@@ -780,7 +780,7 @@ summarize) publishes nothing.
 `rtlslink` SDK reassembles coherent generations — the three header
 fields plus a complete range/MAD/count triple for every masked slot,
 all stamped with the same `time_boot_ms` — and emits one `twr_summary`
-event per generation; frames from different generations are never
+event per device generation; frames from different generations are never
 combined. The extension caches the newest coherent summary per system
 id.
 
@@ -788,22 +788,23 @@ id.
 measurement:
 
 - resolves the canonical cell geometry (the single stored cell; the
-  four-tripod fit requires exactly 8 configured anchors) and locates
-  A0 — the one online device whose `UWB_ROLE` is anchor-initiator and
-  whose `UWB_MAC` matches anchor slot 0 (none, or several, NAKs);
-- waits up to `timeout` seconds (default and cap 3) for a summary
-  **fresher than the request** — a fit never silently reuses whatever
-  happened to be cached;
-- validates it: protocol version 1, every slot A1–A7 masked valid and
-  present with its configured peer MAC, at least 20 samples per spoke
-  — violations NAK naming the offending anchors;
-- runs the strict model and **pins** the summary + result.
+  four-tripod fit requires exactly 8 configured anchors) and maps every
+  configured MAC to one unique online device with the expected role;
+- waits up to `timeout` seconds (default and cap 4) for one responder
+  summary per A1–A7 that is **fresher than the request** and whose
+  server receipt timestamps are within 1.5 s;
+- validates every source independently: protocol version 1, exactly one
+  A0 peer range (`trmask=0x01`), and at least 20 samples — violations
+  NAK naming the offending responder;
+- combines the seven spokes into a server-owned calibration capture,
+  runs the strict model, and **pins** that exact capture + result.
 
-`{"op": "fit", "mode": "refined", "summarySequence": 4711}` re-fits
-exactly the pinned generation (`summarySequence` must equal the pinned
-summary's `sequence`; anything else, or refining before any strict
-fit, NAKs). The refined pass never consumes new telemetry, so the
-strict and refined verdicts always describe the same measurement.
+`{"op": "fit", "mode": "refined", "captureId": 4711}` re-fits exactly
+the pinned capture (`captureId` must match; anything else, or refining
+before any strict fit, NAKs). The refined pass never consumes new
+telemetry, so the strict and refined verdicts always describe the same
+seven device generations. Firmware `trseq` and `time_boot_ms` remain
+per-device provenance and are never compared across device clocks.
 
 Both models place the anchors in canonical A0-origin NED coordinates:
 A0 at the origin, A0→A1 along +X, `POS_YAW_DEG` 0; slots A0–A3 are the
