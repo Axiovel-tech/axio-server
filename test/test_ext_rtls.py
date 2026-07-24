@@ -4084,10 +4084,13 @@ async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
     assert body["summary"]["sequence"] == 1
     assert body["summary"]["validMask"] == 0xFE
     assert body["strict"]["accepted"]
-    assert body["strict"]["parameters"]["lengthM"] == 20.0
+    # numeric recovery is proven to tolerance by the unit fit tests; here we
+    # only confirm the integration wires a sane, apply-ready payload (exact
+    # equality on an LM-solver output would be needlessly brittle)
+    assert abs(body["strict"]["parameters"]["lengthM"] - 20.0) < 1e-3
     assert body["applyGeometry"]["POS_YAW_DEG"] == 0.0
     assert body["applyGeometry"]["UWB_AN0_X"] == 0.0
-    assert body["applyGeometry"]["UWB_AN7_Z"] == -2.5
+    assert abs(body["applyGeometry"]["UWB_AN7_Z"] + 2.5) < 1e-3
 
 
 async def test_geo_refined_fit_reuses_the_requested_pinned_summary(

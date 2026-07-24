@@ -63,7 +63,9 @@ def test_strict_fit_recovers_absolute_canonical_geometry():
     assert abs(result.parameters["lengthM"] - 20.0) < 1e-3
     assert abs(result.parameters["widthM"] - 16.0) < 1e-3
     assert abs(result.parameters["heightM"] - 2.5) < 1e-3
-    assert result.anchors[0] == {"index": 0, "xM": 0.0, "yM": 0.0, "zM": 0.0}
+    # the canonical expansion places the far top corner from the fitted dims
+    # (A0 is trivially the origin, so it is not worth asserting)
+    assert abs(result.anchors[7]["xM"] - 20.0) < 1e-3
     assert result.anchors[7]["zM"] == -2.5
 
 
@@ -148,3 +150,53 @@ def test_excessive_deformation_is_rejected_not_hidden():
     assert not strict.accepted
     assert not refined.accepted
     assert abs(refined.parameters["angleDeg"] - 90.0) <= 5.0 + 1e-6
+
+
+def test_refined_rejection_names_the_safety_bound_it_reached():
+    """The safety-bound check must be what rejects a bound-riding fit, not
+    only the residual gate. A top plane materially larger than the bottom
+    drives the upper/lower dimension difference to its clamp; the refined
+    result must be rejected AND say which bound it hit -- deleting the
+    bound-check block would leave this test failing even though the geometry
+    is otherwise representable."""
+    observations = _observations(
+        _refined_positions(top_length=21.2, top_width=17.2), mad=0.004
+    )
+
+    refined = fit_refined(observations)
+
+    assert not refined.accepted
+    assert any("difference" in reason and "bound" in reason for reason in refined.reasons)
+
+
+def test_height_rides_the_a0_to_a4_spoke_and_a_bias_is_not_caught():
+    """Bench-critical characterization: fitted H rests almost entirely on the
+    same-tripod A0->A4 vertical spoke (which measures height directly), so a
+    bias on it flows into heightM while the diagonal spokes keep the worst
+    residual well under the 0.15 m gate. This pins the documented limitation
+    -- the bench must tape-measure H, not trust the fit here. If a future
+    change made this spoke's bias detectable, this test would flag it."""
+    positions = _strict_positions()
+    bias = 0.15
+    observations = [
+        RangeObservation(
+            anchor_index=index,
+            peer_mac=0x1000 + index,
+            distance_m=sum(v * v for v in positions[index]) ** 0.5
+            + (bias if index == 4 else 0.0),  # A0->A4 measures H directly
+            mad_m=0.004,
+            count=80,
+        )
+        for index in range(1, 8)
+    ]
+
+    result = fit_strict(observations)
+
+    # the bias rides into H (the spoke dominates it) while L and W are clean
+    assert result.parameters["heightM"] > 2.5 + 0.5 * bias
+    assert abs(result.parameters["lengthM"] - 20.0) < 0.02
+    assert abs(result.parameters["widthM"] - 16.0) < 0.02
+    # and the residual gate does NOT catch it -- the whole point of the caveat
+    worst = max(abs(item["residualM"]) for item in result.residuals)
+    assert worst < 0.15
+    assert result.accepted
