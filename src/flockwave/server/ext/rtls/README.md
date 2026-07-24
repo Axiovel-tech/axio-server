@@ -69,6 +69,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   below).
 - `geometry.py` — cell-geometry consistency across the tag fleet: the
   `X-RTLS-GEO` check/sync operations (see below).
+- `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
+  below).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
   NED table, NED->global) for SDK pins that predate them; the
   `rtlslink` implementations are used when present.
@@ -740,6 +742,33 @@ sync, but it stays eligible again later). None of these windows is
 silent: the next `check` reports the fleet inconsistent. UIs should
 therefore re-run `check` after every sync, and re-run `sync` until
 every device reports `synced`.
+
+### X-RTLS-VERIFY — fleet pre-flight verification
+
+Runs the whole "are my drones consistent?" rule set in one message:
+**geometry** (the X-RTLS-GEO check: origin, `POS_YAW_DEG`, `CELL_ID`,
+anchor table, majority reference), **firmware** uniformity per role,
+tag↔drone **pairing** coverage, the ArduPilot **yaw-source** rule
+(`EK3_SRC1_YAW == 9`, the axio fork's virtual compass, and a
+fleet-consistent `EK3_SRC_VC_YAW`, read live over MAVLink with
+per-drone error isolation; the tags' `POS_YAW_DEG` is reported
+alongside), and the **uwb** solving state (rate, fix age, solve
+quality, cluster-clock sync from the live stats). With
+`"inDepth": true` a sixth rule reads the ArduPilot navigation/tuning
+set (EKF sources, VISO, WPNAV, LOIT, position/attitude controllers,
+IMU filters) from every paired drone and reports cross-drone
+differences — always as warnings: deliberate per-drone tuning exists.
+
+```json
+{"type": "X-RTLS-VERIFY", "inDepth": false}
+```
+
+Response: `rules` (each with `id`, `label`, `severity`
+(`error`/`warning`), `status` (`pass`/`fail`/`skipped`), a
+human-readable `detail` and rule-specific extras), `passed` (no
+error-severity rule failed) and the embedded `geometry` check body for
+UI reuse. Concurrent runs are NAKed; expect the in-depth pass to take
+a few seconds per fleet (live MAVLink parameter reads).
 
 ### Notes for control-UI developers
 
