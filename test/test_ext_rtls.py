@@ -3913,6 +3913,31 @@ async def test_verify_passes_on_a_healthy_fleet(
     }
 
 
+async def test_verify_honors_explicit_cell_with_multiple_stored_cells(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await adopt_from(extension, builder, hub)
+    extension._geo_canonical["other"] = {
+        **extension._geo_canonical["default"],
+        "CELL_ID": "other",
+    }
+
+    response = await verify_message(
+        extension, builder, hub, {"cell": "default"}
+    )
+
+    body = response.body
+    assert body["type"] == "X-RTLS-VERIFY"
+    assert body["cell"] == "default"
+    geometry = next(rule for rule in body["rules"] if rule["id"] == "geometry")
+    assert geometry["status"] == "pass"
+
+
 async def test_verify_flags_wrong_yaw_source(
     extension, device, dialect, builder, hub
 ):

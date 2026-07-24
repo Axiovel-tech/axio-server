@@ -499,7 +499,10 @@ async def _in_depth_rule(ext: "RtlsExtension") -> dict[str, Any]:
 
 
 async def run_verify(
-    ext: "RtlsExtension", *, in_depth: bool = False
+    ext: "RtlsExtension",
+    *,
+    cell: Optional[str] = None,
+    in_depth: bool = False,
 ) -> dict[str, Any]:
     """Runs the fleet verification rule set; returns the X-RTLS-VERIFY
     response body. Raises ValueError when another verification is
@@ -511,7 +514,7 @@ async def run_verify(
         geometry: Optional[dict[str, Any]] = None
         geometry_error = ""
         try:
-            geometry = await run_check(ext)
+            geometry = await run_check(ext, cell=cell)
         except ValueError as ex:
             geometry_error = str(ex)
 
@@ -546,6 +549,7 @@ async def run_verify(
         }
         if geometry is not None:
             body["geometry"] = geometry
+            body["cell"] = geometry["cell"]
         return body
     finally:
         ext._verify_running = False

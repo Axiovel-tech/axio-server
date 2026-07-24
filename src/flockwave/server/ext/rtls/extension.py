@@ -2070,7 +2070,10 @@ class RtlsExtension(Extension):
 
         in_depth = bool(message.body.get("inDepth", False))
         try:
-            result = await run_verify(self, in_depth=in_depth)
+            cell = message.body.get("cell")
+            if cell is not None and not isinstance(cell, str):
+                raise ValueError(f"Invalid cell: {cell!r}")
+            result = await run_verify(self, cell=cell, in_depth=in_depth)
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
         return hub.create_response_or_notification(

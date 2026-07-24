@@ -909,16 +909,20 @@ set (EKF sources, VISO, WPNAV, LOIT, position/attitude controllers,
 IMU filters) from every paired drone and reports cross-drone
 differences — always as warnings: deliberate per-drone tuning exists.
 
+Pass the same explicit `cell` used by geometry check/sync so a server
+holding more than one canonical installation never guesses which geometry
+to certify:
+
 ```json
-{"type": "X-RTLS-VERIFY", "inDepth": false}
+{"type": "X-RTLS-VERIFY", "cell": "bench-4", "inDepth": false}
 ```
 
 Response: `rules` (each with `id`, `label`, `severity`
 (`error`/`warning`), `status` (`pass`/`fail`/`skipped`), a
 human-readable `detail` and rule-specific extras), `passed` (no
-error-severity rule failed) and the embedded `geometry` check body for
-UI reuse. Concurrent runs are NAKed; expect the in-depth pass to take
-a few seconds per fleet (live MAVLink parameter reads).
+error-severity rule failed), the resolved `cell`, and the embedded
+`geometry` check body for UI reuse. Concurrent runs are NAKed; expect the
+in-depth pass to take a few seconds per fleet (live MAVLink parameter reads).
 
 ### Notes for control-UI developers
 
