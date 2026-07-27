@@ -3,11 +3,6 @@
 
 # Skybrush Server
 
-> **Axiovel status:** this fork is the current production Axio Server. It
-> receives per-UAV `__show_upload` commands from the Control GUI App, compiles
-> `.skyb`, and uploads shows to AVCopter over MAVFTP. AV-Desktop is maintained
-> separately as an experimental successor candidate.
-
 Skybrush Server is the server component behind the Skybrush ecosystem; it handles
 communication channels to drones and provides an abstraction layer on top of them
 so frontend apps (like Skybrush Live) do not need to know what type of drones
