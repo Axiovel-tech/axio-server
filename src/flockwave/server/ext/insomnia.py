@@ -14,9 +14,9 @@ async def run(app, configuration, logger):
         from adrenaline import prevent_sleep
 
         context = prevent_sleep(
-            app_name="Skybrush Server",
+            app_name="Axio Server",
             display=keep_display_on,
-            reason="Skybrush Server",
+            reason="Axio Server",
         )
     except Exception:
         context = nullcontext()

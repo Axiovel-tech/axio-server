@@ -1,4 +1,4 @@
-"""Application object for the Skybrush gateway server."""
+"""Application object for the Axio gateway server."""
 
 import logging
 from copy import deepcopy
@@ -26,7 +26,7 @@ PACKAGE_NAME = __name__.rpartition(".")[0]
 
 
 class SkybrushGatewayServer(DaemonApp):
-    """Main application object for the Skybrush gateway server."""
+    """Main application object for the Axio gateway server."""
 
     def _create_components(self) -> None:
         self.worker_manager = WorkerManager()

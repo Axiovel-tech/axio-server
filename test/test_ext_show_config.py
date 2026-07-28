@@ -18,7 +18,7 @@ def test_show_config_defaults():
 
 
 def test_show_config_update_from_json_without_scope():
-    # Interactions in this unit test should model how Skybrush Live used to
+    # Interactions in this unit test should model how Axio Control used to
     # behave before the authorization scope was introduced
 
     obj = {
@@ -57,7 +57,7 @@ def test_show_config_update_from_json_without_scope():
 
 
 def test_show_config_update_from_json_with_scope():
-    # Interactions in this unit test should model how Skybrush Live behaves
+    # Interactions in this unit test should model how Axio Control behaves
     # after introducing authorization scopes on the UI
 
     obj = {

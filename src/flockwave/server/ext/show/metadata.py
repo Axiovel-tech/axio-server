@@ -33,7 +33,7 @@ class ShowMetadata(TypedDict):
     """The metadata of a show upload attempt.
 
     Note the camelCased properties; this is intentional as this has to match
-    what is being posted from Skybrush Live.
+    what is being posted from Axio Control.
     """
 
     coordinateSystem: ShowCoordinateSystem

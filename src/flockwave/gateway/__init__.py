@@ -1,4 +1,4 @@
-"""Main package for the Skybrush demo gateway that spins up server instances
+"""Main package for the Axio demo gateway that spins up server instances
 as needed in order to provide a limited "playground" area.
 """
 

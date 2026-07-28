@@ -204,7 +204,7 @@ class SocketIOCommunicationHandler:
         )
 
     def _handle_connection(self, client_id: str, environ) -> None:
-        """Handler called when a client connects to the Skybrush server
+        """Handler called when a client connects to the Axio Server
         socket.
         """
         client = self._app.client_registry.add(

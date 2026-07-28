@@ -18,7 +18,7 @@ __all__ = (
 
 class ShowSpecification(TypedDict, total=False):
     """Specification of a drone show for a single UAV as it appears
-    in show upload commands coming from Skybrush Live."""
+    in show upload commands coming from Axio Control."""
 
     cues: dict[str, Any]
     validation: dict[str, Any]
@@ -63,7 +63,7 @@ def get_coordinate_system_from_show_specification(
 def get_drone_count_from_show_specification(show: ShowSpecification) -> int | None:
     """Returns the number of drones in the show from the show specification if
     known, `None` if not known (which may happen with older versions of
-    Skybrush Live that do not send this information yet).
+    Axio Control that do not send this information yet).
     """
     mission_info = show.get("mission")
     if not mission_info or not isinstance(mission_info, dict):

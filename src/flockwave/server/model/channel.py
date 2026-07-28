@@ -23,7 +23,7 @@ T = TypeVar("T")
 class CommunicationChannel(Generic[T], ABC):
     """Base model object representing a communication channel between the
     server and a client. Concrete implementations of this class are to be
-    found in the appropriate Skybrush server extensions (e.g., the
+    found in the appropriate Axio Server extensions (e.g., the
     ``socketio`` extension for Socket.IO channels).
     """
 

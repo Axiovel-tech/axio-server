@@ -1,4 +1,4 @@
-"""Extension that adds a simple frontend index page to the Skybrush server,
+"""Extension that adds a simple frontend index page to the Axio Server,
 served over HTTP.
 """
 

@@ -14,7 +14,7 @@ if [ -f ${CONFIG_FILE}.md5 ]; then
     md5sum --status --strict -c ${CONFIG_FILE}.md5 && exit 0
 fi
 
-# Calculate MD5 hash of collmot.cfg
+# Calculate MD5 hash of the network configuration file
 md5sum $CONFIG_FILE >${CONFIG_FILE}.md5
 
 # Read configuration file from boot partition

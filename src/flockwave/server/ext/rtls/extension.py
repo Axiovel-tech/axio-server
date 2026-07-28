@@ -5,7 +5,7 @@ rtls-link firmware repo).
 The sans-IO protocol core (:class:`rtlslink.RtlsProtocol`) and the
 MCUmgr/SMP OTA helper (:func:`rtlslink.ota.upgrade`) live in the SDK;
 this extension only runs the discovery/keepalive loop on the server's
-Trio socket and exposes the managed devices to Skybrush clients through
+Trio socket and exposes the managed devices to Axio clients through
 experimental (``X-`` prefixed) message types on the message hub; see
 ``README.md`` in this directory for the message API.
 """

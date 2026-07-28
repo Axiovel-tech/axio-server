@@ -27,7 +27,7 @@ if __name__ == "__main__":
     )
 
     date = datetime.now().strftime("%Y%m%d")
-    archive_path = str(here / f"skybrush-server-docs-{date}")
+    archive_path = str(here / f"axio-server-docs-{date}")
     make_archive(archive_path, "zip", out_dir)
 
     print(f"Documentation archive created in {archive_path}.zip")

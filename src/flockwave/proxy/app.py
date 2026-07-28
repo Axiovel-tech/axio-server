@@ -1,4 +1,4 @@
-"""Application object for the Skybrush proxy server."""
+"""Application object for the Axio proxy server."""
 
 from http.client import parse_headers
 from io import BytesIO
@@ -72,7 +72,7 @@ async def copy_stream(source: StreamConnection, target: StreamConnection) -> Non
 
 
 class SkybrushProxyServer(DaemonApp):
-    """Main application object for the Skybrush proxy server."""
+    """Main application object for the Axio proxy server."""
 
     async def run(self) -> None:
         self.local_connection_factory = create_connection_factory(

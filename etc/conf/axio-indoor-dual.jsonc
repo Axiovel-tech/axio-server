@@ -1,4 +1,4 @@
-// This is the main configuration file for Skybrush Server, pre-configured
+// This is the main configuration file for Axio Server, pre-configured
 // for indoor shows with Crazyflie drones and multiple radios.
 //
 // The file is essentially a JSON file, but C-style comments are allowed, and

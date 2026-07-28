@@ -341,7 +341,7 @@ class MAVProtocolCapability(IntFlag):
     MISSION_RALLY = 0x8000
     FLIGHT_INFORMATION = 0x10000
 
-    # Skybrush-specific extension
+    # Drone-show-firmware-specific extension
     DRONE_SHOW_MODE = 0x4000000
 
 
@@ -646,7 +646,7 @@ class RebootShutdownConditions(IntEnum):
 
 class SkybrushUserCommand(IntEnum):
     """Enum representing the types of the user-specified commands that we
-    can submit to a Skybrush drone with MAVCommand.USER_1.
+    can submit to a drone running the drone show firmware with MAVCommand.USER_1.
     """
 
     RELOAD_SHOW = 0

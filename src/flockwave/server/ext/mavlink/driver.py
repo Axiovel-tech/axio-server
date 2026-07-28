@@ -1171,7 +1171,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     """
 
     _last_skybrush_status_info: DroneShowStatus | None = None
-    """The last Skybrush-specific status packet received from the UAV if it ever
+    """The last firmware-specific status packet received from the UAV if it ever
     sent one.
     """
 
@@ -3054,7 +3054,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 # Geofence error reported from SYS_STATUS...
                 (has_geofence_error and not are_motors_running)
                 # ...or no error reported from SYS_STATUS, but a geofence breach
-                # was reported in the Skybrush-specific status packet
+                # was reported in the firmware-specific status packet
                 or (not has_geofence_error and status.is_geofence_breached)
             ),
             FlockwaveErrorCode.ESC_ERROR.value: status.has_high_esc_error_rate,
@@ -3159,7 +3159,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # breaches (apart from the "Fence breached" STATUSTEXT message, which
         # we ignore because there is no corresponding "Breach resolved" message
         # so we don't know for how long we should mark the geofence breached).
-        # That's why our Skybrush-specific status packet contains a bit to
+        # That's why our firmware-specific status packet contains a bit to
         # indicate geofence breaches even if the geofence mode is set to
         # "report only" -- but it means that we have _two_ sources to check to
         # determine the error code to use for the geofence.
@@ -3171,7 +3171,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         )
 
         # We do not use the LANDED error code yet because the current versions
-        # of the Skybrush firmware report "LANDED" for a long time after landing,
+        # of the drone show firmware report "LANDED" for a long time after landing,
         # which means that we would get an all-blue display in Live after a
         # successful show.
 
@@ -3212,7 +3212,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 # Geofence error reported from SYS_STATUS...
                 (has_geofence_error and not are_motors_running)
                 # ...or no error reported from SYS_STATUS, but a geofence breach
-                # was reported in the Skybrush-specific status packet
+                # was reported in the firmware-specific status packet
                 or (
                     not has_geofence_error
                     and self._last_skybrush_status_info

@@ -1,4 +1,4 @@
-"""Default configuration for the Skybrush server.
+"""Default configuration for the Axio Server.
 
 This script will be evaluated first when the server attempts to load its
 configuration. Configuration files may import variables from this module
@@ -11,7 +11,7 @@ locally, create a configuration file containing this:
 """
 
 # Label that is used to identify the server in SSDP discovery requests
-SERVER_NAME = "Skybrush server"
+SERVER_NAME = "Axio Server"
 
 # Base port from which the port numbers used by the server are derived
 PORT = 5000

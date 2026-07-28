@@ -26,7 +26,7 @@ T = TypeVar("T", bound="ModelObject")
 
 class ModelObject(ABC):
     """Abstract object that defines the interface of generic objects tracked
-    by the Skybrush server.
+    by the Axio Server.
     """
 
     @staticmethod

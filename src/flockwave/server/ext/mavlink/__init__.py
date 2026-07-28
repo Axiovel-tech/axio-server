@@ -1,4 +1,4 @@
-"""Skybrush server extension that adds support for drone flocks that use
+"""Axio Server extension that adds support for drone flocks that use
 the MAVLink protocol.
 """
 

@@ -1,5 +1,5 @@
 """Extension that implements basic username-password based authentication
-for the Skybrush server.
+for the Axio Server.
 
 The authentication messages themselves are easy to decipher if they are not
 sent on an encrypted channel. Make sure that the channels provided by the

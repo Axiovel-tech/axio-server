@@ -1,4 +1,4 @@
-"""Central place to manage TCP and UDP ports related to the Skybrush server
+"""Central place to manage TCP and UDP ports related to the Axio Server
 and related applications.
 """
 
@@ -30,7 +30,7 @@ SERVICE_MAP: dict[str, PortSpec] = {
     "rcin": ("relative", 3),
     "ssdp": ("absolute", 1900),
 }
-"""Dictionary mapping registered Skybrush-related services to the corresponding
+"""Dictionary mapping registered Axio-related services to the corresponding
 suggested absolute or relative port numbers.
 """
 
@@ -68,7 +68,7 @@ def get_port_number_for_service(service: str, base_port: int | None = None) -> i
 
 
 def suggest_port_number_for_service(service: str, base_port: int | None = None) -> int:
-    """Returns a suggested port number for the given Skybrush-related service.
+    """Returns a suggested port number for the given Axio-related service.
 
     Service names are keys in the `SERVICE_MAP` dictionary. Typical service
     names are: `http` for the HTTP (WebSocket) based communication channel,

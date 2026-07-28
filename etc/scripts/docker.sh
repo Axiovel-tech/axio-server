@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# Builds the skybrush-server Docker image.
+# Builds the axio-server Docker image.
 
-IMAGE_NAME=skybrush-server
+IMAGE_NAME=axio-server
 
 SCRIPT_ROOT=$(dirname $0)
 REPO_ROOT="${SCRIPT_ROOT}/../.."
@@ -23,7 +23,7 @@ trap "rm -f requirements-main.txt" EXIT
 docker build \
   --platform linux/amd64 \
   --secret id=NETRC_SECRET_ID,src=${HOME}/.netrc \
-  -t docker.collmot.com/${IMAGE_NAME}:latest \
+  -t ghcr.io/axiovel-tech/${IMAGE_NAME}:latest \
   -f etc/deployment/docker/amd64/Dockerfile \
   .
 echo "Successfully built Docker image."
@@ -31,6 +31,6 @@ echo "Successfully built Docker image."
 # If we are at an exact tag, also tag the image
 GIT_TAG=$(git describe --exact-match --tags 2>/dev/null || echo "")
 if [ "x$GIT_TAG" != x ]; then
-  docker tag docker.collmot.com/${IMAGE_NAME}:latest docker.collmot.com/${IMAGE_NAME}:${GIT_TAG}
+  docker tag ghcr.io/axiovel-tech/${IMAGE_NAME}:latest ghcr.io/axiovel-tech/${IMAGE_NAME}:${GIT_TAG}
   echo "Image tagged as $GIT_TAG."
 fi

@@ -1,11 +1,8 @@
 [project]
 name = "flockwave-server"
 version = "2.46.0"
-description = "Skybrush server component"
-authors = [
-  { name = "Tamas Nepusz", email = "tamas@collmot.com" },
-  { name = "Gabor Vasarhelyi", email = "vasarhelyi@collmot.com" },
-]
+description = "Axio Server — Axiovel drone show server component"
+authors = [{ name = "Axiovel" }]
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10,<4.0"
 dependencies = [

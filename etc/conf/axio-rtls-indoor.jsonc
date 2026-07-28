@@ -5,7 +5,7 @@
 // wired-to-wireless broadcast is blocked on the bench AP.
 {
   "EXTENSIONS": {
-    // Listen on all interfaces so Skybrush Live can connect from anywhere
+    // Listen on all interfaces so Axio Control can connect from anywhere
     "http_server": {
       "host": ""
     },

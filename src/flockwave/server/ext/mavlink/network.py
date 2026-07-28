@@ -1,12 +1,12 @@
 """Classes and functions related to MAVLink networks, i.e. a set of MAVLink
 connections over which the system IDs of the devices share the same namespace.
 
-For instance, a Skybrush server may participate in a MAVLink network with two
+For instance, an Axio Server may participate in a MAVLink network with two
 connections: a wifi connection and a fallback radio connection. The system ID
 of a MAVLink message received on either of these two connections refers to the
 same device. However, the same system ID in a different MAVLink network may
 refer to a completely different device. The introduction of the concept of
-MAVLink networks in the Skybrush server allows us to manage multiple independent
+MAVLink networks in the Axio Server allows us to manage multiple independent
 MAVLink-based drone swarms.
 """
 
@@ -103,7 +103,7 @@ class MAVLinkNetwork:
     _id_formatter: Callable[[int, str], str]
     """Formatter function that is called with the system ID of a UAV and the
     network ID and returns the final ID that should be assigned to the UAV in
-    Skybrush.
+    Axio Server.
     """
 
     _matchers: Matchers
@@ -137,7 +137,7 @@ class MAVLinkNetwork:
 
     _uav_system_id_offset: int = 0
     """Offset to add to the system ID of each UAV in the network before it is
-    sent to the ID formatter that derives the final ID in Skybrush.
+    sent to the ID formatter that derives the final ID in Axio Server.
     """
 
     _uav_system_id_range: tuple[int, int] = (1, 256)
@@ -202,11 +202,11 @@ class MAVLinkNetwork:
         """Constructor.
 
         Creates a new MAVLink network with the given network ID. Network
-        identifiers must be unique in the Skybrush server.
+        identifiers must be unique in the Axio Server.
 
         Parameters:
             id: the network ID
-            system_id: the MAVLink system ID of the Skybrush server within the
+            system_id: the MAVLink system ID of the Axio Server within the
                 network
             id_formatter: function that can be called with a MAVLink system ID
                 and the network ID, and that must return a string that will be
@@ -1056,7 +1056,7 @@ class MAVLinkNetwork:
         self, message: MAVLinkMessage, *, connection_id: str, address: Any
     ):
         """Handles an incoming MAVLink V2_EXTENSION message, currently used to
-        carry debug information injected dynamically by a Skybrush MAVLink
+        carry debug information injected dynamically by a MAVLink debug
         proxy. Not used in production.
         """
         if message.message_type != 42424:

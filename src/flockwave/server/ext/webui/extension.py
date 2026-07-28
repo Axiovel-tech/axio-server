@@ -1,5 +1,5 @@
-"""Skybrush server extension that adds debugging tools and a test page to
-the Skybrush server.
+"""Axio Server extension that adds debugging tools and a test page to
+the Axio Server.
 """
 
 from __future__ import annotations

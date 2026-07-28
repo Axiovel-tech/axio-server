@@ -1,4 +1,4 @@
-"""Command line launcher for the Skybrush gateway server."""
+"""Command line launcher for the Axio gateway server."""
 
 import logging
 import sys
@@ -35,7 +35,7 @@ from .version import __version__
 )
 @click.version_option(version=__version__)
 def start(config, debug, quiet, log_style):
-    """Start the Skybrush gateway server."""
+    """Start the Axio gateway server."""
     # Set up the logging format
     logger.install(
         level=logging.DEBUG if debug else logging.WARN if quiet else logging.INFO,
@@ -50,7 +50,7 @@ def start(config, debug, quiet, log_style):
     from flockwave.gateway.app import app
 
     # Log what we are doing
-    log.info(f"Starting Skybrush gateway server {__version__}")
+    log.info(f"Starting Axio gateway server {__version__}")
 
     # Configure the application
     retval = app.prepare(config, debug=debug)

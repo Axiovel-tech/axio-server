@@ -1,4 +1,4 @@
-"""Extension that extends the Skybrush server with an HTTP server listening
+"""Extension that extends the Axio Server with an HTTP server listening
 on a specific port.
 
 This server can then be used by other extensions to implement HTTP-specific
@@ -184,7 +184,7 @@ def mounted(app, *, path: str, scopes: Iterable[str] | None = None, priority: in
 
 def propose_index_page(route: str, priority: int = 0) -> Disposer:
     """Proposes the given route as a potential index page for the
-    Skybrush server. This method can be called from the ``load()``
+    Axio Server. This method can be called from the ``load()``
     functions of extensions when they want to propose one of their own
     routes as an index page. The server will select the index page with
     the highest priority when all the extensions have been loaded.
@@ -217,7 +217,7 @@ def propose_index_page(route: str, priority: int = 0) -> Disposer:
 @contextmanager
 def proposed_index_page(route: str, priority: int = 0):
     """Context manager that adds the given route as a potential index page for
-    the Skybrush server as long as the execution is within the context, and
+    the Axio Server as long as the execution is within the context, and
     revokes it when the context is exited.
 
     Parameters:
@@ -314,7 +314,7 @@ async def run(app: SkybrushServer, configuration: dict[str, Any], logger: Logger
         if apps:
             message += "\nThe following application(s) may be using this port:\n"
             message += "\n".join(f"  - {app}" for app in apps)
-            message += "\nAlternatively, you might have another instance of Skybrush Server running."
+            message += "\nAlternatively, you might have another instance of Axio Server running."
 
         logger.error(message, extra={"telemetry": "ignore"})
 

@@ -1,4 +1,4 @@
-"""Command line launcher for the Skybrush server."""
+"""Command line launcher for the Axio Server."""
 
 import logging
 import os
@@ -52,7 +52,7 @@ def start(
     quiet: bool = False,
     log_style: str = "fancy",
 ):
-    """Start the Skybrush server."""
+    """Start the Axio Server."""
     # Silence some irrelevant exceptions when exiting the app
     install_unraisable_hook()
 
@@ -97,7 +97,7 @@ def start(
     from flockwave.server.app import app
 
     # Log what we are doing
-    log.info(f"Starting Skybrush server {__version__}")
+    log.info(f"Starting Axio Server {__version__}")
 
     # Configure the application
     retval = app.prepare(config, debug=debug)

@@ -205,7 +205,7 @@ LocalPositioningSystemType_ creates when asked to create a new instance.
 class LocalPositioningSystemType(Generic[T], ABC):
     """Base class for local positioning system (LPS) types.
 
-    New LPS types in the Skybrush server may be implemented by deriving a class
+    New LPS types in the Axio Server may be implemented by deriving a class
     from this base class and then registering it in the LPS type registry.
     """
 

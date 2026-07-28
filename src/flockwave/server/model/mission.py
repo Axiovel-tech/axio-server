@@ -78,7 +78,7 @@ class Altitude:
 
 
 class AltitudeReference(Enum):
-    """Altitude references supported by Skybrush."""
+    """Altitude references supported by Axio Server."""
 
     HOME = "home"
     """Altitude reference is the home altitude."""
@@ -110,7 +110,7 @@ class Heading:
 
 
 class HeadingMode(Enum):
-    """Heading modes supported by Skybrush."""
+    """Heading modes supported by Axio Server."""
 
     ABSOLUTE = "absolute"
     """Heading is given as a fixed absolute value."""
@@ -121,7 +121,7 @@ class HeadingMode(Enum):
 
 class MissionItem(TypedDict):
     """Representation of a mission item in a format that comes/goes directly
-    from/to Skybrush Live.
+    from/to Axio Control.
     """
 
     id: str | None
@@ -146,7 +146,7 @@ class MissionItem(TypedDict):
 
 class MissionItemBundle(TypedDict):
     """Representation of an ordered collection of mission items submitted from
-    or sent to Skybrush Live.
+    or sent to Axio Control.
 
     The bundle can hold single- or multi-UAV missions. In case of multi-UAV
     missions, the `participants` variable of each item must hold the information
@@ -172,7 +172,7 @@ class MissionItemBundle(TypedDict):
 
 
 class MissionItemType(Enum):
-    """Mission item types supported by Skybrush."""
+    """Mission item types supported by Axio Server."""
 
     CHANGE_ALTITUDE = "changeAltitude"
     """Command to change the altitude."""

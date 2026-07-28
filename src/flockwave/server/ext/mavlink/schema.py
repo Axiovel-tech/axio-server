@@ -19,7 +19,7 @@ RSSI_MODE_SCHEMA: dict[str, Any] = {
         "enum_titles": [
             "No RSSI values",
             "From RADIO_STATUS messages",
-            "From RTCM counters (Skybrush only)",
+            "From RTCM counters (drone show firmware only)",
         ]
     },
 }
@@ -55,7 +55,7 @@ NETWORK_PROPERTIES = {
         "description": (
             "Offset to add to the numeric ID of each drone within the network "
             "to derive its final ID. You can use it to map multiple networks "
-            "with the same MAVLink ID range to different Skybrush ID ranges. "
+            "with the same MAVLink ID range to different Axio Server ID ranges. "
             "Leave it at zero if you only have one MAVLink network."
         ),
     },
@@ -168,7 +168,7 @@ NETWORK_PROPERTIES = {
         "title": "STATUSTEXT message handling",
         "properties": {
             "client": MAVSeverity.json_schema(
-                title="Forward to Skybrush clients above this severity",
+                title="Forward to Axio clients above this severity",
             ),
             "server": MAVSeverity.json_schema(
                 title="Log in the server log above this severity",
@@ -238,7 +238,7 @@ schema = {
             "description": (
                 "MAVLink custom flight mode number to switch drones to when "
                 "they are discovered the first time. 127 is the mode number of "
-                "the drone show mode for Skybrush-compatible MAVLink-based "
+                "the drone show mode for show-firmware-compatible MAVLink-based "
                 "drones. Refer to the documentation of your autopilot for more "
                 "details."
             ),
@@ -272,7 +272,7 @@ schema = {
                 "enum_titles": [
                     "Autodetected",
                     "ArduPilot",
-                    "ArduPilot with Skybrush",
+                    "ArduPilot with drone show firmware",
                     "PX4",
                 ]
             },

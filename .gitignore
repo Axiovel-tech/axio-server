@@ -10,7 +10,7 @@
 build/
 dist/
 doc/build/
-doc/skybrush-server-docs-*.zip
+doc/axio-server-docs-*.zip
 htmlcov/
 private/
 tmp/
