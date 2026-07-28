@@ -1,9 +1,9 @@
-"""Extension that allows the Skybrush server to be discoverable on the
+"""Extension that allows the Axio Server to be discoverable on the
 local network with UPnP/SSDP.
 
-The Skybrush server will be represented as a single root device on the
-network. The device has no UUID because there might be multiple Skybrush
-server instances running on the same machine and it is unclear how the UUID
+The Axio Server will be represented as a single root device on the
+network. The device has no UUID because there might be multiple Axio
+Server instances running on the same machine and it is unclear how the UUID
 should be generated in such cases. However, the server will respond to UPnP
 M-SEARCH requests for root devices, and for searches for
 ``urn:collmot-com:device:flockwave`` and
@@ -65,7 +65,7 @@ exports: SSDPExtensionAPIDict = {
 _RESPONSE_HEADERS = {
     "DATE": lambda: format_date_time(mktime(datetime.now().timetuple())),
     "EXT": "",
-    "SERVER": "{0} UPnP/1.1 Skybrush/{1}".format(
+    "SERVER": "{0} UPnP/1.1 AxioServer/{1}".format(
         {
             "Linux": "{0}/{2}".format(*platform.uname()),
             "Darwin": "{0}/{2}".format(*platform.uname()),
@@ -136,10 +136,10 @@ class Sockets:
 
 def get_service_uri(service_id: str, address: IPAddressAndPort) -> str | None:
     """Returns the location URI of the UPnP service that belongs to the given
-    registered Skybrush service ID.
+    registered Axio service ID.
 
     Parameters:
-        service_id: the ID of the registered Skybrush service; typically a
+        service_id: the ID of the registered Axio service; typically a
             channel identifier from the channel type registry
         address: the address of the device requesting the location URI. This
             will be used if the server is listening on multiple interfaces;
@@ -162,7 +162,7 @@ def get_service_uri(service_id: str, address: IPAddressAndPort) -> str | None:
             return uri
 
     # service_id is not found in the list of registered services in this
-    # extension, so it is most likely a Skybrush channel ID (tcp, udp or
+    # extension, so it is most likely an Axio channel ID (tcp, udp or
     # websocket)
     try:
         service = app.channel_type_registry.find_by_id(service_id)

@@ -1,4 +1,4 @@
-# Development Guidelines for Skybrush Server
+# Development Guidelines for Axio Server
 
 This document provides essential information for agentic coding assistants.
 

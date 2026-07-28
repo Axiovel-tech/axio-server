@@ -1306,7 +1306,7 @@ def get_schema():
                 "title": "Register the RTK base station as a beacon",
                 "description": (
                     "Registers the current RTK base station as a beacon in the server. "
-                    "This allows frontends like Skybrush Live to show the position of "
+                    "This allows frontends like Axio Control to show the position of "
                     "the RTK base station on the map."
                 ),
                 "default": True,

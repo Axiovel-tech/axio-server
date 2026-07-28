@@ -1,4 +1,4 @@
-"""Model-related classes for the Skybrush server."""
+"""Model-related classes for the Axio Server."""
 
 from .battery import BatteryInfo
 from .builders import CommandExecutionStatusBuilder, FlockwaveMessageBuilder

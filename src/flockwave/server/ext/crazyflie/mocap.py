@@ -59,7 +59,7 @@ class CrazyflieMocapFrameHandler:
         for item in frame.items:
             # TODO(ntamas): currently we assume that the numeric ID of the
             # Crazyflie that we need to send in the localization packet is
-            # equal to the numeric ID in Skybrush. This is a hack, but we do not
+            # equal to the numeric ID in Axio Server. This is a hack, but we do not
             # have a better mechanism yet; the other option would be to take the
             # Crazyflie URI, assume that it ends with the radio address in hex,
             # and then convert the last two characters back to a numeric ID.

@@ -11,10 +11,10 @@
  * Furthermore, the configuration file assumes that the IP address of your GCS
  * is 192.168.1.254.
  *
- * Refer to skybrush-outdoor-dual-ip.jsonc instead if you have more than one IP
+ * Refer to axio-outdoor-dual-ip.jsonc instead if you have more than one IP
  * network and all drones use the same UDP port numbes.
  *
- * Refer to skybrush-outdoor.jsonc if you have a single IP network and not more
+ * Refer to axio-outdoor.jsonc if you have a single IP network and not more
  * than 250 drones.
  */
 {

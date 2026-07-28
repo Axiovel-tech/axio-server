@@ -39,7 +39,7 @@ MSEC_IN_WEEK = 604800000
 
 def authorization_scope_to_int(authorization_scope: AuthorizationScope) -> int:
     """Converts an authorization scope enum value to its integer representation
-    in the Skybrush firmware.
+    in the drone show firmware.
     """
     if authorization_scope is AuthorizationScope.NONE:
         return 0
@@ -232,7 +232,7 @@ def format_gps_time_of_week(value: int) -> str:
 
 
 class DroneShowStatusFlag(IntFlag):
-    """Status flags used in the Skybrush-specific drone show status packet."""
+    """Status flags used in the firmware-specific drone show status packet."""
 
     # Flags from now on come from the third flag byte in the status packet;
     # four most significant bits only.
@@ -276,7 +276,7 @@ _stage_descriptions = {
 
 
 class DroneShowExecutionStage(IntEnum):
-    """Execution stage constants in the Skybrush-specific drone show status
+    """Execution stage constants in the firmware-specific drone show status
     packet.
     """
 
@@ -317,7 +317,7 @@ class DroneShowExecutionStage(IntEnum):
 
 @dataclass
 class DroneShowStatus:
-    """Dataclass representing a Skybrush-specific drone show status object.
+    """Dataclass representing a firmware-specific drone show status object.
 
     This dataclass encapsulates information that can be extracted from the
     standard drone show status packet. Information that can be extracted only
@@ -360,10 +360,10 @@ class DroneShowStatus:
     """Extended status information, if provided at construction time."""
 
     TYPE: ClassVar[int] = 0x5B
-    """Identifier of Skybrush-specific DATA* show status packets."""
+    """Identifier of firmware-specific DATA* show status packets."""
 
     _struct: ClassVar[Struct] = Struct("<iHBBBBhBB")
-    """Structure of Skybrush-specific DATA* show status packets."""
+    """Structure of firmware-specific DATA* show status packets."""
 
     @classmethod
     def from_bytes(cls, data: bytes):
@@ -451,7 +451,7 @@ class DroneShowStatus:
 
         Raises:
             ValueError: if the type of the MAVLink DATA* packet does not match
-                the expected type of a Skybrush-specific show status packet
+                the expected type of a firmware-specific show status packet
         """
         if message.type != cls.TYPE:
             raise ValueError(
@@ -593,7 +593,7 @@ class DroneShowStatus:
 
 @dataclass
 class DroneShowStatusExtension:
-    """Dataclass representing the extended part of a Skybrush-specific drone
+    """Dataclass representing the extended part of a firmware-specific drone
     show status object.
 
     This dataclass encapsulates information that can be extracted from the

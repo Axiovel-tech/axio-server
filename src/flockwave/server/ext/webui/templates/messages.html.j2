@@ -6,7 +6,7 @@
 <div class="p-4">
 
 <p class="lead">Use the form below to send test messages to this
-    Skybrush server. Predefined message templates may be loaded
+    Axio Server. Predefined message templates may be loaded
     with the buttons on the right.
 </p>
 
@@ -94,27 +94,27 @@
         },
         "DEV-INF": {
             "type": "DEV-INF",
-            "paths": ["/COLLMOT-00", "/COLLMOT-01/thermometer", "/COLLMOT-02/thermometer/temperature"]
+            "paths": ["/AXIOVEL-00", "/AXIOVEL-01/thermometer", "/AXIOVEL-02/thermometer/temperature"]
         },
         "DEV-LIST": {
             "type": "DEV-LIST",
-            "ids": ["COLLMOT-01", "COLLMOT-02"]
+            "ids": ["AXIOVEL-01", "AXIOVEL-02"]
         },
         "DEV-LISTSUB": {
             "type": "DEV-LISTSUB",
-            "pathFilter": ["/COLLMOT-01", "/COLLMOT-01/thermometer", "/COLLMOT-00"]
+            "pathFilter": ["/AXIOVEL-01", "/AXIOVEL-01/thermometer", "/AXIOVEL-00"]
         },
         "DEV-SUB": {
             "type": "DEV-SUB",
-            "paths": ["/COLLMOT-02/thermometer/temperature"]
+            "paths": ["/AXIOVEL-02/thermometer/temperature"]
         },
         "DEV-UNSUB": {
             "type": "DEV-UNSUB",
-            "paths": ["/COLLMOT-02/thermometer/temperature"]
+            "paths": ["/AXIOVEL-02/thermometer/temperature"]
         },
         "OBJ-CMD": {
             "type": "OBJ-CMD",
-            "ids": ["COLLMOT-01", "COLLMOT-02"],
+            "ids": ["AXIOVEL-01", "AXIOVEL-02"],
             "command": "yo"
         },
         "OBJ-LIST": {
@@ -131,34 +131,34 @@
         },
         "UAV-INF": {
             "type": "UAV-INF",
-            "ids": ["COLLMOT-01", "COLLMOT-02"]
+            "ids": ["AXIOVEL-01", "AXIOVEL-02"]
         },
         "UAV-LAND": {
             "type": "UAV-LAND",
-            "ids": ["COLLMOT-00"]
+            "ids": ["AXIOVEL-00"]
         },
         "UAV-LIST": {
             "type": "UAV-LIST"
         },
         "UAV-MOTOR": {
             "type": "UAV-MOTOR",
-            "ids": ["COLLMOT-00"],
+            "ids": ["AXIOVEL-00"],
             "start": true,
             "force": false
         },
         "UAV-SIGNAL": {
             "type": "UAV-SIGNAL",
-            "ids": ["COLLMOT-00"],
+            "ids": ["AXIOVEL-00"],
             "signals": ["light", "sound"],
             "duration": 1000
         },
         "UAV-TAKEOFF": {
             "type": "UAV-TAKEOFF",
-            "ids": ["COLLMOT-00"]
+            "ids": ["AXIOVEL-00"]
         },
         "UAV-VER": {
             "type": "UAV-VER",
-            "ids": ["COLLMOT-00"]
+            "ids": ["AXIOVEL-00"]
         }
     };
 

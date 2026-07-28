@@ -1,4 +1,4 @@
-"""Application object for the Skybrush server."""
+"""Application object for the Axio Server."""
 
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
@@ -108,7 +108,7 @@ NULL_HANDLER = (None, None)
 
 
 class SkybrushServer(DaemonApp):
-    """Main application object for the Skybrush server."""
+    """Main application object for the Axio Server."""
 
     channel_type_registry: ChannelTypeRegistry
     """Central registry for types of communication channels that the server can

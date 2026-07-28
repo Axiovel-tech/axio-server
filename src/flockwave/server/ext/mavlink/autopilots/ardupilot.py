@@ -804,11 +804,11 @@ def extend_custom_modes(
 
 
 class ArduPilotWithSkybrush(ArduPilot):
-    """Class representing the ArduCopter firmware with Skybrush-specific
+    """Class representing the ArduCopter firmware with drone-show-specific
     extensions to support drone shows.
     """
 
-    name = "ArduPilot + Skybrush"
+    name = "ArduPilot + drone show firmware"
     _custom_modes_by_mav_type = extend_custom_modes(
         ArduPilot, MAVType.QUADROTOR, {127: ("show",)}
     )

@@ -6,7 +6,7 @@ A hardware LTC reader (e.g. `ltc-tools`' ``ltcdump -f`` on an audio input,
 or any console feeding frames) streams one timecode per UDP datagram to
 this extension as ``HH:MM:SS:FF`` (drop-frame ``;``/``.``/``,`` separators
 are accepted). The extension registers the clock under the id ``mtc`` --
-the identifier Skybrush Live already offers as the "SMPTE timecode" start
+the identifier Axio Control already offers as the "SMPTE timecode" start
 reference -- and the show extension's clock-synchronization machinery does
 the rest: an operator schedules the start at a timecode instant, the show
 clock locks to the feed, and the scheduled-start seam converts the

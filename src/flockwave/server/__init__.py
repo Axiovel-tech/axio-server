@@ -1,4 +1,4 @@
-"""Main package for the Skybrush server."""
+"""Main package for the Axio Server."""
 
 from .version import __version__, __version_info__
 

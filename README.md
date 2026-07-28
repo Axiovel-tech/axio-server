@@ -1,16 +1,16 @@
 ![Tests](https://github.com/Axiovel-tech/axio-server/actions/workflows/tests.yml/badge.svg)
 ![Linters](https://github.com/Axiovel-tech/axio-server/actions/workflows/linters.yml/badge.svg)
 
-# Skybrush Server
+# Axio Server
 
 > **Axiovel status:** this fork is the current production Axio Server. It
 > receives per-UAV `__show_upload` commands from the Control GUI App, compiles
 > `.skyb`, and uploads shows to AVCopter over MAVFTP. AV-Desktop is maintained
 > separately as an experimental successor candidate.
 
-Skybrush Server is the server component behind the Skybrush ecosystem; it handles
+Axio Server is the server component behind the Axio ecosystem; it handles
 communication channels to drones and provides an abstraction layer on top of them
-so frontend apps (like Skybrush Live) do not need to know what type of drones
+so frontend apps (like Axio Control) do not need to know what type of drones
 they are communicating with.
 
 The server also provides additional facilities like clocks, RTK correction
@@ -50,7 +50,7 @@ ports or endpoints are configured.
 
 1. Install `uv`. `uv` will manage a virtual environment for this project to keep
    things nicely separated. You won't pollute the system Python with the
-   dependencies of the Skybrush server and everyone will be happier.
+   dependencies of the Axio Server and everyone will be happier.
    See <https://docs.astral.sh/uv/> for installation instructions.
 
 2. Check out the source code of the server.
@@ -63,14 +63,15 @@ ports or endpoints are configured.
 
 ## Documentation
 
-- [User guide](https://doc.collmot.com/public/skybrush-live-doc/latest/)
+- API documentation: run `uv run python doc/make.py` to build the
+  `doc/axio-server-docs-<date>.zip` archive from the source code (pdoc).
 
 ## Development
 
 This project contains both public and private dependencies in `pyproject.toml`.
 Public dependencies are either on PyPI or in our public PyPI index at
 [Gemfury](https://gemfury.com). Private dependencies hosted in our private
-PyPI index are _not_ required to build the community version of Skybrush Server.
+PyPI index are _not_ required to build the community version of Axio Server.
 
 However, if you are working with the project on your own and make any changes to
 `pyproject.toml` that would necessitate the regeneration of the lockfile of
@@ -82,12 +83,14 @@ the ones in the `pro` or `collmot` extras.
 
 ## License
 
-Skybrush Server is free software: you can redistribute it and/or modify it under
+Axio Server is a fork of Skybrush Server by CollMot Robotics Ltd.
+
+Axio Server is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
 Foundation, either version 3 of the License, or (at your option) any later
 version.
 
-Skybrush Server is distributed in the hope that it will be useful, but WITHOUT
+Axio Server is distributed in the hope that it will be useful, but WITHOUT
 ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
 FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
 more details.

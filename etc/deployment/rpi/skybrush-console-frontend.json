@@ -1,7 +1,7 @@
 {
   "APPS": [
     {
-      "name": "Skybrush server",
+      "name": "Axio server",
       "command": [
         "/opt/skybrush/server/bin/skybrushd",
         "-c",

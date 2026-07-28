@@ -292,7 +292,7 @@ class MAVLinkNetworkSpecification:
     """
 
     system_id: int = 255
-    """MAVLink system ID reserved for the ground station (the Skybrush server)."""
+    """MAVLink system ID reserved for the ground station (the Axio Server)."""
 
     id_format: str = "{1}{0}"
     """Python format string that receives the MAVLink system ID of a drone

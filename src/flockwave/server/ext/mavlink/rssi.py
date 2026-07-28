@@ -18,7 +18,7 @@ class RSSIMode(Enum):
 
     RTCM_COUNTERS = "rtcm_counters"
     """The RSSI value will be derived from the RTCM message counters embedded
-    in Skybrush-specific status packets. Works with a Skybrush firmware only.
+    in firmware-specific status packets. Works with the drone show firmware only.
     """
 
 

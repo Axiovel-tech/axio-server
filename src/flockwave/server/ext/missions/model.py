@@ -509,7 +509,7 @@ class MissionType(Generic[T], ABC):
     """Base class for mission types, i.e. classes that define how to create a
     mission plan to perform a given task and how to execute such a plan.
 
-    New types of missions in the Skybrush server may be implemented by deriving
+    New types of missions in the Axio Server may be implemented by deriving
     a class from this base class and then registering it in the mission type
     registry.
     """

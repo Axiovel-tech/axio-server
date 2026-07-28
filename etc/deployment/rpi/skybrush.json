@@ -9,7 +9,7 @@
       "exclude_serial_ports": "*ttyAMA0*"
     },
     "ssdp": {
-      "label": "Skybrush RPi server"
+      "label": "Axio RPi server"
     },
     "mavlink": {
       "enabled": true

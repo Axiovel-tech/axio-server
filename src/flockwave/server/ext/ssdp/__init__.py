@@ -1,4 +1,4 @@
-"""Extension that allows the Skybrush server to be discoverable on the
+"""Extension that allows the Axio Server to be discoverable on the
 local network with UPnP/SSDP.
 """
 

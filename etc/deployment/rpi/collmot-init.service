@@ -1,5 +1,5 @@
 [Unit]
-Description=CollMot-specific initialization tasks
+Description=Axiovel-specific initialization tasks
 After=local-fs.target
 Before=raspberrypi-net-mods.service
 

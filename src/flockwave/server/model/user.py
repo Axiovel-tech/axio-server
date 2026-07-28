@@ -11,7 +11,7 @@ __all__ = ("User",)
 
 @dataclass(frozen=True)
 class User:
-    """A single user connected to the Skybrush server via a client
+    """A single user connected to the Axio Server via a client
     connection.
 
     Attributes:

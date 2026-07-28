@@ -1,5 +1,5 @@
 """Extension that provides a clock registry to the app and adds support
-for the ``CLK-...`` commands defined in the Skybrush protocol.
+for the ``CLK-...`` commands defined in the Axio Server protocol.
 """
 
 from __future__ import annotations

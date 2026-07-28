@@ -43,7 +43,7 @@ schema = {
             "title": "Name mapping",
             "description": (
                 "Describe how the names of the rigid bodies from mocap "
-                "systems should be mapped to UAV IDs in Skybrush. Any name that "
+                "systems should be mapped to UAV IDs in Axio Server. Any name that "
                 "passes all rules will be accepted; use an explicit rejection "
                 "rule if needed."
             ),

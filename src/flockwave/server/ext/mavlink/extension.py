@@ -1,4 +1,4 @@
-"""Skybrush server extension that adds support for drone flocks using the
+"""Axio Server extension that adds support for drone flocks using the
 MAVLink protocol.
 """
 
@@ -131,7 +131,7 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 self.log.info("Flight controller firmware: PX4")
             case "skybrush":
                 autopilot_factory = ArduPilotWithSkybrush
-                self.log.info("Flight controller firmware: Skybrush on ArduPilot")
+                self.log.info("Flight controller firmware: drone show firmware on ArduPilot")
             case _:
                 autopilot_factory = None
                 self.log.warning(

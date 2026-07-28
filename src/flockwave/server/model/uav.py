@@ -465,7 +465,7 @@ class UAVDriver(Generic[TUAV], ABC):
     """
 
     app: "SkybrushServer"
-    """The Skybrush server application that hosts the driver."""
+    """The Axio Server application that hosts the driver."""
 
     @staticmethod
     def _execute(func, *args, **kwds):

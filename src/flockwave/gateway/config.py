@@ -1,4 +1,4 @@
-"""Default configuration for the Skybrush gateway server.
+"""Default configuration for the Axio gateway server.
 
 This script will be evaluated first when the gateway attempts to load its
 configuration. Configuration files may import variables from this module

@@ -1,6 +1,6 @@
 /* globals feather:false */
 
-skybrush = (function () {
+axio = (function () {
   "use strict";
 
   feather.replace();

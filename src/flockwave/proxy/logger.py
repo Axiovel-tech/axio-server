@@ -1,4 +1,4 @@
-"""Logger object for the Skybrush proxy server."""
+"""Logger object for the Axio proxy server."""
 
 from flockwave.logger import log as base_log
 

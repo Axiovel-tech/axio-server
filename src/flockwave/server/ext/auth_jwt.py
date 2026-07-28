@@ -1,5 +1,5 @@
-"""Extension that implements JWT token based authentication for the Skybrush
-server.
+"""Extension that implements JWT token based authentication for the Axio
+Server.
 """
 
 from jwt import decode

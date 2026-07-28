@@ -1,7 +1,7 @@
 # rtls — Axiovel rtls-link device management
 
 Manages rtls-link UWB positioning devices over their management UDP
-channel (MAVLink 2, default port 3333) and exposes them to Skybrush
+channel (MAVLink 2, default port 3333) and exposes them to Axio
 clients through the server's message hub:
 
 - **Discovery / presence**: the extension announces itself with GCS
@@ -323,7 +323,7 @@ anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
 debug view can plot both without a lossy GPS round-trip), and `active`
 — true only when a live anchor device with the matching `UWB_MAC` is
 online. These anchors are also published
-to clients through the existing Skybrush **beacon** layer (same stable
+to clients through the existing Axio Server **beacon** layer (same stable
 ids), so the map renders them without a bespoke anchor layer. Set
 `register_beacons: false` to disable the beacon registration.
 

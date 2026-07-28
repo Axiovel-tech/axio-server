@@ -1,4 +1,4 @@
-"""Extension that teaches the Skybrush server how to construct NTRIP connections
+"""Extension that teaches the Axio Server how to construct NTRIP connections
 yielding RTCMv2 and RTCMv3 messages from a remote NTRIP server.
 """
 

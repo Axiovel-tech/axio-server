@@ -1,5 +1,5 @@
-"""Extension that provides a clock named ``system`` in the Skybrush
-server. The ``system`` clock always returns the current timestamp
+"""Extension that provides a clock named ``system`` in the Axio
+Server. The ``system`` clock always returns the current timestamp
 according to the server, expressed as the number of seconds elapsed since
 the Unix epoch, in UTC.
 """
