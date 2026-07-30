@@ -3326,7 +3326,7 @@ async def test_geo_sync_writes_reboots_and_converges(
     await adopt_from(extension, builder, hub)
 
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append((address, port))
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3338,7 +3338,8 @@ async def test_geo_sync_writes_reboots_and_converges(
     assert set(entry["written"]) == {"POS_YAW_DEG", "UWB_AN1_X", "ORIGIN_ALT_MM"}
     assert "ORIGIN_LAT_E7" in entry["skipped"]
     assert entry["rebooted"] is True
-    assert resets == [second.address[0]]
+    # No smp_port configured for this device: the fixed hardware port.
+    assert resets == [(second.address[0], 1337)]
 
     # the device-side wire store converged to the reference geometry
     assert struct.unpack("<f", second.params["UWB_AN1_X"][0][:4])[0] == 10.0
@@ -3348,6 +3349,46 @@ async def test_geo_sync_writes_reboots_and_converges(
         extension, builder, hub, {"op": "check"}
     )
     assert check.body["consistent"] is True
+
+
+def test_configured_devices_accepts_smp_port_entries():
+    """The devices config takes plain strings (hardware, SMP fixed at
+    :1337) and {address, smp_port} objects (simulated devices: shared
+    loopback host, per-device SMP endpoints from the sim manifest)."""
+    from flockwave.server.ext.rtls.extension import _configured_devices
+
+    targets, smp_ports = _configured_devices(
+        ["10.0.0.7", {"address": "127.0.0.1:3433", "smp_port": 1437}], 3333
+    )
+    assert targets == [("10.0.0.7", 3333), ("127.0.0.1", 3433)]
+    assert smp_ports == {("127.0.0.1", 3433): 1437}
+
+
+async def test_geo_sync_reset_targets_the_configured_smp_port(
+    extension, device, dialect, builder, hub
+):
+    """A device whose config entry declared an smp_port is reset there,
+    not at the fixed hardware :1337 -- the whole point of forwarding the
+    sim manifest's per-device ports through the generated config."""
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await adopt_from(extension, builder, hub)
+    extension._smp_ports = {tuple(second.address): 1437}
+
+    resets = []
+    extension._geo_reset = lambda address, *, port: resets.append((address, port))
+
+    response = await geo_message(extension, builder, hub, {"op": "sync"})
+
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["rebooted"] is True
+    assert resets == [(second.address[0], 1437)]
 
 
 async def test_geo_sync_count_is_written_last(
@@ -3374,7 +3415,7 @@ async def test_geo_sync_count_is_written_last(
         return original_handle(data)
 
     second.handle = recording_handle
-    extension._geo_reset = lambda address: None
+    extension._geo_reset = lambda address, *, port: None
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3403,7 +3444,7 @@ async def test_geo_sync_rejected_write_means_partial_and_no_reboot(
 
     second.set_result = PARAM_ACK_FAILED
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append(address)
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3431,7 +3472,7 @@ async def test_geo_sync_no_changes_needed_skips_reboot(
     await adopt_from(extension, builder, hub)
 
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append(address)
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3459,7 +3500,7 @@ async def test_geo_sync_reboot_false_skips_reset(
     await adopt_from(extension, builder, hub)
 
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append(address)
 
     response = await geo_message(
         extension,
@@ -3493,7 +3534,7 @@ async def test_geo_sync_timeout_aborts_that_device_only(
         third.heartbeat(), third.address, time.monotonic()
     )
 
-    extension._geo_reset = lambda address: None
+    extension._geo_reset = lambda address, *, port: None
 
     response = await geo_message(
         extension,
@@ -3530,7 +3571,7 @@ async def test_geo_concurrent_sync_is_refused(
 
     # and the latch is released once a real sync finishes
     extension._geo_sync_running = False
-    extension._geo_reset = lambda address: None
+    extension._geo_reset = lambda address, *, port: None
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
     )
@@ -3612,7 +3653,7 @@ async def test_geo_sync_withholds_count_after_failed_writes(
         return original_handle(data)
 
     second.handle = recording_handle
-    extension._geo_reset = lambda address: None
+    extension._geo_reset = lambda address, *, port: None
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3698,7 +3739,7 @@ async def test_geo_sync_detects_concurrent_drift(
 
     second.handle = drifting_handle
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append(address)
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}
@@ -3759,7 +3800,7 @@ async def test_geo_sync_survives_mid_sync_rediscovery(
 
     second.handle = swapping_handle
     resets = []
-    extension._geo_reset = resets.append
+    extension._geo_reset = lambda address, *, port: resets.append(address)
 
     response = await geo_message(
         extension, builder, hub, {"op": "sync"}

@@ -552,23 +552,31 @@ def _rehome_cell_or_drop(
     ext._drop_anchor_cell(cell_id)
 
 
-def _default_reset(address: str, timeout: float = RESET_TIMEOUT) -> None:
+#: The fixed hardware MCUmgr/SMP port (rtlslink.ota.SMP_PORT). Simulated
+#: devices override it per device through the ``devices`` config.
+DEFAULT_SMP_PORT = 1337
+
+
+def _smp_port_for(ext: "RtlsExtension", device) -> int:
+    """The SMP port this device's reset must target: the one its config
+    entry declared, or the fixed hardware port."""
+    ports = getattr(ext, "_smp_ports", None) or {}
+    return ports.get(tuple(device.address), DEFAULT_SMP_PORT)
+
+
+def _default_reset(
+    address: str, *, port: int = DEFAULT_SMP_PORT, timeout: float = RESET_TIMEOUT
+) -> None:
     """Blocking MCUmgr/SMP os-reset of one device (run in a worker
     thread from Trio) -- the same management surface the OTA path uses
     for its post-upload reset, so no new firmware capability is
-    required. Raises on any transport/SMP failure."""
-    import asyncio
+    required. Delegates to :func:`rtlslink.ota.reset`, which is
+    port-aware (smpclient's high-level client pins :1337, so simulated
+    per-device endpoints would otherwise be unreachable) and retries
+    before declaring a timeout. Raises on any transport/SMP failure."""
+    from rtlslink.ota import reset
 
-    from smpclient import SMPClient
-    from smpclient.requests.os_management import ResetWrite
-    from smpclient.transport.udp import SMPUDPTransport
-
-    async def _run() -> None:
-        client = SMPClient(SMPUDPTransport(), address, timeout_s=timeout)
-        await client.connect()
-        await client.request(ResetWrite())
-
-    asyncio.run(_run())
+    reset(address, port=port, timeout=timeout)
 
 
 async def _sync_one(
@@ -702,7 +710,11 @@ async def _sync_one(
             reset = ext._geo_reset or _default_reset
             try:
                 await trio.to_thread.run_sync(
-                    partial(reset, device.address[0])
+                    partial(
+                        reset,
+                        device.address[0],
+                        port=_smp_port_for(ext, device),
+                    )
                 )
                 rebooted = True
             except ImportError:
