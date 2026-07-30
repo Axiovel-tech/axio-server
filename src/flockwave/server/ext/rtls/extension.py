@@ -252,6 +252,11 @@ class RtlsExtension(Extension):
         #: test hook for the geometry-sync device reset; ``None`` means
         #: "use the SMP os-reset" (see geometry._default_reset)
         self._geo_reset = None
+        #: SMP (MCUmgr) port per configured management address. Hardware is
+        #: always :1337; simulated devices share one loopback host and each
+        #: publish their own port in the sim manifest, which the generated
+        #: config forwards (rtlslink.sim.gcs_config_from_manifest).
+        self._smp_ports: dict[tuple[str, int], int] = {}
         #: True while an X-RTLS-GEO sync runs; a second concurrent sync
         #: is refused, and the cell-source bookkeeping refuses to move
         #: the source off the pinned reference while targets are being
@@ -387,7 +392,9 @@ class RtlsExtension(Extension):
                 "are silently dropped)"
             )
         port = int(configuration.get("port", 3333))
-        targets = _configured_addresses(configuration.get("devices", []), port)
+        targets, self._smp_ports = _configured_devices(
+            configuration.get("devices", []), port
+        )
         broadcast = _configured_addresses(
             configuration.get("broadcast", ["255.255.255.255"]), port
         )
@@ -2525,6 +2532,31 @@ def _configured_addresses(values, default_port: int) -> list[tuple[str, int]]:
     """Parse configured ``host`` / ``host:port`` strings into address tuples,
     defaulting the port to the extension's management port."""
     return [parse_address(value, default_port) for value in values]
+
+
+def _configured_devices(
+    values, default_port: int
+) -> tuple[list[tuple[str, int]], dict[tuple[str, int], int]]:
+    """Parse the ``devices`` config into management targets plus the SMP
+    port each declares, when it declares one.
+
+    Two entry forms coexist so hardware configs stay untouched: the plain
+    ``host`` / ``host:port`` string (SMP at the fixed :1337), and
+    ``{"address": ..., "smp_port": ...}`` for simulated devices, whose SMP
+    endpoints share one loopback host and therefore live on per-device
+    ports (published in the sim manifest)."""
+    targets: list[tuple[str, int]] = []
+    smp_ports: dict[tuple[str, int], int] = {}
+    for value in values:
+        if isinstance(value, dict):
+            address = parse_address(value["address"], default_port)
+            smp_port = value.get("smp_port")
+            if smp_port is not None:
+                smp_ports[address] = int(smp_port)
+        else:
+            address = parse_address(value, default_port)
+        targets.append(address)
+    return targets, smp_ports
 
 
 def _decoded_device_params(device) -> dict[str, Any]:
