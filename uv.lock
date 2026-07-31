@@ -1036,7 +1036,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.1.0,<2.0.0" },
     { name = "quart", specifier = ">=0.20.0,<0.21.0" },
     { name = "quart-trio", specifier = ">=0.12.0,<0.13.0" },
-    { name = "rtls-link", extras = ["ota"], git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=10f6b5407a6888b7fad84a1ec2f181e85b8b29f4" },
+    { name = "rtls-link", extras = ["ota"], git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=77b126af4af2aa71657d69546e5828a162d4e886" },
     { name = "trio", specifier = ">=0.33.0,<0.34.0" },
     { name = "trio-util", specifier = ">=0.8.0,<0.9.0" },
     { name = "unidecode", specifier = ">=1.4.0,<2.0.0" },
@@ -2430,7 +2430,7 @@ wheels = [
 [[package]]
 name = "rtls-link"
 version = "0.1.0"
-source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=10f6b5407a6888b7fad84a1ec2f181e85b8b29f4#10f6b5407a6888b7fad84a1ec2f181e85b8b29f4" }
+source = { git = "https://github.com/Axiovel-tech/rtls-link-zephyr.git?subdirectory=py&rev=77b126af4af2aa71657d69546e5828a162d4e886#77b126af4af2aa71657d69546e5828a162d4e886" }
 dependencies = [
     { name = "anyio" },
     { name = "pymavlink" },
