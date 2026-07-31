@@ -717,10 +717,14 @@ async def _sync_one(
                     )
                 )
                 rebooted = True
-            except ImportError:
+            except ImportError as ex:
+                # Name the actual import failure: "smpclient missing" and
+                # "the installed rtlslink predates ota.reset" both land
+                # here, and the 2026-07-31 nightly lost a night to the
+                # message asserting the wrong one.
                 entry["rebootDetail"] = (
-                    "smpclient is not installed (pip install "
-                    "'rtls-link[ota]'); geometry takes effect on the "
+                    f"reset unavailable ({ex}); install/refresh "
+                    "'rtls-link[ota]'; geometry takes effect on the "
                     "next manual reboot"
                 )
             except Exception as ex:  # noqa: BLE001
