@@ -89,6 +89,13 @@ class FirmwareUpdateConfiguration:
             return None
         return dict(self.simulation_reported_board_id_overrides).get(reported, reported)
 
+    def is_simulated_board(self, reported: int | None) -> bool:
+        """Whether an explicit simulator-only mapping owns this board ID."""
+        return reported is not None and any(
+            source == reported
+            for source, _target in self.simulation_reported_board_id_overrides
+        )
+
 
 class UpdateBackend(Protocol):
     def check_safety(self, board_id: int) -> None: ...
@@ -128,7 +135,7 @@ class ArduPilotUpdateBackend:
         armed = bool(heartbeat and heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value)
         reported_board_id = _board_id_from_version(version)
         board_id = self._configuration.effective_board_id(reported_board_id)
-        on_ground = bool(
+        on_ground = self._configuration.is_simulated_board(reported_board_id) or bool(
             extended_state
             and extended_state.landed_state == MAVLandedState.ON_GROUND.value
         )

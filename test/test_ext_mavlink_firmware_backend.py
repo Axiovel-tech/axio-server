@@ -8,7 +8,7 @@ import pytest
 import trio
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVMessageType
+from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType
 from flockwave.server.ext.mavlink.firmware.backend import (
     ArduPilotUpdateBackend,
     FirmwareUpdateConfiguration,
@@ -60,6 +60,28 @@ class FakeUAV:
         return self._messages.get(message_type)
 
 
+async def test_normal_stream_configuration_requests_landed_state() -> None:
+    calls: list[tuple[MAVCommand, int, float]] = []
+
+    class Driver:
+        async def send_command_long(
+            self, _uav, command: MAVCommand, *, param1: int, param2: float
+        ) -> bool:
+            calls.append((command, param1, param2))
+            return True
+
+    uav = SimpleNamespace(driver=Driver())
+    await MAVLinkUAV._configure_data_streams_with_fine_grained_commands(
+        cast(MAVLinkUAV, uav)
+    )
+
+    assert (
+        MAVCommand.SET_MESSAGE_INTERVAL,
+        MAVMessageType.EXTENDED_SYS_STATE,
+        1_000_000,
+    ) in calls
+
+
 def test_production_configuration_accepts_only_axiolight() -> None:
     state = ArduPilotUpdateBackend(cast(MAVLinkUAV, FakeUAV(1177))).target_state()
     assert state == TargetState(
@@ -92,6 +114,24 @@ def test_sitl_board_zero_requires_explicit_override() -> None:
     assert with_override.compatible
     assert with_override.board_id == 1177
     assert with_override.reason_code is None
+
+
+def test_sitl_landed_override_does_not_weaken_hardware_safety() -> None:
+    configuration = FirmwareUpdateConfiguration.from_json(
+        {"simulation_reported_board_id_overrides": {"0": 1177}}
+    )
+
+    sitl = ArduPilotUpdateBackend(
+        cast(MAVLinkUAV, FakeUAV(0, landed_state=None)), configuration
+    ).target_state()
+    hardware = ArduPilotUpdateBackend(
+        cast(MAVLinkUAV, FakeUAV(1177, landed_state=None)), configuration
+    ).target_state()
+
+    assert sitl.on_ground is True
+    assert sitl.reason_code is None
+    assert hardware.on_ground is False
+    assert hardware.reason_code == "notOnGround"
 
 
 @pytest.mark.parametrize(

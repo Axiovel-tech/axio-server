@@ -2767,6 +2767,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         stream_rates = [
             (MAVMessageType.SYS_STATUS, 1),
+            (MAVMessageType.EXTENDED_SYS_STATE, 1),
             (MAVMessageType.GPS_RAW_INT, 1),
             (MAVMessageType.GLOBAL_POSITION_INT, 2),
         ]
