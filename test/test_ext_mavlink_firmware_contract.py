@@ -55,7 +55,10 @@ def make_message(**body):
     return FlockwaveMessageBuilder().create_message({"type": "X-AP-OTA", **body})
 
 
-async def make_service(*, uavs=None, app=None):
+PROVISIONED = FirmwareUpdateConfiguration(provisioned_uav_ids=frozenset({"7"}))
+
+
+async def make_service(*, uavs=None, app=None, configuration=PROVISIONED):
     hub = MessageHub()
     app = app or cast(SkybrushServer, SimpleNamespace(message_hub=hub))
     nursery_manager = trio.open_nursery()
@@ -64,7 +67,7 @@ async def make_service(*, uavs=None, app=None):
     def provider():
         return uavs or []
 
-    service = ArduPilotOTAService(app, nursery, provider)
+    service = ArduPilotOTAService(app, nursery, provider, configuration)
     return service, hub, nursery_manager, nursery, provider, app
 
 
@@ -167,6 +170,7 @@ async def test_service_constructor_wires_configuration_and_dependencies() -> Non
         assert service._app is app
         assert service._uavs is provider
         assert service._configuration.allowed_board_ids == frozenset({1177})
+        assert service._configuration.provisioned_uav_ids == frozenset({"7"})
         assert service._coordinator._nursery is nursery
         assert callable(service._coordinator._backend_factory)
         assert callable(service._coordinator._notifier)
@@ -262,6 +266,36 @@ async def test_start_decodes_payload_and_preserves_request_operation() -> None:
     assert response.body["id"] == "7"
     assert response.body["job"]["operationId"] == "op-1"
     assert response.refs == request.id
+
+
+async def test_start_rejects_uav_without_provisioned_bootloader() -> None:
+    job = OTAJob(operation_id="op-1", uav_id="7", name="firmware.apj")
+    coordinator = CoordinatorStub(job)
+    service, hub, manager, nursery, _, _ = await make_service(
+        uavs=[SimpleNamespace(id="7")],
+        configuration=FirmwareUpdateConfiguration(),
+    )
+    service._coordinator = coordinator
+    try:
+        response = await service.handle_message(
+            make_message(
+                op="start",
+                id="7",
+                name="firmware.apj",
+                image="YXBq",
+                sha256="0" * 64,
+            ),
+            cast(Client, None),
+            hub,
+        )
+    finally:
+        nursery.cancel_scope.cancel()
+        await manager.__aexit__(None, None, None)
+
+    assert response.body["reason"] == (
+        "UAV is not provisioned with the OTA bootloader"
+    )
+    assert coordinator.start_args is None
 
 
 async def test_status_rejects_stale_operation_and_accepts_current_one() -> None:

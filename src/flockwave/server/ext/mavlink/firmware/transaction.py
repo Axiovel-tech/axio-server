@@ -120,9 +120,9 @@ class FirmwareUpdateCoordinator:
                     await self._stage(job, backend, image)
                     await self._verify_upload(job, backend, image)
                 finally:
-                    self._precommit_cancel_scopes.pop(job.operation_id, None)
+                    del self._precommit_cancel_scopes[job.operation_id]
             self._raise_if_cancelled(job)
-            await self._commit(job, backend)
+            await self._commit(job, backend, image)
             await self._reboot_and_reconnect(job, backend)
             await self._verify_installed(job, backend, image)
             job.transferred_bytes = job.total_bytes
@@ -169,11 +169,13 @@ class FirmwareUpdateCoordinator:
         self._raise_if_cancelled(job)
         backend.check_safety(image.board_id)
 
-    async def _commit(self, job: OTAJob, backend: UpdateBackend) -> None:
+    async def _commit(
+        self, job: OTAJob, backend: UpdateBackend, image: FirmwareImage
+    ) -> None:
         self._raise_if_cancelled(job)
         job.enter_commit()
         await self._notify(job)
-        await backend.commit()
+        await backend.commit(image.board_id)
         job.mark_committed()
         await self._notify(job)
 

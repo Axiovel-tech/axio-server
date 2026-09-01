@@ -172,10 +172,10 @@ def test_apj_rejects_invalid_version(version) -> None:
 
 
 def test_apj_accepts_metadata_boundaries_and_normalizes_hash() -> None:
-    payload = encode_document(version="x" * 64, git_identity="ABCDEF1")
+    payload = encode_document(version="x" * 64, git_identity="ABCDEF12")
     image = parse(payload)
     assert image.version == "x" * 64
-    assert image.git_hash == "abcdef1"
+    assert image.git_hash == "abcdef12"
 
 
 @pytest.mark.parametrize("name", [None, "", "x" * 129, "firmware.bin"])
@@ -305,14 +305,16 @@ def test_integer_metadata_rejects_non_integer_or_negative_values(value) -> None:
     assert _require_int({"value": 0}, "value") == 0
 
 
-@pytest.mark.parametrize("value", [None, 123, "abcdef", "a" * 41])
+@pytest.mark.parametrize(
+    "value", [None, 123, "abcdef", "a" * 7, "a" * 9, "a" * 40]
+)
 def test_git_hash_validation(value) -> None:
     assert_validation_error(
         lambda: _require_git_hash({"git_identity": value}),
         "invalidMetadata",
-        "git_identity must be a 7 to 40 digit hexadecimal hash",
+        "git_identity must be an 8 digit hexadecimal hash",
     )
-    assert _require_git_hash({"git_identity": "a" * 40}) == "a" * 40
+    assert _require_git_hash({"git_identity": "a" * 8}) == "a" * 8
 
 
 @pytest.mark.parametrize("value", [True, False, "0", 1])

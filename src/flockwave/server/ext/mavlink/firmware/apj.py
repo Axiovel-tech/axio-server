@@ -15,7 +15,7 @@ from typing import Any, Collection
 MAX_APJ_SIZE = 3 * 1024 * 1024
 MAX_IMAGE_SIZE_BY_BOARD = {1177: 1_703_936}
 
-_GIT_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{7,40}")
+_GIT_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{8}")
 
 
 class APJValidationError(ValueError):
@@ -181,7 +181,7 @@ def _require_git_hash(document: dict[str, Any]) -> str:
     value = document.get("git_identity")
     if not isinstance(value, str) or _GIT_HASH_PATTERN.fullmatch(value) is None:
         raise APJValidationError(
-            "invalidMetadata", "git_identity must be a 7 to 40 digit hexadecimal hash"
+            "invalidMetadata", "git_identity must be an 8 digit hexadecimal hash"
         )
     return value
 

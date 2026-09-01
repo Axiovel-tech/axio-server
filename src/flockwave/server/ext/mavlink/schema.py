@@ -302,6 +302,15 @@ schema = {
                     "items": {"type": "integer", "enum": [1177]},
                     "default": [1177],
                 },
+                "provisioned_uav_ids": {
+                    "type": "array",
+                    "description": (
+                        "UAV object IDs physically provisioned with the OTA bootloader."
+                    ),
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "uniqueItems": True,
+                    "default": [],
+                },
                 "simulation_reported_board_id_overrides": {
                     "type": "object",
                     "description": "Simulation-only reported board ID mapping.",

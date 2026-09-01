@@ -113,6 +113,10 @@ class ArduPilotOTAService:
         image = message.body.get("image")
         if not isinstance(name, str) or not isinstance(sha256, str):
             return hub.reject(message, reason="Missing firmware name or SHA-256")
+        if uav_id not in self._configuration.provisioned_uav_ids:
+            return hub.reject(
+                message, reason="UAV is not provisioned with the OTA bootloader"
+            )
         try:
             payload = _decode_payload(image)
             self._backend_for_id(uav_id)

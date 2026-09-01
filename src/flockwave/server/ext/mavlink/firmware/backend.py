@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Protocol, cast
 import trio
 
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.logger import log as base_log
 from flockwave.server.show.utils import crc32_mavftp
 
 from ..enums import MAVLandedState, MAVMessageType, MAVModeFlag
@@ -17,6 +18,8 @@ from ..ftp import MAVFTP, MAVFTPErrorCode, OperationNotAcknowledgedError
 if TYPE_CHECKING:
     from ..driver import MAVLinkUAV
     from .apj import FirmwareImage
+
+log = base_log.getChild("ext.mavlink.firmware")
 
 PART_PATH = "/ardupilot.abin.part"
 READY_PATH = "/ardupilot.abin"
@@ -56,6 +59,7 @@ class FirmwareUpdateConfiguration:
     """Validated MAVLink extension settings for application firmware OTA."""
 
     allowed_board_ids: frozenset[int] = frozenset((1177,))
+    provisioned_uav_ids: frozenset[str] = frozenset()
     simulation_reported_board_id_overrides: tuple[tuple[int, int], ...] = ()
     disconnect_timeout: float = 15.0
     reconnect_timeout: float = 180.0
@@ -70,11 +74,13 @@ class FirmwareUpdateConfiguration:
             raise ValueError("firmware_update must be an object")
         configuration = cast(dict[str, Any], value)
         allowed = _parse_board_ids(configuration.get("allowed_board_ids", [1177]))
+        provisioned = _parse_uav_ids(configuration.get("provisioned_uav_ids", []))
         overrides = _parse_board_overrides(
             configuration.get("simulation_reported_board_id_overrides", {})
         )
         return cls(
             allowed_board_ids=frozenset(allowed),
+            provisioned_uav_ids=frozenset(provisioned),
             simulation_reported_board_id_overrides=tuple(overrides.items()),
             disconnect_timeout=_parse_timeout(
                 configuration, "disconnect_timeout", 15.0
@@ -104,7 +110,7 @@ class UpdateBackend(Protocol):
 
     async def verify_upload(self, image: FirmwareImage) -> None: ...
 
-    async def commit(self) -> None: ...
+    async def commit(self, board_id: int) -> None: ...
 
     async def reboot(self) -> None: ...
 
@@ -148,10 +154,14 @@ class ArduPilotUpdateBackend:
             power_sufficient,
             board_id,
             self._configuration.allowed_board_ids,
+            self._uav.id in self._configuration.provisioned_uav_ids,
         )
         return TargetState(
             id=self._uav.id,
-            compatible=board_id in self._configuration.allowed_board_ids,
+            compatible=(
+                board_id in self._configuration.allowed_board_ids
+                and self._uav.id in self._configuration.provisioned_uav_ids
+            ),
             connected=self._uav.is_connected,
             disarmed=not armed,
             on_ground=on_ground,
@@ -199,11 +209,12 @@ class ArduPilotUpdateBackend:
                 f"Remote CRC32 {observed:08x} does not match {expected:08x}",
             )
 
-    async def commit(self) -> None:
+    async def commit(self, board_id: int) -> None:
         async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
             await _remove_if_present(ftp, READY_PATH)
             for path in RESULT_PATHS:
                 await _remove_if_present(ftp, path)
+            self.check_safety(board_id)
             await ftp.rename(PART_PATH, READY_PATH)
 
     async def reboot(self) -> None:
@@ -251,7 +262,14 @@ class ArduPilotUpdateBackend:
                     if failure:
                         raise UpdateOperationError(*failure)
                     if "ardupilot-flashed.abin" in entries:
-                        await _remove_if_present(ftp, "/ardupilot-flashed.abin")
+                        try:
+                            await _remove_if_present(ftp, "/ardupilot-flashed.abin")
+                        except Exception:
+                            log.warning(
+                                "Failed to remove ArduPilot OTA success marker",
+                                exc_info=True,
+                                extra={"id": self._uav.id},
+                            )
                         return
                 await trio.sleep(0.25)
         raise UpdateResultIndeterminateError(*_interrupted_flash_failure(entries))
@@ -295,6 +313,7 @@ def _target_reason(
     power_sufficient: bool,
     board_id: int | None,
     allowed_board_ids: frozenset[int],
+    bootloader_provisioned: bool,
 ) -> str | None:
     if not connected:
         return "disconnected"
@@ -308,6 +327,8 @@ def _target_reason(
         return "boardUnknown"
     if board_id not in allowed_board_ids:
         return "unsupportedBoard"
+    if not bootloader_provisioned:
+        return "bootloaderNotProvisioned"
     return None
 
 
@@ -319,6 +340,7 @@ def _reason_detail(state: TargetState) -> str:
         "batteryLow": "UAV battery is below 30%",
         "boardUnknown": "UAV board ID is not available",
         "unsupportedBoard": f"UAV board ID {state.board_id} is not supported",
+        "bootloaderNotProvisioned": "UAV is not provisioned with the OTA bootloader",
     }
     if state.reason_code is None:
         return "UAV is not ready for an update"
@@ -364,6 +386,23 @@ def _parse_board_ids(value: object) -> set[int]:
             )
         board_ids.add(item)
     return board_ids
+
+
+def _parse_uav_ids(value: object) -> set[str]:
+    if not isinstance(value, list):
+        raise ValueError("firmware_update.provisioned_uav_ids must be a list")
+    uav_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item or len(item) > 128:
+            raise ValueError(
+                "firmware_update.provisioned_uav_ids contains an invalid UAV ID"
+            )
+        if item in uav_ids:
+            raise ValueError(
+                "firmware_update.provisioned_uav_ids contains a duplicate UAV ID"
+            )
+        uav_ids.add(item)
+    return uav_ids
 
 
 def _parse_board_overrides(value: object) -> dict[int, int]:

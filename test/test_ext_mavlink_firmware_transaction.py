@@ -62,7 +62,8 @@ class FakeBackend:
         if self.verify_error is not None:
             raise self.verify_error
 
-    async def commit(self) -> None:
+    async def commit(self, board_id: int) -> None:
+        assert board_id == 1177
         self.calls.append("commit")
 
     async def reboot(self) -> None:
@@ -178,6 +179,7 @@ async def test_cancel_during_staging_never_commits() -> None:
     assert job.status == "cancelled"
     assert not job.committed
     assert "commit" not in backend.calls
+    assert coordinator._precommit_cancel_scopes == {}
 
 
 async def test_cancel_interrupts_upload_verification() -> None:
@@ -194,6 +196,7 @@ async def test_cancel_interrupts_upload_verification() -> None:
     assert job.status == "cancelled"
     assert not job.committed
     assert "commit" not in backend.calls
+    assert coordinator._precommit_cancel_scopes == {}
 
 
 async def test_cancel_after_commit_is_rejected() -> None:
