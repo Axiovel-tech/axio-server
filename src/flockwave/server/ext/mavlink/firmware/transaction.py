@@ -54,6 +54,7 @@ class FirmwareUpdateCoordinator:
         self._allowed_board_ids = frozenset(allowed_board_ids)
         self._jobs: dict[str, OTAJob] = {}
         self._active_operation_id: str | None = None
+        self._precommit_cancel_scopes: dict[str, trio.CancelScope] = {}
 
     def get(self, uav_id: str) -> OTAJob | None:
         return self._jobs.get(uav_id)
@@ -90,6 +91,9 @@ class FirmwareUpdateCoordinator:
             )
         job.cancel_requested.set()
         job.cancellable = False
+        scope = self._precommit_cancel_scopes.get(operation_id)
+        if scope is not None:
+            scope.cancel()
         return job
 
     async def _run(self, job: OTAJob, payload: bytes, sha256: str) -> None:
@@ -109,9 +113,15 @@ class FirmwareUpdateCoordinator:
             await self._notify(job)
             backend = self._backend_factory(job.uav_id)
             backend.check_safety(image.board_id)
+            with trio.CancelScope() as scope:
+                self._precommit_cancel_scopes[job.operation_id] = scope
+                try:
+                    self._raise_if_cancelled(job)
+                    await self._stage(job, backend, image)
+                    await self._verify_upload(job, backend, image)
+                finally:
+                    self._precommit_cancel_scopes.pop(job.operation_id, None)
             self._raise_if_cancelled(job)
-            await self._stage(job, backend, image)
-            await self._verify_upload(job, backend, image)
             await self._commit(job, backend)
             await self._reboot_and_reconnect(job, backend)
             await self._verify_installed(job, backend, image)

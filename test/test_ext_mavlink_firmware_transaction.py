@@ -36,6 +36,7 @@ class FakeBackend:
     marker_error: Exception | None = None
     installed_board_id: int = 1177
     stage_error: Exception | None = None
+    hold_verify: trio.Event | None = None
     verify_error: Exception | None = None
     reconnect_timeout: bool = False
 
@@ -56,6 +57,8 @@ class FakeBackend:
     async def verify_upload(self, image) -> None:
         assert image.board_id == 1177
         self.calls.append("verify")
+        if self.hold_verify is not None:
+            await self.hold_verify.wait()
         if self.verify_error is not None:
             raise self.verify_error
 
@@ -159,8 +162,7 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
 
 
 async def test_cancel_during_staging_never_commits() -> None:
-    release = trio.Event()
-    backend = FakeBackend(hold_staging=release)
+    backend = FakeBackend(hold_staging=trio.Event())
     async with trio.open_nursery() as nursery:
         coordinator, job = await start_job(nursery, backend, [])
         with trio.fail_after(2):
@@ -170,7 +172,22 @@ async def test_cancel_during_staging_never_commits() -> None:
         assert cancelled is job
         assert job.cancel_requested.is_set()
         assert job.cancellable is False
-        release.set()
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "cancelled"
+    assert not job.committed
+    assert "commit" not in backend.calls
+
+
+async def test_cancel_interrupts_upload_verification() -> None:
+    backend = FakeBackend(hold_verify=trio.Event())
+    async with trio.open_nursery() as nursery:
+        coordinator, job = await start_job(nursery, backend, [])
+        with trio.fail_after(2):
+            while "verify" not in backend.calls:
+                await trio.sleep(0)
+        coordinator.cancel(job.operation_id)
         await wait_finished(job)
         nursery.cancel_scope.cancel()
 
