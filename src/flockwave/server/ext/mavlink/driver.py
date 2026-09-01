@@ -1955,6 +1955,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         )
         self.notify_updated()
 
+    def handle_message_extended_sys_state(self, message: MAVLinkMessage):
+        """Stores the autopilot's landed state for safety-sensitive operations."""
+        self._store_message(message)
+
     def handle_message_gps_raw_int(self, message: MAVLinkMessage):
         num_sats = message.satellites_visible
 

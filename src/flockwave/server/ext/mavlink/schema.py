@@ -292,6 +292,49 @@ schema = {
             "format": "checkbox",
             "propertyOrder": 14000,
         },
+        "firmware_update": {
+            "type": "object",
+            "title": "ArduPilot application firmware updates",
+            "propertyOrder": 15000,
+            "properties": {
+                "allowed_board_ids": {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [1177]},
+                    "default": [1177],
+                },
+                "simulation_reported_board_id_overrides": {
+                    "type": "object",
+                    "description": "Simulation-only reported board ID mapping.",
+                    "additionalProperties": {"type": "integer", "enum": [1177]},
+                    "default": {},
+                },
+                "disconnect_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+                "reconnect_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 180,
+                },
+                "result_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+                "version_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+            },
+            "default": {},
+        },
         # packet_loss is an advanced setting and is not included here
     }
 }

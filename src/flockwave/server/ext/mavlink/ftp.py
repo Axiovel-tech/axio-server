@@ -695,6 +695,15 @@ class MAVFTP:
         message = MAVFTPMessage(MAVFTPOpCode.REMOVE_FILE, data=path)
         await self._send_and_wait(message)
 
+    async def rename(self, source: FTPPath, destination: FTPPath) -> None:
+        """Atomically renames a file on the remote filesystem."""
+        source = self._resolve(source)
+        destination = self._resolve(destination)
+        message = MAVFTPMessage(
+            MAVFTPOpCode.RENAME, data=source + b"\x00" + destination
+        )
+        await self._send_and_wait(message)
+
     @asynccontextmanager
     async def _open_session(self, session_id: int) -> AsyncIterator[MAVFTPSession]:
         """Context manager that creates a new MAVFTP session for file uploads or

@@ -28,6 +28,10 @@ if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
 
 
+# Large enough for a bounded 3 MiB APJ after base64 and Flockwave JSON framing.
+MAX_SOCKETIO_MESSAGE_SIZE = 5 * 1024 * 1024
+
+
 class SocketIOChannel(CommunicationChannel):
     """Object that represents a Socket.IO communication channel between a
     server and a single client.
@@ -236,7 +240,10 @@ class SocketIOCommunicationHandler:
     @contextmanager
     def use(self) -> Iterator:
         server = self._protocol.server_class(
-            json=JSONEncoder(), async_mode="asgi", cors_allowed_origins="*"
+            json=JSONEncoder(),
+            async_mode="asgi",
+            cors_allowed_origins="*",
+            max_http_buffer_size=MAX_SOCKETIO_MESSAGE_SIZE,
         )
 
         server.on("connect")(self._handle_connection)
