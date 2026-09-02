@@ -13,7 +13,10 @@ from flockwave.server.logger import log as base_log
 
 from ..enums import MAVLandedState, MAVMessageType, MAVModeFlag
 from ..ftp import MAVFTP, MAVFTPErrorCode, OperationNotAcknowledgedError
-from ..utils import mavlink_version_number_to_semver
+from ..utils import (
+    can_communicate_infer_from_heartbeat,
+    mavlink_version_number_to_semver,
+)
 from .apj import MAX_IMAGE_SIZE_BY_BOARD
 
 if TYPE_CHECKING:
@@ -30,6 +33,7 @@ RESULT_PATHS = (
     "/ardupilot-flashed.abin",
     "/ardupilot-failed.abin",
 )
+MAX_SAFETY_MESSAGE_AGE = 3.0
 
 
 @dataclass(frozen=True)
@@ -117,9 +121,10 @@ class ArduPilotUpdateBackend:
         self._configuration = configuration or FirmwareUpdateConfiguration()
 
     def target_state(self) -> TargetState:
-        heartbeat = self._uav.get_last_message(MAVMessageType.HEARTBEAT)
+        heartbeat = self._fresh_message(MAVMessageType.HEARTBEAT)
         version = self._uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
-        extended_state = self._uav.get_last_message(MAVMessageType.EXTENDED_SYS_STATE)
+        extended_state = self._fresh_message(MAVMessageType.EXTENDED_SYS_STATE)
+        sys_status = self._fresh_message(MAVMessageType.SYS_STATUS)
         armed = bool(heartbeat and heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value)
         reported_board_id = _board_id_from_version(version)
         board_id = self._configuration.effective_board_id(reported_board_id)
@@ -131,13 +136,22 @@ class ArduPilotUpdateBackend:
         voltage = self._uav.status.battery.voltage
         threshold = self._configuration.minimum_battery_voltage
         power_observed = simulated or bool(
-            threshold is not None and voltage is not None and voltage > 0
+            sys_status is not None
+            and threshold is not None
+            and voltage is not None
+            and voltage > 0
         )
         power_sufficient = simulated or bool(
-            threshold is not None and voltage is not None and voltage >= threshold
+            sys_status is not None
+            and threshold is not None
+            and voltage is not None
+            and voltage >= threshold
+        )
+        connected = self._uav.is_connected and can_communicate_infer_from_heartbeat(
+            heartbeat
         )
         reason = _target_reason(
-            self._uav.is_connected,
+            connected,
             armed,
             on_ground,
             power_observed,
@@ -151,7 +165,7 @@ class ArduPilotUpdateBackend:
                 board_id in MAX_IMAGE_SIZE_BY_BOARD
                 and self._uav.id in self._configuration.provisioned_uav_ids
             ),
-            connected=self._uav.is_connected,
+            connected=connected,
             disarmed=not armed,
             on_ground=on_ground,
             power_sufficient=power_sufficient,
@@ -164,6 +178,11 @@ class ArduPilotUpdateBackend:
             ),
             reason_code=reason,
         )
+
+    def _fresh_message(self, message_type: MAVMessageType):
+        if self._uav.get_age_of_message(message_type) > MAX_SAFETY_MESSAGE_AGE:
+            return None
+        return self._uav.get_last_message(message_type)
 
     def check_safety(self, board_id: int) -> None:
         state = self.target_state()
@@ -209,10 +228,14 @@ class ArduPilotUpdateBackend:
         with trio.fail_after(self._configuration.reconnect_timeout):
             await self._uav.wait_until_connected()
 
-    async def read_installed(self) -> InstalledFirmware:
+    async def refresh_version_info(self) -> None:
+        """Discard any pre-reconnect identity and request it from the live FC."""
         with trio.fail_after(self._configuration.version_timeout):
             self._uav.invalidate_version_info()
             await self._uav.get_version_info()
+
+    async def read_installed(self) -> InstalledFirmware:
+        await self.refresh_version_info()
         message = self._uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
         if message is None:
             raise RuntimeError("Autopilot version was not cached after requesting it")

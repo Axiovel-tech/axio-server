@@ -46,6 +46,9 @@ class FakeBackend:
         if self.final_safety_error is not None and "stage" in self.calls:
             raise self.final_safety_error
 
+    async def refresh_version_info(self) -> None:
+        self.calls.append("refresh")
+
     async def stage(self, image):
         assert image.board_id == 1177
         self.calls.append("stage")
@@ -88,11 +91,15 @@ class FakeBackend:
         return InstalledFirmware(self.installed_board_id, self.git_hash, "4.6.0")
 
 
-async def start_job(nursery, backend: FakeBackend, notifications: list[dict]):
+async def start_job(
+    nursery, backend: FakeBackend, notifications: list[dict], notify_hook=None
+):
     payload = make_apj()
 
     async def notify(job) -> None:
         notifications.append(job.json())
+        if notify_hook is not None:
+            notify_hook(job)
 
     def make_backend(uav_id: str) -> ArduPilotUpdateBackend:
         assert uav_id == "1"
@@ -136,8 +143,10 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
         "version": "4.6.0",
     }
     assert backend.calls == [
+        "refresh",
         "safety",
         "stage",
+        "refresh",
         "safety",
         "commit",
         "reboot",
@@ -246,7 +255,7 @@ async def test_stage_transport_loss_fails_before_commit_without_reboot() -> None
         "code": "internalError",
         "detail": "MAVFTP packet retry exhausted",
     }
-    assert backend.calls == ["safety", "stage"]
+    assert backend.calls == ["refresh", "safety", "stage"]
 
 
 async def test_put_gen_crc_failure_prevents_commit_rename_and_reboot() -> None:
@@ -261,7 +270,7 @@ async def test_put_gen_crc_failure_prevents_commit_rename_and_reboot() -> None:
         "code": "internalError",
         "detail": "CRC mismatch after MAVFTP upload",
     }
-    assert backend.calls == ["safety", "stage"]
+    assert backend.calls == ["refresh", "safety", "stage"]
 
 
 async def test_lost_rename_ack_is_indeterminate_and_past_cancellation() -> None:
@@ -275,17 +284,29 @@ async def test_lost_rename_ack_is_indeterminate_and_past_cancellation() -> None:
     assert job.committed is True
     assert job.cancellable is False
     assert job.error == {"code": "internalError", "detail": "rename ACK lost"}
-    assert backend.calls == ["safety", "stage", "safety", "commit"]
+    assert backend.calls == [
+        "refresh",
+        "safety",
+        "stage",
+        "refresh",
+        "safety",
+        "commit",
+    ]
 
 
 async def test_final_safety_rejection_is_failed_before_commit() -> None:
-    backend = FakeBackend(
-        final_safety_error=UpdateOperationError(
-            "armed", "UAV became armed while its image was staged"
-        )
-    )
+    backend = FakeBackend()
+
+    def arm_during_commit_notification(job) -> None:
+        if job.phase == "committing":
+            backend.final_safety_error = UpdateOperationError(
+                "armed", "UAV became armed while its image was staged"
+            )
+
     async with trio.open_nursery() as nursery:
-        _, job = await start_job(nursery, backend, [])
+        _, job = await start_job(
+            nursery, backend, [], notify_hook=arm_during_commit_notification
+        )
         await wait_finished(job)
         nursery.cancel_scope.cancel()
 
@@ -296,7 +317,7 @@ async def test_final_safety_rejection_is_failed_before_commit() -> None:
         "code": "armed",
         "detail": "UAV became armed while its image was staged",
     }
-    assert backend.calls == ["safety", "stage", "safety"]
+    assert backend.calls == ["refresh", "safety", "stage", "refresh", "safety"]
 
 
 async def test_marker_timeout_after_commit_is_indeterminate_without_retry() -> None:

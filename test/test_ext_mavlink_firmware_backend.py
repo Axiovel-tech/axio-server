@@ -6,8 +6,9 @@ from typing import cast
 import pytest
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType
+from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType, MAVState
 from flockwave.server.ext.mavlink.firmware.backend import (
+    MAX_SAFETY_MESSAGE_AGE,
     ArduPilotUpdateBackend,
     FirmwareUpdateConfiguration,
     TargetState,
@@ -41,13 +42,18 @@ class FakeUAV:
             battery=SimpleNamespace(voltage=battery_voltage, percentage=None)
         )
         self._messages = {
-            MAVMessageType.HEARTBEAT: SimpleNamespace(base_mode=128 if armed else 0),
+            MAVMessageType.HEARTBEAT: SimpleNamespace(
+                base_mode=128 if armed else 0,
+                system_status=MAVState.STANDBY.value,
+            ),
             MAVMessageType.AUTOPILOT_VERSION: SimpleNamespace(
                 board_version=board_id << 16,
                 flight_custom_version=b"0123abcd",
                 flight_sw_version=4 << 24 | 6 << 16 | 1 << 8 | 255,
             ),
+            MAVMessageType.SYS_STATUS: SimpleNamespace(),
         }
+        self._message_ages = {}
         if landed_state is not None:
             self._messages[MAVMessageType.EXTENDED_SYS_STATE] = SimpleNamespace(
                 landed_state=landed_state
@@ -55,6 +61,9 @@ class FakeUAV:
 
     def get_last_message(self, message_type):
         return self._messages.get(message_type)
+
+    def get_age_of_message(self, message_type):
+        return self._message_ages.get(message_type, 0)
 
 
 PROVISIONED = FirmwareUpdateConfiguration(
@@ -299,6 +308,39 @@ def test_battery_voltage_threshold_is_inclusive() -> None:
     state = make_backend(FakeUAV(1177, battery_voltage=14)).target_state()
     assert state.power_sufficient is True
     assert state.reason_code is None
+
+
+@pytest.mark.parametrize(
+    ("message_type", "code"),
+    [
+        (MAVMessageType.HEARTBEAT, "disconnected"),
+        (MAVMessageType.EXTENDED_SYS_STATE, "notOnGround"),
+        (MAVMessageType.SYS_STATUS, "batteryUnknown"),
+    ],
+)
+def test_stale_safety_telemetry_fails_closed(message_type, code: str) -> None:
+    uav = FakeUAV(1177)
+    uav._message_ages[message_type] = MAX_SAFETY_MESSAGE_AGE + 0.01
+    state = make_backend(uav).target_state()
+    assert state.reason_code == code
+
+
+def test_sleeping_flight_controller_is_not_connected_for_update() -> None:
+    uav = FakeUAV(1177)
+    uav._messages[MAVMessageType.HEARTBEAT].system_status = MAVState.BOOT.value
+    state = make_backend(uav).target_state()
+    assert state.connected is False
+    assert state.reason_code == "disconnected"
+
+
+def test_safety_telemetry_at_freshness_boundary_is_accepted() -> None:
+    uav = FakeUAV(1177)
+    uav._message_ages = {
+        MAVMessageType.HEARTBEAT: MAX_SAFETY_MESSAGE_AGE,
+        MAVMessageType.EXTENDED_SYS_STATE: MAX_SAFETY_MESSAGE_AGE,
+        MAVMessageType.SYS_STATUS: MAX_SAFETY_MESSAGE_AGE,
+    }
+    assert make_backend(uav).target_state().reason_code is None
 
 
 @pytest.mark.parametrize(
