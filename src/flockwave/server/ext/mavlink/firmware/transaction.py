@@ -124,11 +124,8 @@ class FirmwareUpdateCoordinator:
             self._raise_if_cancelled(job)
             job.enter_commit()
             await self._notifier(job)
-            await backend.refresh_version_info()
-            backend.check_safety(image.board_id)
-            job.committed = True
             try:
-                await backend.commit()
+                await backend.commit(image.board_id, job.mark_committed)
             except CommitRejectedError:
                 job.committed = False
                 raise

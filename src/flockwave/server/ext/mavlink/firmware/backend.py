@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterator, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
 
 import trio
 from flockwave.concurrency import AdaptiveExponentialBackoffPolicy, RetryPolicy
@@ -219,8 +219,11 @@ class ArduPilotUpdateBackend:
                     percentage = item.percentage or 0
                     yield min(image.total_size, image.total_size * percentage // 100)
 
-    async def commit(self) -> None:
+    async def commit(self, board_id: int, mark_committed: Callable[[], None]) -> None:
         async with _use_update_ftp(self._uav) as ftp:
+            await self.refresh_version_info()
+            self.check_safety(board_id)
+            mark_committed()
             try:
                 await ftp.rename(PART_PATH, READY_PATH)
             except OperationNotAcknowledgedError as ex:
@@ -273,13 +276,15 @@ class ArduPilotUpdateBackend:
         )
 
     async def verify_flash_result(self) -> None:
-        with trio.move_on_after(self._configuration.result_timeout):
-            while True:
-                async with _use_update_ftp(self._uav) as ftp:
-                    entries: set[str] = set()
+        entries: set[str] = set()
+        async with _use_update_ftp(self._uav) as ftp:
+            with trio.move_on_after(self._configuration.result_timeout):
+                while True:
+                    next_entries: set[str] = set()
                     async with ftp.ls("/") as listing:
                         async for entry in listing:
-                            entries.add(entry.name.lower())
+                            next_entries.add(entry.name.lower())
+                    entries = next_entries
                     failure = _flash_failure(entries)
                     if failure:
                         raise UpdateOperationError(*failure)
@@ -293,7 +298,7 @@ class ArduPilotUpdateBackend:
                                 extra={"id": self._uav.id},
                             )
                         return
-                await trio.sleep(0.25)
+                    await trio.sleep(0.25)
         raise UpdateResultIndeterminateError(*_interrupted_flash_failure(entries))
 
 

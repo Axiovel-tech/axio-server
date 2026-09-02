@@ -63,8 +63,11 @@ class FakeBackend:
             await self.hold_staging.wait()
         yield image.total_size
 
-    async def commit(self) -> None:
+    async def commit(self, board_id: int, mark_committed) -> None:
+        await self.refresh_version_info()
+        self.check_safety(board_id)
         self.calls.append("commit")
+        mark_committed()
         if self.commit_error is not None:
             raise self.commit_error
 

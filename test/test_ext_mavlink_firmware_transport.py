@@ -173,8 +173,11 @@ async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    await backend.commit()
+    monkeypatch.setattr(backend, "refresh_version_info", AsyncMock())
+
+    await backend.commit(1177, lambda: events.append(("committed",)))
     assert events == [
+        ("committed",),
         ("rename", PART_PATH, READY_PATH),
         ("close",),
     ]
@@ -191,7 +194,9 @@ async def test_commit_translates_an_explicit_rename_rejection(monkeypatch) -> No
     monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: FTP())
 
     with pytest.raises(CommitRejectedError) as raised:
-        await make_backend(FakeUAV(1177)).commit()
+        backend = make_backend(FakeUAV(1177))
+        monkeypatch.setattr(backend, "refresh_version_info", AsyncMock())
+        await backend.commit(1177, lambda: None)
 
     assert raised.value.code == "commitRejected"
     assert str(raised.value) == (
