@@ -243,8 +243,15 @@ class ArduPilotUpdateBackend:
                 await trio.sleep(0.2)
 
     async def wait_for_reconnect(self) -> None:
+        previous = self._uav.get_last_message(MAVMessageType.HEARTBEAT)
         with trio.fail_after(self._configuration.reconnect_timeout):
-            await self._uav.wait_until_connected()
+            while True:
+                heartbeat = self._uav.get_last_message(MAVMessageType.HEARTBEAT)
+                if heartbeat is not previous and can_communicate_infer_from_heartbeat(
+                    heartbeat
+                ):
+                    return
+                await trio.sleep(0.2)
 
     async def refresh_version_info(self) -> None:
         """Discard any pre-reconnect identity and request it from the live FC."""

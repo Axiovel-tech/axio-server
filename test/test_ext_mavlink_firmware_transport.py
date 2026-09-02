@@ -231,13 +231,33 @@ async def test_wait_for_disconnect_accepts_proxy_boot_heartbeat() -> None:
     assert uav.is_connected is True
 
 
-async def test_wait_for_reconnect_uses_uav_connection_primitive() -> None:
-    uav = FakeUAV(1177, connected=False)
-    uav.wait_until_connected = AsyncMock()  # type: ignore[attr-defined]
+async def test_wait_for_reconnect_requires_a_new_communicable_heartbeat(
+    monkeypatch,
+) -> None:
+    uav = FakeUAV(1177)
+    previous = uav._messages[MAVMessageType.HEARTBEAT]
+    previous.system_status = MAVState.BOOT.value
+    boot = SimpleNamespace(system_status=MAVState.BOOT.value)
+    replacement = SimpleNamespace(system_status=MAVState.STANDBY.value)
+    delays = []
 
+    async def receive_heartbeat(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 1:
+            previous.system_status = MAVState.STANDBY.value
+        elif len(delays) == 2:
+            uav._messages[MAVMessageType.HEARTBEAT] = boot
+        elif len(delays) == 3:
+            uav._messages[MAVMessageType.HEARTBEAT] = replacement
+        else:
+            raise AssertionError("reconnect did not accept a fresh heartbeat")
+        await trio.lowlevel.checkpoint()
+
+    monkeypatch.setattr(trio, "sleep", receive_heartbeat)
     await make_backend(uav).wait_for_reconnect()
 
-    uav.wait_until_connected.assert_awaited_once_with()  # type: ignore[attr-defined]
+    assert delays == [0.2, 0.2, 0.2]
+    assert uav.get_last_message(MAVMessageType.HEARTBEAT) is replacement
 
 
 async def test_installed_version_invalidates_cache_after_reconnect() -> None:
