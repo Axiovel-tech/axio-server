@@ -1898,18 +1898,15 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                     self._request_autopilot_capabilities_and_ignore_result
                 )
 
-        # If we haven't received a SYS_STATUS message for a while but we keep
-        # on receiving heartbeats, chances are that the data streams are not
-        # configured correctly so we configure them.
+        # Configure streams on first contact. Retry if heartbeats continue but
+        # SYS_STATUS becomes stale. A fresh default SYS_STATUS must not suppress
+        # the first attempt because other inherited streams may still saturate
+        # a constrained link.
         #
         # TODO(ntamas): This can be problematic with Skynet if it is deduplicating
         # HEARTBEAT or SYS_STATUS messages that contain no change. Make sure that
         # in these cases self.driver.assume_data_streams_configured is True
-        if (
-            not self.driver.assume_data_streams_configured
-            and age_of_last_heartbeat < 2
-            and self.get_age_of_message(MAVMessageType.SYS_STATUS) > 5
-        ):
+        if self._should_configure_data_streams(age_of_last_heartbeat):
             self._configure_data_streams_soon()
 
         # Update error codes and basic status info if needed
@@ -2729,6 +2726,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.driver.run_in_background(self._configure_data_streams)
         self._last_data_stream_configuration_attempted_at = monotonic()
 
+    def _should_configure_data_streams(self, age_of_last_heartbeat: float) -> bool:
+        """Return whether this heartbeat should trigger stream configuration."""
+        return (
+            not self.driver.assume_data_streams_configured
+            and age_of_last_heartbeat < 2
+            and (
+                self._last_data_stream_configuration_attempted_at is None
+                or self.get_age_of_message(MAVMessageType.SYS_STATUS) > 5
+            )
+        )
+
     async def _configure_data_streams(self) -> None:
         """Configures the data streams that we want to receive from the UAV."""
         success = False
@@ -2796,7 +2804,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         # TODO(ntamas): these are unsafe; there are no confirmations for
         # REQUEST_DATA_STREAM commands so we never know if we succeeded.
-        # _configure_data_streams() retries if the requested messages stay absent.
         #
         # EXTENDED_STATUS: we need SYS_STATUS from it for the general status
         # flags and GPS_RAW_INT for the GPS fix info.
@@ -2980,6 +2987,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # was somehow reset and it does not "understand" MAVLink v2 in its new
             # configuration
             self._reset_mavlink_version()
+            self._last_data_stream_configuration_attempted_at = None
 
         elif value is ConnectionState.CONNECTED:
             # We assume that the autopilot type stays the same even if we lost

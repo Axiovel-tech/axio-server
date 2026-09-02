@@ -6,7 +6,13 @@ from typing import cast
 import pytest
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType, MAVState
+from flockwave.server.ext.mavlink.enums import (
+    ConnectionState,
+    MAVCommand,
+    MAVDataStream,
+    MAVMessageType,
+    MAVState,
+)
 from flockwave.server.ext.mavlink.firmware.backend import (
     MAX_SAFETY_MESSAGE_AGE,
     ArduPilotUpdateBackend,
@@ -71,6 +77,22 @@ PROVISIONED = FirmwareUpdateConfiguration(
 )
 
 
+def request_stream(stream_id: int, rate: int, start: int) -> tuple[str, dict[str, int]]:
+    return (
+        "REQUEST_DATA_STREAM",
+        {"req_stream_id": stream_id, "req_message_rate": rate, "start_stop": start},
+    )
+
+
+def message_interval(
+    message_type: MAVMessageType, interval_usec: float
+) -> tuple[str, tuple[MAVCommand, MAVMessageType, float]]:
+    return (
+        "command",
+        (MAVCommand.SET_MESSAGE_INTERVAL, message_type, interval_usec),
+    )
+
+
 def make_backend(uav: FakeUAV) -> ArduPilotUpdateBackend:
     return ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), PROVISIONED)
 
@@ -80,6 +102,7 @@ async def test_normal_stream_configuration_requests_landed_state() -> None:
 
     class Driver:
         async def send_packet(self, packet, *, target) -> None:
+            assert target is uav
             events.append(("packet", packet))
 
         async def send_command_long(
@@ -92,21 +115,51 @@ async def test_normal_stream_configuration_requests_landed_state() -> None:
     uav._driver = Driver()
     await MAVLinkUAV._configure_data_streams_with_fine_grained_commands(uav)
 
-    assert events[0] == (
-        "packet",
-        (
-            "REQUEST_DATA_STREAM",
-            {"req_stream_id": 0, "req_message_rate": 0, "start_stop": 0},
-        ),
-    )
-    assert (
-        "command",
-        (
-            MAVCommand.SET_MESSAGE_INTERVAL,
-            MAVMessageType.EXTENDED_SYS_STATE,
-            1_000_000,
-        ),
-    ) in events
+    assert events == [
+        ("packet", request_stream(0, 0, 0)),
+        message_interval(MAVMessageType.SYS_STATUS, 1_000_000),
+        message_interval(MAVMessageType.EXTENDED_SYS_STATE, 1_000_000),
+        message_interval(MAVMessageType.GPS_RAW_INT, 1_000_000),
+        message_interval(MAVMessageType.GLOBAL_POSITION_INT, 500_000),
+    ]
+
+
+async def test_legacy_stream_configuration_stops_defaults_first() -> None:
+    packets: list[object] = []
+
+    class Driver:
+        async def send_packet(self, packet, *, target) -> None:
+            assert target is uav
+            packets.append(packet)
+
+    uav = object.__new__(MAVLinkUAV)
+    uav._driver = Driver()
+    await MAVLinkUAV._configure_data_streams_with_legacy_commands(uav)
+
+    assert packets == [
+        request_stream(0, 0, 0),
+        request_stream(MAVDataStream.EXTENDED_STATUS, 1, 1),
+        request_stream(MAVDataStream.POSITION, 2, 1),
+    ]
+
+
+def test_initial_connection_configures_streams_even_with_fresh_status() -> None:
+    uav = object.__new__(MAVLinkUAV)
+    uav._driver = SimpleNamespace(assume_data_streams_configured=False)
+    uav._last_data_stream_configuration_attempted_at = None
+    uav.get_age_of_message = lambda _message_type: 0
+
+    assert MAVLinkUAV._should_configure_data_streams(uav, 0)
+
+
+def test_disconnect_makes_stream_configuration_due_again() -> None:
+    uav = object.__new__(MAVLinkUAV)
+    uav._connection_state = ConnectionState.CONNECTED
+    uav._last_data_stream_configuration_attempted_at = 1
+
+    MAVLinkUAV._set_connection_state(uav, ConnectionState.DISCONNECTED, None)
+
+    assert uav._last_data_stream_configuration_attempted_at is None
 
 
 def test_production_configuration_accepts_only_axiolight() -> None:
