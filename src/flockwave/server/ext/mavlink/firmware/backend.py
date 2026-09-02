@@ -11,7 +11,7 @@ import trio
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.logger import log as base_log
 
-from ..enums import MAVLandedState, MAVMessageType, MAVModeFlag
+from ..enums import MAVCommand, MAVLandedState, MAVMessageType, MAVModeFlag
 from ..ftp import MAVFTP, MAVFTPErrorCode, OperationNotAcknowledgedError
 from ..utils import (
     can_communicate_infer_from_heartbeat,
@@ -202,6 +202,7 @@ class ArduPilotUpdateBackend:
             raise UpdateOperationError("showAuthorized", "UAV is authorized for a show")
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
+        await self._suppress_simulation_truth_stream()
         async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
             await _remove_if_present(ftp, PART_PATH)
             await _remove_if_present(ftp, READY_PATH)
@@ -211,6 +212,28 @@ class ArduPilotUpdateBackend:
                 async for item in progress:
                     percentage = item.percentage or 0
                     yield min(image.total_size, image.total_size * percentage // 100)
+
+    async def _suppress_simulation_truth_stream(self) -> None:
+        """Remove SITL-only ground truth traffic before the MAVFTP upload.
+
+        The RTLS native simulator requests SIM_STATE at 50 Hz for positioning.
+        Physical flight controllers never emit it, and only the explicit board
+        0 simulator mapping can enter this branch.
+        """
+        version = self._uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
+        if not self._configuration.is_simulated_board(_board_id_from_version(version)):
+            return
+        success = await self._uav.driver.send_command_long(
+            self._uav,
+            MAVCommand.SET_MESSAGE_INTERVAL,
+            param1=MAVMessageType.SIM_STATE,
+            param2=-1,
+        )
+        if not success:
+            raise UpdateOperationError(
+                "simulationSetupFailed",
+                "SITL did not stop its simulator-only ground truth stream",
+            )
 
     async def commit(self) -> None:
         async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:

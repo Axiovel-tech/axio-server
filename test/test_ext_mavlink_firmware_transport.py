@@ -10,7 +10,8 @@ import trio
 from test_ext_mavlink_firmware_backend import FakeUAV, make_backend
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVMessageType
+from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType
+from flockwave.server.ext.mavlink.firmware.apj import FirmwareImage
 from flockwave.server.ext.mavlink.firmware.backend import (
     PART_PATH,
     READY_PATH,
@@ -29,8 +30,9 @@ from flockwave.server.ext.mavlink.ftp import (
 )
 
 
-async def test_stage_cleans_markers_and_uses_put_gen_crc_upload(monkeypatch) -> None:
+async def test_sitl_stage_quiets_truth_then_uses_crc_upload(monkeypatch) -> None:
     abin = b"x" * 200
+    events = []
 
     class FTP:
         def __init__(self):
@@ -39,6 +41,7 @@ async def test_stage_cleans_markers_and_uses_put_gen_crc_upload(monkeypatch) -> 
             self.closed = False
 
         async def rm(self, path: str) -> None:
+            events.append(("rm", path))
             self.removed.append(path)
 
         @asynccontextmanager
@@ -56,7 +59,16 @@ async def test_stage_cleans_markers_and_uses_put_gen_crc_upload(monkeypatch) -> 
             self.closed = True
 
     ftp = FTP()
-    uav = FakeUAV(1177)
+    uav = FakeUAV(0)
+
+    class Driver:
+        async def send_command_long(
+            self, candidate, command, *, param1: int, param2: float
+        ) -> bool:
+            events.append(("command", candidate, command, param1, param2))
+            return True
+
+    uav.driver = Driver()
 
     def make_ftp(candidate):
         assert candidate is uav
@@ -65,16 +77,53 @@ async def test_stage_cleans_markers_and_uses_put_gen_crc_upload(monkeypatch) -> 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
     image = SimpleNamespace(abin=abin, total_size=len(abin))
 
-    transferred = [
-        amount
-        async for amount in make_backend(uav).stage(image)  # type: ignore[arg-type]
-    ]
+    configuration = FirmwareUpdateConfiguration.from_json(
+        {
+            "provisioned_uav_ids": ["1"],
+            "simulation_reported_board_id_overrides": {"0": 1177},
+        }
+    )
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    transferred = [amount async for amount in backend.stage(cast(FirmwareImage, image))]
 
+    assert events[0] == (
+        "command",
+        uav,
+        MAVCommand.SET_MESSAGE_INTERVAL,
+        MAVMessageType.SIM_STATE,
+        -1,
+    )
     assert ftp.removed == [PART_PATH, READY_PATH, *RESULT_PATHS]
     assert ftp.upload == (abin, PART_PATH)
     assert transferred == [0, len(abin) // 2, len(abin)]
     assert all(type(amount) is int for amount in transferred)
     assert ftp.closed is True
+
+
+async def test_hardware_stage_setup_leaves_sim_truth_unchanged() -> None:
+    uav = FakeUAV(1177)
+    uav.driver = SimpleNamespace(send_command_long=AsyncMock(return_value=True))
+
+    await make_backend(uav)._suppress_simulation_truth_stream()
+
+    uav.driver.send_command_long.assert_not_awaited()
+
+
+async def test_sitl_stage_fails_if_truth_stream_cannot_be_stopped() -> None:
+    uav = FakeUAV(0)
+    uav.driver = SimpleNamespace(send_command_long=AsyncMock(return_value=False))
+    configuration = FirmwareUpdateConfiguration.from_json(
+        {
+            "provisioned_uav_ids": ["1"],
+            "simulation_reported_board_id_overrides": {"0": 1177},
+        }
+    )
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+
+    with pytest.raises(UpdateOperationError) as ex:
+        await backend._suppress_simulation_truth_stream()
+
+    assert ex.value.code == "simulationSetupFailed"
 
 
 async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
