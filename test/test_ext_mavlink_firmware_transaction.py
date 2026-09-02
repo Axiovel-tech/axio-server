@@ -32,6 +32,8 @@ class FakeBackend:
     calls: list[str] = field(default_factory=list)
     hold_initial_refresh: trio.Event | None = None
     hold_staging: trio.Event | None = None
+    hold_commit_lock: trio.Event | None = None
+    hold_final_refresh: trio.Event | None = None
     hold_reboot: trio.Event | None = None
     reboot_ack_lost: bool = False
     disconnect_timeout: bool = False
@@ -52,6 +54,8 @@ class FakeBackend:
         self.calls.append("refresh")
         if self.hold_initial_refresh is not None and "stage" not in self.calls:
             await self.hold_initial_refresh.wait()
+        if self.hold_final_refresh is not None and "stage" in self.calls:
+            await self.hold_final_refresh.wait()
 
     async def stage(self, image):
         assert image.board_id == 1177
@@ -64,6 +68,9 @@ class FakeBackend:
         yield image.total_size
 
     async def commit(self, board_id: int, mark_committed) -> None:
+        if self.hold_commit_lock is not None:
+            self.calls.append("commitLock")
+            await self.hold_commit_lock.wait()
         await self.refresh_version_info()
         self.check_safety(board_id)
         self.calls.append("commit")
@@ -154,8 +161,8 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
         "refresh",
         "safety",
         "commit",
-        "reboot",
         "disconnect",
+        "reboot",
         "reconnect",
         "marker",
         "installed",
@@ -248,6 +255,7 @@ async def test_cancel_after_commit_is_rejected() -> None:
         with trio.fail_after(2):
             while not job.committed:
                 await trio.sleep(0)
+        assert coordinator._precommit_cancel_scopes == {}
         with pytest.raises(CancellationRejectedError) as raised:
             coordinator.cancel(job.operation_id)
         assert str(raised.value) == "The update has passed its cancellation point"

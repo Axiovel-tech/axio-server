@@ -70,11 +70,11 @@ class OTAJob:
 
     def enter_commit(self) -> None:
         self.phase = "committing"
-        self.cancellable = False
 
     def mark_committed(self) -> None:
         """Record that the atomic remote rename is being attempted."""
         self.committed = True
+        self.cancellable = False
 
     def finish(self, status: OTAStatus, error: OTAError | None = None) -> None:
         self.status = status

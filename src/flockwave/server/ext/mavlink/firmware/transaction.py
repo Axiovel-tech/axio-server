@@ -119,16 +119,21 @@ class FirmwareUpdateCoordinator:
                         if transferred != job.transferred_bytes:
                             job.transferred_bytes = transferred
                             await self._notifier(job)
+                    self._raise_if_cancelled(job)
+                    job.enter_commit()
+                    await self._notifier(job)
+                    self._raise_if_cancelled(job)
+                    try:
+                        await backend.commit(
+                            image.board_id,
+                            lambda: self._mark_committed(job),
+                        )
+                    except CommitRejectedError:
+                        job.committed = False
+                        raise
                 finally:
-                    del self._precommit_cancel_scopes[job.operation_id]
+                    self._precommit_cancel_scopes.pop(job.operation_id, None)
             self._raise_if_cancelled(job)
-            job.enter_commit()
-            await self._notifier(job)
-            try:
-                await backend.commit(image.board_id, job.mark_committed)
-            except CommitRejectedError:
-                job.committed = False
-                raise
             await self._notifier(job)
             await self._reboot_and_reconnect(job, backend)
             job.phase = "verifyingInstalled"
@@ -170,21 +175,43 @@ class FirmwareUpdateCoordinator:
         job.phase = "rebooting"
         await self._notifier(job)
         reboot_error: Exception | None = None
-        try:
-            await backend.reboot()
-        except Exception as ex:  # noqa: BLE001
-            reboot_error = ex
+        disconnect_error: Exception | None = None
+        disconnect_observer_started = trio.Event()
+        disconnect_observer_finished = trio.Event()
+
+        async def observe_disconnect() -> None:
+            nonlocal disconnect_error
+            disconnect_observer_started.set()
+            try:
+                await backend.wait_for_disconnect()
+            except Exception as ex:  # noqa: BLE001
+                disconnect_error = ex
+            finally:
+                disconnect_observer_finished.set()
+
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(observe_disconnect)
+            await disconnect_observer_started.wait()
+            try:
+                await backend.reboot()
+            except Exception as ex:  # noqa: BLE001
+                reboot_error = ex
+            await disconnect_observer_finished.wait()
 
         job.phase = "reconnecting"
         await self._notifier(job)
-        try:
-            await backend.wait_for_disconnect()
-        except trio.TooSlowError:
+        if isinstance(disconnect_error, trio.TooSlowError):
             detail = "Reboot was not observed after the image was committed"
             if reboot_error:
                 detail += f": {reboot_error}"
             raise IndeterminateUpdate(detail) from reboot_error
+        if disconnect_error is not None:
+            raise disconnect_error
         await backend.wait_for_reconnect()
+
+    def _mark_committed(self, job: OTAJob) -> None:
+        job.mark_committed()
+        del self._precommit_cancel_scopes[job.operation_id]
 
     def _raise_if_cancelled(self, job: OTAJob) -> None:
         if job.cancel_requested.is_set():
