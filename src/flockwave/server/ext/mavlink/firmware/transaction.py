@@ -17,6 +17,8 @@ from .backend import (
 )
 from .model import OTAError, OTAJob
 
+POST_COMMIT_NOTIFICATION_TIMEOUT = 0.1
+
 
 class UpdateBusyError(RuntimeError):
     """Raised when another flight-controller update already runs."""
@@ -134,17 +136,16 @@ class FirmwareUpdateCoordinator:
                 finally:
                     self._precommit_cancel_scopes.pop(job.operation_id, None)
             self._raise_if_cancelled(job)
-            await self._notifier(job)
             await self._reboot_and_reconnect(job, backend)
             job.phase = "verifyingInstalled"
-            await self._notifier(job)
+            await self._notify_best_effort(job)
             await backend.verify_flash_result()
             installed = await backend.read_installed()
             job.observed.update(
                 gitHash=installed.git_hash,
                 version=installed.version,
             )
-            await self._notifier(job)
+            await self._notify_best_effort(job)
             _check_installed(image, installed)
             job.transferred_bytes = job.total_bytes
             job.finish("success")
@@ -167,13 +168,16 @@ class FirmwareUpdateCoordinator:
         finally:
             if self._active_operation_id == job.operation_id:
                 self._active_operation_id = None
-            await self._notifier(job)
+            if job.committed:
+                await self._notify_best_effort(job)
+            else:
+                await self._notifier(job)
 
     async def _reboot_and_reconnect(
         self, job: OTAJob, backend: ArduPilotUpdateBackend
     ) -> None:
         job.phase = "rebooting"
-        await self._notifier(job)
+        await self._notify_best_effort(job)
         reboot_error: Exception | None = None
         disconnect_error: Exception | None = None
         disconnect_observer_started = trio.Event()
@@ -199,7 +203,7 @@ class FirmwareUpdateCoordinator:
             await disconnect_observer_finished.wait()
 
         job.phase = "reconnecting"
-        await self._notifier(job)
+        await self._notify_best_effort(job)
         if isinstance(disconnect_error, trio.TooSlowError):
             detail = "Reboot was not observed after the image was committed"
             if reboot_error:
@@ -212,6 +216,13 @@ class FirmwareUpdateCoordinator:
     def _mark_committed(self, job: OTAJob) -> None:
         job.mark_committed()
         del self._precommit_cancel_scopes[job.operation_id]
+
+    async def _notify_best_effort(self, job: OTAJob) -> None:
+        with trio.move_on_after(POST_COMMIT_NOTIFICATION_TIMEOUT):
+            try:
+                await self._notifier(job)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _raise_if_cancelled(self, job: OTAJob) -> None:
         if job.cancel_requested.is_set():

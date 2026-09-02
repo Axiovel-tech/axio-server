@@ -1,12 +1,19 @@
 """Race regressions for the firmware update transaction coordinator."""
 
+import hashlib
+from typing import cast
+
 import pytest
 import trio
+from test_ext_mavlink_firmware_apj import make_apj
 from test_ext_mavlink_firmware_transaction import (
     FakeBackend,
     start_job,
     wait_finished,
 )
+
+from flockwave.server.ext.mavlink.firmware.backend import ArduPilotUpdateBackend
+from flockwave.server.ext.mavlink.firmware.transaction import FirmwareUpdateCoordinator
 
 
 @pytest.mark.parametrize("wait_point", ["ftpLock", "versionRefresh"])
@@ -87,3 +94,46 @@ async def test_observes_reboot_cycle_while_reboot_command_is_awaiting() -> None:
     assert job.status == "success"
     assert backend.calls.index("disconnect") < backend.calls.index("reboot")
     assert backend.calls.index("reboot") < backend.calls.index("reconnect")
+
+
+async def test_saturated_notifier_cannot_delay_committed_reboot() -> None:
+    release_reboot = trio.Event()
+    backend = FakeBackend(hold_reboot=release_reboot)
+    blocked_phases: list[str] = []
+
+    async def saturated_notifier(job) -> None:
+        if job.committed:
+            blocked_phases.append(job.phase)
+            await trio.sleep_forever()
+
+    def make_backend(_uav_id: str) -> ArduPilotUpdateBackend:
+        return cast(ArduPilotUpdateBackend, backend)
+
+    async with trio.open_nursery() as nursery:
+        coordinator = FirmwareUpdateCoordinator(
+            nursery, make_backend, saturated_notifier
+        )
+        payload = make_apj()
+        job = coordinator.start(
+            uav_id="1",
+            name="arducopter.apj",
+            payload=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        with trio.fail_after(1):
+            while "reboot" not in backend.calls:
+                await trio.lowlevel.checkpoint()
+
+        assert blocked_phases == ["rebooting"]
+        release_reboot.set()
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "success"
+    assert blocked_phases == [
+        "rebooting",
+        "reconnecting",
+        "verifyingInstalled",
+        "verifyingInstalled",
+        "complete",
+    ]
