@@ -11,6 +11,7 @@ from test_ext_mavlink_firmware_backend import FakeUAV, make_backend
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 from flockwave.server.ext.mavlink.enums import MAVMessageType
+from flockwave.server.ext.mavlink.firmware.apj import FirmwareImage
 from flockwave.server.ext.mavlink.firmware.backend import (
     ArduPilotUpdateBackend,
     FirmwareUpdateConfiguration,
@@ -25,6 +26,27 @@ class CommitFTP:
 
     async def rename(self, _source: str, _destination: str) -> None:
         raise AssertionError("unsafe image was renamed")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class StageFTP:
+    def __init__(self) -> None:
+        self.mutations: list[str] = []
+        self.closed = False
+
+    async def rm(self, path: str) -> None:
+        self.mutations.append(f"remove:{path}")
+
+    @asynccontextmanager
+    async def put_gen(self, _data: bytes, path: str):
+        self.mutations.append(f"upload:{path}")
+
+        async def progress():
+            yield SimpleNamespace(percentage=100)
+
+        yield progress()
 
     async def aclose(self) -> None:
         self.closed = True
@@ -102,6 +124,53 @@ async def test_commit_rechecks_safety_after_waiting_for_mavftp_lock(
     assert errors and errors[0].code == "armed"
     assert committed == []
     assert ftp.closed is True
+
+
+@pytest.mark.parametrize(
+    ("state_change", "error_code"),
+    [("arm", "armed"), ("scheduleShow", "showScheduled")],
+)
+async def test_stage_rechecks_safety_before_mutating_ftp_after_lock_wait(
+    monkeypatch, state_change: str, error_code: str
+) -> None:
+    ftp = StageFTP()
+    uav = FakeUAV(1177)
+    backend = make_backend(uav)
+    refresh = AsyncMock()
+    monkeypatch.setattr(backend, "refresh_version_info", refresh)
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+    image = cast(
+        FirmwareImage,
+        SimpleNamespace(board_id=1177, abin=b"image", total_size=5),
+    )
+    errors: list[UpdateOperationError] = []
+    finished = trio.Event()
+
+    async def stage() -> None:
+        try:
+            async for _transferred in backend.stage(image):
+                pass
+        except UpdateOperationError as ex:
+            errors.append(ex)
+        finally:
+            finished.set()
+
+    await uav.mavftp_lock.acquire()
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(stage)
+        await _wait_until_lock_is_contended(uav.mavftp_lock)
+        if state_change == "arm":
+            uav._messages[MAVMessageType.HEARTBEAT].base_mode = 128
+        else:
+            uav.scheduled_takeoff_time = 1
+        uav.mavftp_lock.release()
+        await finished.wait()
+        nursery.cancel_scope.cancel()
+
+    assert errors and errors[0].code == error_code
+    assert ftp.mutations == []
+    assert ftp.closed is True
+    refresh.assert_awaited_once_with()
 
 
 async def test_flash_result_timeout_starts_after_mavftp_lock_acquisition(

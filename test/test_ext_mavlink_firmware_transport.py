@@ -68,7 +68,7 @@ async def test_sitl_stage_uses_crc_upload(monkeypatch) -> None:
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    image = SimpleNamespace(abin=abin, total_size=len(abin))
+    image = SimpleNamespace(board_id=1177, abin=abin, total_size=len(abin))
 
     configuration = FirmwareUpdateConfiguration.from_json(
         {
@@ -125,7 +125,7 @@ async def test_stage_shields_session_reset_from_user_cancellation(monkeypatch) -
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    image = cast(FirmwareImage, SimpleNamespace(abin=b"x", total_size=1))
+    image = cast(FirmwareImage, SimpleNamespace(board_id=1177, abin=b"x", total_size=1))
     started = trio.Event()
     finished = trio.Event()
     stage_scope: trio.CancelScope | None = None

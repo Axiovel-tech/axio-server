@@ -78,6 +78,12 @@ class FakeUAV:
     def get_age_of_drone_show_status(self):
         return self._show_status_age
 
+    def invalidate_version_info(self) -> None:
+        pass
+
+    async def get_version_info(self) -> dict:
+        return {}
+
 
 PROVISIONED = FirmwareUpdateConfiguration(
     provisioned_uav_ids=frozenset({"1"}), minimum_battery_voltage=14

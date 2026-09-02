@@ -207,6 +207,8 @@ class ArduPilotUpdateBackend:
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
         async with _use_update_ftp(self._uav) as ftp:
+            await self.refresh_version_info()
+            self.check_safety(image.board_id)
             await _remove_if_present(ftp, PART_PATH)
             await _remove_if_present(ftp, READY_PATH)
             for path in RESULT_PATHS:
