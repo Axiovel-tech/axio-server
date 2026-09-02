@@ -1898,19 +1898,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                     self._request_autopilot_capabilities_and_ignore_result
                 )
 
-        # If a safety-relevant status message is missing while heartbeats keep
-        # arriving, the data streams are probably not configured correctly.
+        # If we haven't received a SYS_STATUS message for a while but we keep
+        # on receiving heartbeats, chances are that the data streams are not
+        # configured correctly so we configure them.
         #
         # TODO(ntamas): This can be problematic with Skynet if it is deduplicating
-        # HEARTBEAT or status messages that contain no change. Make sure that in
-        # these cases self.driver.assume_data_streams_configured is True.
+        # HEARTBEAT or SYS_STATUS messages that contain no change. Make sure that
+        # in these cases self.driver.assume_data_streams_configured is True
         if (
             not self.driver.assume_data_streams_configured
             and age_of_last_heartbeat < 2
-            and (
-                self.get_age_of_message(MAVMessageType.SYS_STATUS) > 5
-                or self.get_age_of_message(MAVMessageType.EXTENDED_SYS_STATE) > 5
-            )
+            and self.get_age_of_message(MAVMessageType.SYS_STATUS) > 5
         ):
             self._configure_data_streams_soon()
 
@@ -2144,6 +2142,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         if can_communicate_infer_from_heartbeat(heartbeat):
             new_state = ConnectionState.CONNECTED
+            if not self.driver.assume_data_streams_configured:
+                self._configure_data_streams_soon(force=True)
         else:
             new_state = ConnectionState.SLEEPING
         self._set_connection_state(new_state, heartbeat)
