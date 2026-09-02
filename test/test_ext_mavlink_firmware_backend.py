@@ -76,25 +76,37 @@ def make_backend(uav: FakeUAV) -> ArduPilotUpdateBackend:
 
 
 async def test_normal_stream_configuration_requests_landed_state() -> None:
-    calls: list[tuple[MAVCommand, int, float]] = []
+    events: list[tuple[str, object]] = []
 
     class Driver:
+        async def send_packet(self, packet, *, target) -> None:
+            events.append(("packet", packet))
+
         async def send_command_long(
             self, _uav, command: MAVCommand, *, param1: int, param2: float
         ) -> bool:
-            calls.append((command, param1, param2))
+            events.append(("command", (command, param1, param2)))
             return True
 
-    uav = SimpleNamespace(driver=Driver())
-    await MAVLinkUAV._configure_data_streams_with_fine_grained_commands(
-        cast(MAVLinkUAV, uav)
-    )
+    uav = object.__new__(MAVLinkUAV)
+    uav._driver = Driver()
+    await MAVLinkUAV._configure_data_streams_with_fine_grained_commands(uav)
 
+    assert events[0] == (
+        "packet",
+        (
+            "REQUEST_DATA_STREAM",
+            {"req_stream_id": 0, "req_message_rate": 0, "start_stop": 0},
+        ),
+    )
     assert (
-        MAVCommand.SET_MESSAGE_INTERVAL,
-        MAVMessageType.EXTENDED_SYS_STATE,
-        1_000_000,
-    ) in calls
+        "command",
+        (
+            MAVCommand.SET_MESSAGE_INTERVAL,
+            MAVMessageType.EXTENDED_SYS_STATE,
+            1_000_000,
+        ),
+    ) in events
 
 
 def test_production_configuration_accepts_only_axiolight() -> None:

@@ -2765,6 +2765,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Configures the intervals of the messages that we want to receive from
         the UAV using the newer `SET_MESSAGE_INTERVAL` MAVLink command.
         """
+        await self._stop_all_data_streams()
+
         stream_rates = [
             (MAVMessageType.SYS_STATUS, 1),
             (MAVMessageType.EXTENDED_SYS_STATE, 1),
@@ -2790,14 +2792,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """Configures the data streams that we want to receive from the UAV
         using the deprecated `REQUEST_DATA_STREAM` MAVLink command.
         """
-        # TODO(ntamas): this is unsafe; there are no confirmations for
-        # REQUEST_DATA_STREAM commands so we never know if we succeeded or
-        # not
-        await self.driver.send_packet(
-            spec.request_data_stream(req_stream_id=0, req_message_rate=0, start_stop=0),
-            target=self,
-        )
+        await self._stop_all_data_streams()
 
+        # TODO(ntamas): these are unsafe; there are no confirmations for
+        # REQUEST_DATA_STREAM commands so we never know if we succeeded.
+        # _configure_data_streams() retries if the requested messages stay absent.
+        #
         # EXTENDED_STATUS: we need SYS_STATUS from it for the general status
         # flags and GPS_RAW_INT for the GPS fix info.
         await self.driver.send_packet(
@@ -2816,6 +2816,18 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 req_message_rate=2,
                 start_stop=1,
             ),
+            target=self,
+        )
+
+    async def _stop_all_data_streams(self) -> None:
+        """Stop inherited stream groups before enabling the rates we consume.
+
+        SET_MESSAGE_INTERVAL does not disable the autopilot's other default
+        streams. Leaving those active can starve request-response traffic such
+        as MAVFTP on a constrained radio link.
+        """
+        await self.driver.send_packet(
+            spec.request_data_stream(req_stream_id=0, req_message_rate=0, start_stop=0),
             target=self,
         )
 
