@@ -97,7 +97,6 @@ class FirmwareUpdateCoordinator:
                 name=job.name,
             )
             job.expected.update(
-                boardId=image.board_id,
                 gitHash=image.git_hash,
                 version=image.version,
             )
@@ -133,7 +132,6 @@ class FirmwareUpdateCoordinator:
             await backend.verify_flash_result()
             installed = await backend.read_installed()
             job.observed.update(
-                boardId=installed.board_id,
                 gitHash=installed.git_hash,
                 version=installed.version,
             )

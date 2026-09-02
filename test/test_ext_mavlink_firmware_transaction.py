@@ -133,12 +133,10 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
     assert job.committed
     assert job.transferred_bytes == job.total_bytes == len(parse_abin())
     assert job.expected == {
-        "boardId": 1177,
         "gitHash": "0123abcd",
         "version": "4.6.1",
     }
     assert job.observed == {
-        "boardId": 1177,
         "gitHash": "0123abcd",
         "version": "4.6.0",
     }

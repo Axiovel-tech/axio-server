@@ -20,7 +20,6 @@ OTAPhase = Literal[
 
 
 class FirmwareIdentity(TypedDict):
-    boardId: int | None
     gitHash: str | None
     version: str | None
 
@@ -44,10 +43,10 @@ class OTAJob:
     committed: bool = False
     cancellable: bool = True
     expected: FirmwareIdentity = field(
-        default_factory=lambda: {"boardId": None, "gitHash": None, "version": None}
+        default_factory=lambda: {"gitHash": None, "version": None}
     )
     observed: FirmwareIdentity = field(
-        default_factory=lambda: {"boardId": None, "gitHash": None, "version": None}
+        default_factory=lambda: {"gitHash": None, "version": None}
     )
     error: OTAError | None = None
     cancel_requested: trio.Event = field(default_factory=trio.Event, repr=False)
