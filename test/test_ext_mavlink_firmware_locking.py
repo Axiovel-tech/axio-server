@@ -33,24 +33,35 @@ class CommitFTP:
 class ResultFTP:
     removed: list[str]
 
-    def __init__(self, *, block_listing: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        block_listing: bool = False,
+        listing_delay: float = 0,
+        remove_delay: float = 0,
+    ) -> None:
         self.removed = []
         self.block_listing = block_listing
+        self.listing_delay = listing_delay
+        self.remove_delay = remove_delay
+        self.closed = False
 
     @asynccontextmanager
     async def ls(self, _path: str):
         async def entries():
             if self.block_listing:
                 await trio.sleep_forever()
+            await trio.sleep(self.listing_delay)
             yield SimpleNamespace(name="ardupilot-flashed.abin")
 
         yield entries()
 
     async def rm(self, path: str) -> None:
+        await trio.sleep(self.remove_delay)
         self.removed.append(path)
 
     async def aclose(self) -> None:
-        pass
+        self.closed = True
 
 
 async def _wait_until_lock_is_contended(lock: trio.Lock) -> None:
@@ -139,3 +150,18 @@ async def test_flash_result_timeout_during_first_listing_is_indeterminate(
         await backend.verify_flash_result()
 
     assert raised.value.code == "resultMissing"
+
+
+async def test_success_marker_cleanup_finishes_outside_result_deadline(
+    monkeypatch,
+) -> None:
+    uav = FakeUAV(1177)
+    ftp = ResultFTP(listing_delay=0.08, remove_delay=0.05)
+    configuration = FirmwareUpdateConfiguration(result_timeout=0.1)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+
+    await backend.verify_flash_result()
+
+    assert ftp.removed == ["/ardupilot-flashed.abin"]
+    assert ftp.closed is True

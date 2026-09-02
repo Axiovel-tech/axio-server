@@ -405,7 +405,10 @@ async def test_flash_result_accepts_success_marker_and_removes_it(monkeypatch) -
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    await ArduPilotUpdateBackend(cast(MAVLinkUAV, uav)).verify_flash_result()
+    configuration = FirmwareUpdateConfiguration(result_timeout=1)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    with trio.fail_after(0.2):
+        await backend.verify_flash_result()
     assert ftp.removed == ["/ardupilot-flashed.abin"]
     assert ftp.closed is True
 
@@ -426,7 +429,9 @@ async def test_flash_result_ignores_success_marker_cleanup_failure(monkeypatch) 
         "warning",
         lambda message, **kwargs: warnings.append((message, kwargs)),
     )
-    await make_backend(uav).verify_flash_result()
+    configuration = FirmwareUpdateConfiguration(result_timeout=0.1)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    await backend.verify_flash_result()
     assert ftp.removed == ["/ardupilot-flashed.abin"]
     assert ftp.closed is True
     assert warnings == [

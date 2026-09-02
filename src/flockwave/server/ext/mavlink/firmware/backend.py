@@ -161,6 +161,14 @@ class ArduPilotUpdateBackend:
             power_sufficient,
             board_id,
             self._uav.id in self._configuration.provisioned_uav_ids,
+            show_state_fresh=(
+                self._uav.get_age_of_drone_show_status() <= MAX_SAFETY_MESSAGE_AGE
+            ),
+            show_scheduled=self._uav.scheduled_takeoff_time is not None,
+            show_authorized=(
+                self._uav.scheduled_takeoff_authorization_scope
+                is not AuthorizationScope.NONE
+            ),
         )
         return TargetState(
             id=self._uav.id,
@@ -196,17 +204,6 @@ class ArduPilotUpdateBackend:
                 "boardMismatch",
                 f"Firmware board ID {board_id} does not match UAV board ID {state.board_id}",
             )
-        if self._uav.get_age_of_drone_show_status() > MAX_SAFETY_MESSAGE_AGE:
-            raise UpdateOperationError(
-                "showStateUnknown", "UAV drone-show state is unavailable or stale"
-            )
-        if self._uav.scheduled_takeoff_time is not None:
-            raise UpdateOperationError("showScheduled", "UAV has a scheduled takeoff")
-        if (
-            self._uav.scheduled_takeoff_authorization_scope
-            is not AuthorizationScope.NONE
-        ):
-            raise UpdateOperationError("showAuthorized", "UAV is authorized for a show")
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
         async with _use_update_ftp(self._uav) as ftp:
@@ -289,16 +286,18 @@ class ArduPilotUpdateBackend:
                     if failure:
                         raise UpdateOperationError(*failure)
                     if "ardupilot-flashed.abin" in entries:
-                        try:
-                            await _remove_if_present(ftp, "/ardupilot-flashed.abin")
-                        except Exception:
-                            log.warning(
-                                "Failed to remove ArduPilot OTA success marker",
-                                exc_info=True,
-                                extra={"id": self._uav.id},
-                            )
-                        return
+                        break
                     await trio.sleep(0.25)
+            if "ardupilot-flashed.abin" in entries:
+                try:
+                    await _remove_if_present(ftp, "/ardupilot-flashed.abin")
+                except Exception:
+                    log.warning(
+                        "Failed to remove ArduPilot OTA success marker",
+                        exc_info=True,
+                        extra={"id": self._uav.id},
+                    )
+                return
         raise UpdateResultIndeterminateError(*_interrupted_flash_failure(entries))
 
 
@@ -355,6 +354,10 @@ def _target_reason(
     power_sufficient: bool,
     board_id: int | None,
     bootloader_provisioned: bool,
+    *,
+    show_state_fresh: bool = True,
+    show_scheduled: bool = False,
+    show_authorized: bool = False,
 ) -> str | None:
     if not connected:
         return "disconnected"
@@ -372,6 +375,12 @@ def _target_reason(
         return "batteryUnknown"
     if not power_sufficient:
         return "batteryLow"
+    if not show_state_fresh:
+        return "showStateUnknown"
+    if show_scheduled:
+        return "showScheduled"
+    if show_authorized:
+        return "showAuthorized"
     return None
 
 
@@ -387,6 +396,9 @@ def _reason_detail(state: TargetState) -> str:
         "boardUnknown": "UAV board ID is not available",
         "unsupportedBoard": f"UAV board ID {state.board_id} is not supported",
         "bootloaderNotProvisioned": "UAV is not provisioned with the OTA bootloader",
+        "showStateUnknown": "UAV drone-show state is unavailable or stale",
+        "showScheduled": "UAV has a scheduled takeoff",
+        "showAuthorized": "UAV is authorized for a show",
     }
     return details.get(state.reason_code, "UAV is not ready for an update")
 
