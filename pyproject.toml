@@ -120,6 +120,21 @@ lint.ignore = ["B905", "C901", "E402", "E501"]
 lint.select = ["B", "C", "E", "F", "I", "W"]
 extend-exclude = ["src/flockwave/server/ext/socketio/vendor"]
 
+[tool.mutmut]
+source_paths = ["src"]
+only_mutate = ["src/flockwave/server/ext/mavlink/firmware/*.py"]
+pytest_add_cli_args_test_selection = [
+  "test/test_ext_mavlink_firmware_apj.py",
+  "test/test_ext_mavlink_firmware_backend.py",
+  "test/test_ext_mavlink_firmware_locking.py",
+  "test/test_ext_mavlink_firmware_safety.py",
+  "test/test_ext_mavlink_firmware_transport.py",
+  "test/test_ext_mavlink_firmware_contract.py",
+  "test/test_ext_mavlink_firmware_transaction.py",
+  "test/test_ext_mavlink_firmware_transaction_races.py",
+]
+mutate_only_covered_lines = true
+
 [tool.ty.src]
 exclude = ["src/flockwave/server/ext/socketio/vendor"]
 

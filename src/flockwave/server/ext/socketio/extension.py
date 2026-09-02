@@ -28,6 +28,11 @@ if TYPE_CHECKING:
     from flockwave.server.app import SkybrushServer
 
 
+# Large enough for a bounded 3 MiB APJ after base64 and Flockwave JSON framing.
+MAX_SOCKETIO_MESSAGE_SIZE = 5 * 1024 * 1024
+SOCKETIO_V4_MAX_MESSAGE_SIZE = 100_000_000
+
+
 class SocketIOChannel(CommunicationChannel):
     """Object that represents a Socket.IO communication channel between a
     server and a single client.
@@ -99,15 +104,22 @@ class SocketIOProtocol(Enum):
     channel_id: str
     server_class: Callable
     expected_engine_io_query_param: list[str]
+    max_http_buffer_size: int
 
     def __new__(
-        cls, value: str, channel_id: str, server_class: Callable, engine_io_version: int
+        cls,
+        value: str,
+        channel_id: str,
+        server_class: Callable,
+        engine_io_version: int,
+        max_http_buffer_size: int,
     ):
         obj = object.__new__(cls)
         obj._value_ = value
         obj.channel_id = channel_id
         obj.server_class = server_class
         obj.expected_engine_io_query_param = [str(engine_io_version)]
+        obj.max_http_buffer_size = max_http_buffer_size
         return obj
 
     @classmethod
@@ -132,8 +144,20 @@ class SocketIOProtocol(Enum):
         else:
             return False
 
-    SOCKETIO_V4 = ("socketio-v4", "sio", TrioServerForSocketIOV4, 3)
-    SOCKETIO_V5 = ("socketio-v5", "sio5", TrioServerForSocketIOV5, 4)
+    SOCKETIO_V4 = (
+        "socketio-v4",
+        "sio",
+        TrioServerForSocketIOV4,
+        3,
+        SOCKETIO_V4_MAX_MESSAGE_SIZE,
+    )
+    SOCKETIO_V5 = (
+        "socketio-v5",
+        "sio5",
+        TrioServerForSocketIOV5,
+        4,
+        MAX_SOCKETIO_MESSAGE_SIZE,
+    )
 
 
 def get_enabled_protocols(
@@ -236,7 +260,10 @@ class SocketIOCommunicationHandler:
     @contextmanager
     def use(self) -> Iterator:
         server = self._protocol.server_class(
-            json=JSONEncoder(), async_mode="asgi", cors_allowed_origins="*"
+            json=JSONEncoder(),
+            async_mode="asgi",
+            cors_allowed_origins="*",
+            max_http_buffer_size=self._protocol.max_http_buffer_size,
         )
 
         server.on("connect")(self._handle_connection)

@@ -5,13 +5,14 @@ MAVLink protocol.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable
+from contextlib import ExitStack
 from functools import partial
 from typing import TYPE_CHECKING, Any, overload
 
+import trio
+
 from flockwave.server.ext.base import UAVExtension
-from flockwave.server.ext.mavlink.fw_upload import FirmwareUpdateTarget
 from flockwave.server.ext.show.time import BinaryTimeAxisConfiguration
 from flockwave.server.ext.show.types import ShowExtensionAPI
 from flockwave.server.ext.signals import SignalsExtensionAPI
@@ -23,6 +24,8 @@ from .autopilots import PX4, ArduPilot, ArduPilotWithSkybrush, Autopilot
 from .channel import use_mavlink_message_channel_factory
 from .driver import MAVLinkDriver, MAVLinkUAV
 from .errors import InvalidSigningKeyError
+from .firmware import ArduPilotOTAService
+from .firmware.backend import FirmwareUpdateConfiguration
 from .led_lights import LEDLightConfigurationSignalDispatcher
 from .network import MAVLinkNetwork
 from .packets import create_rc_override_packet
@@ -85,6 +88,7 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         self._networks = {}
         self._start_method = None
         self._uavs = None
+        self._firmware_update_configuration = FirmwareUpdateConfiguration()
 
         self._led_light_configuration_signal_dispatcher = (
             LEDLightConfigurationSignalDispatcher()
@@ -131,7 +135,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 self.log.info("Flight controller firmware: PX4")
             case "skybrush":
                 autopilot_factory = ArduPilotWithSkybrush
-                self.log.info("Flight controller firmware: drone show firmware on ArduPilot")
+                self.log.info(
+                    "Flight controller firmware: drone show firmware on ArduPilot"
+                )
             case _:
                 autopilot_factory = None
                 self.log.warning(
@@ -153,6 +159,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         driver.run_in_background = self.run_in_background
         driver.send_packet = self._send_packet
         driver.use_bulk_parameter_uploads = use_bulk_parameter_uploads
+        self._firmware_update_configuration = FirmwareUpdateConfiguration.from_json(
+            configuration.get("firmware_update")
+        )
 
     def exports(self) -> dict[str, Any]:
         return {
@@ -297,43 +306,36 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
 
             try:
                 async with self.use_nursery() as nursery:
-                    # Create one task for each network
-                    for network in networks.values():
-                        nursery.start_soon(partial(network.run, **kwds))
+                    firmware_updates = ArduPilotOTAService(
+                        app,
+                        nursery,
+                        lambda: uavs,
+                        self._firmware_update_configuration,
+                    )
+                    with app.message_hub.use_message_handlers(
+                        {"X-AP-OTA": firmware_updates.handle_message}
+                    ):
+                        # Create one task for each network
+                        for network in networks.values():
+                            nursery.start_soon(partial(network.run, **kwds))
 
-                    # Create tasks for the signal dispatchers
-                    nursery.start_soon(
-                        self._led_light_configuration_signal_dispatcher.run
-                    )
-                    nursery.start_soon(self._takeoff_signal_dispatcher.run)
-                    nursery.start_soon(
-                        self._time_axis_configuration_signal_dispatcher.run
-                    )
+                        # Create tasks for the signal dispatchers
+                        nursery.start_soon(
+                            self._led_light_configuration_signal_dispatcher.run
+                        )
+                        nursery.start_soon(self._takeoff_signal_dispatcher.run)
+                        nursery.start_soon(
+                            self._time_axis_configuration_signal_dispatcher.run
+                        )
 
-                    # Create an additional task that periodically checks whether the UAVs
-                    # registered in the extension are still alive, and that sends
-                    # status summary signals to interested consumers (typically
-                    # the sidekick extension)
-                    nursery.start_soon(
-                        check_uavs_alive, uavs, status_summary_signal, self.log
-                    )
+                        # Periodically check whether UAVs are still alive.
+                        nursery.start_soon(
+                            check_uavs_alive, uavs, status_summary_signal, self.log
+                        )
+                        await trio.sleep_forever()
             finally:
                 for uav in uavs:
                     app.object_registry.remove(uav)
-
-    @staticmethod
-    @contextmanager
-    def use_firmware_update_support(api) -> Iterator[None]:
-        """Enhancer context manager that adds support for remote firmware updates
-        to virtual UAVs.
-        """
-        with ExitStack() as stack:
-            for target_id in FirmwareUpdateTarget:
-                target = api.create_target(
-                    id=target_id.value, name=target_id.describe()
-                )
-                stack.enter_context(api.use_target(target))
-            yield
 
     async def _broadcast_packet(
         self,

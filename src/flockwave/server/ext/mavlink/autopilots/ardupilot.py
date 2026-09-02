@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator, Iterable, Sequence
-from contextlib import AsyncExitStack, aclosing
+from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
@@ -641,7 +641,7 @@ class ArduPilot(Autopilot):
         # TODO(ntamas): validate .abin firmware
 
         # Upload firmware
-        async with aclosing(MAVFTP.for_uav(uav)) as ftp:
+        async with MAVFTP.use_for_uav(uav) as ftp:
             async with ftp.put_gen(blob, "/ardupilot.abin") as gen:
                 async for progress in gen:
                     # Scale progress down to a max of 90% -- the remaining
@@ -692,7 +692,7 @@ class ArduPilot(Autopilot):
         await sleep(2)
 
         # Check whether the firmware update was successful
-        async with aclosing(MAVFTP.for_uav(uav)) as ftp:
+        async with MAVFTP.use_for_uav(uav) as ftp:
             async with ftp.ls("/") as gen:
                 entries: list[str] = []
                 async for entry in gen:
