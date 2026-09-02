@@ -74,6 +74,7 @@ async def test_sitl_stage_quiets_truth_then_uses_crc_upload(monkeypatch) -> None
         assert candidate is uav
         assert retry_policy.base_timeout == 1
         assert retry_policy.max_retries == 20
+        assert retry_policy.max_timeout == 3
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
@@ -126,6 +127,7 @@ async def test_sitl_stage_fails_if_truth_stream_cannot_be_stopped() -> None:
         await backend._suppress_simulation_truth_stream()
 
     assert ex.value.code == "simulationSetupFailed"
+    assert str(ex.value) == "SITL did not stop its simulator-only ground truth stream"
 
 
 async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
