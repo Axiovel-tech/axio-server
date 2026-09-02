@@ -104,12 +104,13 @@ class FirmwareUpdateCoordinator:
             job.total_bytes = image.total_size
             await self._notifier(job)
             backend = self._backend_factory(job.uav_id)
-            await backend.refresh_version_info()
-            backend.check_safety(image.board_id)
             with trio.CancelScope() as scope:
                 self._precommit_cancel_scopes[job.operation_id] = scope
                 try:
                     self._raise_if_cancelled(job)
+                    await backend.refresh_version_info()
+                    self._raise_if_cancelled(job)
+                    backend.check_safety(image.board_id)
                     job.phase = "staging"
                     await self._notifier(job)
                     async for transferred in backend.stage(image):

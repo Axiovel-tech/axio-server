@@ -30,6 +30,7 @@ class FakeBackend:
 
     git_hash: str = "0123abcd"
     calls: list[str] = field(default_factory=list)
+    hold_initial_refresh: trio.Event | None = None
     hold_staging: trio.Event | None = None
     hold_reboot: trio.Event | None = None
     reboot_ack_lost: bool = False
@@ -49,6 +50,8 @@ class FakeBackend:
 
     async def refresh_version_info(self) -> None:
         self.calls.append("refresh")
+        if self.hold_initial_refresh is not None and "stage" not in self.calls:
+            await self.hold_initial_refresh.wait()
 
     async def stage(self, image):
         assert image.board_id == 1177
@@ -180,6 +183,23 @@ async def test_cancel_during_staging_never_commits() -> None:
     assert job.status == "cancelled"
     assert not job.committed
     assert "commit" not in backend.calls
+    assert coordinator._precommit_cancel_scopes == {}
+
+
+async def test_cancel_during_initial_version_refresh_finishes_cancelled() -> None:
+    backend = FakeBackend(hold_initial_refresh=trio.Event())
+    async with trio.open_nursery() as nursery:
+        coordinator, job = await start_job(nursery, backend, [])
+        with trio.fail_after(2):
+            while backend.calls != ["refresh"]:
+                await trio.sleep(0)
+        coordinator.cancel(job.operation_id)
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "cancelled"
+    assert job.committed is False
+    assert backend.calls == ["refresh"]
     assert coordinator._precommit_cancel_scopes == {}
 
 
