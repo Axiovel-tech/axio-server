@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -18,7 +18,7 @@ from flockwave.concurrency import FutureCancelled, delayed
 from flockwave.gps.time import datetime_to_gps_time_of_week, gps_time_of_week_to_utc
 from flockwave.gps.vectors import GPSCoordinate, VelocityNED
 from flockwave.spec.errors import FlockwaveErrorCode
-from trio import Event, TooSlowError, fail_after, move_on_after, sleep
+from trio import Event, Lock, TooSlowError, fail_after, move_on_after, sleep
 from trio_util import periodic
 
 from flockwave.server.command_handlers import (
@@ -1123,6 +1123,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     drone any more.
     """
 
+    _mavftp_lock: Lock
+    """Serializes MAVFTP connections whose cleanup resets all remote sessions."""
+
     _last_skybrush_status_info: DroneShowStatus | None = None
 
     _log_downloader: MAVLinkLogDownloader | None = None
@@ -1209,6 +1212,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._connected_event = Event()
         self._gps_fix = GPSFix()
         self._last_messages = defaultdict(MAVLinkMessageRecord)
+        self._mavftp_lock = Lock()
         self._preflight_status = PreflightCheckInfo()
         self._position = GPSCoordinate()
         self._rssi_mode = RSSIMode.NONE
@@ -1218,6 +1222,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.send_log_message_to_gcs = nop
 
         self._reset_mavlink_version()
+
+    @property
+    def mavftp_lock(self) -> Lock:
+        return self._mavftp_lock
 
     def assign_to_network_and_system_id(self, network_id: str, system_id: int) -> None:
         """Assigns the UAV to the MAVLink network with the given network ID.
@@ -1672,7 +1680,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
         if len(parameters) > 1 and self._autopilot.supports_mavftp_parameter_upload:
             # Do a bulk upload
-            async with aclosing(MAVFTP.for_uav(self)) as ftp:
+            async with MAVFTP.use_for_uav(self) as ftp:
                 filename, contents = self._autopilot.prepare_mavftp_parameter_upload(
                     parameters
                 )
@@ -2643,7 +2651,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             data = show_file.get_contents()
 
         # Upload show file
-        async with aclosing(MAVFTP.for_uav(self)) as ftp:
+        async with MAVFTP.use_for_uav(self) as ftp:
             await ftp.put(data, "/collmot/show.skyb")
 
         # We give some time for the filesystem to flush caches etc before

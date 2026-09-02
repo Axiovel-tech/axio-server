@@ -216,9 +216,12 @@ async def test_wait_for_disconnect_observes_connection_loss(monkeypatch) -> None
     async def disconnect(delay: float) -> None:
         delays.append(delay)
         uav.is_connected = False
+        await trio.lowlevel.checkpoint()
 
     monkeypatch.setattr(trio, "sleep", disconnect)
-    await make_backend(uav).wait_for_disconnect()
+    configuration = FirmwareUpdateConfiguration(disconnect_timeout=0.05)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    await backend.wait_for_disconnect()
     assert delays == [0.2]
 
 
@@ -226,7 +229,9 @@ async def test_wait_for_disconnect_accepts_proxy_boot_heartbeat() -> None:
     uav = FakeUAV(1177)
     uav._messages[MAVMessageType.HEARTBEAT].system_status = MAVState.BOOT.value
 
-    await make_backend(uav).wait_for_disconnect()
+    configuration = FirmwareUpdateConfiguration(disconnect_timeout=0.05)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    await backend.wait_for_disconnect()
 
     assert uav.is_connected is True
 

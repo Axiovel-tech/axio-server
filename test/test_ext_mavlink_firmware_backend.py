@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from trio import Lock
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 from flockwave.server.ext.mavlink.enums import (
@@ -42,6 +43,7 @@ class FakeUAV:
         landed_state: int | None = 1,
     ):
         self.is_connected = connected
+        self.mavftp_lock = Lock()
         self.scheduled_takeoff_time = None
         self.scheduled_takeoff_authorization_scope = AuthorizationScope.NONE
         self.status = SimpleNamespace(

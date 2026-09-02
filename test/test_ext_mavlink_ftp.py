@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 from typing import cast
 
+import trio
 from flockwave.concurrency import AdaptiveExponentialBackoffPolicy
 
+from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 from flockwave.server.ext.mavlink.ftp import MAVFTP, MAVFTPMessage, MAVFTPOpCode
 from flockwave.server.ext.mavlink.types import UAVBoundPacketSenderFn
 
@@ -48,3 +50,63 @@ async def test_mavftp_rename_uses_two_nul_separated_paths() -> None:
 
     assert sent[0].opcode == MAVFTPOpCode.RENAME
     assert sent[0].data == b"ardupilot.abin.part\x00ardupilot.abin"
+
+
+async def test_mavftp_connections_to_one_uav_do_not_overlap() -> None:
+    events: list[str] = []
+    connection_count = 0
+    first_entered = trio.Event()
+    release_first = trio.Event()
+    second_started = trio.Event()
+    second_entered = trio.Event()
+
+    class Connection:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def aclose(self) -> None:
+            events.append(f"close {self.name}")
+
+    class RecordingMAVFTP(MAVFTP):
+        @classmethod
+        def for_uav(cls, uav, *, retry_policy=None):
+            nonlocal connection_count
+            del cls, retry_policy
+            assert uav is candidate
+            connection_count += 1
+            name = f"connection {connection_count}"
+            events.append(f"open {name}")
+            return Connection(name)
+
+    candidate = cast(MAVLinkUAV, SimpleNamespace(mavftp_lock=trio.Lock()))
+
+    async def use_first_connection() -> None:
+        async with RecordingMAVFTP.use_for_uav(candidate):
+            events.append("use first")
+            first_entered.set()
+            await release_first.wait()
+
+    async def use_second_connection() -> None:
+        second_started.set()
+        async with RecordingMAVFTP.use_for_uav(candidate):
+            events.append("use second")
+            second_entered.set()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(use_first_connection)
+        await first_entered.wait()
+        nursery.start_soon(use_second_connection)
+        await second_started.wait()
+        await trio.lowlevel.checkpoint()
+        assert not second_entered.is_set()
+        release_first.set()
+        await second_entered.wait()
+
+    assert events == [
+        "open connection 1",
+        "use first",
+        "close connection 1",
+        "open connection 2",
+        "use second",
+        "close connection 2",
+    ]

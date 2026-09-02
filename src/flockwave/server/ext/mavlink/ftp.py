@@ -22,6 +22,7 @@ from flockwave.concurrency import (
 )
 from trio import (
     BrokenResourceError,
+    CancelScope,
     TooSlowError,
     as_safe_channel,
     move_on_after,
@@ -454,6 +455,27 @@ class MAVFTP:
         """Constructs a MAVFTP connection object to the given UAV."""
         sender = partial(uav.driver.send_packet, target=uav)
         return cls(sender, retry_policy=retry_policy)
+
+    @classmethod
+    @asynccontextmanager
+    async def use_for_uav(
+        cls,
+        uav: MAVLinkUAV,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ) -> AsyncIterator[MAVFTP]:
+        """Use the UAV's single exclusive MAVFTP connection.
+
+        Closing a MAVFTP connection resets every remote session, so two local
+        connections to one UAV cannot safely overlap.
+        """
+        async with uav.mavftp_lock:
+            ftp = cls.for_uav(uav, retry_policy=retry_policy)
+            try:
+                yield ftp
+            finally:
+                with CancelScope(shield=True):
+                    await ftp.aclose()
 
     def __init__(
         self,

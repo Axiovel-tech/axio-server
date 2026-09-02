@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import aclosing
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, cast
 
 import trio
-from flockwave.concurrency import AdaptiveExponentialBackoffPolicy
+from flockwave.concurrency import AdaptiveExponentialBackoffPolicy, RetryPolicy
 
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.logger import log as base_log
@@ -205,8 +205,7 @@ class ArduPilotUpdateBackend:
             raise UpdateOperationError("showAuthorized", "UAV is authorized for a show")
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
-        ftp = _make_update_ftp(self._uav)
-        try:
+        async with _use_update_ftp(self._uav) as ftp:
             await _remove_if_present(ftp, PART_PATH)
             await _remove_if_present(ftp, READY_PATH)
             for path in RESULT_PATHS:
@@ -215,15 +214,9 @@ class ArduPilotUpdateBackend:
                 async for item in progress:
                     percentage = item.percentage or 0
                     yield min(image.total_size, image.total_size * percentage // 100)
-        finally:
-            # A user cancellation arrives through the coordinator's cancel scope.
-            # Reset the remote sessions before that cancellation can unwind the
-            # upload, otherwise an immediate retry may inherit an open file handle.
-            with trio.CancelScope(shield=True):
-                await ftp.aclose()
 
     async def commit(self) -> None:
-        async with aclosing(_make_update_ftp(self._uav)) as ftp:
+        async with _use_update_ftp(self._uav) as ftp:
             try:
                 await ftp.rename(PART_PATH, READY_PATH)
             except OperationNotAcknowledgedError as ex:
@@ -278,7 +271,7 @@ class ArduPilotUpdateBackend:
     async def verify_flash_result(self) -> None:
         with trio.move_on_after(self._configuration.result_timeout):
             while True:
-                async with aclosing(_make_update_ftp(self._uav)) as ftp:
+                async with _use_update_ftp(self._uav) as ftp:
                     entries: set[str] = set()
                     async with ftp.ls("/") as listing:
                         async for entry in listing:
@@ -324,16 +317,18 @@ async def _remove_if_present(ftp: MAVFTP, path: str) -> None:
             raise
 
 
-def _make_update_ftp(uav: MAVLinkUAV) -> MAVFTP:
-    """Create an OTA session without flooding a high-latency MAVLink link."""
-    return MAVFTP.for_uav(
-        uav,
-        retry_policy=AdaptiveExponentialBackoffPolicy(
-            max_retries=OTA_MAVFTP_MAX_RETRIES,
-            base_timeout=OTA_MAVFTP_INITIAL_TIMEOUT,
-            max_timeout=3,
-        ),
+def _update_retry_policy() -> RetryPolicy:
+    """Create the conservative retry policy used by OTA MAVFTP sessions."""
+    return AdaptiveExponentialBackoffPolicy(
+        max_retries=OTA_MAVFTP_MAX_RETRIES,
+        base_timeout=OTA_MAVFTP_INITIAL_TIMEOUT,
+        max_timeout=3,
     )
+
+
+def _use_update_ftp(uav: MAVLinkUAV) -> AbstractAsyncContextManager[MAVFTP]:
+    """Use the UAV's exclusive MAVFTP connection with OTA retry timing."""
+    return MAVFTP.use_for_uav(uav, retry_policy=_update_retry_policy())
 
 
 def _board_id_from_version(version) -> int | None:
