@@ -1123,6 +1123,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     drone any more.
     """
 
+    _last_drone_show_status_at: float | None = None
+    """Monotonic timestamp of the latest drone-show status packet."""
+
     _mavftp_lock: Lock
     """Serializes MAVFTP connections whose cleanup resets all remote sessions."""
 
@@ -1211,6 +1214,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._battery = BatteryInfo()
         self._connected_event = Event()
         self._gps_fix = GPSFix()
+        self._last_drone_show_status_at = None
         self._last_messages = defaultdict(MAVLinkMessageRecord)
         self._mavftp_lock = Lock()
         self._preflight_status = PreflightCheckInfo()
@@ -1406,6 +1410,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         if now is None:
             now = monotonic()
         return now - record.timestamp if record else inf
+
+    def get_age_of_drone_show_status(self, now: float | None = None) -> float:
+        """Return the age of the latest drone-show status packet."""
+        if now is None:
+            now = monotonic()
+        timestamp = self._last_drone_show_status_at
+        return now - timestamp if timestamp is not None else inf
 
     async def get_geofence_status(self) -> GeofenceStatus:
         """Returns the status of the geofence of the UAV."""
@@ -1814,6 +1825,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope
+        self._last_drone_show_status_at = monotonic()
 
         debug = data.message.encode("utf-8")
 
@@ -2955,6 +2967,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     def _set_connection_state(
         self, value: ConnectionState, heartbeat: MAVLinkMessage | None
     ) -> None:
+        if value is ConnectionState.DISCONNECTED:
+            self._last_drone_show_status_at = None
+
         if self._connection_state is value:
             return
 

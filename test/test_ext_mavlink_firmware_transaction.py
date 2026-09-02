@@ -203,6 +203,40 @@ async def test_cancel_during_initial_version_refresh_finishes_cancelled() -> Non
     assert coordinator._precommit_cancel_scopes == {}
 
 
+async def test_cancel_interrupts_the_initial_notification() -> None:
+    backend = FakeBackend()
+    notification_started = trio.Event()
+    notifications: list[dict] = []
+
+    async def notify(job) -> None:
+        if not notification_started.is_set():
+            notification_started.set()
+            await trio.sleep_forever()
+        notifications.append(job.json())
+
+    def make_backend(_uav_id: str) -> ArduPilotUpdateBackend:
+        return cast(ArduPilotUpdateBackend, backend)
+
+    async with trio.open_nursery() as nursery:
+        coordinator = FirmwareUpdateCoordinator(nursery, make_backend, notify)
+        payload = make_apj()
+        job = coordinator.start(
+            uav_id="1",
+            name="arducopter.apj",
+            payload=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        await notification_started.wait()
+        coordinator.cancel(job.operation_id)
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "cancelled"
+    assert backend.calls == []
+    assert notifications[-1]["status"] == "cancelled"
+    assert coordinator._precommit_cancel_scopes == {}
+
+
 async def test_cancel_after_commit_is_rejected() -> None:
     release = trio.Event()
     backend = FakeBackend(hold_reboot=release)

@@ -102,11 +102,12 @@ class FirmwareUpdateCoordinator:
                 version=image.version,
             )
             job.total_bytes = image.total_size
-            await self._notifier(job)
             backend = self._backend_factory(job.uav_id)
             with trio.CancelScope() as scope:
                 self._precommit_cancel_scopes[job.operation_id] = scope
                 try:
+                    self._raise_if_cancelled(job)
+                    await self._notifier(job)
                     self._raise_if_cancelled(job)
                     await backend.refresh_version_info()
                     self._raise_if_cancelled(job)

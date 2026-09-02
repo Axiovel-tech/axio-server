@@ -41,6 +41,7 @@ class FakeUAV:
         battery_voltage: float | None = 16,
         connected: bool = True,
         landed_state: int | None = 1,
+        show_status_age: float = 0,
     ):
         self.is_connected = connected
         self.mavftp_lock = Lock()
@@ -49,6 +50,7 @@ class FakeUAV:
         self.status = SimpleNamespace(
             battery=SimpleNamespace(voltage=battery_voltage, percentage=None)
         )
+        self._show_status_age = show_status_age
         self._messages = {
             MAVMessageType.HEARTBEAT: SimpleNamespace(
                 base_mode=128 if armed else 0,
@@ -72,6 +74,9 @@ class FakeUAV:
 
     def get_age_of_message(self, message_type):
         return self._message_ages.get(message_type, 0)
+
+    def get_age_of_drone_show_status(self):
+        return self._show_status_age
 
 
 PROVISIONED = FirmwareUpdateConfiguration(
@@ -441,6 +446,44 @@ def test_safety_gate_rechecks_board_and_show_state() -> None:
         backend.check_safety(1177)
     assert authorized.value.code == "showAuthorized"
     assert str(authorized.value) == "UAV is authorized for a show"
+
+
+@pytest.mark.parametrize("age", [float("inf"), MAX_SAFETY_MESSAGE_AGE + 0.01])
+def test_safety_gate_rejects_missing_or_stale_show_state(age: float) -> None:
+    backend = make_backend(FakeUAV(1177, show_status_age=age))
+
+    with pytest.raises(UpdateOperationError) as raised:
+        backend.check_safety(1177)
+
+    assert raised.value.code == "showStateUnknown"
+    assert str(raised.value) == "UAV drone-show state is unavailable or stale"
+
+
+def test_show_state_at_freshness_boundary_is_accepted() -> None:
+    backend = make_backend(FakeUAV(1177, show_status_age=MAX_SAFETY_MESSAGE_AGE))
+    backend.check_safety(1177)
+
+
+@pytest.mark.parametrize(
+    "connection_state", [ConnectionState.CONNECTED, ConnectionState.DISCONNECTED]
+)
+def test_disconnect_invalidates_show_state_timestamp(
+    connection_state: ConnectionState,
+) -> None:
+    uav = SimpleNamespace(
+        _connection_state=connection_state,
+        _last_drone_show_status_at=1.0,
+        _reset_mavlink_version=lambda: None,
+    )
+
+    MAVLinkUAV._set_connection_state(
+        cast(MAVLinkUAV, uav), ConnectionState.DISCONNECTED, None
+    )
+
+    assert uav._last_drone_show_status_at is None
+    assert MAVLinkUAV.get_age_of_drone_show_status(
+        cast(MAVLinkUAV, uav), now=2.0
+    ) == float("inf")
 
 
 def test_version_helpers_preserve_reported_identity() -> None:

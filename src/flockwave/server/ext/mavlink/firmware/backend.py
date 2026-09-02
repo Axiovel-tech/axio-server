@@ -196,6 +196,10 @@ class ArduPilotUpdateBackend:
                 "boardMismatch",
                 f"Firmware board ID {board_id} does not match UAV board ID {state.board_id}",
             )
+        if self._uav.get_age_of_drone_show_status() > MAX_SAFETY_MESSAGE_AGE:
+            raise UpdateOperationError(
+                "showStateUnknown", "UAV drone-show state is unavailable or stale"
+            )
         if self._uav.scheduled_takeoff_time is not None:
             raise UpdateOperationError("showScheduled", "UAV has a scheduled takeoff")
         if (
