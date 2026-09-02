@@ -205,7 +205,8 @@ class ArduPilotUpdateBackend:
             raise UpdateOperationError("showAuthorized", "UAV is authorized for a show")
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
-        async with aclosing(_make_update_ftp(self._uav)) as ftp:
+        ftp = _make_update_ftp(self._uav)
+        try:
             await _remove_if_present(ftp, PART_PATH)
             await _remove_if_present(ftp, READY_PATH)
             for path in RESULT_PATHS:
@@ -214,17 +215,31 @@ class ArduPilotUpdateBackend:
                 async for item in progress:
                     percentage = item.percentage or 0
                     yield min(image.total_size, image.total_size * percentage // 100)
+        finally:
+            # A user cancellation arrives through the coordinator's cancel scope.
+            # Reset the remote sessions before that cancellation can unwind the
+            # upload, otherwise an immediate retry may inherit an open file handle.
+            with trio.CancelScope(shield=True):
+                await ftp.aclose()
 
     async def commit(self) -> None:
         async with aclosing(_make_update_ftp(self._uav)) as ftp:
-            await ftp.rename(PART_PATH, READY_PATH)
+            try:
+                await ftp.rename(PART_PATH, READY_PATH)
+            except OperationNotAcknowledgedError as ex:
+                raise CommitRejectedError(
+                    "commitRejected",
+                    f"Flight controller rejected the staged image: {ex}",
+                ) from ex
 
     async def reboot(self) -> None:
         await self._uav.reboot_after_update()
 
     async def wait_for_disconnect(self) -> None:
         with trio.fail_after(self._configuration.disconnect_timeout):
-            while self._uav.is_connected:
+            while self._uav.is_connected and can_communicate_infer_from_heartbeat(
+                self._uav.get_last_message(MAVMessageType.HEARTBEAT)
+            ):
                 await trio.sleep(0.2)
 
     async def wait_for_reconnect(self) -> None:
@@ -284,6 +299,10 @@ class UpdateOperationError(RuntimeError):
     def __init__(self, code: str, detail: str):
         super().__init__(detail)
         self.code = code
+
+
+class CommitRejectedError(UpdateOperationError):
+    """A definite pre-commit rejection of the atomic MAVFTP rename."""
 
 
 class UpdateResultIndeterminateError(UpdateOperationError):

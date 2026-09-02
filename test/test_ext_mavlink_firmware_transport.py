@@ -10,13 +10,14 @@ import trio
 from test_ext_mavlink_firmware_backend import FakeUAV, make_backend
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVMessageType
+from flockwave.server.ext.mavlink.enums import MAVMessageType, MAVState
 from flockwave.server.ext.mavlink.firmware.apj import FirmwareImage
 from flockwave.server.ext.mavlink.firmware.backend import (
     PART_PATH,
     READY_PATH,
     RESULT_PATHS,
     ArduPilotUpdateBackend,
+    CommitRejectedError,
     FirmwareUpdateConfiguration,
     UpdateOperationError,
     UpdateResultIndeterminateError,
@@ -85,6 +86,73 @@ async def test_sitl_stage_uses_crc_upload(monkeypatch) -> None:
     assert ftp.closed is True
 
 
+async def test_stage_shields_session_reset_from_user_cancellation(monkeypatch) -> None:
+    remote = SimpleNamespace(open=False, attempts=0, resets=0)
+
+    class FTP:
+        closed = False
+
+        async def rm(self, _path: str) -> None:
+            pass
+
+        @asynccontextmanager
+        async def put_gen(self, _data: bytes, _path: str):
+            if remote.open:
+                raise RuntimeError("previous MAVFTP session remains open")
+            remote.open = True
+            remote.attempts += 1
+
+            async def progress():
+                if remote.attempts == 1:
+                    yield SimpleNamespace(percentage=0)
+                    await trio.sleep_forever()
+                yield SimpleNamespace(percentage=100)
+
+            yield progress()
+
+        async def aclose(self) -> None:
+            await trio.lowlevel.checkpoint()
+            remote.open = False
+            remote.resets += 1
+            self.closed = True
+
+    ftps = []
+    uav = FakeUAV(1177)
+
+    def make_ftp(*_args, **_kwargs):
+        ftp = FTP()
+        ftps.append(ftp)
+        return ftp
+
+    monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
+    image = cast(FirmwareImage, SimpleNamespace(abin=b"x", total_size=1))
+    started = trio.Event()
+    finished = trio.Event()
+    stage_scope: trio.CancelScope | None = None
+
+    async def consume_stage() -> None:
+        nonlocal stage_scope
+        with trio.CancelScope() as scope:
+            stage_scope = scope
+            try:
+                async for _transferred in make_backend(uav).stage(image):
+                    started.set()
+            finally:
+                finished.set()
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(consume_stage)
+        await started.wait()
+        assert stage_scope is not None
+        stage_scope.cancel()
+        await finished.wait()
+        nursery.cancel_scope.cancel()
+
+    assert ftps[0].closed is True
+    assert [amount async for amount in make_backend(uav).stage(image)] == [1]
+    assert remote.attempts == remote.resets == 2
+
+
 async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
     events = []
 
@@ -112,6 +180,26 @@ async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
     ]
 
 
+async def test_commit_translates_an_explicit_rename_rejection(monkeypatch) -> None:
+    class FTP:
+        async def rename(self, _source: str, _destination: str) -> None:
+            raise OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_PROTECTED)
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: FTP())
+
+    with pytest.raises(CommitRejectedError) as raised:
+        await make_backend(FakeUAV(1177)).commit()
+
+    assert raised.value.code == "commitRejected"
+    assert str(raised.value) == (
+        "Flight controller rejected the staged image: "
+        "File or directory is write protected"
+    )
+
+
 async def test_reboot_uses_the_uav_update_command_without_early_invalidation() -> None:
     uav = FakeUAV(1177)
     uav.reboot_after_update = AsyncMock()  # type: ignore[attr-defined]
@@ -132,6 +220,15 @@ async def test_wait_for_disconnect_observes_connection_loss(monkeypatch) -> None
     monkeypatch.setattr(trio, "sleep", disconnect)
     await make_backend(uav).wait_for_disconnect()
     assert delays == [0.2]
+
+
+async def test_wait_for_disconnect_accepts_proxy_boot_heartbeat() -> None:
+    uav = FakeUAV(1177)
+    uav._messages[MAVMessageType.HEARTBEAT].system_status = MAVState.BOOT.value
+
+    await make_backend(uav).wait_for_disconnect()
+
+    assert uav.is_connected is True
 
 
 async def test_wait_for_reconnect_uses_uav_connection_primitive() -> None:

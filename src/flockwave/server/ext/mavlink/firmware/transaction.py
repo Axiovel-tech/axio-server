@@ -10,6 +10,7 @@ import trio
 from .apj import APJValidationError, FirmwareImage, parse_apj
 from .backend import (
     ArduPilotUpdateBackend,
+    CommitRejectedError,
     InstalledFirmware,
     UpdateOperationError,
     UpdateResultIndeterminateError,
@@ -124,7 +125,11 @@ class FirmwareUpdateCoordinator:
             await backend.refresh_version_info()
             backend.check_safety(image.board_id)
             job.committed = True
-            await backend.commit()
+            try:
+                await backend.commit()
+            except CommitRejectedError:
+                job.committed = False
+                raise
             await self._notifier(job)
             await self._reboot_and_reconnect(job, backend)
             job.phase = "verifyingInstalled"

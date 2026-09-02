@@ -6,7 +6,12 @@ from typing import Any, cast
 import pytest
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType, MAVState
+from flockwave.server.ext.mavlink.enums import (
+    ConnectionState,
+    MAVCommand,
+    MAVMessageType,
+    MAVState,
+)
 from flockwave.server.ext.mavlink.firmware.backend import (
     MAX_SAFETY_MESSAGE_AGE,
     ArduPilotUpdateBackend,
@@ -96,6 +101,38 @@ async def test_normal_stream_configuration_requests_landed_state() -> None:
         MAVMessageType.EXTENDED_SYS_STATE,
         1_000_000,
     ) in calls
+
+
+def test_fresh_sys_status_does_not_hide_missing_landed_state() -> None:
+    requested = []
+    ages = {
+        MAVMessageType.HEARTBEAT: 0,
+        MAVMessageType.SYS_STATUS: 0,
+        MAVMessageType.EXTENDED_SYS_STATE: 6,
+    }
+    uav = SimpleNamespace(
+        _mavlink_version=2,
+        _connection_state=ConnectionState.CONNECTED,
+        _autopilot=SimpleNamespace(is_duplicate_message=lambda _message: True),
+        _last_autopilot_capabilities_requested_at=None,
+        driver=SimpleNamespace(
+            assume_data_streams_configured=False,
+            autopilot_factory=True,
+        ),
+        get_age_of_message=lambda message_type: ages[message_type],
+        _store_message=lambda _message: None,
+        _configure_data_streams_soon=lambda: requested.append(True),
+        touch_status=lambda: None,
+        notify_updated=lambda: None,
+    )
+    heartbeat = SimpleNamespace(
+        get_msgbuf=lambda: b"\xfd",
+        system_status=MAVState.STANDBY.value,
+    )
+
+    MAVLinkUAV.handle_message_heartbeat(cast(MAVLinkUAV, uav), heartbeat)
+
+    assert requested == [True]
 
 
 def test_production_configuration_accepts_only_axiolight() -> None:

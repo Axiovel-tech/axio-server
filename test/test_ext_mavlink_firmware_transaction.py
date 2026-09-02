@@ -12,6 +12,7 @@ from test_ext_mavlink_firmware_apj import make_apj
 
 from flockwave.server.ext.mavlink.firmware.backend import (
     ArduPilotUpdateBackend,
+    CommitRejectedError,
     InstalledFirmware,
     UpdateOperationError,
     UpdateResultIndeterminateError,
@@ -290,6 +291,27 @@ async def test_lost_rename_ack_is_indeterminate_and_past_cancellation() -> None:
         "safety",
         "commit",
     ]
+
+
+async def test_explicit_rename_rejection_fails_without_claiming_commit() -> None:
+    backend = FakeBackend(
+        commit_error=CommitRejectedError(
+            "commitRejected", "Flight controller rejected the staged image"
+        )
+    )
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "failed"
+    assert job.committed is False
+    assert job.cancellable is False
+    assert job.error == {
+        "code": "commitRejected",
+        "detail": "Flight controller rejected the staged image",
+    }
+    assert "reboot" not in backend.calls
 
 
 async def test_final_safety_rejection_is_failed_before_commit() -> None:
