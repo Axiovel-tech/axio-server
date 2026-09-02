@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, cast
 
 import trio
+from flockwave.concurrency import AdaptiveExponentialBackoffPolicy
 
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.logger import log as base_log
@@ -34,6 +35,8 @@ RESULT_PATHS = (
     "/ardupilot-failed.abin",
 )
 MAX_SAFETY_MESSAGE_AGE = 3.0
+OTA_MAVFTP_MAX_RETRIES = 20
+OTA_MAVFTP_INITIAL_TIMEOUT = 1.0
 
 
 @dataclass(frozen=True)
@@ -203,7 +206,7 @@ class ArduPilotUpdateBackend:
 
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
         await self._suppress_simulation_truth_stream()
-        async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
+        async with aclosing(_make_update_ftp(self._uav)) as ftp:
             await _remove_if_present(ftp, PART_PATH)
             await _remove_if_present(ftp, READY_PATH)
             for path in RESULT_PATHS:
@@ -236,7 +239,7 @@ class ArduPilotUpdateBackend:
             )
 
     async def commit(self) -> None:
-        async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
+        async with aclosing(_make_update_ftp(self._uav)) as ftp:
             await ftp.rename(PART_PATH, READY_PATH)
 
     async def reboot(self) -> None:
@@ -276,7 +279,7 @@ class ArduPilotUpdateBackend:
     async def verify_flash_result(self) -> None:
         with trio.move_on_after(self._configuration.result_timeout):
             while True:
-                async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
+                async with aclosing(_make_update_ftp(self._uav)) as ftp:
                     entries: set[str] = set()
                     async with ftp.ls("/") as listing:
                         async for entry in listing:
@@ -316,6 +319,18 @@ async def _remove_if_present(ftp: MAVFTP, path: str) -> None:
     except OperationNotAcknowledgedError as ex:
         if ex.code != MAVFTPErrorCode.FILE_NOT_FOUND:
             raise
+
+
+def _make_update_ftp(uav: MAVLinkUAV) -> MAVFTP:
+    """Create an OTA session without flooding a high-latency MAVLink link."""
+    return MAVFTP.for_uav(
+        uav,
+        retry_policy=AdaptiveExponentialBackoffPolicy(
+            max_retries=OTA_MAVFTP_MAX_RETRIES,
+            base_timeout=OTA_MAVFTP_INITIAL_TIMEOUT,
+            max_timeout=3,
+        ),
+    )
 
 
 def _board_id_from_version(version) -> int | None:

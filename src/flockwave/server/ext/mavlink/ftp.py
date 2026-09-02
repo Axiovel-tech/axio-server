@@ -445,20 +445,32 @@ class MAVFTP:
     """An iterator yielding sequence numbers for the connection."""
 
     @classmethod
-    def for_uav(cls, uav: MAVLinkUAV):
+    def for_uav(
+        cls,
+        uav: MAVLinkUAV,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ):
         """Constructs a MAVFTP connection object to the given UAV."""
         sender = partial(uav.driver.send_packet, target=uav)
-        return cls(sender)
+        return cls(sender, retry_policy=retry_policy)
 
-    def __init__(self, sender: UAVBoundPacketSenderFn):
+    def __init__(
+        self,
+        sender: UAVBoundPacketSenderFn,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ):
         """Constructor."""
         self._closed = False
         self._closing = False
 
-        self._retry_policy = AdaptiveExponentialBackoffPolicy(
-            max_retries=600,
-            base_timeout=0.1,
-            max_timeout=3,
+        self._retry_policy = (
+            retry_policy
+            if retry_policy is not None
+            else AdaptiveExponentialBackoffPolicy(
+                max_retries=600, base_timeout=0.1, max_timeout=3
+            )
         )
 
         self._path = PurePosixPath("/")

@@ -22,9 +22,11 @@ async def test_mavftp_retries_lost_crc_requests() -> None:
         reply = MAVFTPMessage(MAVFTPOpCode.ACK, data=b"\x78\x56\x34\x12")
         return SimpleNamespace(payload=reply.encode((request_sequence + 1) % 65536))
 
-    ftp = MAVFTP(cast(UAVBoundPacketSenderFn, sender))
-    ftp._retry_policy = AdaptiveExponentialBackoffPolicy(
-        max_retries=3, base_timeout=0, max_timeout=0
+    ftp = MAVFTP(
+        cast(UAVBoundPacketSenderFn, sender),
+        retry_policy=AdaptiveExponentialBackoffPolicy(
+            max_retries=3, base_timeout=0, max_timeout=0
+        ),
     )
     assert await ftp.crc32("/firmware.part") == 0x12345678
     assert calls == 3

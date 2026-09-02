@@ -70,8 +70,10 @@ async def test_sitl_stage_quiets_truth_then_uses_crc_upload(monkeypatch) -> None
 
     uav.driver = Driver()
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
         assert candidate is uav
+        assert retry_policy.base_timeout == 1
+        assert retry_policy.max_retries == 20
         return ftp
 
     monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
@@ -140,7 +142,8 @@ async def test_commit_atomically_renames_the_staged_image(monkeypatch) -> None:
     uav = FakeUAV(1177)
     backend = make_backend(uav)
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
+        del retry_policy
         assert candidate is uav
         return ftp
 
@@ -312,7 +315,8 @@ async def test_flash_result_accepts_success_marker_and_removes_it(monkeypatch) -
     uav = FakeUAV(1177)
     ftp = MarkerFTP({"ardupilot-flashed.abin"})
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
+        del retry_policy
         assert candidate is uav
         return ftp
 
@@ -327,7 +331,8 @@ async def test_flash_result_ignores_success_marker_cleanup_failure(monkeypatch) 
     ftp = MarkerFTP({"ardupilot-flashed.abin"}, OSError("read-only SD card"))
     warnings = []
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
+        del retry_policy
         assert candidate is uav
         return ftp
 
@@ -352,7 +357,8 @@ async def test_flash_result_rejects_explicit_failure_marker(monkeypatch) -> None
     uav = FakeUAV(1177)
     ftp = MarkerFTP({"ardupilot-failed.abin"})
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
+        del retry_policy
         assert candidate is uav
         return ftp
 
@@ -368,7 +374,8 @@ async def test_flash_result_times_out_as_indeterminate(monkeypatch) -> None:
     uav = FakeUAV(1177)
     ftp = MarkerFTP({"ardupilot-verify.abin"})
 
-    def make_ftp(candidate):
+    def make_ftp(candidate, *, retry_policy):
+        del retry_policy
         assert candidate is uav
         return ftp
 
