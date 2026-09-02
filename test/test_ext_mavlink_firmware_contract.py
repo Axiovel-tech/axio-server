@@ -8,6 +8,7 @@ import pytest
 import trio
 
 from flockwave.server.app import SkybrushServer
+from flockwave.server.ext.mavlink import enhancers
 from flockwave.server.ext.mavlink.firmware.backend import (
     FirmwareUpdateConfiguration,
     TargetState,
@@ -27,6 +28,10 @@ from flockwave.server.ext.mavlink.firmware.transaction import (
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model import Client
 from flockwave.server.model.builders import FlockwaveMessageBuilder
+
+
+def test_legacy_generic_firmware_api_is_not_registered_for_mavlink() -> None:
+    assert enhancers == {}
 
 
 class CoordinatorStub:
@@ -55,7 +60,9 @@ def make_message(**body):
     return FlockwaveMessageBuilder().create_message({"type": "X-AP-OTA", **body})
 
 
-PROVISIONED = FirmwareUpdateConfiguration(provisioned_uav_ids=frozenset({"7"}))
+PROVISIONED = FirmwareUpdateConfiguration(
+    provisioned_uav_ids=frozenset({"7"}), minimum_battery_voltage=14
+)
 
 
 async def make_service(*, uavs=None, app=None, configuration=PROVISIONED):
@@ -169,25 +176,10 @@ async def test_service_constructor_wires_configuration_and_dependencies() -> Non
     try:
         assert service._app is app
         assert service._uavs is provider
-        assert service._configuration.allowed_board_ids == frozenset({1177})
         assert service._configuration.provisioned_uav_ids == frozenset({"7"})
         assert service._coordinator._nursery is nursery
         assert callable(service._coordinator._backend_factory)
         assert callable(service._coordinator._notifier)
-        assert service._coordinator._allowed_board_ids == frozenset({1177})
-    finally:
-        nursery.cancel_scope.cancel()
-        await manager.__aexit__(None, None, None)
-
-
-async def test_service_passes_explicit_board_allowlist_to_coordinator() -> None:
-    service, _, manager, nursery, _, _ = await make_service()
-    try:
-        configuration = FirmwareUpdateConfiguration(allowed_board_ids=frozenset())
-        replacement = ArduPilotOTAService(
-            service._app, nursery, service._uavs, configuration
-        )
-        assert replacement._coordinator._allowed_board_ids == frozenset()
     finally:
         nursery.cancel_scope.cancel()
         await manager.__aexit__(None, None, None)
@@ -292,9 +284,7 @@ async def test_start_rejects_uav_without_provisioned_bootloader() -> None:
         nursery.cancel_scope.cancel()
         await manager.__aexit__(None, None, None)
 
-    assert response.body["reason"] == (
-        "UAV is not provisioned with the OTA bootloader"
-    )
+    assert response.body["reason"] == "UAV is not provisioned with the OTA bootloader"
     assert coordinator.start_args is None
 
 

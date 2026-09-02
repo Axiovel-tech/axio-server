@@ -68,12 +68,7 @@ def test_apj_is_converted_to_md5_checked_abin() -> None:
 
     assert image.board_id == 1177
     assert image.git_hash == "0123abcd"
-    assert image.signed
     assert image.version == "4.6.1"
-    assert image.image == b"abc"
-    assert image.name == "arducopter.apj"
-    assert image.sha256 == hashlib.sha256(payload).hexdigest()
-    assert image.size == 3
     assert image.total_size == len(image.abin)
     assert image.abin == (
         b"git version: 0123abcd\nMD5: 900150983cd24fb0d6963f7d28e17f72\n--\nabc"
@@ -147,18 +142,6 @@ def test_apj_decompression_is_bounded() -> None:
     assert str(raised.value) == (
         f"Firmware image exceeds the {MAX_IMAGE_SIZE_BY_BOARD[1177]}-byte board limit"
     )
-
-
-def test_apj_board_allowlist_is_explicit() -> None:
-    payload = make_apj()
-    with pytest.raises(APJValidationError) as raised:
-        parse_apj(
-            payload,
-            expected_sha256=hashlib.sha256(payload).hexdigest(),
-            name="arducopter.apj",
-            allowed_board_ids=(),
-        )
-    assert raised.value.code == "unsupportedBoard"
 
 
 @pytest.mark.parametrize("version", [None, 7, "", "x" * 65])
@@ -305,9 +288,7 @@ def test_integer_metadata_rejects_non_integer_or_negative_values(value) -> None:
     assert _require_int({"value": 0}, "value") == 0
 
 
-@pytest.mark.parametrize(
-    "value", [None, 123, "abcdef", "a" * 7, "a" * 9, "a" * 40]
-)
+@pytest.mark.parametrize("value", [None, 123, "abcdef", "a" * 7, "a" * 9, "a" * 40])
 def test_git_hash_validation(value) -> None:
     assert_validation_error(
         lambda: _require_git_hash({"git_identity": value}),

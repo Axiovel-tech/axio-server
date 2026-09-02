@@ -49,7 +49,6 @@ class ArduPilotOTAService:
             nursery,
             self._backend_for_id,
             self._broadcast_job,
-            allowed_board_ids=configuration.allowed_board_ids,
         )
 
     async def handle_message(

@@ -126,6 +126,7 @@ only_mutate = ["src/flockwave/server/ext/mavlink/firmware/*.py"]
 pytest_add_cli_args_test_selection = [
   "test/test_ext_mavlink_firmware_apj.py",
   "test/test_ext_mavlink_firmware_backend.py",
+  "test/test_ext_mavlink_firmware_transport.py",
   "test/test_ext_mavlink_firmware_contract.py",
   "test/test_ext_mavlink_firmware_transaction.py",
 ]

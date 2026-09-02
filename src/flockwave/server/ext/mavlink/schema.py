@@ -297,11 +297,6 @@ schema = {
             "title": "ArduPilot application firmware updates",
             "propertyOrder": 15000,
             "properties": {
-                "allowed_board_ids": {
-                    "type": "array",
-                    "items": {"type": "integer", "enum": [1177]},
-                    "default": [1177],
-                },
                 "provisioned_uav_ids": {
                     "type": "array",
                     "description": (
@@ -311,9 +306,23 @@ schema = {
                     "uniqueItems": True,
                     "default": [],
                 },
+                "minimum_battery_voltage": {
+                    "type": ["number", "null"],
+                    "description": (
+                        "Pack-specific minimum voltage required for hardware OTA. "
+                        "Leave unset to reject hardware updates when safe battery "
+                        "voltage cannot be established."
+                    ),
+                    "minimum": 0.1,
+                    "maximum": 100,
+                    "default": None,
+                },
                 "simulation_reported_board_id_overrides": {
                     "type": "object",
-                    "description": "Simulation-only reported board ID mapping.",
+                    "description": (
+                        "Simulation-only board mapping; mapped SITL targets bypass "
+                        "hardware landed-state and battery-voltage observability."
+                    ),
                     "additionalProperties": {"type": "integer", "enum": [1177]},
                     "default": {},
                 },

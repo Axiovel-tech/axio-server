@@ -1741,7 +1741,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         ):
             yield event
 
-        self._clear_autopilot_capabilities()
+        self.invalidate_version_info()
 
     def handle_message_autopilot_version(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink AUTOPILOT_VERSION message targeted at
@@ -2860,12 +2860,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # Reset our internal state object of the compass calibration procedure
         self.compass_calibration.reset()
 
-    def _clear_autopilot_capabilities(self) -> None:
-        """Clears the cached autopilot capabilities and firmware version number
-        of the UAV.
+    def invalidate_version_info(self) -> None:
+        """Clears the cached autopilot firmware version information.
 
-        This function should be called after a firmware update to ensure that
-        we query the new firmware version after the update.
+        Call this after reconnecting from a firmware update so the next version
+        request cannot return the firmware identity cached before the reboot.
         """
         self._last_messages.pop(MAVMessageType.AUTOPILOT_VERSION, None)
 

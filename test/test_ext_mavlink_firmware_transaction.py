@@ -11,8 +11,8 @@ import trio
 from test_ext_mavlink_firmware_apj import make_apj
 
 from flockwave.server.ext.mavlink.firmware.backend import (
+    ArduPilotUpdateBackend,
     InstalledFirmware,
-    UpdateBackend,
     UpdateOperationError,
     UpdateResultIndeterminateError,
 )
@@ -36,13 +36,15 @@ class FakeBackend:
     marker_error: Exception | None = None
     installed_board_id: int = 1177
     stage_error: Exception | None = None
-    hold_verify: trio.Event | None = None
-    verify_error: Exception | None = None
+    commit_error: Exception | None = None
+    final_safety_error: UpdateOperationError | None = None
     reconnect_timeout: bool = False
 
     def check_safety(self, board_id: int) -> None:
         assert board_id == 1177
         self.calls.append("safety")
+        if self.final_safety_error is not None and "stage" in self.calls:
+            raise self.final_safety_error
 
     async def stage(self, image):
         assert image.board_id == 1177
@@ -54,17 +56,10 @@ class FakeBackend:
             await self.hold_staging.wait()
         yield image.total_size
 
-    async def verify_upload(self, image) -> None:
-        assert image.board_id == 1177
-        self.calls.append("verify")
-        if self.hold_verify is not None:
-            await self.hold_verify.wait()
-        if self.verify_error is not None:
-            raise self.verify_error
-
-    async def commit(self, board_id: int) -> None:
-        assert board_id == 1177
+    async def commit(self) -> None:
         self.calls.append("commit")
+        if self.commit_error is not None:
+            raise self.commit_error
 
     async def reboot(self) -> None:
         self.calls.append("reboot")
@@ -99,9 +94,9 @@ async def start_job(nursery, backend: FakeBackend, notifications: list[dict]):
     async def notify(job) -> None:
         notifications.append(job.json())
 
-    def make_backend(uav_id: str) -> UpdateBackend:
+    def make_backend(uav_id: str) -> ArduPilotUpdateBackend:
         assert uav_id == "1"
-        return cast(UpdateBackend, backend)
+        return cast(ArduPilotUpdateBackend, backend)
 
     coordinator = FirmwareUpdateCoordinator(nursery, make_backend, notify)
     job = coordinator.start(
@@ -143,7 +138,6 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
     assert backend.calls == [
         "safety",
         "stage",
-        "verify",
         "safety",
         "commit",
         "reboot",
@@ -155,8 +149,7 @@ async def test_full_update_survives_lost_reboot_ack() -> None:
     phases = [item["phase"] for item in notifications]
     assert phases[0] == "validating"
     assert phases[-1] == "complete"
-    assert phases.index("staging") < phases.index("verifyingUpload")
-    assert phases.index("verifyingUpload") < phases.index("committing")
+    assert phases.index("staging") < phases.index("committing")
     assert phases.index("committing") < phases.index("rebooting")
     assert phases.index("rebooting") < phases.index("reconnecting")
     assert phases.index("reconnecting") < phases.index("verifyingInstalled")
@@ -173,23 +166,6 @@ async def test_cancel_during_staging_never_commits() -> None:
         assert cancelled is job
         assert job.cancel_requested.is_set()
         assert job.cancellable is False
-        await wait_finished(job)
-        nursery.cancel_scope.cancel()
-
-    assert job.status == "cancelled"
-    assert not job.committed
-    assert "commit" not in backend.calls
-    assert coordinator._precommit_cancel_scopes == {}
-
-
-async def test_cancel_interrupts_upload_verification() -> None:
-    backend = FakeBackend(hold_verify=trio.Event())
-    async with trio.open_nursery() as nursery:
-        coordinator, job = await start_job(nursery, backend, [])
-        with trio.fail_after(2):
-            while "verify" not in backend.calls:
-                await trio.sleep(0)
-        coordinator.cancel(job.operation_id)
         await wait_finished(job)
         nursery.cancel_scope.cancel()
 
@@ -273,12 +249,8 @@ async def test_stage_transport_loss_fails_before_commit_without_reboot() -> None
     assert backend.calls == ["safety", "stage"]
 
 
-async def test_crc_mismatch_prevents_commit_rename_and_reboot() -> None:
-    backend = FakeBackend(
-        verify_error=UpdateOperationError(
-            "uploadHashMismatch", "Remote CRC32 does not match"
-        )
-    )
+async def test_put_gen_crc_failure_prevents_commit_rename_and_reboot() -> None:
+    backend = FakeBackend(stage_error=RuntimeError("CRC mismatch after MAVFTP upload"))
     async with trio.open_nursery() as nursery:
         _, job = await start_job(nursery, backend, [])
         await wait_finished(job)
@@ -286,10 +258,45 @@ async def test_crc_mismatch_prevents_commit_rename_and_reboot() -> None:
     assert job.status == "failed"
     assert job.committed is False
     assert job.error == {
-        "code": "uploadHashMismatch",
-        "detail": "Remote CRC32 does not match",
+        "code": "internalError",
+        "detail": "CRC mismatch after MAVFTP upload",
     }
-    assert backend.calls == ["safety", "stage", "verify"]
+    assert backend.calls == ["safety", "stage"]
+
+
+async def test_lost_rename_ack_is_indeterminate_and_past_cancellation() -> None:
+    backend = FakeBackend(commit_error=TimeoutError("rename ACK lost"))
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "indeterminate"
+    assert job.committed is True
+    assert job.cancellable is False
+    assert job.error == {"code": "internalError", "detail": "rename ACK lost"}
+    assert backend.calls == ["safety", "stage", "safety", "commit"]
+
+
+async def test_final_safety_rejection_is_failed_before_commit() -> None:
+    backend = FakeBackend(
+        final_safety_error=UpdateOperationError(
+            "armed", "UAV became armed while its image was staged"
+        )
+    )
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert job.status == "failed"
+    assert job.committed is False
+    assert job.cancellable is False
+    assert job.error == {
+        "code": "armed",
+        "detail": "UAV became armed while its image was staged",
+    }
+    assert backend.calls == ["safety", "stage", "safety"]
 
 
 async def test_marker_timeout_after_commit_is_indeterminate_without_retry() -> None:
@@ -415,33 +422,6 @@ async def test_lost_reboot_ack_is_included_when_disconnect_is_not_observed() -> 
         "code": "indeterminate",
         "detail": ("Reboot was not observed after the image was committed: ACK lost"),
     }
-
-
-async def test_explicit_allowed_board_set_is_used_by_parser() -> None:
-    backend = FakeBackend()
-    payload = make_apj()
-
-    async def notify(job) -> None:
-        pass
-
-    async with trio.open_nursery() as nursery:
-        coordinator = FirmwareUpdateCoordinator(
-            nursery,
-            lambda _uav_id: cast(UpdateBackend, backend),
-            notify,
-            allowed_board_ids=(),
-        )
-        job = coordinator.start(
-            uav_id="1",
-            name="arducopter.apj",
-            payload=payload,
-            sha256=hashlib.sha256(payload).hexdigest(),
-        )
-        await wait_finished(job)
-        nursery.cancel_scope.cancel()
-    assert job.status == "failed"
-    assert job.error and job.error["code"] == "unsupportedBoard"
-    assert backend.calls == []
 
 
 async def test_completed_job_releases_global_lock() -> None:

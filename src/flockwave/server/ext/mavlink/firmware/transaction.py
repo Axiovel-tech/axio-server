@@ -3,23 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Collection, Protocol
 from uuid import uuid4
 
 import trio
 
 from .apj import APJValidationError, FirmwareImage, parse_apj
 from .backend import (
+    ArduPilotUpdateBackend,
     InstalledFirmware,
-    UpdateBackend,
     UpdateOperationError,
     UpdateResultIndeterminateError,
 )
 from .model import OTAError, OTAJob
-
-
-class JobNotifier(Protocol):
-    def __call__(self, job: OTAJob) -> Awaitable[None]: ...
 
 
 class UpdateBusyError(RuntimeError):
@@ -44,14 +39,12 @@ class FirmwareUpdateCoordinator:
     def __init__(
         self,
         nursery: trio.Nursery,
-        backend_factory: Callable[[str], UpdateBackend],
-        notifier: JobNotifier,
-        allowed_board_ids: Collection[int] = (1177,),
+        backend_factory: Callable[[str], ArduPilotUpdateBackend],
+        notifier: Callable[[OTAJob], Awaitable[None]],
     ):
         self._nursery = nursery
         self._backend_factory = backend_factory
         self._notifier = notifier
-        self._allowed_board_ids = frozenset(allowed_board_ids)
         self._jobs: dict[str, OTAJob] = {}
         self._active_operation_id: str | None = None
         self._precommit_cancel_scopes: dict[str, trio.CancelScope] = {}
@@ -102,7 +95,6 @@ class FirmwareUpdateCoordinator:
                 payload,
                 expected_sha256=sha256,
                 name=job.name,
-                allowed_board_ids=self._allowed_board_ids,
             )
             job.expected.update(
                 boardId=image.board_id,
@@ -110,21 +102,41 @@ class FirmwareUpdateCoordinator:
                 version=image.version,
             )
             job.total_bytes = image.total_size
-            await self._notify(job)
+            await self._notifier(job)
             backend = self._backend_factory(job.uav_id)
             backend.check_safety(image.board_id)
             with trio.CancelScope() as scope:
                 self._precommit_cancel_scopes[job.operation_id] = scope
                 try:
                     self._raise_if_cancelled(job)
-                    await self._stage(job, backend, image)
-                    await self._verify_upload(job, backend, image)
+                    job.phase = "staging"
+                    await self._notifier(job)
+                    async for transferred in backend.stage(image):
+                        self._raise_if_cancelled(job)
+                        if transferred != job.transferred_bytes:
+                            job.transferred_bytes = transferred
+                            await self._notifier(job)
                 finally:
                     del self._precommit_cancel_scopes[job.operation_id]
             self._raise_if_cancelled(job)
-            await self._commit(job, backend, image)
+            backend.check_safety(image.board_id)
+            job.enter_commit()
+            await self._notifier(job)
+            job.committed = True
+            await backend.commit()
+            await self._notifier(job)
             await self._reboot_and_reconnect(job, backend)
-            await self._verify_installed(job, backend, image)
+            job.phase = "verifyingInstalled"
+            await self._notifier(job)
+            await backend.verify_flash_result()
+            installed = await backend.read_installed()
+            job.observed.update(
+                boardId=installed.board_id,
+                gitHash=installed.git_hash,
+                version=installed.version,
+            )
+            await self._notifier(job)
+            _check_installed(image, installed)
             job.transferred_bytes = job.total_bytes
             job.finish("success")
         except UserCancelled:
@@ -146,50 +158,21 @@ class FirmwareUpdateCoordinator:
         finally:
             if self._active_operation_id == job.operation_id:
                 self._active_operation_id = None
-            await self._notify(job)
+            await self._notifier(job)
 
-    async def _stage(
-        self, job: OTAJob, backend: UpdateBackend, image: FirmwareImage
+    async def _reboot_and_reconnect(
+        self, job: OTAJob, backend: ArduPilotUpdateBackend
     ) -> None:
-        job.set_phase("staging")
-        await self._notify(job)
-        async for transferred in backend.stage(image):
-            self._raise_if_cancelled(job)
-            if transferred != job.transferred_bytes:
-                job.transferred_bytes = transferred
-                await self._notify(job)
-
-    async def _verify_upload(
-        self, job: OTAJob, backend: UpdateBackend, image: FirmwareImage
-    ) -> None:
-        self._raise_if_cancelled(job)
-        job.set_phase("verifyingUpload")
-        await self._notify(job)
-        await backend.verify_upload(image)
-        self._raise_if_cancelled(job)
-        backend.check_safety(image.board_id)
-
-    async def _commit(
-        self, job: OTAJob, backend: UpdateBackend, image: FirmwareImage
-    ) -> None:
-        self._raise_if_cancelled(job)
-        job.enter_commit()
-        await self._notify(job)
-        await backend.commit(image.board_id)
-        job.mark_committed()
-        await self._notify(job)
-
-    async def _reboot_and_reconnect(self, job: OTAJob, backend: UpdateBackend) -> None:
-        job.set_phase("rebooting")
-        await self._notify(job)
+        job.phase = "rebooting"
+        await self._notifier(job)
         reboot_error: Exception | None = None
         try:
             await backend.reboot()
         except Exception as ex:  # noqa: BLE001
             reboot_error = ex
 
-        job.set_phase("reconnecting")
-        await self._notify(job)
+        job.phase = "reconnecting"
+        await self._notifier(job)
         try:
             await backend.wait_for_disconnect()
         except trio.TooSlowError:
@@ -199,27 +182,9 @@ class FirmwareUpdateCoordinator:
             raise IndeterminateUpdate(detail) from reboot_error
         await backend.wait_for_reconnect()
 
-    async def _verify_installed(
-        self, job: OTAJob, backend: UpdateBackend, image: FirmwareImage
-    ) -> None:
-        job.set_phase("verifyingInstalled")
-        await self._notify(job)
-        await backend.verify_flash_result()
-        installed = await backend.read_installed()
-        job.observed.update(
-            boardId=installed.board_id,
-            gitHash=installed.git_hash,
-            version=installed.version,
-        )
-        await self._notify(job)
-        _check_installed(image, installed)
-
     def _raise_if_cancelled(self, job: OTAJob) -> None:
         if job.cancel_requested.is_set():
             raise UserCancelled
-
-    async def _notify(self, job: OTAJob) -> None:
-        await self._notifier(job)
 
 
 def _check_installed(image: FirmwareImage, installed: InstalledFirmware) -> None:

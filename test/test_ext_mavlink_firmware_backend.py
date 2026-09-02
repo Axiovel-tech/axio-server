@@ -1,34 +1,24 @@
 """Tests for ArduPilot firmware target configuration and discovery."""
 
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
 
 import pytest
-import trio
 
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType
 from flockwave.server.ext.mavlink.firmware.backend import (
-    PART_PATH,
-    READY_PATH,
-    RESULT_PATHS,
     ArduPilotUpdateBackend,
     FirmwareUpdateConfiguration,
     TargetState,
     UpdateOperationError,
-    UpdateResultIndeterminateError,
     _board_id_from_version,
     _flash_failure,
-    _flight_version,
     _git_hash_from_version,
     _interrupted_flash_failure,
     _reason_detail,
     _target_reason,
-    log,
 )
-from flockwave.server.ext.mavlink.ftp import MAVFTP
 from flockwave.server.ext.show.config import AuthorizationScope
 
 
@@ -40,14 +30,16 @@ class FakeUAV:
         board_id: int,
         *,
         armed: bool = False,
-        battery: int | None = 100,
+        battery_voltage: float | None = 16,
         connected: bool = True,
         landed_state: int | None = 1,
     ):
         self.is_connected = connected
         self.scheduled_takeoff_time = None
         self.scheduled_takeoff_authorization_scope = AuthorizationScope.NONE
-        self.status = SimpleNamespace(battery=SimpleNamespace(percentage=battery))
+        self.status = SimpleNamespace(
+            battery=SimpleNamespace(voltage=battery_voltage, percentage=None)
+        )
         self._messages = {
             MAVMessageType.HEARTBEAT: SimpleNamespace(base_mode=128 if armed else 0),
             MAVMessageType.AUTOPILOT_VERSION: SimpleNamespace(
@@ -65,7 +57,9 @@ class FakeUAV:
         return self._messages.get(message_type)
 
 
-PROVISIONED = FirmwareUpdateConfiguration(provisioned_uav_ids=frozenset({"1"}))
+PROVISIONED = FirmwareUpdateConfiguration(
+    provisioned_uav_ids=frozenset({"1"}), minimum_battery_voltage=14
+)
 
 
 def make_backend(uav: FakeUAV) -> ArduPilotUpdateBackend:
@@ -160,9 +154,6 @@ def test_sitl_landed_override_does_not_weaken_hardware_safety() -> None:
     "configuration",
     [
         [],
-        {"allowed_board_ids": []},
-        {"allowed_board_ids": "1177"},
-        {"allowed_board_ids": [True]},
         {"provisioned_uav_ids": "1"},
         {"provisioned_uav_ids": [""]},
         {"provisioned_uav_ids": [7]},
@@ -172,7 +163,10 @@ def test_sitl_landed_override_does_not_weaken_hardware_safety() -> None:
         {"simulation_reported_board_id_overrides": {"0": 42}},
         {"simulation_reported_board_id_overrides": {0: 1177}},
         {"simulation_reported_board_id_overrides": []},
-        {"allowed_board_ids": [0]},
+        {"minimum_battery_voltage": 0},
+        {"minimum_battery_voltage": 100.1},
+        {"minimum_battery_voltage": True},
+        {"minimum_battery_voltage": "14"},
         {"result_timeout": 0},
         {"result_timeout": 0.09},
         {"result_timeout": 601},
@@ -222,9 +216,9 @@ def test_configuration_parses_all_bounds_and_simulation_mapping() -> None:
 
     configuration = FirmwareUpdateConfiguration.from_json(
         {
-            "allowed_board_ids": [1177, 1177],
             "provisioned_uav_ids": ["1"],
             "simulation_reported_board_id_overrides": {"0": 1177},
+            "minimum_battery_voltage": 13.2,
             "disconnect_timeout": 0.1,
             "reconnect_timeout": 600,
             "result_timeout": 3,
@@ -232,15 +226,20 @@ def test_configuration_parses_all_bounds_and_simulation_mapping() -> None:
         }
     )
     assert configuration == FirmwareUpdateConfiguration(
-        allowed_board_ids=frozenset({1177}),
         provisioned_uav_ids=frozenset({"1"}),
         simulation_reported_board_id_overrides=((0, 1177),),
+        minimum_battery_voltage=13.2,
         disconnect_timeout=0.1,
         reconnect_timeout=600.0,
         result_timeout=3.0,
         version_timeout=4.5,
     )
     assert configuration.effective_board_id(0) == 1177
+    for voltage in (0.1, 1.0, 100):
+        parsed = FirmwareUpdateConfiguration.from_json(
+            {"minimum_battery_voltage": voltage}
+        )
+        assert parsed.minimum_battery_voltage == voltage
 
 
 @pytest.mark.parametrize(
@@ -249,7 +248,7 @@ def test_configuration_parses_all_bounds_and_simulation_mapping() -> None:
         (FakeUAV(1177, connected=False), "disconnected"),
         (FakeUAV(1177, armed=True), "armed"),
         (FakeUAV(1177, landed_state=None), "notOnGround"),
-        (FakeUAV(1177, battery=29), "batteryLow"),
+        (FakeUAV(1177, battery_voltage=13.9), "batteryLow"),
         (FakeUAV(42), "unsupportedBoard"),
     ],
 )
@@ -261,10 +260,10 @@ def test_target_safety_reasons_are_reported_in_priority_order(
 
 
 def test_unknown_board_and_unknown_battery_are_handled_explicitly() -> None:
-    uav = FakeUAV(1177, battery=None)
+    uav = FakeUAV(1177, battery_voltage=None)
     del uav._messages[MAVMessageType.AUTOPILOT_VERSION]
     state = make_backend(uav).target_state()
-    assert state.power_sufficient is True
+    assert state.power_sufficient is False
     assert state.board_id is None
     assert state.compatible is False
     assert state.current_hash is None
@@ -272,8 +271,32 @@ def test_unknown_board_and_unknown_battery_are_handled_explicitly() -> None:
     assert state.reason_code == "boardUnknown"
 
 
-def test_battery_threshold_is_inclusive() -> None:
-    state = make_backend(FakeUAV(1177, battery=30)).target_state()
+def test_unknown_hardware_battery_fails_closed() -> None:
+    for voltage in (None, 0):
+        backend = make_backend(FakeUAV(1177, battery_voltage=voltage))
+        state = backend.target_state()
+        assert state.power_sufficient is False
+        assert state.reason_code == "batteryUnknown"
+        with pytest.raises(UpdateOperationError) as raised:
+            backend.check_safety(1177)
+        assert raised.value.code == "batteryUnknown"
+        assert str(raised.value) == (
+            "UAV battery voltage is unavailable or its minimum is not configured"
+        )
+
+    low = make_backend(FakeUAV(1177, battery_voltage=0.5)).target_state()
+    assert low.reason_code == "batteryLow"
+
+    unconfigured = FirmwareUpdateConfiguration(provisioned_uav_ids=frozenset({"1"}))
+    state = ArduPilotUpdateBackend(
+        cast(MAVLinkUAV, FakeUAV(1177)), unconfigured
+    ).target_state()
+    assert state.power_sufficient is False
+    assert state.reason_code == "batteryUnknown"
+
+
+def test_battery_voltage_threshold_is_inclusive() -> None:
+    state = make_backend(FakeUAV(1177, battery_voltage=14)).target_state()
     assert state.power_sufficient is True
     assert state.reason_code is None
 
@@ -288,7 +311,16 @@ def test_battery_threshold_is_inclusive() -> None:
             1177,
             "UAV does not report that it is on the ground",
         ),
-        ("batteryLow", 1177, "UAV battery is below 30%"),
+        (
+            "batteryUnknown",
+            1177,
+            "UAV battery voltage is unavailable or its minimum is not configured",
+        ),
+        (
+            "batteryLow",
+            1177,
+            "UAV battery voltage is below the configured minimum",
+        ),
         ("boardUnknown", None, "UAV board ID is not available"),
         ("unsupportedBoard", 42, "UAV board ID 42 is not supported"),
         (
@@ -343,51 +375,6 @@ def test_safety_gate_rechecks_board_and_show_state() -> None:
     assert str(authorized.value) == "UAV is authorized for a show"
 
 
-async def test_commit_rechecks_safety_after_marker_cleanup(monkeypatch) -> None:
-    uav = FakeUAV(1177)
-
-    class FTP:
-        renamed = False
-
-        async def rm(self, path: str) -> None:
-            if path == RESULT_PATHS[-1]:
-                uav._messages[MAVMessageType.HEARTBEAT].base_mode = 128
-
-        async def rename(self, _source: str, _destination: str) -> None:
-            self.renamed = True
-
-        async def aclose(self) -> None:
-            pass
-
-    ftp = FTP()
-
-    def make_ftp(candidate):
-        assert candidate is uav
-        return ftp
-
-    monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    with pytest.raises(UpdateOperationError) as raised:
-        await make_backend(uav).commit(1177)
-    assert raised.value.code == "armed"
-    assert str(raised.value) == "UAV is armed"
-    assert ftp.renamed is False
-
-
-async def test_commit_checks_board_immediately_before_atomic_rename(monkeypatch) -> None:
-    ftp = SimpleNamespace(rm=AsyncMock(), rename=AsyncMock(), aclose=AsyncMock())
-    backend = make_backend(FakeUAV(1177))
-    checked = []
-    monkeypatch.setattr(MAVFTP, "for_uav", lambda _uav: ftp)
-    monkeypatch.setattr(backend, "check_safety", checked.append)
-    await backend.commit(1177)
-    assert [call.args[0] for call in ftp.rm.await_args_list] == [
-        READY_PATH,
-        *RESULT_PATHS,
-    ]
-    assert checked == [1177]
-    ftp.rename.assert_awaited_once_with(PART_PATH, READY_PATH)
-
-
 def test_version_helpers_preserve_reported_identity() -> None:
     version = SimpleNamespace(
         board_version=1177 << 16,
@@ -397,7 +384,6 @@ def test_version_helpers_preserve_reported_identity() -> None:
     assert _board_id_from_version(None) is None
     assert _board_id_from_version(version) == 1177
     assert _board_id_from_version(SimpleNamespace()) is None
-    assert _flight_version(version.flight_sw_version) == "4.6.1"
     assert _git_hash_from_version(None) is None
     assert _git_hash_from_version(version) == "abcdef1"
     version.flight_custom_version = b"\x00" * 8
@@ -409,14 +395,12 @@ def test_version_helpers_preserve_reported_identity() -> None:
 
 
 def test_target_reason_function_allows_only_ready_supported_target() -> None:
-    allowed = frozenset({1177})
-    assert _target_reason(True, False, True, True, 1177, allowed, True) is None
+    assert _target_reason(True, False, True, True, True, 1177, True) is None
     assert (
-        _target_reason(False, True, False, False, None, allowed, False)
-        == "disconnected"
+        _target_reason(False, True, False, False, False, None, False) == "disconnected"
     )
     assert (
-        _target_reason(True, False, True, True, 1177, allowed, False)
+        _target_reason(True, False, True, True, True, 1177, False)
         == "bootloaderNotProvisioned"
     )
 
@@ -424,14 +408,6 @@ def test_target_reason_function_allows_only_ready_supported_target() -> None:
 @pytest.mark.parametrize(
     ("configuration", "detail"),
     [
-        (
-            {"allowed_board_ids": []},
-            "firmware_update.allowed_board_ids must be a non-empty list",
-        ),
-        (
-            {"allowed_board_ids": [0]},
-            "firmware_update.allowed_board_ids contains an unsupported board",
-        ),
         (
             {"provisioned_uav_ids": {}},
             "firmware_update.provisioned_uav_ids must be a list",
@@ -453,6 +429,14 @@ def test_target_reason_function_allows_only_ready_supported_target() -> None:
             "Only the simulation board override 0 -> 1177 is supported",
         ),
         (
+            {"minimum_battery_voltage": True},
+            "firmware_update.minimum_battery_voltage must be a number",
+        ),
+        (
+            {"minimum_battery_voltage": 0},
+            "firmware_update.minimum_battery_voltage must be between 0.1 and 100 volts",
+        ),
+        (
             {"result_timeout": True},
             "firmware_update.result_timeout must be a number",
         ),
@@ -466,92 +450,3 @@ def test_configuration_errors_have_stable_details(configuration, detail: str) ->
     with pytest.raises(ValueError) as raised:
         FirmwareUpdateConfiguration.from_json(configuration)
     assert str(raised.value) == detail
-
-
-class MarkerFTP:
-    def __init__(self, entries: set[str], remove_error: Exception | None = None):
-        self.entries = entries
-        self.remove_error = remove_error
-        self.removed: list[str] = []
-        self.closed = False
-
-    @asynccontextmanager
-    async def ls(self, path: str):
-        assert path == "/"
-
-        async def generate():
-            for name in self.entries:
-                yield SimpleNamespace(name=name)
-
-        yield generate()
-
-    async def rm(self, path: str) -> None:
-        self.removed.append(path)
-        if self.remove_error:
-            raise self.remove_error
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-async def test_flash_result_accepts_success_marker_and_removes_it(monkeypatch) -> None:
-    uav = FakeUAV(1177)
-    ftp = MarkerFTP({"ardupilot-flashed.abin"})
-
-    def make_ftp(candidate):
-        assert candidate is uav
-        return ftp
-
-    monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
-    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav))
-    await backend.verify_flash_result()
-    assert ftp.removed == ["/ardupilot-flashed.abin"]
-    assert ftp.closed is True
-
-
-async def test_flash_result_ignores_success_marker_cleanup_failure(monkeypatch) -> None:
-    ftp = MarkerFTP({"ardupilot-flashed.abin"}, OSError("read-only SD card"))
-    warnings = []
-    monkeypatch.setattr(MAVFTP, "for_uav", lambda _uav: ftp)
-    monkeypatch.setattr(
-        log,
-        "warning",
-        lambda message, **kwargs: warnings.append((message, kwargs)),
-    )
-    await make_backend(FakeUAV(1177)).verify_flash_result()
-    assert ftp.removed == ["/ardupilot-flashed.abin"]
-    assert ftp.closed is True
-    assert warnings == [
-        (
-            "Failed to remove ArduPilot OTA success marker",
-            {"exc_info": True, "extra": {"id": "1"}},
-        )
-    ]
-
-
-async def test_flash_result_rejects_explicit_failure_marker(monkeypatch) -> None:
-    ftp = MarkerFTP({"ardupilot-failed.abin"})
-    monkeypatch.setattr(MAVFTP, "for_uav", lambda _uav: ftp)
-    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, FakeUAV(1177)))
-    with pytest.raises(UpdateOperationError) as raised:
-        await backend.verify_flash_result()
-    assert raised.value.code == "imageRejected"
-    assert ftp.closed is True
-
-
-async def test_flash_result_times_out_as_indeterminate(monkeypatch) -> None:
-    ftp = MarkerFTP({"ardupilot-verify.abin"})
-    monkeypatch.setattr(MAVFTP, "for_uav", lambda _uav: ftp)
-    delays = []
-
-    async def wait_for_next_poll(delay: float) -> None:
-        delays.append(delay)
-        await trio.sleep_forever()
-
-    monkeypatch.setattr(trio, "sleep", wait_for_next_poll)
-    configuration = FirmwareUpdateConfiguration(result_timeout=0.1)
-    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, FakeUAV(1177)), configuration)
-    with pytest.raises(UpdateResultIndeterminateError) as raised:
-        await backend.verify_flash_result()
-    assert raised.value.code == "verificationInterrupted"
-    assert delays == [0.25]

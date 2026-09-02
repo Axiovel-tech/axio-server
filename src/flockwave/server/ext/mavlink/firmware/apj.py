@@ -10,7 +10,7 @@ import re
 import zlib
 from dataclasses import dataclass
 from hmac import compare_digest
-from typing import Any, Collection
+from typing import Any
 
 MAX_APJ_SIZE = 3 * 1024 * 1024
 MAX_IMAGE_SIZE_BY_BOARD = {1177: 1_703_936}
@@ -33,15 +33,7 @@ class FirmwareImage:
     abin: bytes
     board_id: int
     git_hash: str
-    image: bytes
-    name: str
-    sha256: str
-    signed: bool
-    version: str | None
-
-    @property
-    def size(self) -> int:
-        return len(self.image)
+    version: str
 
     @property
     def total_size(self) -> int:
@@ -53,14 +45,13 @@ def parse_apj(
     *,
     expected_sha256: str,
     name: str,
-    allowed_board_ids: Collection[int] = (1177,),
 ) -> FirmwareImage:
     """Parse and validate an APJ file without unbounded decompression."""
     _validate_envelope(payload, expected_sha256, name)
     document = _decode_document(payload)
     board_id = _require_int(document, "board_id")
     max_size = MAX_IMAGE_SIZE_BY_BOARD.get(board_id)
-    if board_id not in allowed_board_ids or max_size is None:
+    if max_size is None:
         raise APJValidationError(
             "unsupportedBoard", f"Unsupported ArduPilot board ID: {board_id}"
         )
@@ -87,10 +78,6 @@ def parse_apj(
         abin=header + image,
         board_id=board_id,
         git_hash=git_hash.lower(),
-        image=image,
-        name=name,
-        sha256=hashlib.sha256(payload).hexdigest(),
-        signed=document.get("signed_firmware") is True,
         version=version,
     )
 
@@ -153,12 +140,7 @@ def _decode_image(document: dict[str, Any], *, max_size: int) -> bytes:
         raise APJValidationError(
             "imageTooLarge", f"Firmware image exceeds the {max_size}-byte board limit"
         )
-    try:
-        image += inflater.flush(max_size + 1 - len(image))
-    except zlib.error as ex:
-        raise APJValidationError(
-            "invalidImage", "APJ image is not valid zlib data"
-        ) from ex
+    image += inflater.flush(max_size + 1 - len(image))
     if not inflater.eof or inflater.unused_data:
         raise APJValidationError(
             "invalidImage", "APJ image has incomplete or trailing zlib data"

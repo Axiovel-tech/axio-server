@@ -11,7 +11,6 @@ OTAStatus = Literal["running", "success", "failed", "cancelled", "indeterminate"
 OTAPhase = Literal[
     "validating",
     "staging",
-    "verifyingUpload",
     "committing",
     "rebooting",
     "reconnecting",
@@ -70,15 +69,9 @@ class OTAJob:
             "error": dict(self.error) if self.error else None,
         }
 
-    def set_phase(self, phase: OTAPhase) -> None:
-        self.phase = phase
-
     def enter_commit(self) -> None:
         self.phase = "committing"
         self.cancellable = False
-
-    def mark_committed(self) -> None:
-        self.committed = True
 
     def finish(self, status: OTAStatus, error: OTAError | None = None) -> None:
         self.status = status

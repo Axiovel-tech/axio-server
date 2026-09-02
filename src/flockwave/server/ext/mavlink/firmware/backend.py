@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from contextlib import aclosing
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncIterator, Protocol, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, cast
 
 import trio
 
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.logger import log as base_log
-from flockwave.server.show.utils import crc32_mavftp
 
 from ..enums import MAVLandedState, MAVMessageType, MAVModeFlag
 from ..ftp import MAVFTP, MAVFTPErrorCode, OperationNotAcknowledgedError
+from ..utils import mavlink_version_number_to_semver
+from .apj import MAX_IMAGE_SIZE_BY_BOARD
 
 if TYPE_CHECKING:
     from ..driver import MAVLinkUAV
@@ -58,9 +59,9 @@ class InstalledFirmware:
 class FirmwareUpdateConfiguration:
     """Validated MAVLink extension settings for application firmware OTA."""
 
-    allowed_board_ids: frozenset[int] = frozenset((1177,))
     provisioned_uav_ids: frozenset[str] = frozenset()
     simulation_reported_board_id_overrides: tuple[tuple[int, int], ...] = ()
+    minimum_battery_voltage: float | None = None
     disconnect_timeout: float = 15.0
     reconnect_timeout: float = 180.0
     result_timeout: float = 15.0
@@ -73,15 +74,16 @@ class FirmwareUpdateConfiguration:
         if not isinstance(value, dict):
             raise ValueError("firmware_update must be an object")
         configuration = cast(dict[str, Any], value)
-        allowed = _parse_board_ids(configuration.get("allowed_board_ids", [1177]))
         provisioned = _parse_uav_ids(configuration.get("provisioned_uav_ids", []))
         overrides = _parse_board_overrides(
             configuration.get("simulation_reported_board_id_overrides", {})
         )
         return cls(
-            allowed_board_ids=frozenset(allowed),
             provisioned_uav_ids=frozenset(provisioned),
             simulation_reported_board_id_overrides=tuple(overrides.items()),
+            minimum_battery_voltage=_parse_optional_voltage(
+                configuration.get("minimum_battery_voltage")
+            ),
             disconnect_timeout=_parse_timeout(
                 configuration, "disconnect_timeout", 15.0
             ),
@@ -103,26 +105,6 @@ class FirmwareUpdateConfiguration:
         )
 
 
-class UpdateBackend(Protocol):
-    def check_safety(self, board_id: int) -> None: ...
-
-    def stage(self, image: FirmwareImage) -> AsyncIterator[int]: ...
-
-    async def verify_upload(self, image: FirmwareImage) -> None: ...
-
-    async def commit(self, board_id: int) -> None: ...
-
-    async def reboot(self) -> None: ...
-
-    async def wait_for_disconnect(self) -> None: ...
-
-    async def wait_for_reconnect(self) -> None: ...
-
-    async def read_installed(self) -> InstalledFirmware: ...
-
-    async def verify_flash_result(self) -> None: ...
-
-
 class ArduPilotUpdateBackend:
     """Runs an SD-staged update against one connected ArduPilot UAV."""
 
@@ -141,25 +123,32 @@ class ArduPilotUpdateBackend:
         armed = bool(heartbeat and heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value)
         reported_board_id = _board_id_from_version(version)
         board_id = self._configuration.effective_board_id(reported_board_id)
-        on_ground = self._configuration.is_simulated_board(reported_board_id) or bool(
+        simulated = self._configuration.is_simulated_board(reported_board_id)
+        on_ground = simulated or bool(
             extended_state
             and extended_state.landed_state == MAVLandedState.ON_GROUND.value
         )
-        percentage = self._uav.status.battery.percentage
-        power_sufficient = percentage is None or percentage >= 30
+        voltage = self._uav.status.battery.voltage
+        threshold = self._configuration.minimum_battery_voltage
+        power_observed = simulated or bool(
+            threshold is not None and voltage is not None and voltage > 0
+        )
+        power_sufficient = simulated or bool(
+            threshold is not None and voltage is not None and voltage >= threshold
+        )
         reason = _target_reason(
             self._uav.is_connected,
             armed,
             on_ground,
+            power_observed,
             power_sufficient,
             board_id,
-            self._configuration.allowed_board_ids,
             self._uav.id in self._configuration.provisioned_uav_ids,
         )
         return TargetState(
             id=self._uav.id,
             compatible=(
-                board_id in self._configuration.allowed_board_ids
+                board_id in MAX_IMAGE_SIZE_BY_BOARD
                 and self._uav.id in self._configuration.provisioned_uav_ids
             ),
             connected=self._uav.is_connected,
@@ -169,7 +158,9 @@ class ArduPilotUpdateBackend:
             board_id=board_id,
             current_hash=_git_hash_from_version(version),
             current_version=(
-                _flight_version(version.flight_sw_version) if version else None
+                mavlink_version_number_to_semver(version.flight_sw_version)
+                if version
+                else None
             ),
             reason_code=reason,
         )
@@ -194,31 +185,19 @@ class ArduPilotUpdateBackend:
     async def stage(self, image: FirmwareImage) -> AsyncIterator[int]:
         async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
             await _remove_if_present(ftp, PART_PATH)
+            await _remove_if_present(ftp, READY_PATH)
+            for path in RESULT_PATHS:
+                await _remove_if_present(ftp, path)
             async with ftp.put_gen(image.abin, PART_PATH) as progress:
                 async for item in progress:
                     percentage = item.percentage or 0
                     yield min(image.total_size, image.total_size * percentage // 100)
 
-    async def verify_upload(self, image: FirmwareImage) -> None:
-        expected = crc32_mavftp(image.abin)
+    async def commit(self) -> None:
         async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
-            observed = await ftp.crc32(PART_PATH)
-        if observed != expected:
-            raise UpdateOperationError(
-                "uploadHashMismatch",
-                f"Remote CRC32 {observed:08x} does not match {expected:08x}",
-            )
-
-    async def commit(self, board_id: int) -> None:
-        async with aclosing(MAVFTP.for_uav(self._uav)) as ftp:
-            await _remove_if_present(ftp, READY_PATH)
-            for path in RESULT_PATHS:
-                await _remove_if_present(ftp, path)
-            self.check_safety(board_id)
             await ftp.rename(PART_PATH, READY_PATH)
 
     async def reboot(self) -> None:
-        self._uav._clear_autopilot_capabilities()
         await self._uav.reboot_after_update()
 
     async def wait_for_disconnect(self) -> None:
@@ -228,27 +207,25 @@ class ArduPilotUpdateBackend:
 
     async def wait_for_reconnect(self) -> None:
         with trio.fail_after(self._configuration.reconnect_timeout):
-            while not self._uav.is_connected:
-                await trio.sleep(0.5)
+            await self._uav.wait_until_connected()
 
     async def read_installed(self) -> InstalledFirmware:
         with trio.fail_after(self._configuration.version_timeout):
+            self._uav.invalidate_version_info()
             await self._uav.get_version_info()
-            while True:
-                message = self._uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
-                if message is not None:
-                    return InstalledFirmware(
-                        board_id=self._configuration.effective_board_id(
-                            _board_id_from_version(message)
-                        )
-                        or 0,
-                        git_hash=bytes(message.flight_custom_version)
-                        .rstrip(b"\x00")
-                        .decode("ascii", errors="replace")
-                        .lower(),
-                        version=_flight_version(message.flight_sw_version),
-                    )
-                await trio.sleep(0.2)
+        message = self._uav.get_last_message(MAVMessageType.AUTOPILOT_VERSION)
+        if message is None:
+            raise RuntimeError("Autopilot version was not cached after requesting it")
+        board_id = self._configuration.effective_board_id(
+            _board_id_from_version(message)
+        )
+        if board_id is None:
+            raise RuntimeError("Fresh autopilot version has no board identity")
+        return InstalledFirmware(
+            board_id=board_id,
+            git_hash=_git_hash_from_version(message) or "",
+            version=mavlink_version_number_to_semver(message.flight_sw_version),
+        )
 
     async def verify_flash_result(self) -> None:
         with trio.move_on_after(self._configuration.result_timeout):
@@ -283,12 +260,8 @@ class UpdateOperationError(RuntimeError):
         self.code = code
 
 
-class UpdateResultIndeterminateError(RuntimeError):
+class UpdateResultIndeterminateError(UpdateOperationError):
     """A committed update whose terminal bootloader result is not observable."""
-
-    def __init__(self, code: str, detail: str):
-        super().__init__(detail)
-        self.code = code
 
 
 async def _remove_if_present(ftp: MAVFTP, path: str) -> None:
@@ -310,9 +283,9 @@ def _target_reason(
     connected: bool,
     armed: bool,
     on_ground: bool,
+    power_observed: bool,
     power_sufficient: bool,
     board_id: int | None,
-    allowed_board_ids: frozenset[int],
     bootloader_provisioned: bool,
 ) -> str | None:
     if not connected:
@@ -321,34 +294,33 @@ def _target_reason(
         return "armed"
     if not on_ground:
         return "notOnGround"
-    if not power_sufficient:
-        return "batteryLow"
     if board_id is None:
         return "boardUnknown"
-    if board_id not in allowed_board_ids:
+    if board_id not in MAX_IMAGE_SIZE_BY_BOARD:
         return "unsupportedBoard"
     if not bootloader_provisioned:
         return "bootloaderNotProvisioned"
+    if not power_observed:
+        return "batteryUnknown"
+    if not power_sufficient:
+        return "batteryLow"
     return None
 
 
 def _reason_detail(state: TargetState) -> str:
-    details = {
+    details: dict[str | None, str] = {
         "disconnected": "UAV is disconnected",
         "armed": "UAV is armed",
         "notOnGround": "UAV does not report that it is on the ground",
-        "batteryLow": "UAV battery is below 30%",
+        "batteryUnknown": (
+            "UAV battery voltage is unavailable or its minimum is not configured"
+        ),
+        "batteryLow": "UAV battery voltage is below the configured minimum",
         "boardUnknown": "UAV board ID is not available",
         "unsupportedBoard": f"UAV board ID {state.board_id} is not supported",
         "bootloaderNotProvisioned": "UAV is not provisioned with the OTA bootloader",
     }
-    if state.reason_code is None:
-        return "UAV is not ready for an update"
     return details.get(state.reason_code, "UAV is not ready for an update")
-
-
-def _flight_version(value: int) -> str:
-    return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8))
 
 
 def _flash_failure(entries: set[str]) -> tuple[str, str] | None:
@@ -373,19 +345,6 @@ def _git_hash_from_version(version) -> str | None:
     raw_hash = bytes(version.flight_custom_version).rstrip(b"\x00")
     text = raw_hash.decode(errors="replace")
     return text.lower() or None
-
-
-def _parse_board_ids(value: object) -> set[int]:
-    if not isinstance(value, list) or not value:
-        raise ValueError("firmware_update.allowed_board_ids must be a non-empty list")
-    board_ids: set[int] = set()
-    for item in value:
-        if type(item) is not int or item != 1177:
-            raise ValueError(
-                "firmware_update.allowed_board_ids contains an unsupported board"
-            )
-        board_ids.add(item)
-    return board_ids
 
 
 def _parse_uav_ids(value: object) -> set[str]:
@@ -418,6 +377,19 @@ def _parse_board_overrides(value: object) -> dict[int, int]:
             )
         overrides[0] = 1177
     return overrides
+
+
+def _parse_optional_voltage(value: object) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError("firmware_update.minimum_battery_voltage must be a number")
+    voltage = float(value)
+    if not 0.1 <= voltage <= 100:
+        raise ValueError(
+            "firmware_update.minimum_battery_voltage must be between 0.1 and 100 volts"
+        )
+    return voltage
 
 
 def _parse_timeout(value: dict[str, Any], key: str, default: float) -> float:
