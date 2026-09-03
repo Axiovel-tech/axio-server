@@ -666,9 +666,10 @@ from the reference. Response:
   "type": "X-RTLS-GEOM",
   "tolerance": 0.02,
   "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+  "references": {"default": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]},
   "consistent": false,
   "devices": {
-    "42": {"id": 42, "status": "agree", "state": 3, "stateName": "calibrated",
+    "42": {"id": 42, "cell": "default", "status": "agree", "state": 3, "stateName": "calibrated",
            "residualM": -0.075, "driftM": 0.002,
            "distancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
            "maxDeviationM": 0.001},
@@ -683,16 +684,21 @@ from the reference. Response:
 }
 ```
 
-Per-tag `status`: `agree` / `deviates` (graded against `reference`, with
-`maxDeviationM` and the offending `deviations`), or `manual` (uses its
-provisioned table), `calibrating`, `failed` (AN1..AN3 not all heard;
-the firmware retries), `stale` (stats older than 10 s) and `unknown` (no
-geometry telemetry, i.e. firmware without automatic geometry). Anchors
-are never graded. `reference` is `null` until at least one tag is
-calibrated. `consistent` is true when at least one tag agrees and none
-deviates, is still calibrating, failed, went silent or is unknown;
-manual tags are reported but do not block — the table is the operator's
-deliberate choice.
+Per-tag `status`: `agree` / `deviates` (graded against the reference of
+the tag's cell, with `maxDeviationM` and the offending `deviations`),
+`drifted` (the live initiator distances moved more than `tolerance` away
+from the fit — a tripod moved after calibration; recalibrate), or
+`manual` (uses its provisioned table), `calibrating`, `failed`
+(AN1..AN3 not all heard; the firmware retries), `stale` (stats older
+than 10 s) and `unknown` (no geometry telemetry, i.e. firmware without
+automatic geometry). Every entry names its `cell` (`CELL_ID`); tags are
+compared within their cell only, `references` holds one reference per
+cell and `reference` is that of the only cell (`null` with none or
+several). Anchors — by advertised role, or `UWB_ROLE` when the
+advertisement is absent — are never graded. `consistent` is true when at
+least one cell has a reference and no tag deviates, drifted, is still
+calibrating, failed, went silent or is unknown; manual tags are reported
+but do not block — the table is the operator's deliberate choice.
 
 A fit is repeated on the tag with `UWB_GEOM_RECAL=1` (through
 `X-RTLS-PARAM-SET`); the residual and drift readouts are also

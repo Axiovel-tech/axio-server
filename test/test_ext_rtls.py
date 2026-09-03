@@ -3653,3 +3653,82 @@ async def test_geom_anchors_are_not_graded(extension, device, builder, hub):
     response = await geom_message(extension, builder, hub)
     assert response.body["devices"] == {}
     assert response.body["consistent"] is False
+
+
+async def test_geom_flags_live_drift_as_blocking(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    # same fit, but this tag's live distances moved 5 cm since (a tripod)
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+    )
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is False
+    drifted = body["devices"][str(DEVICE_SYSID + 1)]
+    assert drifted["status"] == "drifted"
+    assert "5.0 cm" in drifted["detail"]
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # the verify rule blocks on it too
+    wire_verify_fleet(extension, device, dialect)
+    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.05
+    response = await verify_message(extension, builder, hub)
+    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
+    assert rule["status"] == "fail"
+    assert "moved" in rule["detail"]
+
+
+async def test_geom_references_are_per_cell(extension, device, dialect, builder, hub):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "CELL_ID", "other", "custom")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    # a legitimately different cell: every distance 50 cm longer
+    other = {
+        **GEOM_STATS,
+        **{f"gd{i + 1}": d + 0.5 for i, d in enumerate(FLEET_DISTANCES)},
+    }
+    await _feed_stats(extension, second, other, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is True
+    assert body["reference"] is None  # two cells: no single reference
+    assert set(body["references"]) == {"default", "other"}
+    assert body["references"]["other"][0] == pytest.approx(
+        FLEET_DISTANCES[0] + 0.5, abs=1e-4
+    )
+    assert (
+        body["devices"][str(DEVICE_SYSID)] | {"cell": "default"}
+        == body["devices"][str(DEVICE_SYSID)]
+    )
+    assert body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "other"
+    assert all(entry["status"] == "agree" for entry in body["devices"].values())
+
+
+async def test_geom_honors_the_advertised_role(extension, device, builder, hub):
+    # an anchor known from its state advertisement whose UWB_ROLE has not
+    # reached the parameter cache yet must not be graded as a tag
+    await discover(extension, device)
+    device_params = extension._protocol.devices[DEVICE_SYSID].params
+    device_params.pop("UWB_ROLE", None)
+    extension._adv[DEVICE_SYSID] = {"role": "anchor-responder"}
+    await _feed_stats(extension, device, FULL_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"] == {}

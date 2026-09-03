@@ -20,7 +20,8 @@ import time
 from statistics import median_low
 from typing import TYPE_CHECKING, Any, Optional
 
-from .extension import _decoded_device_params
+from .cell_compat import role_from_params
+from .extension import _cell_id_from_params, _decoded_device_params
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -33,7 +34,9 @@ __all__ = (
 )
 
 #: a fitted distance farther than this from the fleet's median reference
-#: marks the drone as deviating, metres. Bench: independent fits of the
+#: marks the drone as deviating, metres; a live initiator distance that
+#: drifted farther than this from its calibrated value marks the drone as
+#: drifted (a tripod moved after the fit). Bench: independent fits of the
 #: same cell agree within ~4 mm; a moved tripod shows as centimetres.
 DEFAULT_TOLERANCE_M = 0.02
 
@@ -54,15 +57,26 @@ STATE_MANUAL = 0
 STATE_CALIBRATED = 3
 
 
+def _is_tag(ext: "RtlsExtension", system_id: int, params: dict[str, Any]) -> bool:
+    """Whether a device is (or may still turn out to be) a tag. The state
+    advertisement names the role before the parameter cache does, so it
+    is consulted first, as X-RTLS-INF does; a device of unknown role is
+    graded (and reported as ``unknown``) rather than silently skipped."""
+    role = ext._adv.get(system_id, {}).get("role") or role_from_params(params)
+    return role is None or role == "tag"
+
+
 def _entry_for(
     system_id: int,
+    cell: str,
     stats: Optional[dict[str, Any]],
     stats_age: float,
+    tolerance: float,
 ) -> dict[str, Any]:
     """The per-device entry before the fleet comparison: everything the
     tag reports about its own fit, plus a status for the tags that
     cannot take part in the comparison."""
-    entry: dict[str, Any] = {"id": system_id}
+    entry: dict[str, Any] = {"id": system_id, "cell": cell}
     if not stats or "geometryState" not in stats:
         entry["status"] = "unknown"
         entry["detail"] = "no geometry telemetry (firmware without automatic geometry?)"
@@ -96,6 +110,17 @@ def _entry_for(
         entry["detail"] = "calibrated but the fitted distances have not arrived yet"
         return entry
     entry["distancesM"] = list(distances)
+    drift = float(stats.get("geometryDriftM", 0.0))
+    if drift > tolerance:
+        # the fit still describes the cell as it was at boot: the live
+        # distances say an anchor has moved since, so the table is stale
+        # even if every tag agrees on it
+        entry["status"] = "drifted"
+        entry["detail"] = (
+            f"an initiator distance moved {drift * 100:.1f} cm since the fit "
+            "(a tripod moved?) — recalibrate"
+        )
+        return entry
     entry["status"] = "candidate"
     return entry
 
@@ -172,11 +197,14 @@ def run_agreement(
     """Compares the fleet's fitted geometries; returns the X-RTLS-GEOM
     response body.
 
-    Tags (role 1, or unknown role) among the live devices are graded:
-    ``agree`` / ``deviates`` against the per-distance median of the
-    calibrated tags, or ``manual`` / ``calibrating`` / ``failed`` /
-    ``stale`` / ``unknown`` when they cannot take part. ``consistent`` is
-    true when at least one tag agrees and no tag deviates, is still
+    Tags (role 1, or unknown role) among the live devices are graded per
+    cell (``CELL_ID``): ``agree`` / ``deviates`` against the per-distance
+    lower median of that cell's calibrated tags, ``drifted`` when the live
+    distances moved away from the fit, or ``manual`` / ``calibrating`` /
+    ``failed`` / ``stale`` / ``unknown`` when they cannot take part.
+    ``references`` holds one reference per cell; ``reference`` is that of
+    the only cell (``None`` with none or several). ``consistent`` is true
+    when at least one tag agrees and no tag deviates, drifted, is still
     calibrating, failed, stale or unknown — manual tags are reported but
     do not block, their table is the operator's deliberate choice."""
     protocol = ext._require_protocol()
@@ -186,27 +214,38 @@ def run_agreement(
     for system_id, device in sorted(protocol.devices.items()):
         if ids is not None and system_id not in ids:
             continue
-        role = _decoded_device_params(device).get("UWB_ROLE")
-        if role is not None and role != 1:
+        params = _decoded_device_params(device)
+        if not _is_tag(ext, system_id, params):
             continue  # anchors carry no fit
         stats = ext._stats.get(system_id)
         stats_age = now - ext._stats_at.get(system_id, float("-inf"))
-        entries[str(system_id)] = _entry_for(system_id, stats, stats_age)
+        entries[str(system_id)] = _entry_for(
+            system_id, _cell_id_from_params(params), stats, stats_age, tolerance
+        )
 
-    candidates = [e for e in entries.values() if e["status"] == "candidate"]
-    reference = _reference(candidates)
-    if reference is not None:
+    references: dict[str, list[Optional[float]]] = {}
+    for cell in sorted({entry["cell"] for entry in entries.values()}):
+        candidates = [
+            e
+            for e in entries.values()
+            if e["status"] == "candidate" and e["cell"] == cell
+        ]
+        reference = _reference(candidates)
+        if reference is None:
+            continue
+        references[cell] = reference
         for entry in candidates:
             _compare(entry, reference, tolerance)
 
-    blocking = {"deviates", "calibrating", "failed", "stale", "unknown"}
-    consistent = bool(candidates) and not any(
+    blocking = {"deviates", "drifted", "calibrating", "failed", "stale", "unknown"}
+    consistent = bool(references) and not any(
         entry["status"] in blocking for entry in entries.values()
     )
     return {
         "type": "X-RTLS-GEOM",
         "tolerance": tolerance,
-        "reference": reference,
+        "reference": next(iter(references.values())) if len(references) == 1 else None,
+        "references": references,
         "consistent": consistent,
         "devices": entries,
     }
