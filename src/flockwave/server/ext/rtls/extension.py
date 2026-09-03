@@ -583,6 +583,14 @@ class RtlsExtension(Extension):
             entry["role"] = kind
         if advertisement.uptime_ms is not None:
             entry["uptimeMs"] = int(advertisement.uptime_ms)
+            previous = self._adv.get(advertisement.system_id, {}).get("uptimeMs")
+            if previous is not None and entry["uptimeMs"] < previous:
+                # the board rebooted (an OTA, a power cycle): the stats
+                # accumulated so far may describe firmware it no longer
+                # runs — a downgrade would keep emitting the legacy fields
+                # while the geometry ones silently stop, and the cached
+                # copies would stay "fresh" forever
+                self._forget_stats(advertisement.system_id)
         self._adv[advertisement.system_id] = entry
         frames = _sanitized_advertisement_frames(data, advertisement.system_id)
         if frames:
@@ -1152,6 +1160,16 @@ class RtlsExtension(Extension):
         hub = self.app.message_hub
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
         await hub.broadcast_message(hub.create_notification(body))
+
+    def _forget_stats(self, system_id: int) -> None:
+        """Drops every cached stat of a device, including the SDK's
+        per-field accumulator, so the next snapshot only carries what the
+        running firmware actually emits."""
+        self._stats.pop(system_id, None)
+        self._stats_at.pop(system_id, None)
+        device = self._protocol.devices.get(system_id) if self._protocol else None
+        if device is not None:
+            device.stats.clear()
 
     async def _on_stats(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache the latest health-telemetry snapshot for a device and

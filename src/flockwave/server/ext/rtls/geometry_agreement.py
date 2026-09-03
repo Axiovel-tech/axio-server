@@ -235,8 +235,21 @@ def _frame_names(entry: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _frame_value(name: str, value: Any) -> Any:
+    """A frame parameter as compared across the cell: a non-finite real
+    is not a value (``None``, so the tag stays ``incomplete`` rather than
+    certified on an invalid yaw or bias); the show yaw is one revolution
+    modulo, 0 and 360 being the same rotation."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if name == "POS_YAW_DEG":
+            return round(value % 360.0, 6) % 360.0
+    return value
+
+
 def _frame_of(params: dict[str, Any], names: tuple[str, ...]) -> tuple[Any, ...]:
-    return tuple(params.get(name) for name in names)
+    return tuple(_frame_value(name, params.get(name)) for name in names)
 
 
 def _cell_known(device: Any, params: dict[str, Any]) -> bool:

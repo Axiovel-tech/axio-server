@@ -3772,6 +3772,37 @@ async def test_geom_waits_for_the_cell_id_of_a_partial_listing(
     assert response.body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "default"
 
 
+async def test_geom_forgets_the_stats_of_a_rebooted_tag(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # the board reboots (uptime goes backwards) into firmware that only
+    # emits the legacy fields: the accumulated geometry must not outlive it
+    extension._parse_advertisement = stub_advertisement_parser(
+        kind="tag", uptime_ms=120_000
+    )
+    await extension._process_advertisement(
+        make_advertisement(device), ADV_SOURCE, time.monotonic()
+    )
+    extension._parse_advertisement = stub_advertisement_parser(
+        kind="tag", uptime_ms=5_000
+    )
+    await extension._process_advertisement(
+        make_advertisement(device), ADV_SOURCE, time.monotonic()
+    )
+    assert DEVICE_SYSID not in extension._stats
+    await _feed_stats(extension, device, FULL_STATS, now=time.monotonic())
+    assert "geometryState" not in extension._stats[DEVICE_SYSID]
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "unknown"
+
+
 async def test_geom_references_are_per_cell(extension, device, dialect, builder, hub):
     add_rtls_cell_params(device)
     second = make_second_tag(dialect)
@@ -3897,6 +3928,28 @@ async def test_geom_flags_a_differing_coordinate_frame(
         413900000,
         "int32",
     )
+    # the same rotation written as 360 is not a differing frame...
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 450.0, "real32"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert "frame" not in response.body["devices"][str(DEVICE_SYSID + 1)]
+    # ...while a non-finite yaw is no frame at all
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "POS_YAW_DEG",
+        float("inf"),
+        "real32",
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "incomplete"
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["missingParams"] == [
+        "POS_YAW_DEG"
+    ]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 90.0, "real32"
+    )
+
     # a different anchor count consumes a different table
     set_cached_param(
         extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 4, "uint8"
