@@ -345,7 +345,9 @@ def run_agreement(
         if not _is_tag(ext, system_id, params):
             continue  # anchors carry no fit
         stats = ext._stats.get(system_id)
-        stats_age = now - ext._stats_at.get(system_id, float("-inf"))
+        # the geometry fields' own receipt time: the legacy stats keep a
+        # snapshot "fresh" long after a downgraded tag stopped sending them
+        stats_age = now - ext._geom_at.get(system_id, float("-inf"))
         entry = _entry_for(
             system_id, _cell_id_from_params(params), stats, stats_age, tolerance
         )

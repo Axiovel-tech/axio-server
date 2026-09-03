@@ -1868,12 +1868,14 @@ async def test_inf_sleeping_omitted_when_latch_stale(extension, device):
 # ---- X-RTLS-STATS health telemetry --------------------------------------
 
 
-async def _feed_stats(extension, device, values, now):
+async def _feed_stats(extension, device, values, now, boot_ms=0):
     """Feed one NAMED_VALUE_FLOAT per stat at a controlled monotonic time,
     mirroring the firmware's per-stat emit cycle."""
     for name, value in values.items():
         await extension._process_datagram(
-            device.named_value_float(name, value), device.address, now
+            device.named_value_float(name, value, time_boot_ms=boot_ms),
+            device.address,
+            now,
         )
 
 
@@ -3289,6 +3291,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "geometryDistancesM": list(FLEET_DISTANCES),
         }
         extension._stats_at[sysid] = time.monotonic()
+        extension._geom_at[sysid] = time.monotonic()
     return second
 
 
@@ -3436,7 +3439,9 @@ async def test_verify_flags_silent_telemetry_as_stale(
     )
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
+    extension._geom_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now - 60  # stream went silent
+    extension._geom_at[DEVICE_SYSID + 1] = now - 60  # stream went silent
 
     response = await verify_message(extension, builder, hub)
 
@@ -3455,7 +3460,9 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     )
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
+    extension._geom_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now
+    extension._geom_at[DEVICE_SYSID + 1] = now
     # 0 and 360 are the same yaw: must NOT fail the fleet
     extension.app.find_uav_by_id = lambda uav_id: {
         "05": StubUAV({"EK3_SRC1_YAW": 9.0, "EK3_SRC_VC_YAW": 0.0}),
@@ -3660,6 +3667,7 @@ async def test_geom_reports_uncalibrated_manual_stale_and_unknown_tags(
     # silence makes a fit stale
     extension._stats[DEVICE_SYSID]["geometryState"] = 3
     extension._stats_at[DEVICE_SYSID] = now - 60
+    extension._geom_at[DEVICE_SYSID] = now - 60
     response = await geom_message(extension, builder, hub)
     assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "stale"
 
@@ -3770,6 +3778,44 @@ async def test_geom_waits_for_the_cell_id_of_a_partial_listing(
     response = await geom_message(extension, builder, hub)
     assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
     assert response.body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "default"
+
+
+async def test_geom_freshness_follows_the_geometry_fields(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    # the geometry arrived a while ago; only the legacy stats kept flowing
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic() - 30.0)
+    await _feed_stats(extension, device, FULL_STATS, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "stale"
+    # a fresh geometry tick certifies again
+    await _feed_stats(extension, device, {"geom": 3.0}, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+
+async def test_geom_forgets_the_stats_after_a_boot_clock_rewind(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(
+        extension, device, GEOM_STATS, now=time.monotonic(), boot_ms=600_000
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+    # rebooted into firmware that only emits the legacy fields, with no
+    # advertisement to say so: the stat clock rewinding is the evidence
+    await _feed_stats(
+        extension, device, FULL_STATS, now=time.monotonic(), boot_ms=2_000
+    )
+    assert "geometryState" not in extension._stats[DEVICE_SYSID]
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "unknown"
 
 
 async def test_geom_forgets_the_stats_of_a_rebooted_tag(
