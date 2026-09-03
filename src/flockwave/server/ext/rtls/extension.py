@@ -2576,8 +2576,11 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         body["geometryDriftM"] = round(float(data["gdrift"]), 4)
     distances = [data.get(f"gd{i}") for i in range(1, 8)]
     if any(d is not None for d in distances):
+        # the firmware sends 0 for a plane it did not fit (a four-anchor
+        # cell, or a recalibration that lost the top plane): not a distance
         body["geometryDistancesM"] = [
-            round(float(d), 4) if d is not None else None for d in distances
+            round(float(d), 4) if d is not None and float(d) > 0.0 else None
+            for d in distances
         ]
     return body
 

@@ -104,12 +104,18 @@ def _entry_for(
             else "could not fit the cell (AN1..AN3 not all heard); retrying"
         )
         return entry
-    distances = stats.get("geometryDistancesM")
-    if not distances or not any(d is not None for d in distances):
+    distances = list(stats.get("geometryDistancesM") or [])
+    distances += [None] * (7 - len(distances))
+    # The stats arrive one field at a time: certify only a complete fit —
+    # the three bottom-plane distances, plus either all four or none of
+    # the top plane (the firmware zeroes the top plane it did not fit).
+    bottom_complete = all(d is not None for d in distances[:3])
+    top = [d is not None for d in distances[3:7]]
+    if not bottom_complete or (any(top) and not all(top)):
         entry["status"] = "calibrating"
-        entry["detail"] = "calibrated but the fitted distances have not arrived yet"
+        entry["detail"] = "calibrated but the fitted distances have not all arrived yet"
         return entry
-    entry["distancesM"] = list(distances)
+    entry["distancesM"] = distances
     drift = float(stats.get("geometryDriftM", 0.0))
     if drift > tolerance:
         # the fit still describes the cell as it was at boot: the live
@@ -187,6 +193,44 @@ def _compare(
         entry["status"] = "agree"
 
 
+#: parameters that place the fitted cell in the world: the origin the NED
+#: frame hangs off and the show-frame yaw. Identical distances are not the
+#: same cell if these differ, so the graded tags of one cell must agree on
+#: them too (the removed X-RTLS-GEO check compared them as well).
+FRAME_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "POS_YAW_DEG")
+
+
+def _frame_of(params: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(params.get(name) for name in FRAME_PARAMS)
+
+
+def _check_frames(protocol: Any, graded: list[dict[str, Any]]) -> None:
+    """Downgrades graded tags whose coordinate-frame parameters differ from
+    the majority of their cell to ``frame`` (blocking). A parameter absent
+    from a tag's cache is not compared (older registries, dump-loss holes)."""
+    frames = {
+        entry["id"]: _frame_of(_decoded_device_params(protocol.devices[entry["id"]]))
+        for entry in graded
+    }
+    complete = [f for f in frames.values() if all(v is not None for v in f)]
+    if len(complete) < 2:
+        return
+    majority = max(set(complete), key=complete.count)
+    for entry in graded:
+        differing = [
+            name
+            for name, value, ref in zip(FRAME_PARAMS, frames[entry["id"]], majority)
+            if value is not None and ref is not None and value != ref
+        ]
+        if differing:
+            entry["status"] = "frame"
+            entry["frame"] = differing
+            entry["detail"] = (
+                "coordinate frame differs from the rest of the cell: "
+                + ", ".join(differing)
+            )
+
+
 def run_agreement(
     ext: "RtlsExtension",
     *,
@@ -200,7 +244,9 @@ def run_agreement(
     Tags (role 1, or unknown role) among the live devices are graded per
     cell (``CELL_ID``): ``agree`` / ``deviates`` against the per-distance
     lower median of that cell's calibrated tags, ``drifted`` when the live
-    distances moved away from the fit, or ``manual`` / ``calibrating`` /
+    distances moved away from the fit, ``frame`` when the origin or
+    show-yaw parameters differ from the cell's majority, or ``manual`` /
+    ``calibrating`` /
     ``failed`` / ``stale`` / ``unknown`` when they cannot take part.
     ``references`` holds one reference per cell; ``reference`` is that of
     the only cell (``None`` with none or several). ``consistent`` is true
@@ -236,8 +282,17 @@ def run_agreement(
         references[cell] = reference
         for entry in candidates:
             _compare(entry, reference, tolerance)
+        _check_frames(protocol, candidates)
 
-    blocking = {"deviates", "drifted", "calibrating", "failed", "stale", "unknown"}
+    blocking = {
+        "deviates",
+        "drifted",
+        "frame",
+        "calibrating",
+        "failed",
+        "stale",
+        "unknown",
+    }
     consistent = bool(references) and not any(
         entry["status"] in blocking for entry in entries.values()
     )

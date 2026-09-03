@@ -3732,3 +3732,75 @@ async def test_geom_honors_the_advertised_role(extension, device, builder, hub):
 
     response = await geom_message(extension, builder, hub)
     assert response.body["devices"] == {}
+
+
+async def test_geom_waits_for_a_complete_distance_vector(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    # only the first distance has arrived so far
+    partial = {
+        k: val
+        for k, val in GEOM_STATS.items()
+        if k not in ("gd2", "gd3", "gd4", "gd5", "gd6", "gd7")
+    }
+    await _feed_stats(extension, device, partial, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "calibrating"
+    assert response.body["consistent"] is False
+    # a half top plane is equally incomplete
+    await _feed_stats(
+        extension, device, {"gd2": 9.2, "gd3": 12.5, "gd4": 4.0}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "calibrating"
+    # a four-anchor cell reports zeros for the top plane: complete
+    await _feed_stats(
+        extension,
+        device,
+        {"gd4": 0.0, "gd5": 0.0, "gd6": 0.0, "gd7": 0.0},
+        now=time.monotonic(),
+    )
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "agree"
+    assert entry["distancesM"][3:] == [None, None, None, None]
+
+
+async def test_geom_flags_a_differing_coordinate_frame(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "ORIGIN_LAT_E7", 413900100, "int32")  # 1.1 m north
+    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
+    wire_devices(extension, device, second, third)
+    await discover(extension, device)
+    for tag in (second, third):
+        await extension._process_datagram(
+            tag.heartbeat(), tag.address, time.monotonic()
+        )
+    # the frame params as the identity refill would have cached them
+    for sysid, lat in (
+        (DEVICE_SYSID, 413900000),
+        (DEVICE_SYSID + 1, 413900100),
+        (DEVICE_SYSID + 2, 413900000),
+    ):
+        cached = extension._protocol.devices[sysid]
+        set_cached_param(cached, "ORIGIN_LAT_E7", lat, "int32")
+        set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
+        set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
+        set_cached_param(cached, "POS_YAW_DEG", 90.0, "real32")
+    for tag in (device, second, third):
+        await _feed_stats(extension, tag, GEOM_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is False
+    odd = body["devices"][str(DEVICE_SYSID + 1)]
+    assert odd["status"] == "frame"
+    assert odd["frame"] == ["ORIGIN_LAT_E7"]
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+    assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"

@@ -687,16 +687,23 @@ from the reference. Response:
 Per-tag `status`: `agree` / `deviates` (graded against the reference of
 the tag's cell, with `maxDeviationM` and the offending `deviations`),
 `drifted` (the live initiator distances moved more than `tolerance` away
-from the fit — a tripod moved after calibration; recalibrate), or
+from the fit — a tripod moved after calibration; recalibrate), `frame`
+(the tag's `ORIGIN_*` / `POS_YAW_DEG` differ from the rest of its cell —
+same distances, different world placement; `frame` lists the parameters),
+or
 `manual` (uses its provisioned table), `calibrating`, `failed`
 (AN1..AN3 not all heard; the firmware retries), `stale` (stats older
 than 10 s) and `unknown` (no geometry telemetry, i.e. firmware without
-automatic geometry). Every entry names its `cell` (`CELL_ID`); tags are
+automatic geometry). A candidate needs a complete fit — the three
+bottom-plane distances and all or none of the top plane (the firmware
+sends `0` for a plane it did not fit) — before it is graded. Every entry
+names its `cell` (`CELL_ID`); tags are
 compared within their cell only, `references` holds one reference per
 cell and `reference` is that of the only cell (`null` with none or
 several). Anchors — by advertised role, or `UWB_ROLE` when the
 advertisement is absent — are never graded. `consistent` is true when at
-least one cell has a reference and no tag deviates, drifted, is still
+least one cell has a reference and no tag deviates, drifted, differs in
+frame, is still
 calibrating, failed, went silent or is unknown; manual tags are reported
 but do not block — the table is the operator's deliberate choice.
 
