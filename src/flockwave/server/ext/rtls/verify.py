@@ -173,6 +173,16 @@ def _geometry_rule(agreement: dict[str, Any]) -> dict:
             "fail",
             "; ".join(problems),
         )
+    if len(manual) == len(devices):
+        # a layout outside the convention, provisioned on every tag: the
+        # operator's deliberate choice, nothing to compare
+        return _rule(
+            "geometry",
+            "Cell geometry agreement",
+            "error",
+            "pass",
+            "every tag uses its provisioned table (UWB_GEOM_MODE=0)",
+        )
     if not agreement["consistent"]:
         return _rule(
             "geometry",

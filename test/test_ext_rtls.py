@@ -3804,3 +3804,20 @@ async def test_geom_flags_a_differing_coordinate_frame(
     assert odd["frame"] == ["ORIGIN_LAT_E7"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
     assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
+
+
+async def test_verify_passes_an_all_manual_fleet(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
+        extension._stats[sysid]["geometryState"] = 0  # provisioned tables
+
+    response = await verify_message(extension, builder, hub)
+    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
+    assert rule["status"] == "pass", rule
+    assert "provisioned table" in rule["detail"]
