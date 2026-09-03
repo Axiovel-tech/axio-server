@@ -35,11 +35,11 @@ import trio
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from flockwave.server.ext.rtls.extension import RtlsExtension  # noqa: E402
 from rtlslink.protocol import (  # noqa: E402
-    PARAM_ACK_ACCEPTED,
     PARAM_ACK_VALUE_UNSUPPORTED,
 )
+
+from flockwave.server.ext.rtls.extension import RtlsExtension  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("e2e")

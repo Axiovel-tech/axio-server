@@ -20,15 +20,16 @@ clients through the server's message hub:
   re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
   debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
   `X-RTLS-INF`. The same stats feed drives the cluster->GPS show-clock
-  pin distribution (see below), and the responders' rolling TWR summaries
-  feed the anchor-geometry fit (see `X-RTLS-GEO fit`).
+  pin distribution (see below) and the fleet geometry agreement check
+  (`X-RTLS-GEOM`): every tag fits the cell itself at boot and streams
+  its fit as stats, so the server never writes anchor tables.
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
   `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
   Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
   revert — so the recovery path is health-check + re-upload of the
   previous artifact. `smpclient` is an optional dependency of the SDK and
-  the server installs the SDK's `ota` extra because OTA and geometry-sync
-  reboot are first-class RTLS operations.
+  the server installs the SDK's `ota` extra because OTA is a first-class
+  RTLS operation.
 
 ## Firmware requirements
 
@@ -69,14 +70,10 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
   message handlers documented below.
 - `show_clock.py` — the cluster->GPS show-clock pin manager (see
   below).
-- `geometry.py` — cell-geometry consistency across the tag fleet: the
-  `X-RTLS-GEO` check/sync operations (see below).
+- `geometry_agreement.py` — the `X-RTLS-GEOM` fleet geometry agreement
+  check: a pure function over the cached geometry stats (see below).
 - `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
   below).
-- `fit.py` — the per-responder rolling-TWR cache, distributed calibration
-  capture and `X-RTLS-GEO` fit op (see below).
-- `anchor_geometry.py` — the pure strict/refined four-tripod geometry
-  models behind the fit (no MAVLink, devices or server state).
 - `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
   NED table, NED->global) for SDK pins that predate them; the
   `rtlslink` implementations are used when present.
@@ -565,7 +562,12 @@ Response / notification body — entries keyed by system id (as string):
       "clockPpm": 1.2,
       "anchorMask": 15,
       "sleeping": false,
-      "batteryVoltage": 7.812
+      "batteryVoltage": 7.812,
+      "clockSyncOk": true,
+      "geometryState": 3,
+      "geometryResidualM": -0.075,
+      "geometryDriftM": 0.002,
+      "geometryDistancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]
     }
   }
 }
@@ -575,6 +577,14 @@ Response / notification body — entries keyed by system id (as string):
   firmware that predates sleep mode, so a UI can tell "unknown".
 - `batteryVoltage` — the optional `vbat` stat, in volts; omitted on
   boards that cannot measure it.
+- `geometryState` / `geometryResidualM` / `geometryDriftM` /
+  `geometryDistancesM` — the tag's automatic cell geometry
+  (rtls-link-zephyr#208; firmware `geom`/`gres`/`gdrift`/`gd1..gd7`):
+  fit state (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed),
+  rectangle-diagonal residual (m), largest live initiator-distance drift
+  since calibration (m), and the seven fitted AN0-ANi distances (m; the
+  last four are `null` for a four-anchor cell). Present only on firmware
+  with automatic geometry; the distances arrive once calibrated.
 - The first broadcast for a device waits until the full legacy stat set
   (`solveRateHz` … `anchorMask`) has arrived once, so it never carries a
   half-populated snapshot; optional stats never gate the broadcast.
@@ -630,274 +640,69 @@ a complete estimate, keyed by system id (as string):
 
 Estimates of a device that drops off the network are pruned with it.
 
-### X-RTLS-GEO — canonical cell geometry: adopt / check / sync
+### X-RTLS-GEOM — fleet cell-geometry agreement
 
-Every drone's tag carries its own copy of the cell geometry
-(`ORIGIN_LAT_E7/LON_E7/ALT_MM`, `POS_YAW_DEG`, `CELL_ID`,
-`UWB_AN_COUNT` and the `UWB_AN{i}_X/Y/Z/MAC/BIAS_M` anchor table); tags
-that disagree position their drones in different frames. This message
-answers the daily pre-flight question "do my drones agree?" and repairs
-the ones that do not.
-
-`op` selects the operation:
-
-- **`check`** diffs the geometry of every live tag (or the tags in
-  `ids`) against a *reference* tag and reports per-device verdicts;
-- **`sync`** writes the reference geometry to the target tags (verified
-  per-parameter acks; one device's failure never affects another), then
-  **reboots** each fully rewritten tag over MCUmgr/SMP — the same
-  management surface OTA uses — so the new geometry takes effect (the
-  firmware reads the anchor table at startup). Pass `"reboot": false`
-  to skip the reset. A device whose writes partially failed is reported
-  `partial` and deliberately NOT rebooted (that would activate a mixed
-  geometry — re-run the sync). Writes order the anchor table first and
-  `UWB_AN_COUNT` last, so a half-synced registry never declares a
-  window onto a half-written table.
-
-THE SERVER OWNS THE TRUTH: each cell's canonical geometry is a
-persisted document (`geometry.json` in the extension's data dir).
-Bootstrap it once with **`op: "adopt"`** — with a `reference` system id
-the named tag's geometry is taken verbatim; without one the fleet must
-be unanimous, so a drifted tag can never be adopted by accident. From
-then on `check` diffs EVERY live tag against the canonical geometry and
-`sync` distributes it; a calibration fit updates it through the sync
-op's explicit `geometry` payload. Pass `cell` to pick among multiple
-stored cells. Optional
-members: `ids` (target system ids; default = every other live tag),
-`tolerance` (float comparison tolerance in the parameter's own unit,
-default `1e-4`), `timeout` (per parameter transaction, as usual). Both
-operations compare against the server's parameter cache (kept fresh by
-discovery, the refill poller and the server's own writes); `sync`'s
-device-side acks re-verify reality where it matters.
-
-Request:
+Every tag fits the anchor table itself at boot from the initiator
+distances it receives (rtls-link-zephyr#208, `docs/auto-geometry.md`
+there): no anchor table is written from the ground any more, and
+`UWB_GEOM_MODE=0` keeps a provisioned `UWB_AN*` table for layouts
+outside the stacked-rectangle convention. The fitted table is a
+deterministic function of the seven fitted AN0-ANi distances the tag
+streams as stats, so "did every drone converge on the same cell?" is a
+comparison of those distances against the fleet's per-distance median.
+The check is a pure function over the cached `X-RTLS-STATS` snapshots:
+no device I/O, instant, swarm-sized.
 
 ```json
-{"type": "X-RTLS-GEO", "op": "check"}
+{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.02}
 ```
 
-Response — one entry per target (the reference is never a target),
-keyed by system id; `status` is `consistent`, `mismatch` (with
-`deltas`), `incomplete` (with `missing`) or `error` (with `detail`):
+`ids` (optional) restricts the grading to those system ids; `tolerance`
+(metres, default 0.02) is the largest accepted deviation of one distance
+from the reference. Response:
 
 ```json
 {
-  "type": "X-RTLS-GEO",
-  "op": "check",
-  "reference": 42,
-  "cell": "default",
+  "type": "X-RTLS-GEOM",
+  "tolerance": 0.02,
+  "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
   "consistent": false,
   "devices": {
-    "43": {
-      "status": "mismatch",
-      "deltas": {"UWB_AN1_X": {"expected": 10.0, "actual": 10.5}}
-    },
-    "44": {"status": "consistent"}
+    "42": {"id": 42, "status": "agree", "state": 3, "stateName": "calibrated",
+           "residualM": -0.075, "driftM": 0.002,
+           "distancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+           "maxDeviationM": 0.001},
+    "43": {"id": 43, "status": "deviates", "state": 3, "stateName": "calibrated",
+           "residualM": -0.074, "driftM": 0.001,
+           "distancesM": [8.637, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+           "maxDeviationM": 0.05, "deviations": {"AN0-AN1": 0.05},
+           "detail": "off the fleet reference by AN0-AN1 5.0 cm"},
+    "44": {"id": 44, "status": "calibrating", "state": 2, "stateName": "calibrating",
+           "detail": "still fitting the cell"}
   }
 }
 ```
 
-Sync request / response:
+Per-tag `status`: `agree` / `deviates` (graded against `reference`, with
+`maxDeviationM` and the offending `deviations`), or `manual` (uses its
+provisioned table), `calibrating`, `failed` (AN1..AN3 not all heard;
+the firmware retries), `stale` (stats older than 10 s) and `unknown` (no
+geometry telemetry, i.e. firmware without automatic geometry). Anchors
+are never graded. `reference` is `null` until at least one tag is
+calibrated. `consistent` is true when at least one tag agrees and none
+deviates, is still calibrating, failed, went silent or is unknown;
+manual tags are reported but do not block — the table is the operator's
+deliberate choice.
 
-```json
-{"type": "X-RTLS-GEO", "op": "sync", "reference": 42, "reboot": true}
-```
-
-```json
-{
-  "type": "X-RTLS-GEO",
-  "op": "sync",
-  "reference": 42,
-  "cell": "default",
-  "devices": {
-    "43": {
-      "status": "synced",
-      "written": ["UWB_AN1_X"],
-      "skipped": ["ORIGIN_LAT_E7", "..."],
-      "failures": {},
-      "rebooted": true
-    }
-  }
-}
-```
-
-- `status` — `synced` (all needed writes accepted), `partial` (some
-  writes failed; see `failures`) or `error` (device stopped answering;
-  see `detail`).
-- `written` / `skipped` — parameters written vs. already consistent.
-- `failures` — parameter name → human-readable failure (device-side
-  rejections carry the ack code and the value the device applied).
-- `rebooted` — present only when `reboot` was requested; `false` comes
-  with a `rebootDetail` explaining why (writes failed, nothing to
-  write, smpclient missing, or the reset itself failed).
-
-A sync that changed anything also pushes an `X-RTLS-INF` notification,
-so clients re-render the site anchors immediately. Requests that
-resolve no complete reference (no live tag with a full cell, unknown
-`reference`/`cell`) are NAKed.
-
-Concurrency: only one sync runs at a time (a second request is NAKed),
-parameter writes are serialized per (device, parameter) with a
-late-ack drain, and a post-write verification re-diff gates the
-reboot. Two windows remain that the PARAM_EXT wire protocol cannot
-close (acks carry no transaction id, and verify-then-reboot cannot be
-atomic): an ack straggling in more than `timeout` + 1 s late may be
-attributed to a subsequent write of the same parameter, and a
-parameter written by a third party in the instant between verification
-and reset is only caught by the next `check`. A device reported
-`partial`/`error` may hold mixed persistent geometry until a re-run
-converges it (its cells are re-homed away from it right after the
-sync, but it stays eligible again later). None of these windows is
-silent: the next `check` reports the fleet inconsistent. UIs should
-therefore re-run `check` after every sync, and re-run `sync` until
-every device reports `synced`.
-
-### X-RTLS-GEO fit — measure the anchors' true geometry
-
-Tripods go up in roughly the surveyed spots; "roughly" is centimeters
-of error the UWB solver bakes into every position. The standing
-geometry is measured from the ranging the responders do anyway — the
-server only selects a fresh, bounded-skew set of rolling windows.
-
-**Responder rolling summaries (rtls-link summary protocol v1).** On the
-SR250, each DL-TDoA responder measures its range to the A0 initiator;
-A0 receives no corresponding per-responder measurements. Each A1–A7
-responder therefore keeps its own 2 s rolling window and publishes a
-robust aggregate at 1 Hz on the management channel, as **one bundled
-datagram** of NAMED_VALUE_FLOAT frames that all carry that device
-generation's `time_boot_ms`. A0 and sources that cannot summarize
-publish nothing.
-
-| field | meaning |
-| --- | --- |
-| `trcap` | summary protocol version (currently 1) |
-| `trseq` | generation sequence, 24-bit wrap-around |
-| `trmask` | one bit per valid peer slot (a responder normally reports only bit 0 for A0) |
-| `twrXXXX` | filtered range to peer MAC `XXXX`, meters — median of the window's inliers (median ± 3×MAD gate) |
-| `twmXXXX` | the window's MAD, meters |
-| `twnXXXX` | inlier sample count (a peer needs ≥ 20 to be published at all) |
-
-`XXXX` is the peer MAC as exactly four lowercase hex digits. The
-`rtlslink` SDK reassembles coherent generations — the three header
-fields plus a complete range/MAD/count triple for every masked slot,
-all stamped with the same `time_boot_ms` — and emits one `twr_summary`
-event per device generation; frames from different generations are never
-combined. The extension caches the newest coherent summary per system
-id.
-
-**Fitting.** `{"op": "fit", "mode": "strict"}` fits the newest
-measurement:
-
-- resolves the canonical cell geometry (the single stored cell; the
-  four-tripod fit requires exactly 8 configured anchors) and maps every
-  configured MAC to one unique online device with the expected role;
-- waits up to `timeout` seconds (default and cap 4) for one responder
-  summary per A1–A7 that is **fresher than the request** and whose
-  server receipt timestamps are within 1.5 s;
-- validates every source independently: protocol version 1, exactly one
-  A0 peer range (`trmask=0x01`), and at least 20 samples — violations
-  NAK naming the offending responder;
-- combines the seven spokes into a server-owned calibration capture,
-  runs the strict model, and **pins** that exact capture + result.
-
-`{"op": "fit", "mode": "refined", "captureId": 4711}` re-fits exactly
-the pinned capture (`captureId` must match; anything else, or refining
-before any strict fit, NAKs). The refined pass never consumes new
-telemetry, so the strict and refined verdicts always describe the same
-seven device generations. Firmware `trseq` and `time_boot_ms` remain
-per-device provenance and are never compared across device clocks.
-
-Both models place the anchors in canonical A0-origin NED coordinates:
-A0 at the origin, A0→A1 along +X, `POS_YAW_DEG` 0; slots A0–A3 are the
-lower plane, A4–A7 the upper one (upper anchors get negative `zM`).
-
-- `strict` — two congruent, perpendicular rectangles; parameters
-  `lengthM`, `widthM`, `heightM`.
-- `refined` — aligned upper/lower parallelograms sharing one corner
-  angle; parameters `bottomLengthM`, `bottomWidthM`, `topLengthM`,
-  `topWidthM`, `heightM`, `angleDeg`. Hard safety bounds: the angle
-  within ±5° of 90°, upper−lower length/width differences within
-  max(0.25 m, 2 % of the lower dimension).
-
-A model whose worst spoke residual exceeds 0.15 m is rejected
-(`accepted: false`, human-readable `reasons`). `refined` is
-additionally accepted only when its RMS improvement over `strict`
-exceeds the measurement noise floor (median of the spokes' MAD, at
-least 1 cm) AND no parameter reached a safety bound — a bound-riding
-fit means the installation deviates more than the refined model
-permits, and is rejected instead of hidden.
-
-Explicit NON-GOALS: per-anchor move suggestions, free per-anchor XYZ
-fitting, full pairwise-mesh capture and independent per-plane skew.
-Seven A0-star radii cannot identify any of them.
-
-Response — `refined` is `null` on a strict-only run; `comparison`
-(refined runs only) restates the acceptance arithmetic
-(`rmsImprovementM`, `noiseFloorM`, `meaningfulImprovement`);
-`selectedModel` names the requested model when it was accepted, else
-`null`; `applyGeometry` is a ready-to-sync geometry payload (origin,
-`CELL_ID`, MACs and biases copied from the canonical geometry,
-`POS_YAW_DEG` forced to 0, fitted `xM`/`yM`/`zM` as the anchor table)
-or `null` when the selected model was rejected:
-
-```json
-{
-  "type": "X-RTLS-GEO",
-  "op": "fit",
-  "mode": "strict",
-  "cell": "default",
-  "summary": {
-    "systemId": 70,
-    "version": 1,
-    "sequence": 4711,
-    "timeBootMs": 123456,
-    "validMask": 254,
-    "ageMs": 180,
-    "ranges": [
-      {"anchorIndex": 1, "peerMac": 2, "distanceM": 20.001, "madM": 0.012, "count": 57},
-      "..."
-    ]
-  },
-  "strict": {
-    "model": "strict",
-    "accepted": true,
-    "parameters": {"lengthM": 20.003, "widthM": 15.001, "heightM": 2.499},
-    "anchors": [{"index": 0, "xM": 0.0, "yM": 0.0, "zM": 0.0}, "..."],
-    "rmsM": 0.011,
-    "weightedObjective": 0.000123,
-    "residuals": [
-      {"anchorIndex": 1, "peerMac": 2, "measuredM": 20.001, "predictedM": 20.003,
-       "residualM": 0.002, "madM": 0.012, "count": 57, "weight": 1.0},
-      "..."
-    ],
-    "reasons": [],
-    "warnings": []
-  },
-  "refined": null,
-  "selectedModel": "strict",
-  "applyGeometry": {"ORIGIN_LAT_E7": 413900000, "POS_YAW_DEG": 0.0, "...": "..."}
-}
-```
-
-To APPLY a fit result, pass its `applyGeometry` to the sync op as an
-explicit payload — it is validated and written to EVERY tag (the
-former reference included), with the same verified-write/reboot
-semantics:
-
-```json
-{"type": "X-RTLS-GEO", "op": "sync", "geometry": {"ORIGIN_LAT_E7": 413900000, "...": "..."}, "reboot": true}
-```
-
-Firmware/SDK dependency: the fit needs A0 firmware that speaks the
-rolling-summary protocol (v1) and an `rtls-link` SDK new enough to
-emit the `twr_summary` event; without them a strict fit NAKs after the
-wait with "no rolling TWR summary arrived from A0".
+A fit is repeated on the tag with `UWB_GEOM_RECAL=1` (through
+`X-RTLS-PARAM-SET`); the residual and drift readouts are also
+available as the `UWB_GEOM_*` parameters.
 
 ### X-RTLS-VERIFY — fleet pre-flight verification
 
 Runs the whole "are my drones consistent?" rule set in one message:
-**geometry** (the X-RTLS-GEO check: origin, `POS_YAW_DEG`, `CELL_ID`,
-anchor table, majority reference), **firmware** uniformity per role,
+**geometry** (the X-RTLS-GEOM agreement: every tag has fitted the cell
+and the fleet agrees on it), **firmware** uniformity per role,
 tag↔drone **pairing** coverage, the ArduPilot **yaw-source** rule
 (`EK3_SRC1_YAW == 9`, the axio fork's virtual compass, and a
 fleet-consistent `EK3_SRC_VC_YAW`, read live over MAVLink with
@@ -909,20 +714,16 @@ set (EKF sources, VISO, WPNAV, LOIT, position/attitude controllers,
 IMU filters) from every paired drone and reports cross-drone
 differences — always as warnings: deliberate per-drone tuning exists.
 
-Pass the same explicit `cell` used by geometry check/sync so a server
-holding more than one canonical installation never guesses which geometry
-to certify:
-
 ```json
-{"type": "X-RTLS-VERIFY", "cell": "bench-4", "inDepth": false}
+{"type": "X-RTLS-VERIFY", "inDepth": false}
 ```
 
 Response: `rules` (each with `id`, `label`, `severity`
 (`error`/`warning`), `status` (`pass`/`fail`/`skipped`), a
 human-readable `detail` and rule-specific extras), `passed` (no
-error-severity rule failed), the resolved `cell`, and the embedded
-`geometry` check body for UI reuse. Concurrent runs are NAKed; expect the
-in-depth pass to take a few seconds per fleet (live MAVLink parameter reads).
+error-severity rule failed) and the embedded `geometry` agreement body
+for UI reuse. Concurrent runs are NAKed; expect the in-depth pass to
+take a few seconds per fleet (live MAVLink parameter reads).
 
 ### Notes for control-UI developers
 
