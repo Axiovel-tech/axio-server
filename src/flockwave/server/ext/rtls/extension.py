@@ -2570,16 +2570,19 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
     # fleet agreement check (X-RTLS-GEOM) compares the distances.
     if "geom" in data:
         body["geometryState"] = int(data["geom"])
-    if "gres" in data:
+    # non-finite floats cannot be JSON and cannot be graded: drop them
+    if "gres" in data and math.isfinite(float(data["gres"])):
         body["geometryResidualM"] = round(float(data["gres"]), 4)
-    if "gdrift" in data:
+    if "gdrift" in data and math.isfinite(float(data["gdrift"])):
         body["geometryDriftM"] = round(float(data["gdrift"]), 4)
     distances = [data.get(f"gd{i}") for i in range(1, 8)]
     if any(d is not None for d in distances):
         # the firmware sends 0 for a plane it did not fit (a four-anchor
         # cell, or a recalibration that lost the top plane): not a distance
         body["geometryDistancesM"] = [
-            round(float(d), 4) if d is not None and float(d) > 0.0 else None
+            round(float(d), 4)
+            if d is not None and math.isfinite(float(d)) and float(d) > 0.0
+            else None
             for d in distances
         ]
     return body

@@ -3514,6 +3514,7 @@ def cache_frame(extension, *sysids, lat=413900000, yaw=90.0, macs=None):
             set_cached_param(
                 cached, f"UWB_AN{slot}_MAC", (macs or {}).get(slot, slot + 1), "uint16"
             )
+            set_cached_param(cached, f"UWB_AN{slot}_BIAS_M", 0.0, "real32")
 
 
 async def geom_message(extension, builder, hub, body=None):
@@ -3539,6 +3540,21 @@ def test_stats_json_without_geometry_omits_the_fields():
     body = _stats_json(7, dict(FULL_STATS))
     assert "geometryState" not in body
     assert "geometryDistancesM" not in body
+    # non-finite values are dropped rather than forwarded
+    body = _stats_json(
+        7,
+        {
+            **FULL_STATS,
+            "geom": 3.0,
+            "gres": float("nan"),
+            "gdrift": float("inf"),
+            "gd1": float("nan"),
+            "gd2": 9.0,
+        },
+    )
+    assert "geometryResidualM" not in body
+    assert "geometryDriftM" not in body
+    assert body["geometryDistancesM"][:2] == [None, 9.0]
     # a four-anchor cell reports only the bottom plane
     body = _stats_json(
         7, {**FULL_STATS, "geom": 3.0, "gd1": 8.0, "gd2": 9.0, "gd3": 12.0}
@@ -3830,6 +3846,24 @@ async def test_geom_flags_a_differing_coordinate_frame(
     assert odd["frame"] == ["ORIGIN_LAT_E7"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
     assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
+
+    # a different range bias on one anchor solves differently too
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.25, "real32"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == [
+        "UWB_AN3_BIAS_M"
+    ]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.0, "real32"
+    )
 
     # two slots swapped on one tag: same distances, different anchors
     set_cached_param(

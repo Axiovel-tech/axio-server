@@ -16,6 +16,7 @@ often as a UI likes.
 
 from __future__ import annotations
 
+import math
 import time
 from statistics import median_low
 from typing import TYPE_CHECKING, Any, Optional
@@ -117,6 +118,12 @@ def _entry_for(
         return entry
     entry["distancesM"] = distances
     drift = float(stats.get("geometryDriftM", 0.0))
+    if not math.isfinite(drift) or not all(
+        d is None or math.isfinite(d) for d in distances
+    ):
+        entry["status"] = "calibrating"
+        entry["detail"] = "fitted distances are not finite yet"
+        return entry
     if drift > tolerance:
         # the fit still describes the cell as it was at boot: the live
         # distances say an anchor has moved since, so the table is stale
@@ -208,7 +215,11 @@ def _frame_names(entry: dict[str, Any]) -> tuple[str, ...]:
     placement, plus the MAC of every slot the fit includes."""
     distances = entry.get("distancesM") or []
     slots = 8 if len(distances) >= 7 and distances[3] is not None else 4
-    return FRAME_PARAMS + tuple(f"UWB_AN{i}_MAC" for i in range(slots))
+    # the MAC binds a slot to an anchor; the bias is the range correction
+    # the solver applies to that anchor — both change where a tag solves
+    return FRAME_PARAMS + tuple(
+        name for i in range(slots) for name in (f"UWB_AN{i}_MAC", f"UWB_AN{i}_BIAS_M")
+    )
 
 
 def _frame_of(params: dict[str, Any], names: tuple[str, ...]) -> tuple[Any, ...]:
