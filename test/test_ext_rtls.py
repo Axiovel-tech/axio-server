@@ -3510,6 +3510,7 @@ def cache_frame(extension, *sysids, lat=413900000, yaw=90.0, macs=None):
         set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
         set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
         set_cached_param(cached, "POS_YAW_DEG", yaw, "real32")
+        set_cached_param(cached, "UWB_AN_COUNT", 8, "uint8")
         for slot in range(8):
             set_cached_param(
                 cached, f"UWB_AN{slot}_MAC", (macs or {}).get(slot, slot + 1), "uint16"
@@ -3889,6 +3890,22 @@ async def test_geom_flags_a_differing_coordinate_frame(
     assert odd["frame"] == ["ORIGIN_LAT_E7"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
     assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
+
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    # a different anchor count consumes a different table
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 4, "uint8"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == ["UWB_AN_COUNT"]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 8, "uint8"
+    )
 
     # a different range bias on one anchor solves differently too
     set_cached_param(

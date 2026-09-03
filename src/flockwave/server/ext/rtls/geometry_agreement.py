@@ -213,7 +213,14 @@ def _compare(
 #: swapped fits the same distances onto different anchors), so the graded
 #: tags of one cell must agree on them too — as the removed X-RTLS-GEO
 #: check compared them.
-FRAME_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "POS_YAW_DEG")
+FRAME_PARAMS = (
+    "ORIGIN_LAT_E7",
+    "ORIGIN_LON_E7",
+    "ORIGIN_ALT_MM",
+    "POS_YAW_DEG",
+    # how many rows of the anchor table the solver consumes
+    "UWB_AN_COUNT",
+)
 
 
 def _frame_names(entry: dict[str, Any]) -> tuple[str, ...]:
