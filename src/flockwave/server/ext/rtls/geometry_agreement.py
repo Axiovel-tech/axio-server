@@ -193,34 +193,59 @@ def _compare(
         entry["status"] = "agree"
 
 
-#: parameters that place the fitted cell in the world: the origin the NED
-#: frame hangs off and the show-frame yaw. Identical distances are not the
-#: same cell if these differ, so the graded tags of one cell must agree on
-#: them too (the removed X-RTLS-GEO check compared them as well).
+#: parameters that place the fitted cell in the world and bind the fitted
+#: slots to physical anchors: the origin the NED frame hangs off, the
+#: show-frame yaw and the slot->anchor MAC table. Identical distances are
+#: not the same cell if these differ (a symmetric rig with two slots
+#: swapped fits the same distances onto different anchors), so the graded
+#: tags of one cell must agree on them too — as the removed X-RTLS-GEO
+#: check compared them.
 FRAME_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "POS_YAW_DEG")
 
 
-def _frame_of(params: dict[str, Any]) -> tuple[Any, ...]:
-    return tuple(params.get(name) for name in FRAME_PARAMS)
+def _frame_names(entry: dict[str, Any]) -> tuple[str, ...]:
+    """The frame parameters that matter for this tag's fit: the world
+    placement, plus the MAC of every slot the fit includes."""
+    distances = entry.get("distancesM") or []
+    slots = 8 if len(distances) >= 7 and distances[3] is not None else 4
+    return FRAME_PARAMS + tuple(f"UWB_AN{i}_MAC" for i in range(slots))
+
+
+def _frame_of(params: dict[str, Any], names: tuple[str, ...]) -> tuple[Any, ...]:
+    return tuple(params.get(name) for name in names)
 
 
 def _check_frames(protocol: Any, graded: list[dict[str, Any]]) -> None:
     """Downgrades graded tags whose coordinate-frame parameters differ from
-    the majority of their cell to ``frame`` (blocking). A parameter absent
-    from a tag's cache is not compared (older registries, dump-loss holes)."""
+    the majority of their cell to ``frame`` (blocking), and tags whose
+    frame is not fully known yet (identity refill still running, or a
+    lossy dump) to ``incomplete`` (blocking): a fit cannot be certified
+    without knowing where it stands."""
+    if not graded:
+        return
+    names = _frame_names(graded[0])
     frames = {
-        entry["id"]: _frame_of(_decoded_device_params(protocol.devices[entry["id"]]))
+        entry["id"]: _frame_of(
+            _decoded_device_params(protocol.devices[entry["id"]]), names
+        )
         for entry in graded
     }
     complete = [f for f in frames.values() if all(v is not None for v in f)]
-    if len(complete) < 2:
-        return
-    majority = max(set(complete), key=complete.count)
+    majority = max(set(complete), key=complete.count) if complete else None
     for entry in graded:
+        frame = frames[entry["id"]]
+        missing = [name for name, value in zip(names, frame) if value is None]
+        if missing:
+            entry["status"] = "incomplete"
+            entry["missingParams"] = missing
+            entry["detail"] = "coordinate frame not fully known yet: " + ", ".join(
+                missing
+            )
+            continue
+        if majority is None:
+            continue
         differing = [
-            name
-            for name, value, ref in zip(FRAME_PARAMS, frames[entry["id"]], majority)
-            if value is not None and ref is not None and value != ref
+            name for name, value, ref in zip(names, frame, majority) if value != ref
         ]
         if differing:
             entry["status"] = "frame"
@@ -244,9 +269,10 @@ def run_agreement(
     Tags (role 1, or unknown role) among the live devices are graded per
     cell (``CELL_ID``): ``agree`` / ``deviates`` against the per-distance
     lower median of that cell's calibrated tags, ``drifted`` when the live
-    distances moved away from the fit, ``frame`` when the origin or
-    show-yaw parameters differ from the cell's majority, or ``manual`` /
-    ``calibrating`` /
+    distances moved away from the fit, ``frame`` when the origin, show-yaw
+    or anchor-MAC parameters differ from the cell's majority,
+    ``incomplete`` while those parameters are not all known, ``missing``
+    for a requested id that is not online, or ``manual`` / ``calibrating`` /
     ``failed`` / ``stale`` / ``unknown`` when they cannot take part.
     ``references`` holds one reference per cell; ``reference`` is that of
     the only cell (``None`` with none or several). ``consistent`` is true
@@ -257,6 +283,15 @@ def run_agreement(
     if now is None:
         now = time.monotonic()
     entries: dict[str, dict[str, Any]] = {}
+    if ids is not None:
+        # an explicitly requested device that is not online is a verdict
+        # too: the caller asked about it, so silence would certify it
+        for system_id in sorted(set(ids) - set(protocol.devices)):
+            entries[str(system_id)] = {
+                "id": system_id,
+                "status": "missing",
+                "detail": "device is not online",
+            }
     for system_id, device in sorted(protocol.devices.items()):
         if ids is not None and system_id not in ids:
             continue
@@ -270,7 +305,9 @@ def run_agreement(
         )
 
     references: dict[str, list[Optional[float]]] = {}
-    for cell in sorted({entry["cell"] for entry in entries.values()}):
+    for cell in sorted(
+        {entry["cell"] for entry in entries.values() if "cell" in entry}
+    ):
         candidates = [
             e
             for e in entries.values()
@@ -288,6 +325,8 @@ def run_agreement(
         "deviates",
         "drifted",
         "frame",
+        "incomplete",
+        "missing",
         "calibrating",
         "failed",
         "stale",

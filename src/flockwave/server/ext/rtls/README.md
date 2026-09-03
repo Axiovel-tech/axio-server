@@ -688,9 +688,11 @@ Per-tag `status`: `agree` / `deviates` (graded against the reference of
 the tag's cell, with `maxDeviationM` and the offending `deviations`),
 `drifted` (the live initiator distances moved more than `tolerance` away
 from the fit — a tripod moved after calibration; recalibrate), `frame`
-(the tag's `ORIGIN_*` / `POS_YAW_DEG` differ from the rest of its cell —
-same distances, different world placement; `frame` lists the parameters),
-or
+(the tag's `ORIGIN_*` / `POS_YAW_DEG` / `UWB_AN{i}_MAC` differ from the
+rest of its cell — same distances, different world placement or
+slot-to-anchor binding; `frame` lists the parameters), `incomplete` (those
+parameters are not all in the cache yet; `missingParams` lists them),
+`missing` (an explicitly requested id that is not online), or
 `manual` (uses its provisioned table), `calibrating`, `failed`
 (AN1..AN3 not all heard; the firmware retries), `stale` (stats older
 than 10 s) and `unknown` (no geometry telemetry, i.e. firmware without

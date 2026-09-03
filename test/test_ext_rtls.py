@@ -3318,6 +3318,7 @@ async def test_verify_passes_on_a_healthy_fleet(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
 
     response = await verify_message(extension, builder, hub)
 
@@ -3346,6 +3347,7 @@ async def test_verify_flags_wrong_yaw_source(extension, device, dialect, builder
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
 
     response = await verify_message(extension, builder, hub)
 
@@ -3363,6 +3365,7 @@ async def test_verify_flags_missing_stats(extension, device, dialect, builder, h
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     del extension._stats[DEVICE_SYSID + 1]  # one tag went silent
 
     response = await verify_message(extension, builder, hub)
@@ -3384,6 +3387,7 @@ async def test_verify_in_depth_reports_param_diffs_as_warnings(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     # give both drones the full in-depth set; one WPNAV_SPEED differs
     from flockwave.server.ext.rtls.verify import IN_DEPTH_PARAMS
 
@@ -3470,6 +3474,7 @@ async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder,
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     drifted = list(FLEET_DISTANCES)
     drifted[0] += 0.05  # AN1's tripod moved 5 cm for this tag only
     extension._stats[DEVICE_SYSID + 1]["geometryDistancesM"] = drifted
@@ -3494,6 +3499,21 @@ GEOM_STATS = {
     "gdrift": 0.002,
     **{f"gd{i + 1}": d for i, d in enumerate(FLEET_DISTANCES)},
 }
+
+
+def cache_frame(extension, *sysids, lat=413900000, yaw=90.0, macs=None):
+    """Caches the coordinate-frame params (origin, show yaw, slot MACs) on
+    live protocol devices, as the identity refill would after discovery."""
+    for sysid in sysids:
+        cached = extension._protocol.devices[sysid]
+        set_cached_param(cached, "ORIGIN_LAT_E7", lat, "int32")
+        set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
+        set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
+        set_cached_param(cached, "POS_YAW_DEG", yaw, "real32")
+        for slot in range(8):
+            set_cached_param(
+                cached, f"UWB_AN{slot}_MAC", (macs or {}).get(slot, slot + 1), "uint16"
+            )
 
 
 async def geom_message(extension, builder, hub, body=None):
@@ -3534,6 +3554,7 @@ async def test_geom_agreeing_fleet(extension, device, dialect, builder, hub):
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
     # the second tag fitted the same cell 3 mm off on one distance
     await _feed_stats(
@@ -3568,6 +3589,7 @@ async def test_geom_flags_a_deviating_tag_and_names_the_distance(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
     await _feed_stats(
         extension,
@@ -3632,6 +3654,7 @@ async def test_geom_ids_filter_and_validation(extension, device, dialect, builde
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
 
     response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID]})
@@ -3665,6 +3688,7 @@ async def test_geom_flags_live_drift_as_blocking(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
     # same fit, but this tag's live distances moved 5 cm since (a tripod)
     await _feed_stats(
@@ -3697,6 +3721,7 @@ async def test_geom_references_are_per_cell(extension, device, dialect, builder,
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
     # a legitimately different cell: every distance 50 cm longer
     other = {
@@ -3745,6 +3770,7 @@ async def test_geom_waits_for_a_complete_distance_vector(
         for k, val in GEOM_STATS.items()
         if k not in ("gd2", "gd3", "gd4", "gd5", "gd6", "gd7")
     }
+    cache_frame(extension, DEVICE_SYSID)
     await _feed_stats(extension, device, partial, now=time.monotonic())
     response = await geom_message(extension, builder, hub)
     entry = response.body["devices"][str(DEVICE_SYSID)]
@@ -3782,19 +3808,19 @@ async def test_geom_flags_a_differing_coordinate_frame(
         await extension._process_datagram(
             tag.heartbeat(), tag.address, time.monotonic()
         )
-    # the frame params as the identity refill would have cached them
-    for sysid, lat in (
-        (DEVICE_SYSID, 413900000),
-        (DEVICE_SYSID + 1, 413900100),
-        (DEVICE_SYSID + 2, 413900000),
-    ):
-        cached = extension._protocol.devices[sysid]
-        set_cached_param(cached, "ORIGIN_LAT_E7", lat, "int32")
-        set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
-        set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
-        set_cached_param(cached, "POS_YAW_DEG", 90.0, "real32")
     for tag in (device, second, third):
         await _feed_stats(extension, tag, GEOM_STATS, now=time.monotonic())
+
+    # before the identity refill cached the frame, a fit is not certified
+    response = await geom_message(extension, builder, hub)
+    assert response.body["consistent"] is False
+    incomplete = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert incomplete["status"] == "incomplete"
+    assert "POS_YAW_DEG" in incomplete["missingParams"]
+
+    # the frame params as the identity refill would have cached them
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 2)
+    cache_frame(extension, DEVICE_SYSID + 1, lat=413900100)
 
     response = await geom_message(extension, builder, hub)
     body = response.body
@@ -3804,6 +3830,24 @@ async def test_geom_flags_a_differing_coordinate_frame(
     assert odd["frame"] == ["ORIGIN_LAT_E7"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
     assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
+
+    # two slots swapped on one tag: same distances, different anchors
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN1_MAC", 3, "uint16"
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN2_MAC", 2, "uint16"
+    )
+    response = await geom_message(extension, builder, hub)
+    odd = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert odd["status"] == "frame"
+    assert odd["frame"] == ["UWB_AN1_MAC", "UWB_AN2_MAC"]
 
 
 async def test_verify_passes_an_all_manual_fleet(
@@ -3821,3 +3865,17 @@ async def test_verify_passes_an_all_manual_fleet(
     rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
     assert rule["status"] == "pass", rule
     assert "provisioned table" in rule["detail"]
+
+
+async def test_geom_reports_requested_ids_that_are_not_online(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID, 77]})
+    body = response.body
+    assert body["consistent"] is False
+    assert body["devices"]["77"]["status"] == "missing"
