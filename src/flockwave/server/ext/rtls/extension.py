@@ -130,19 +130,6 @@ POS_REBOOT_BACKSTEP_MS = 5000
 #: through to the parse + exact name check.
 _POS_DEBUG_MARKERS = (b"pn", b"pe", b"pd", b"psig")
 
-#: the NAMED_VALUE_FLOAT names of the automatic-geometry telemetry
-#: (rtls-link-zephyr#208); their receipt time is tracked separately from
-#: the legacy stats so a fit is only certified on live geometry telemetry
-GEOMETRY_STAT_NAMES = frozenset(
-    ("geom", "gres", "gdrift", *(f"gd{i}" for i in range(1, 8)))
-)
-#: cheap pre-check before parsing a datagram for stat stamps: the legacy
-#: `rate` rides every stats tick, the geometry names every geometry tick
-_STAT_MARKERS = (b"rate", b"geom", b"gres", b"gd")
-#: a NAMED_VALUE_FLOAT ``time_boot_ms`` this far below the device's last
-#: one is a reboot, not jitter (the firmware stamps stats from one clock)
-_BOOT_REWIND_MS = 60_000
-
 #: how often the X-RTLS-INF device list is broadcast at most, in seconds;
 #: gained/lost transitions inside the window coalesce into one trailing-edge
 #: notification (during a show, drone tags flap in bursts)
@@ -246,12 +233,6 @@ class RtlsExtension(Extension):
         #: judge "is this tag healthy NOW" (fleet verify) must not trust
         #: an indefinitely cached snapshot from a stream that went silent
         self._stats_at: dict[int, float] = {}
-        #: when a device's geometry telemetry (GEOMETRY_STAT_NAMES) was last
-        #: received -- the legacy stats keep arriving after a downgrade
-        self._geom_at: dict[int, float] = {}
-        #: the last NAMED_VALUE_FLOAT ``time_boot_ms`` per device, to spot
-        #: a reboot on the management channel
-        self._stats_boot_ms: dict[int, int] = {}
         #: monotonic timestamp of the last stats broadcast per device, for
         #: the broadcast throttle
         self._last_stats_broadcast: dict[int, float] = {}
@@ -602,14 +583,6 @@ class RtlsExtension(Extension):
             entry["role"] = kind
         if advertisement.uptime_ms is not None:
             entry["uptimeMs"] = int(advertisement.uptime_ms)
-            previous = self._adv.get(advertisement.system_id, {}).get("uptimeMs")
-            if previous is not None and entry["uptimeMs"] < previous:
-                # the board rebooted (an OTA, a power cycle): the stats
-                # accumulated so far may describe firmware it no longer
-                # runs — a downgrade would keep emitting the legacy fields
-                # while the geometry ones silently stop, and the cached
-                # copies would stay "fresh" forever
-                self._forget_stats(advertisement.system_id)
         self._adv[advertisement.system_id] = entry
         frames = _sanitized_advertisement_frames(data, advertisement.system_id)
         if frames:
@@ -621,7 +594,6 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        self._scan_stat_stamps(data, now)
         if self._passive:
             # In passive mode the boards are probed only every
             # hello_interval, so ANY inbound datagram from a device counts
@@ -1181,18 +1153,6 @@ class RtlsExtension(Extension):
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
         await hub.broadcast_message(hub.create_notification(body))
 
-    def _forget_stats(self, system_id: int) -> None:
-        """Drops every cached stat of a device, including the SDK's
-        per-field accumulator, so the next snapshot only carries what the
-        running firmware actually emits."""
-        self._stats.pop(system_id, None)
-        self._stats_at.pop(system_id, None)
-        self._geom_at.pop(system_id, None)
-        self._stats_boot_ms.pop(system_id, None)
-        device = self._protocol.devices.get(system_id) if self._protocol else None
-        if device is not None:
-            device.stats.clear()
-
     async def _on_stats(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache the latest health-telemetry snapshot for a device and
         broadcast it to clients, throttled to at most one per
@@ -1238,41 +1198,6 @@ class RtlsExtension(Extension):
             await self._broadcast_stats(system_id, now)
 
     # ---- position-estimate debug stream (X-RTLS-POS) ----
-
-    def _scan_stat_stamps(self, data: bytes, now: float) -> None:
-        """Record, from a raw management datagram, when a device's
-        geometry telemetry last arrived and whether its stat clock rewound.
-
-        The SDK folds every NAMED_VALUE_FLOAT into one accumulated
-        ``device.stats`` and surfaces the snapshot without saying which
-        field just arrived, so a device rebooted into firmware without
-        geometry telemetry would keep its old ``geom``/``gd*`` fields
-        "fresh" for as long as the legacy stats flow. This second parser
-        (the pattern :meth:`_scan_pos_debug` uses) sees the frame names
-        and stamps: a geometry name refreshes ``_geom_at``; a
-        ``time_boot_ms`` far below the last one is a reboot and drops the
-        accumulated stats."""
-        if not any(marker in data for marker in _STAT_MARKERS):
-            return
-        parser = self._pos_parser
-        if parser is None:
-            dialect = load_dialect()
-            parser = dialect.MAVLink(None)
-            parser.robust_parsing = True
-            self._pos_parser = parser
-        for message in parser.parse_buffer(data) or []:
-            if message.get_type() != "NAMED_VALUE_FLOAT":
-                continue
-            system_id = message.get_srcSystem()
-            if self._protocol is None or system_id not in self._protocol.devices:
-                continue
-            stamp = int(message.time_boot_ms)
-            last = self._stats_boot_ms.get(system_id)
-            if last is not None and stamp + _BOOT_REWIND_MS < last:
-                self._forget_stats(system_id)
-            self._stats_boot_ms[system_id] = stamp
-            if _named_value_name(message.name) in GEOMETRY_STAT_NAMES:
-                self._geom_at[system_id] = now
 
     def _scan_pos_debug(self, data: bytes, now: float) -> None:
         """Harvest the tag's position-estimate debug stream from a raw
@@ -1428,8 +1353,6 @@ class RtlsExtension(Extension):
         """Drop all cached stats state for a device (e.g. on ``lost``)."""
         self._stats.pop(system_id, None)
         self._stats_at.pop(system_id, None)
-        self._geom_at.pop(system_id, None)
-        self._stats_boot_ms.pop(system_id, None)
         self._last_stats_broadcast.pop(system_id, None)
         self._last_stats_sent.pop(system_id, None)
 
