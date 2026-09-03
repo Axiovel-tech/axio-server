@@ -2568,9 +2568,9 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
     # calibration and the seven fitted AN0-ANi distances (emitted only
     # once calibrated; a four-anchor cell reports the first three). The
     # fleet agreement check (X-RTLS-GEOM) compares the distances.
-    if "geom" in data:
-        body["geometryState"] = int(data["geom"])
     # non-finite floats cannot be JSON and cannot be graded: drop them
+    if "geom" in data and math.isfinite(float(data["geom"])):
+        body["geometryState"] = int(data["geom"])
     if "gres" in data and math.isfinite(float(data["gres"])):
         body["geometryResidualM"] = round(float(data["gres"]), 4)
     if "gdrift" in data and math.isfinite(float(data["gdrift"])):

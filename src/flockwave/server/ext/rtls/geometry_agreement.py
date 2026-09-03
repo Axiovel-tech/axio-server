@@ -117,7 +117,13 @@ def _entry_for(
         entry["detail"] = "calibrated but the fitted distances have not all arrived yet"
         return entry
     entry["distancesM"] = distances
-    drift = float(stats.get("geometryDriftM", 0.0))
+    if "geometryDriftM" not in stats:
+        # the fit alone cannot be certified: without the live drift the
+        # cell may have moved since boot and nothing would say so
+        entry["status"] = "calibrating"
+        entry["detail"] = "calibrated but the live drift has not arrived yet"
+        return entry
+    drift = float(stats["geometryDriftM"])
     if not math.isfinite(drift) or not all(
         d is None or math.isfinite(d) for d in distances
     ):
@@ -226,6 +232,15 @@ def _frame_of(params: dict[str, Any], names: tuple[str, ...]) -> tuple[Any, ...]
     return tuple(params.get(name) for name in names)
 
 
+def _cell_known(device: Any, params: dict[str, Any]) -> bool:
+    """Whether the cell a tag belongs to can be trusted: ``CELL_ID`` is
+    cached, or the parameter listing is complete and lacks it (older
+    firmware; the default cell)."""
+    if params.get("CELL_ID") or params.get("RTLS_CELL_ID"):
+        return True
+    return device.param_count is not None and len(device.params) >= device.param_count
+
+
 def _check_frames(protocol: Any, graded: list[dict[str, Any]]) -> None:
     """Downgrades graded tags whose coordinate-frame parameters differ from
     the majority of their cell to ``frame`` (blocking), and tags whose
@@ -311,9 +326,18 @@ def run_agreement(
             continue  # anchors carry no fit
         stats = ext._stats.get(system_id)
         stats_age = now - ext._stats_at.get(system_id, float("-inf"))
-        entries[str(system_id)] = _entry_for(
+        entry = _entry_for(
             system_id, _cell_id_from_params(params), stats, stats_age, tolerance
         )
+        if entry["status"] == "candidate" and not _cell_known(device, params):
+            # a partial parameter cache without CELL_ID would file the tag
+            # under the default cell — and certify it against the wrong
+            # reference; the legacy default is only for a complete listing
+            # that genuinely lacks the parameter
+            entry["status"] = "incomplete"
+            entry["missingParams"] = ["CELL_ID"]
+            entry["detail"] = "cell not known yet: CELL_ID"
+        entries[str(system_id)] = entry
 
     references: dict[str, list[Optional[float]]] = {}
     for cell in sorted(

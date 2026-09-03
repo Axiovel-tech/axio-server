@@ -3545,13 +3545,14 @@ def test_stats_json_without_geometry_omits_the_fields():
         7,
         {
             **FULL_STATS,
-            "geom": 3.0,
+            "geom": float("nan"),
             "gres": float("nan"),
             "gdrift": float("inf"),
             "gd1": float("nan"),
             "gd2": 9.0,
         },
     )
+    assert "geometryState" not in body
     assert "geometryResidualM" not in body
     assert "geometryDriftM" not in body
     assert body["geometryDistancesM"][:2] == [None, 9.0]
@@ -3726,6 +3727,48 @@ async def test_geom_flags_live_drift_as_blocking(
     rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
     assert rule["status"] == "fail"
     assert "moved" in rule["detail"]
+
+
+async def test_geom_needs_the_live_drift(extension, device, builder, hub):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    without_drift = {k: v for k, v in GEOM_STATS.items() if k != "gdrift"}
+    await _feed_stats(extension, device, without_drift, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "calibrating"
+    assert "drift" in entry["detail"]
+    assert response.body["consistent"] is False
+
+
+async def test_geom_waits_for_the_cell_id_of_a_partial_listing(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    await _feed_stats(extension, second, GEOM_STATS, now=time.monotonic())
+    cached = extension._protocol.devices[DEVICE_SYSID + 1]
+    assert "CELL_ID" not in cached.params
+    # the listing is still being refilled: the tag's cell is unknown
+    cached.param_count = len(cached.params) + 1
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "incomplete"
+    assert entry["missingParams"] == ["CELL_ID"]
+    assert response.body["consistent"] is False
+    # a complete listing that lacks CELL_ID is the legacy default cell
+    cached.param_count = len(cached.params)
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "default"
 
 
 async def test_geom_references_are_per_cell(extension, device, dialect, builder, hub):
