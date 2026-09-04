@@ -2562,23 +2562,27 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # UI both need it; previously only the show-clock pin manager
         # consumed it internally
         body["clockSyncOk"] = bool(data["clkok"])
-    # Automatic cell geometry (rtls-link-zephyr#208): the tag's fit state
-    # (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed), the
-    # rectangle-diagonal residual, the largest live drift since
-    # calibration and the seven fitted AN0-ANi distances (emitted only
-    # once calibrated; a four-anchor cell reports the first three). The
-    # fleet agreement check (X-RTLS-GEOM) compares the distances.
+    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state
+    # (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed), why the
+    # last fit was rejected (0 none, 1 anchor count not 4 or 8, 2 anchor
+    # missing, 3 side too short, 4 not a rectangle, 5 top plane not above
+    # the bottom one), the rectangle-diagonal residual, the largest live
+    # drift since calibration and the seven fitted AN0-ANi distances (0
+    # without a fit; a four-anchor cell reports the first three). The fleet
+    # agreement check (X-RTLS-GEOM) compares the distances.
     # non-finite floats cannot be JSON and cannot be graded: drop them
     if "geom" in data and math.isfinite(float(data["geom"])):
         body["geometryState"] = int(data["geom"])
+    if "gfail" in data and math.isfinite(float(data["gfail"])):
+        body["geometryReason"] = int(data["gfail"])
     if "gres" in data and math.isfinite(float(data["gres"])):
         body["geometryResidualM"] = round(float(data["gres"]), 4)
     if "gdrift" in data and math.isfinite(float(data["gdrift"])):
         body["geometryDriftM"] = round(float(data["gdrift"]), 4)
     distances = [data.get(f"gd{i}") for i in range(1, 8)]
     if any(d is not None for d in distances):
-        # the firmware sends 0 for a plane it did not fit (a four-anchor
-        # cell, or a recalibration that lost the top plane): not a distance
+        # the firmware sends 0 for a distance it has no fit for (a
+        # four-anchor cell's top plane, or no fit at all): not a distance
         body["geometryDistancesM"] = [
             round(float(d), 4)
             if d is not None and math.isfinite(float(d)) and float(d) > 0.0

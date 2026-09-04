@@ -3495,6 +3495,7 @@ async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder,
 GEOM_STATS = {
     **FULL_STATS,
     "geom": 3.0,
+    "gfail": 0.0,
     "gres": -0.075,
     "gdrift": 0.002,
     **{f"gd{i + 1}": d for i, d in enumerate(FLEET_DISTANCES)},
@@ -3532,6 +3533,7 @@ async def test_stats_carry_the_fitted_geometry(extension, device, builder, hub):
 
     entry = response.body["stats"][str(DEVICE_SYSID)]
     assert entry["geometryState"] == 3
+    assert entry["geometryReason"] == 0
     assert entry["geometryResidualM"] == -0.075
     assert entry["geometryDriftM"] == 0.002
     assert entry["geometryDistancesM"] == list(FLEET_DISTANCES)
@@ -3662,6 +3664,27 @@ async def test_geom_reports_uncalibrated_manual_stale_and_unknown_tags(
     extension._stats_at[DEVICE_SYSID] = now - 60
     response = await geom_message(extension, builder, hub)
     assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "stale"
+
+
+async def test_geom_names_why_a_tag_rejected_the_rig(extension, device, builder, hub):
+    """A placement outside the convention (two anchors swapped) is rejected
+    on the tag with a reason code; the verdict names it and blocks."""
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    await _feed_stats(
+        extension,
+        device,
+        {**FULL_STATS, "geom": 4.0, "gfail": 4.0, "gres": -5.83, "gdrift": 0.0},
+        now=time.monotonic(),
+    )
+
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "failed"
+    assert entry["reason"] == 4
+    assert entry["residualM"] == -5.83
+    assert "not a rectangle" in entry["detail"]
+    assert response.body["consistent"] is False
 
 
 async def test_geom_ids_filter_and_validation(extension, device, dialect, builder, hub):

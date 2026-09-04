@@ -565,6 +565,7 @@ Response / notification body — entries keyed by system id (as string):
       "batteryVoltage": 7.812,
       "clockSyncOk": true,
       "geometryState": 3,
+      "geometryReason": 0,
       "geometryResidualM": -0.075,
       "geometryDriftM": 0.002,
       "geometryDistancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]
@@ -577,11 +578,14 @@ Response / notification body — entries keyed by system id (as string):
   firmware that predates sleep mode, so a UI can tell "unknown".
 - `batteryVoltage` — the optional `vbat` stat, in volts; omitted on
   boards that cannot measure it.
-- `geometryState` / `geometryResidualM` / `geometryDriftM` /
-  `geometryDistancesM` — the tag's automatic cell geometry
-  (rtls-link-zephyr#208; firmware `geom`/`gres`/`gdrift`/`gd1..gd7`):
+- `geometryState` / `geometryReason` / `geometryResidualM` /
+  `geometryDriftM` / `geometryDistancesM` — the tag's automatic cell
+  geometry (rtls-link-zephyr#210; firmware
+  `geom`/`gfail`/`gres`/`gdrift`/`gd1..gd7`):
   fit state (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed),
-  rectangle-diagonal residual (m), largest live initiator-distance drift
+  why the last fit was rejected (0 none, 1 anchor count not 4 or 8,
+  2 anchor missing, 3 side too short, 4 not a rectangle, 5 top plane not
+  above the bottom one), rectangle-diagonal residual (m), largest live initiator-distance drift
   since calibration (m), and the seven fitted AN0-ANi distances (m; the
   last four are `null` for a four-anchor cell). Present only on firmware
   with automatic geometry; the distances arrive once calibrated.
@@ -643,7 +647,7 @@ Estimates of a device that drops off the network are pruned with it.
 ### X-RTLS-GEOM — fleet cell-geometry agreement
 
 Every tag fits the anchor table itself at boot from the initiator
-distances it receives (rtls-link-zephyr#208, `docs/auto-geometry.md`
+distances it receives (rtls-link-zephyr#210, `docs/auto-geometry.md`
 there): no anchor table is written from the ground any more, and
 `UWB_GEOM_MODE=0` keeps a provisioned `UWB_AN*` table for layouts
 outside the stacked-rectangle convention. The fitted table is a
@@ -694,7 +698,9 @@ slot-to-anchor binding; `frame` lists the parameters), `incomplete` (those
 parameters are not all in the cache yet; `missingParams` lists them),
 `missing` (an explicitly requested id that is not online), or
 `manual` (uses its provisioned table), `calibrating`, `failed`
-(AN1..AN3 not all heard; the firmware retries), `stale` (stats older
+(the tag rejected the rig — a placement outside the convention, such as
+two anchors swapped, or an anchor never heard; `reason` carries the
+firmware's code and `detail` names it; the firmware retries), `stale` (stats older
 than 10 s) and `unknown` (no geometry telemetry, i.e. firmware without
 automatic geometry). A candidate needs a complete fit — the three
 bottom-plane distances and all or none of the top plane (the firmware
@@ -710,8 +716,8 @@ calibrating, failed, went silent or is unknown; manual tags are reported
 but do not block — the table is the operator's deliberate choice.
 
 A fit is repeated on the tag with `UWB_GEOM_RECAL=1` (through
-`X-RTLS-PARAM-SET`); the residual and drift readouts are also
-available as the `UWB_GEOM_*` parameters.
+`X-RTLS-PARAM-SET`). The stats contract is pinned in AxioStack's
+`contracts/rtls-geometry-stats.md`.
 
 ### X-RTLS-VERIFY — fleet pre-flight verification
 

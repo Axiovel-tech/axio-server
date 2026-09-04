@@ -1,10 +1,12 @@
 """Fleet cell-geometry agreement (X-RTLS-GEOM).
 
-Since rtls-link-zephyr#208 every tag fits the anchor table itself at boot
+Since rtls-link-zephyr#210 every tag fits the anchor table itself at boot
 from the initiator distances it receives (stacked-rectangle deployment
-convention) and streams the fit as health stats: the geometry state, the
-rectangle-diagonal residual, the largest live drift since calibration and
-the seven fitted AN0-ANi distances. The fitted table is a deterministic
+convention) and streams the fit as health stats: the geometry state, why the last fit was
+rejected, the rectangle-diagonal residual, the largest live drift since
+calibration and the seven fitted AN0-ANi distances. A rig outside the
+convention (two anchors swapped, one missing) is rejected on the tag, never
+fitted; the reason is reported here. The fitted table is a deterministic
 function of those distances, so "did every drone converge on the same
 cell?" reduces to comparing the distances across the fleet against a
 per-distance median reference.
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DEFAULT_TOLERANCE_M",
+    "GEOMETRY_REASON_NAMES",
     "GEOMETRY_STATE_NAMES",
     "STATS_FRESH_S",
     "run_agreement",
@@ -45,7 +48,7 @@ DEFAULT_TOLERANCE_M = 0.02
 #: went silent and the tag's geometry cannot be certified on it
 STATS_FRESH_S = 10.0
 
-#: firmware UWB_GEOM_STATE / ``geom`` stat codes
+#: firmware ``geom`` stat codes
 GEOMETRY_STATE_NAMES = {
     0: "manual",
     1: "waiting",
@@ -54,8 +57,19 @@ GEOMETRY_STATE_NAMES = {
     4: "failed",
 }
 
+#: firmware ``gfail`` stat codes: why the last fit was rejected
+GEOMETRY_REASON_NAMES = {
+    0: "",
+    1: "the provisioned anchor count is not 4 or 8",
+    2: "an anchor was never heard",
+    3: "a side or the height is under 1 m",
+    4: "not a rectangle: the diagonal disagrees with the sides (anchors swapped?)",
+    5: "the top plane is not above the bottom one (anchors swapped?)",
+}
+
 STATE_MANUAL = 0
 STATE_CALIBRATED = 3
+STATE_FAILED = 4
 
 
 def _is_tag(ext: "RtlsExtension", system_id: int, params: dict[str, Any]) -> bool:
@@ -67,16 +81,12 @@ def _is_tag(ext: "RtlsExtension", system_id: int, params: dict[str, Any]) -> boo
     return role is None or role == "tag"
 
 
-def _entry_for(
-    system_id: int,
-    cell: str,
-    stats: Optional[dict[str, Any]],
-    stats_age: float,
-    tolerance: float,
+def _fit_state(
+    system_id: int, cell: str, stats: Optional[dict[str, Any]], stats_age: float
 ) -> dict[str, Any]:
-    """The per-device entry before the fleet comparison: everything the
-    tag reports about its own fit, plus a status for the tags that
-    cannot take part in the comparison."""
+    """What the tag reports about its own fit, with a status for every tag
+    that cannot take part in the comparison; ``candidate`` for a fresh,
+    calibrated tag."""
     entry: dict[str, Any] = {"id": system_id, "cell": cell}
     if not stats or "geometryState" not in stats:
         entry["status"] = "unknown"
@@ -85,62 +95,78 @@ def _entry_for(
     state = int(stats["geometryState"])
     entry["state"] = state
     entry["stateName"] = GEOMETRY_STATE_NAMES.get(state, "?")
-    if "geometryResidualM" in stats:
-        entry["residualM"] = stats["geometryResidualM"]
-    if "geometryDriftM" in stats:
-        entry["driftM"] = stats["geometryDriftM"]
+    for key, field in (
+        ("geometryResidualM", "residualM"),
+        ("geometryDriftM", "driftM"),
+        ("geometryReason", "reason"),
+    ):
+        if key in stats:
+            entry[field] = stats[key]
     if stats_age > STATS_FRESH_S:
         entry["status"] = "stale"
         entry["detail"] = f"telemetry went silent ({stats_age:.0f} s ago)"
-        return entry
-    if state == STATE_MANUAL:
+    elif state == STATE_MANUAL:
         entry["status"] = "manual"
         entry["detail"] = "uses its provisioned UWB_AN* table"
-        return entry
-    if state != STATE_CALIBRATED:
-        entry["status"] = "calibrating" if state in (1, 2) else "failed"
+    elif state == STATE_CALIBRATED:
+        entry["status"] = "candidate"
+    elif state == STATE_FAILED:
+        reason = GEOMETRY_REASON_NAMES.get(int(stats.get("geometryReason", 0)), "?")
+        entry["status"] = "failed"
         entry["detail"] = (
-            "still fitting the cell"
-            if state in (1, 2)
-            else "could not fit the cell (AN1..AN3 not all heard); retrying"
+            f"the tag rejected the rig: {reason or 'no reason reported'}; it retries"
         )
-        return entry
+    else:
+        entry["status"] = "calibrating"
+        entry["detail"] = "still fitting the cell"
+    return entry
+
+
+def _fitted_distances(entry: dict[str, Any], stats: dict[str, Any], tolerance: float) -> None:
+    """Attaches a candidate's fit or downgrades the entry. The stats arrive
+    one field at a time, so only a complete, finite fit — the three
+    bottom-plane distances plus all or none of the top plane — with its
+    live drift is graded; a drift over ``tolerance`` means a tripod moved
+    since the fit, and the table is stale even if every tag agrees on it."""
     distances = list(stats.get("geometryDistancesM") or [])
     distances += [None] * (7 - len(distances))
-    # The stats arrive one field at a time: certify only a complete fit —
-    # the three bottom-plane distances, plus either all four or none of
-    # the top plane (the firmware zeroes the top plane it did not fit).
     bottom_complete = all(d is not None for d in distances[:3])
     top = [d is not None for d in distances[3:7]]
     if not bottom_complete or (any(top) and not all(top)):
         entry["status"] = "calibrating"
         entry["detail"] = "calibrated but the fitted distances have not all arrived yet"
-        return entry
+        return
     entry["distancesM"] = distances
     if "geometryDriftM" not in stats:
-        # the fit alone cannot be certified: without the live drift the
-        # cell may have moved since boot and nothing would say so
         entry["status"] = "calibrating"
         entry["detail"] = "calibrated but the live drift has not arrived yet"
-        return entry
+        return
     drift = float(stats["geometryDriftM"])
     if not math.isfinite(drift) or not all(
         d is None or math.isfinite(d) for d in distances
     ):
         entry["status"] = "calibrating"
         entry["detail"] = "fitted distances are not finite yet"
-        return entry
+        return
     if drift > tolerance:
-        # the fit still describes the cell as it was at boot: the live
-        # distances say an anchor has moved since, so the table is stale
-        # even if every tag agrees on it
         entry["status"] = "drifted"
         entry["detail"] = (
             f"an initiator distance moved {drift * 100:.1f} cm since the fit "
             "(a tripod moved?) — recalibrate"
         )
-        return entry
-    entry["status"] = "candidate"
+
+
+def _entry_for(
+    system_id: int,
+    cell: str,
+    stats: Optional[dict[str, Any]],
+    stats_age: float,
+    tolerance: float,
+) -> dict[str, Any]:
+    """The per-device entry before the fleet comparison."""
+    entry = _fit_state(system_id, cell, stats, stats_age)
+    if entry["status"] == "candidate":
+        _fitted_distances(entry, stats or {}, tolerance)
     return entry
 
 
@@ -302,6 +328,84 @@ def _check_frames(protocol: Any, graded: list[dict[str, Any]]) -> None:
             )
 
 
+BLOCKING = frozenset(
+    {
+        "deviates",
+        "drifted",
+        "frame",
+        "incomplete",
+        "missing",
+        "calibrating",
+        "failed",
+        "stale",
+        "unknown",
+    }
+)
+
+
+def _tag_entries(
+    ext: "RtlsExtension",
+    protocol: Any,
+    ids: Optional[list[int]],
+    tolerance: float,
+    now: float,
+) -> dict[str, dict[str, Any]]:
+    """One entry per graded device: a requested id that is not online is a
+    verdict too (``missing``: the caller asked, so silence would certify
+    it), anchors carry no fit and are skipped, and a tag whose cell is not
+    known yet is ``incomplete`` (a partial parameter cache without CELL_ID
+    would file it under the default cell and certify it against the wrong
+    reference)."""
+    entries: dict[str, dict[str, Any]] = {}
+    if ids is not None:
+        for system_id in sorted(set(ids) - set(protocol.devices)):
+            entries[str(system_id)] = {
+                "id": system_id,
+                "status": "missing",
+                "detail": "device is not online",
+            }
+    for system_id, device in sorted(protocol.devices.items()):
+        if ids is not None and system_id not in ids:
+            continue
+        params = _decoded_device_params(device)
+        if not _is_tag(ext, system_id, params):
+            continue
+        stats_age = now - ext._stats_at.get(system_id, float("-inf"))
+        entry = _entry_for(
+            system_id,
+            _cell_id_from_params(params),
+            ext._stats.get(system_id),
+            stats_age,
+            tolerance,
+        )
+        if entry["status"] == "candidate" and not _cell_known(device, params):
+            entry["status"] = "incomplete"
+            entry["missingParams"] = ["CELL_ID"]
+            entry["detail"] = "cell not known yet: CELL_ID"
+        entries[str(system_id)] = entry
+    return entries
+
+
+def _grade_cells(
+    protocol: Any, entries: dict[str, dict[str, Any]], tolerance: float
+) -> dict[str, list[Optional[float]]]:
+    """Grades the candidates of every cell against that cell's reference
+    (in place) and returns the references."""
+    references: dict[str, list[Optional[float]]] = {}
+    for cell in sorted({entry["cell"] for entry in entries.values() if "cell" in entry}):
+        candidates = [
+            e for e in entries.values() if e["status"] == "candidate" and e["cell"] == cell
+        ]
+        reference = _reference(candidates)
+        if reference is None:
+            continue
+        references[cell] = reference
+        for entry in candidates:
+            _compare(entry, reference, tolerance)
+        _check_frames(protocol, candidates)
+    return references
+
+
 def run_agreement(
     ext: "RtlsExtension",
     *,
@@ -319,76 +423,20 @@ def run_agreement(
     or anchor-MAC parameters differ from the cell's majority,
     ``incomplete`` while those parameters are not all known, ``missing``
     for a requested id that is not online, or ``manual`` / ``calibrating`` /
-    ``failed`` / ``stale`` / ``unknown`` when they cannot take part.
-    ``references`` holds one reference per cell; ``reference`` is that of
-    the only cell (``None`` with none or several). ``consistent`` is true
-    when at least one tag agrees and no tag deviates, drifted, is still
-    calibrating, failed, stale or unknown — manual tags are reported but
-    do not block, their table is the operator's deliberate choice."""
+    ``failed`` (with the tag's ``reason``) / ``stale`` / ``unknown`` when
+    they cannot take part. ``references`` holds one reference per cell;
+    ``reference`` is that of the only cell (``None`` with none or several).
+    ``consistent`` is true when at least one tag agrees and no tag
+    deviates, drifted, is still calibrating, failed, stale or unknown —
+    manual tags are reported but do not block, their table is the
+    operator's deliberate choice."""
     protocol = ext._require_protocol()
     if now is None:
         now = time.monotonic()
-    entries: dict[str, dict[str, Any]] = {}
-    if ids is not None:
-        # an explicitly requested device that is not online is a verdict
-        # too: the caller asked about it, so silence would certify it
-        for system_id in sorted(set(ids) - set(protocol.devices)):
-            entries[str(system_id)] = {
-                "id": system_id,
-                "status": "missing",
-                "detail": "device is not online",
-            }
-    for system_id, device in sorted(protocol.devices.items()):
-        if ids is not None and system_id not in ids:
-            continue
-        params = _decoded_device_params(device)
-        if not _is_tag(ext, system_id, params):
-            continue  # anchors carry no fit
-        stats = ext._stats.get(system_id)
-        stats_age = now - ext._stats_at.get(system_id, float("-inf"))
-        entry = _entry_for(
-            system_id, _cell_id_from_params(params), stats, stats_age, tolerance
-        )
-        if entry["status"] == "candidate" and not _cell_known(device, params):
-            # a partial parameter cache without CELL_ID would file the tag
-            # under the default cell — and certify it against the wrong
-            # reference; the legacy default is only for a complete listing
-            # that genuinely lacks the parameter
-            entry["status"] = "incomplete"
-            entry["missingParams"] = ["CELL_ID"]
-            entry["detail"] = "cell not known yet: CELL_ID"
-        entries[str(system_id)] = entry
-
-    references: dict[str, list[Optional[float]]] = {}
-    for cell in sorted(
-        {entry["cell"] for entry in entries.values() if "cell" in entry}
-    ):
-        candidates = [
-            e
-            for e in entries.values()
-            if e["status"] == "candidate" and e["cell"] == cell
-        ]
-        reference = _reference(candidates)
-        if reference is None:
-            continue
-        references[cell] = reference
-        for entry in candidates:
-            _compare(entry, reference, tolerance)
-        _check_frames(protocol, candidates)
-
-    blocking = {
-        "deviates",
-        "drifted",
-        "frame",
-        "incomplete",
-        "missing",
-        "calibrating",
-        "failed",
-        "stale",
-        "unknown",
-    }
+    entries = _tag_entries(ext, protocol, ids, tolerance, now)
+    references = _grade_cells(protocol, entries, tolerance)
     consistent = bool(references) and not any(
-        entry["status"] in blocking for entry in entries.values()
+        entry["status"] in BLOCKING for entry in entries.values()
     )
     return {
         "type": "X-RTLS-GEOM",
