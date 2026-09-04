@@ -192,11 +192,11 @@ REFILL_READ_SPACING = 0.01
 REFILL_MAX_ANCHOR_TABLE = 16
 
 #: identity params a tag must carry for its cell geometry to render
-#: (see :func:`_has_cell_geometry`) — plus the geometry-consistency
-#: params: X-RTLS-GEO refuses to trust a snapshot whose optional
-#: geometry params may be dump-loss holes, so the refill must repair
-#: those holes too. A name genuinely absent from an older registry
-#: costs the capped retry rounds and is then left alone.
+#: (see :func:`_has_cell_geometry`) — plus ``POS_YAW_DEG`` (reported by
+#: the fleet-verification yaw rule) and ``CELL_ID`` (cell naming), which
+#: are optional on older registries: the refill repairs dump-loss holes
+#: in them too. A name genuinely absent from an older registry costs the
+#: capped retry rounds and is then left alone.
 TAG_IDENTITY_PARAMS = (
     "ORIGIN_LAT_E7",
     "ORIGIN_LON_E7",
@@ -249,39 +249,15 @@ class RtlsExtension(Extension):
         self._last_inf_broadcast: Optional[float] = None
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
-        #: test hook for the geometry-sync device reset; ``None`` means
-        #: "use the SMP os-reset" (see geometry._default_reset)
-        self._geo_reset = None
         #: SMP (MCUmgr) port per configured management address. Hardware is
         #: always :1337; simulated devices share one loopback host and each
         #: publish their own port in the sim manifest, which the generated
         #: config forwards (rtlslink.sim.gcs_config_from_manifest).
         self._smp_ports: dict[tuple[str, int], int] = {}
-        #: True while an X-RTLS-GEO sync runs; a second concurrent sync
-        #: is refused, and the cell-source bookkeeping refuses to move
-        #: the source off the pinned reference while targets are being
-        #: rewritten (see :meth:`_sync_anchor_beacons`)
-        self._geo_sync_running = False
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
         self._verify_running = False
-        #: complete rolling TWR summaries keyed by reporting system ID.
-        #: Scalar ``twr`` events remain in ``_twr`` for X-RTLS-INF only;
-        #: calibration consumes these capability-gated coherent generations.
-        self._twr_summaries: dict[int, Any] = {}
-        #: edge-triggered wakeup for fit requests waiting for a generation
-        self._twr_summary_changed = trio.Event()
-        #: strict fit + exact summary pinned for an optional refined fit
-        self._geo_fit_session = None
-        #: Process-local identifier for a distributed calibration capture.
-        #: A restart clears the pinned session, so persistence is unnecessary.
-        self._next_geo_capture_id = 1
-        #: lazily loaded canonical-geometry store (see geometry.py);
-        #: ``None`` = not loaded yet
-        self._geo_canonical: Optional[dict[str, Any]] = None
-        #: test seam: overrides the canonical store's file path
-        self._geo_store_path = None
         #: per-(system id, name) write serialization: PARAM_EXT acks
         #: carry no transaction id — they are matched by device + name
         #: only — so two overlapping writes of the same parameter could
@@ -366,9 +342,7 @@ class RtlsExtension(Extension):
         self._refill: dict[int, dict[str, Any]] = {}
         #: spacing between refill retry rounds; recomputed in run() from
         #: the presence config (the hello interval paces passive mode)
-        self._refill_interval = max(
-            DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL
-        )
+        self._refill_interval = max(DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL)
         #: lazy proxy of the mavlink extension's API (``None`` when the
         #: extension module is unavailable); source of the UAV source
         #: addresses the tag<->drone association joins against
@@ -437,9 +411,9 @@ class RtlsExtension(Extension):
         # management conversation. Both a config of 0/None and a pinned
         # SDK without the advertisement parser disable the listener; the
         # rest of the extension is unaffected either way.
-        advertisement_port = int(configuration.get(
-            "advertisement_port", DEFAULT_ADVERTISEMENT_PORT
-        ) or 0)
+        advertisement_port = int(
+            configuration.get("advertisement_port", DEFAULT_ADVERTISEMENT_PORT) or 0
+        )
         if advertisement_port:
             if self._parse_advertisement is None:
                 self._parse_advertisement = _load_advertisement_parser(logger)
@@ -468,11 +442,7 @@ class RtlsExtension(Extension):
             f"({len(targets)} static, broadcast {len(broadcast)}, "
             f"{'passive' if self._passive else 'active'} presence, "
             f"advertisements "
-            + (
-                f"on UDP :{advertisement_port}"
-                if self._adv_sock is not None
-                else "off"
-            )
+            + (f"on UDP :{advertisement_port}" if self._adv_sock is not None else "off")
             + ")"
         )
 
@@ -480,9 +450,7 @@ class RtlsExtension(Extension):
             async with trio.open_nursery() as nursery:
                 self._nursery = nursery
                 if self._adv_sock is not None:
-                    nursery.start_soon(
-                        self._run_advertisement_loop, self._adv_sock
-                    )
+                    nursery.start_soon(self._run_advertisement_loop, self._adv_sock)
                 with app.message_hub.use_message_handlers(
                     {
                         "X-RTLS-INF": self._handle_RTLS_INF,
@@ -493,7 +461,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
-                        "X-RTLS-GEO": self._handle_RTLS_GEO,
+                        "X-RTLS-GEOM": self._handle_RTLS_GEOM,
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                     }
                 ):
@@ -701,14 +669,6 @@ class RtlsExtension(Extension):
                 # from the wire name); cache it per peer with a harvest stamp so
                 # X-RTLS-INF can report its age.
                 self._on_twr(event.system_id, event.data, now)
-            elif event.kind == "twr_summary":
-                # The SDK emits this only after it has assembled a coherent
-                # capability/header plus complete range/quality/count triples
-                # from one device generation. Calibration later combines one
-                # A0 spoke from each responder.
-                from .fit import on_twr_summary
-
-                on_twr_summary(self, event.system_id, event.data, now)
             elif event.kind == "param_value":
                 # a freshly learned parameter may complete a tag's cell or
                 # change an anchor's MAC/role; resync the anchor beacons
@@ -943,9 +903,7 @@ class RtlsExtension(Extension):
                 if device is None:
                     raise KeyError(system_id)
                 with self._subscribed_events() as events:
-                    request = protocol.set_param(
-                        system_id, name, encoded, param_type
-                    )
+                    request = protocol.set_param(system_id, name, encoded, param_type)
                     if request is None:
                         raise KeyError(system_id)
                     await self._send(*request)
@@ -983,9 +941,7 @@ class RtlsExtension(Extension):
                             )
                             self._refresh_anchor_cells()
                     return {
-                        "value": decode_param_value(
-                            event.data["value"], param_type
-                        ),
+                        "value": decode_param_value(event.data["value"], param_type),
                         "type": param_type_to_name(param_type),
                         "result": result,
                         "accepted": result == PARAM_ACK_ACCEPTED,
@@ -1058,9 +1014,7 @@ class RtlsExtension(Extension):
 
             await trio.sleep(settle)
             try:
-                state = await self.get_param(
-                    system_id, SLEEP_PARAM, timeout=timeout
-                )
+                state = await self.get_param(system_id, SLEEP_PARAM, timeout=timeout)
             except (KeyError, trio.TooSlowError):
                 # The write was acknowledged, so the device is most likely
                 # asleep -- report the verification gap instead of a plain
@@ -1199,9 +1153,7 @@ class RtlsExtension(Extension):
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
         await hub.broadcast_message(hub.create_notification(body))
 
-    async def _on_stats(
-        self, system_id: int, data: dict[str, Any], now: float
-    ) -> None:
+    async def _on_stats(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache the latest health-telemetry snapshot for a device and
         broadcast it to clients, throttled to at most one per
         ``STATS_INTERVAL`` per device.
@@ -1278,10 +1230,7 @@ class RtlsExtension(Extension):
             if name not in POS_DEBUG_FIELDS:
                 continue
             system_id = message.get_srcSystem()
-            if (
-                self._protocol is None
-                or system_id not in self._protocol.devices
-            ):
+            if self._protocol is None or system_id not in self._protocol.devices:
                 # Only known (heartbeating) devices may populate the caches:
                 # an unknown sysid has no ``lost`` path, so accepting it here
                 # would grow the pos dicts unboundedly (spoofed traffic) or
@@ -1300,10 +1249,7 @@ class RtlsExtension(Extension):
                 # under a recurring stamp).
                 current = next(iter(wire.values()))[1]
                 if stamp != current:
-                    if (
-                        stamp > current
-                        or current - stamp > POS_REBOOT_BACKSTEP_MS
-                    ):
+                    if stamp > current or current - stamp > POS_REBOOT_BACKSTEP_MS:
                         wire.clear()
                     else:
                         continue
@@ -1392,13 +1338,6 @@ class RtlsExtension(Extension):
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
-        self._twr_summaries.pop(event.system_id, None)
-        if (
-            self._geo_fit_session is not None
-            and event.system_id
-            in self._geo_fit_session.capture.participant_system_ids
-        ):
-            self._geo_fit_session = None
         self._adv.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
@@ -1588,15 +1527,11 @@ class RtlsExtension(Extension):
                 # the paced reads sleep between datagrams; run them off
                 # the receive loop so a large round cannot stall
                 # heartbeat consumption into false device expiry
-                self._nursery.start_soon(
-                    self._send_refill_reads, system_id, missing
-                )
+                self._nursery.start_soon(self._send_refill_reads, system_id, missing)
             else:
                 await self._send_refill_reads(system_id, missing)
 
-    async def _send_refill_reads(
-        self, system_id: int, names: list[str]
-    ) -> None:
+    async def _send_refill_reads(self, system_id: int, names: list[str]) -> None:
         """Send one targeted PARAM_EXT_REQUEST_READ per name, paced: each
         read is answered immediately by the firmware, whose management TX
         queue cannot absorb a burst of replies (the reason its own dump
@@ -1647,18 +1582,14 @@ class RtlsExtension(Extension):
         snapshot (see :func:`_missing_identity_param_names`); the role is
         resolved like :meth:`_device_json` does, preferring the fresher
         state advertisement over the param cache."""
-        if (
-            device.param_count is not None
-            and len(device.params) >= device.param_count
-        ):
+        if device.param_count is not None and len(device.params) >= device.param_count:
             # the snapshot is count-complete, so the dump lost nothing:
             # an identity param absent from it is genuinely absent on the
             # device and must not be re-polled
             return []
         params = _decoded_device_params(device)
-        role = (
-            self._adv.get(device.system_id, {}).get("role")
-            or role_from_params(params)
+        role = self._adv.get(device.system_id, {}).get("role") or role_from_params(
+            params
         )
         return _missing_identity_param_names(params, role)
 
@@ -1927,9 +1858,7 @@ class RtlsExtension(Extension):
             stats = self._stats.get(system_id)
             snapshot = {str(system_id): dict(stats)} if stats is not None else {}
         else:
-            snapshot = {
-                str(sysid): dict(stats) for sysid, stats in self._stats.items()
-            }
+            snapshot = {str(sysid): dict(stats) for sysid, stats in self._stats.items()}
 
         return hub.create_response_or_notification(
             body={"type": "X-RTLS-STATS", "stats": snapshot},
@@ -1964,110 +1893,26 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
-    async def _handle_RTLS_GEO(
+    async def _handle_RTLS_GEOM(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
-        # Lazy import: geometry.py imports helpers from this module, so
-        # importing it at module load would be a cycle.
-        from .geometry import (
-            DEFAULT_FLOAT_TOLERANCE,
-            run_adopt,
-            run_check,
-            run_sync,
-        )
+        # Lazy import: geometry_agreement.py imports helpers from this module.
+        from .geometry_agreement import DEFAULT_TOLERANCE_M, run_agreement
 
         body = message.body
-        op = body.get("op")
-        if op == "fit":
-            from .fit import SUMMARY_WAIT_TIMEOUT_S, run_fit
-
-            try:
-                mode = body.get("mode", "strict")
-                if not isinstance(mode, str):
-                    raise ValueError(f"Invalid fit mode: {mode!r}")
-                capture_id = body.get("captureId")
-                if capture_id is not None:
-                    try:
-                        capture_id = int(capture_id)
-                    except (TypeError, ValueError):
-                        raise ValueError(
-                            f"Invalid captureId: {capture_id!r}"
-                        ) from None
-                timeout = body.get("timeout", SUMMARY_WAIT_TIMEOUT_S)
-                try:
-                    timeout = float(timeout)
-                except (TypeError, ValueError):
-                    raise ValueError(f"Invalid timeout: {timeout!r}") from None
-                cell = body.get("cell")
-                if cell is not None and not isinstance(cell, str):
-                    raise ValueError(f"Invalid cell: {cell!r}")
-                result = await run_fit(
-                    self,
-                    mode=mode,
-                    cell=cell,
-                    capture_id=capture_id,
-                    timeout=timeout,
-                )
-            except ValueError as ex:
-                return hub.reject(message, reason=str(ex))
-            return hub.create_response_or_notification(
-                body=result, in_response_to=message
-            )
-        if op not in ("adopt", "check", "sync"):
-            return hub.reject(
-                message,
-                reason=f"Invalid op: {op!r} (expected 'adopt', 'check', "
-                "'sync' or 'fit')",
-            )
         try:
-            reference = _get_optional_device_id(body, "reference")
             ids = _get_optional_device_ids(body)
-            cell = body.get("cell")
-            if cell is not None and not isinstance(cell, str):
-                raise ValueError(f"Invalid cell: {cell!r}")
-            tolerance = body.get("tolerance", DEFAULT_FLOAT_TOLERANCE)
-            try:
-                tolerance = float(tolerance)
-            except (TypeError, ValueError):
-                raise ValueError(f"Invalid tolerance: {tolerance!r}") from None
-            if not 0 <= tolerance <= 1:
-                raise ValueError("Tolerance must be between 0 and 1")
-            timeout = _get_timeout(message, DEFAULT_PARAM_TIMEOUT)
+            tolerance = body.get("tolerance", DEFAULT_TOLERANCE_M)
+            if (
+                isinstance(tolerance, bool)
+                or not isinstance(tolerance, (int, float))
+                or not 0.0 < float(tolerance) <= 1.0
+            ):
+                raise ValueError("Invalid tolerance (metres, 0 < tolerance <= 1)")
+            result = run_agreement(self, ids=ids, tolerance=float(tolerance))
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-
-        try:
-            if op == "adopt":
-                result = await run_adopt(
-                    self, reference=reference, tolerance=tolerance
-                )
-            elif op == "check":
-                result = await run_check(
-                    self, cell=cell, ids=ids, tolerance=tolerance
-                )
-            else:
-                geometry = body.get("geometry")
-                if geometry is not None and not isinstance(geometry, dict):
-                    return hub.reject(
-                        message,
-                        reason="'geometry' must be an object of "
-                        "parameter name -> value",
-                    )
-                result = await run_sync(
-                    self,
-                    cell=cell,
-                    ids=ids,
-                    geometry=geometry,
-                    tolerance=tolerance,
-                    reboot=bool(body.get("reboot", True)),
-                    timeout=timeout,
-                )
-        except ValueError as ex:
-            return hub.reject(message, reason=str(ex))
-
-        return hub.create_response_or_notification(
-            body=result, in_response_to=message
-        )
+        return hub.create_response_or_notification(body=result, in_response_to=message)
 
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2077,15 +1922,10 @@ class RtlsExtension(Extension):
 
         in_depth = bool(message.body.get("inDepth", False))
         try:
-            cell = message.body.get("cell")
-            if cell is not None and not isinstance(cell, str):
-                raise ValueError(f"Invalid cell: {cell!r}")
-            result = await run_verify(self, cell=cell, in_depth=in_depth)
+            result = await run_verify(self, in_depth=in_depth)
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-        return hub.create_response_or_notification(
-            body=result, in_response_to=message
-        )
+        return hub.create_response_or_notification(body=result, in_response_to=message)
 
     # ---- helpers / exports ----
 
@@ -2131,8 +1971,7 @@ class RtlsExtension(Extension):
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "firmwareVersion": adv.get("firmwareVersion")
-            or firmware_version(device),
+            "firmwareVersion": adv.get("firmwareVersion") or firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
@@ -2191,9 +2030,7 @@ class RtlsExtension(Extension):
             if device is None:
                 continue
             try:
-                cell = cell_from_params(
-                    _decoded_device_params(device), cell_id=cell_id
-                )
+                cell = cell_from_params(_decoded_device_params(device), cell_id=cell_id)
             except (KeyError, TypeError, ValueError):
                 continue
             for anchor in cell.anchors:
@@ -2654,9 +2491,7 @@ def _missing_identity_param_names(
     if role in ("anchor-initiator", "anchor-responder"):
         if _anchor_index_for_device(params) is not None:
             return []  # A-index already resolves
-        missing = [
-            name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params
-        ]
+        missing = [name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params]
         missing.extend(_missing_anchor_table_names(params, ("MAC",)))
         return missing
     if role == "tag":
@@ -2665,9 +2500,7 @@ def _missing_identity_param_names(
         # (and the MAC drives the beacon's live/active matching); a hole
         # there keeps the whole cell — hence the map beacons — unrendered
         missing.extend(
-            _missing_anchor_table_names(
-                params, ("X", "Y", "Z", "MAC", "BIAS_M")
-            )
+            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC", "BIAS_M"))
         )
         return missing
     if role is None and "UWB_ROLE" not in params:
@@ -2729,6 +2562,33 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # UI both need it; previously only the show-clock pin manager
         # consumed it internally
         body["clockSyncOk"] = bool(data["clkok"])
+    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state
+    # (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed), why the
+    # last fit was rejected (0 none, 1 anchor count not 4 or 8, 2 anchor
+    # missing, 3 side too short, 4 not a rectangle, 5 top plane not above
+    # the bottom one), the rectangle-diagonal residual, the largest live
+    # drift since calibration and the seven fitted AN0-ANi distances (0
+    # without a fit; a four-anchor cell reports the first three). The fleet
+    # agreement check (X-RTLS-GEOM) compares the distances.
+    # non-finite floats cannot be JSON and cannot be graded: drop them
+    if "geom" in data and math.isfinite(float(data["geom"])):
+        body["geometryState"] = int(data["geom"])
+    if "gfail" in data and math.isfinite(float(data["gfail"])):
+        body["geometryReason"] = int(data["gfail"])
+    if "gres" in data and math.isfinite(float(data["gres"])):
+        body["geometryResidualM"] = round(float(data["gres"]), 4)
+    if "gdrift" in data and math.isfinite(float(data["gdrift"])):
+        body["geometryDriftM"] = round(float(data["gdrift"]), 4)
+    distances = [data.get(f"gd{i}") for i in range(1, 8)]
+    if any(d is not None for d in distances):
+        # the firmware sends 0 for a distance it has no fit for (a
+        # four-anchor cell's top plane, or no fit at all): not a distance
+        body["geometryDistancesM"] = [
+            round(float(d), 4)
+            if d is not None and math.isfinite(float(d)) and float(d) > 0.0
+            else None
+            for d in distances
+        ]
     return body
 
 
@@ -2889,8 +2749,7 @@ schema = {
         },
         "hello_interval": {
             "type": "number",
-            "title": "Interval of the active hello probe in passive mode, "
-            "in seconds",
+            "title": "Interval of the active hello probe in passive mode, in seconds",
             "default": 60,
         },
     }
