@@ -131,7 +131,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 self.log.info("Flight controller firmware: PX4")
             case "skybrush":
                 autopilot_factory = ArduPilotWithSkybrush
-                self.log.info("Flight controller firmware: drone show firmware on ArduPilot")
+                self.log.info(
+                    "Flight controller firmware: drone show firmware on ArduPilot"
+                )
             case _:
                 autopilot_factory = None
                 self.log.warning(
@@ -158,7 +160,16 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         return {
             "find_network_by_id": self._find_network_by_id,
             "get_uav_source_addresses": self._get_uav_source_addresses,
+            "get_uav_system_ids": self._get_uav_system_ids,
             "use_mavlink_message_channel_factory": use_mavlink_message_channel_factory,
+        }
+
+    def _get_uav_system_ids(self) -> dict[str, int]:
+        """Known server UAV IDs, including disconnected controllers, by MAVLink ID."""
+        return {
+            uav.id: uav.system_id
+            for network in (self._networks or {}).values()
+            for uav in network.uav_addresses()
         }
 
     def _get_uav_source_addresses(self) -> dict[str, tuple[str, int]]:

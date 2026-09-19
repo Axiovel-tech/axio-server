@@ -737,6 +737,8 @@ async def test_refill_restores_tag_cell_and_beacons(extension, device):
     # refill entry is dropped as before
     assert sorted(device.read_requests) == [
         "CELL_ID",
+        "FC_STATE",
+        "FC_SYS_ID",
         "ORIGIN_LAT_E7",
         "POS_YAW_DEG",
         "UWB_AN1_MAC",
@@ -3206,7 +3208,12 @@ async def test_refill_repairs_geometry_consistency_params(extension, device):
     device.read_requests.clear()
     await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
-    assert sorted(device.read_requests) == ["POS_YAW_DEG", "UWB_AN1_BIAS_M"]
+    assert sorted(device.read_requests) == [
+        "FC_STATE",
+        "FC_SYS_ID",
+        "POS_YAW_DEG",
+        "UWB_AN1_BIAS_M",
+    ]
     assert "POS_YAW_DEG" in cached.params
     assert "UWB_AN1_BIAS_M" in cached.params
     assert DEVICE_SYSID not in extension._refill

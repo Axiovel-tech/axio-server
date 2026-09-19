@@ -18,7 +18,15 @@ from flockwave.concurrency import FutureCancelled, delayed
 from flockwave.gps.time import datetime_to_gps_time_of_week, gps_time_of_week_to_utc
 from flockwave.gps.vectors import GPSCoordinate, VelocityNED
 from flockwave.spec.errors import FlockwaveErrorCode
-from trio import Event, TooSlowError, fail_after, move_on_after, sleep
+from trio import (
+    CapacityLimiter,
+    Event,
+    Lock,
+    TooSlowError,
+    fail_after,
+    move_on_after,
+    sleep,
+)
 from trio_util import periodic
 
 from flockwave.server.command_handlers import (
@@ -77,6 +85,7 @@ from .enums import (
     MAVFrame,
     MAVMessageType,
     MAVModeFlag,
+    MAVParamType,
     MAVProtocolCapability,
     MAVResult,
     MAVState,
@@ -203,6 +212,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         self.run_in_background = None  # type: ignore
         self.send_packet = None  # type: ignore
 
+        self._operator_limiter = CapacityLimiter(2)
         self._default_timeout = 2
         self._default_retries = 10
         self._default_delay = 0.1
@@ -357,6 +367,21 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         else:
             await uav.set_mode(mode)
             return f"Mode changed to {mode!r}"
+
+    async def handle_command___operator(
+        self,
+        uav: "MAVLinkUAV",
+        operation: str,
+        *,
+        names: list[str] | None = None,
+        values: dict[str, float] | None = None,
+        timeout: float = 30,
+    ) -> dict[str, object]:
+        from .operator_tools import run_operation
+
+        return await run_operation(
+            uav, operation, names=names, values=values, timeout=timeout
+        )
 
     async def handle_command_servo(
         self, uav: "MAVLinkUAV", servo: int | str, value: int | str
@@ -1208,6 +1233,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._battery = BatteryInfo()
         self._connected_event = Event()
         self._gps_fix = GPSFix()
+        self._operator_lock = Lock()
         self._last_messages = defaultdict(MAVLinkMessageRecord)
         self._preflight_status = PreflightCheckInfo()
         self._position = GPSCoordinate()
@@ -1417,9 +1443,17 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         detect if a parameter does not exist as there will be no reply from
         the drone -- which is indistinguishable from a lost packet.
         """
+        value, _ = await self.get_parameter_info(name)
+        return value
+
+    async def get_parameter_info(self, name: str) -> tuple[float, int]:
+        """Read value and wire type together for selected-parameter operations."""
         response = await self._get_parameter(name)
-        return self._autopilot.decode_param_from_wire_representation(
-            response.param_value, response.param_type
+        return (
+            self._autopilot.decode_param_from_wire_representation(
+                response.param_value, response.param_type
+            ),
+            response.param_type,
         )
 
     async def _get_parameter(self, name: str) -> MAVLinkMessage:
@@ -1611,7 +1645,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         return self._scheduled_takeoff_time_gps_time_of_week
 
-    async def _set_parameter_single(self, name: str, value: float) -> None:
+    async def _set_parameter_single(
+        self, name: str, value: float, *, param_type: int | None = None
+    ) -> None:
         """Sets the value of a single parameter on the UAV.
 
         This function assumes that all sanity checks on the name and the value
@@ -1620,10 +1656,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # We need to retrieve the current value of the parameter first because
         # we need its type
         param_id = name.encode("utf-8")[:16]
-        response = await self._get_parameter(name)
-        param_type = response.param_type
+        if param_type is None:
+            response = await self._get_parameter(name)
+            param_type = response.param_type
         encoded_value = self._autopilot.encode_param_to_wire_representation(
-            value, param_type
+            value, MAVParamType(param_type)
         )
 
         try:

@@ -6,6 +6,14 @@ Agents must NEVER COMMIT changes, unless explicitly requested by the user.
 
 Agents must NEVER PUSH changes.
 
+## Field operations
+
+Read [doc/operator.md](doc/operator.md) before controlling a fleet. Use the
+`axio-operator` CLI and existing server connection for flight-controller work.
+Tag configuration and verified power/geometry are owned by the RTLS SDK. Start
+with inventory and explicit identities; do not rebuild ad hoc polling scripts
+or infer a drone ID from an IP address.
+
 ## Build, Lint, and Test Commands
 
 ```bash
