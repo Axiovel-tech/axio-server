@@ -89,12 +89,47 @@ async def test_arming_and_rejected_value_stop_ordered_writes():
     uav.armed = True
     result = await parameter_operation(uav, "apply", values={"A": 5, "B": 6})
     assert not result["complete"] and not uav.writes
+    assert result["changes"][0]["status"] == "failed"
     uav.armed = False
     uav.clamp = True
     result = await parameter_operation(uav, "apply", values={"A": 5, "B": 6})
     assert not result["complete"]
     assert uav.writes == ["A"]
+    assert result["changes"][0]["status"] == "failed"
     assert result["changes"][0]["actual"] == 99
+
+
+@pytest.mark.parametrize("phase", ["write", "readback"])
+@pytest.mark.parametrize("error_type", [trio.TooSlowError, RuntimeError, OSError])
+async def test_write_without_readback_stays_unverified(phase, error_type):
+    uav = UAV()
+    original = uav._set_parameter_single
+
+    async def write(name, value, *, param_type):
+        await original(name, value, param_type=param_type)
+        if phase == "write":
+            raise error_type("reply unavailable")
+
+    async def read(name, fetch=False):
+        assert fetch
+        raise error_type("reply unavailable")
+
+    uav._set_parameter_single = write
+    uav.get_parameter = read
+    result = await parameter_operation(uav, "apply", values={"A": 5, "B": 6})
+
+    assert not result["complete"]
+    assert uav.values["A"][0] == 5
+    assert uav.writes == ["A"]
+    assert result["changes"] == [
+        {
+            "name": "A",
+            "before": 1,
+            "requested": 5,
+            "status": "unverified",
+            "error": "reply unavailable",
+        }
+    ]
 
 
 async def test_invalid_later_value_prevents_prior_changes():

@@ -196,10 +196,9 @@ async def parameter_operation(
                 raise ValueError("fresh readback differs from requested value")
             change["status"] = "applied"
         except (trio.TooSlowError, ValueError, RuntimeError, OSError) as error:
-            change.update(
-                status="failed",
-                error=str(error) or "write/readback timed out; outcome unknown",
-            )
+            if change["status"] == "not-started" or "actual" in change:
+                change["status"] = "failed"
+            change["error"] = str(error) or "write/readback timed out; outcome unknown"
             result["complete"] = False
             break
     return result
