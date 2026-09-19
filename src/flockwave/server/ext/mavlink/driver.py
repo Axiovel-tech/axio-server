@@ -36,7 +36,7 @@ from flockwave.server.command_handlers import (
     create_test_command_handler,
     create_version_command_handler,
 )
-from flockwave.server.errors import NotSupportedError
+from flockwave.server.errors import NotSupportedError, ParameterWriteMismatchError
 from flockwave.server.ext.rc import RCExtensionAPI
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.model.battery import BatteryInfo
@@ -1685,10 +1685,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # This is where we try to recover
             observed_value = await self.get_parameter(name)
             if value != observed_value:
-                raise RuntimeError(
-                    f"Failed to set parameter {name!r}, "
-                    f"tried to set {value!r}, got {observed_value!r}"
-                ) from None
+                raise ParameterWriteMismatchError(name, value, observed_value) from None
 
     async def set_parameter(self, name: str, value: float) -> None:
         """Sets the value of a single parameter on the UAV."""

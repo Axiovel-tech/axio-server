@@ -6,6 +6,8 @@ import pytest
 import trio
 from rtlslink.protocol import RtlsDevice
 
+from flockwave.server.ext.mavlink.autopilots import ArduPilot
+from flockwave.server.ext.mavlink.driver import MAVLinkDriver, MAVLinkUAV
 from flockwave.server.ext.mavlink.operator_tools import (
     parameter_operation,
     run_operation,
@@ -130,6 +132,56 @@ async def test_write_without_readback_stays_unverified(phase, error_type):
             "error": "reply unavailable",
         }
     ]
+
+
+@pytest.mark.parametrize("observed", [99.0, None])
+async def test_write_ack_timeout_preserves_recovery_read_evidence(
+    observed, monkeypatch
+):
+    driver = MAVLinkDriver()
+    driver.autopilot_factory = ArduPilot
+    driver._default_retries = 0
+    uav = MAVLinkUAV("11", driver=driver)
+    uav.assign_to_network_and_system_id("test", 11)
+    reads = []
+    writes = []
+
+    async def send(packet, target, **kwargs):
+        kind, fields = packet
+        if kind == "COMMAND_LONG":
+            return SimpleNamespace(
+                base_mode=0,
+                get_srcSystem=lambda: 11,
+                get_srcComponent=lambda: 1,
+            )
+        name = fields["param_id"].decode("ascii")
+        if kind == "PARAM_SET":
+            writes.append(name)
+            raise trio.TooSlowError
+        assert kind == "PARAM_REQUEST_READ"
+        reads.append(name)
+        value = {"A": 1.0, "B": 2.0}[name]
+        if writes:
+            if observed is None:
+                raise trio.TooSlowError
+            value = observed
+        return SimpleNamespace(param_value=value, param_type=6)
+
+    monkeypatch.setattr(driver, "send_packet", send)
+    result = await parameter_operation(uav, "apply", values={"A": 5, "B": 6})
+
+    assert not result["complete"]
+    assert writes == ["A"]
+    assert reads.count("A") == 2
+    assert reads.count("B") == 1
+    assert len(result["changes"]) == 1
+    change = result["changes"][0]
+    if observed is None:
+        assert change["status"] == "unverified"
+        assert "actual" not in change
+    else:
+        assert change["status"] == "failed"
+        assert change["actual"] == observed
 
 
 async def test_invalid_later_value_prevents_prior_changes():
