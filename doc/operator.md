@@ -7,18 +7,19 @@ SDK after checking the server's onboard association against the tag itself.
 It does not open a second flight-controller connection or change stream rates.
 
 Start with `uv run axio-operator devices`. Copy the server UAV IDs from the
-result; a server ID need not be the numeric MAVLink system ID. Do not infer
-an association from a sticker, an IP suffix, or a numeric server ID.
+result; a server ID need not be the numeric MAVLink system ID. For example,
+FC system ID `6` may have server UAV ID `06`; preserve the leading zero.
+Do not infer an association from a sticker, an IP suffix, or a numeric server ID.
 
 ```sh
 uv run axio-operator devices
 uv run axio-operator power --fc-id 11 --wake --wait-for flight-controller
 uv run axio-operator params read --uav 11 --profile rc-switches
-uv run axio-operator params compare --uav 6 --reference 11 --profile rc-switches
-uv run axio-operator params apply --uav 6 --reference 11 --profile rc-switches
-uv run axio-operator telemetry --uav 6 --uav 11
-uv run axio-operator geometry --uav 6 --uav 11 --tolerance 0.05
-uv run axio-operator power --uav 6 --sleep
+uv run axio-operator params compare --uav 06 --reference 11 --profile rc-switches
+uv run axio-operator params apply --uav 06 --reference 11 --profile rc-switches
+uv run axio-operator telemetry --uav 06 --uav 11
+uv run axio-operator geometry --uav 06 --uav 11 --tolerance 0.05
+uv run axio-operator power --uav 06 --sleep
 ```
 
 The IDs above are examples. For a remote server, put `--host HOST --port PORT`
@@ -41,10 +42,15 @@ not an unconditional delay. Firmware with requested-heartbeat and correlated
 uptime support is required for verified power. Older firmware can still be
 inspected, but an unsupported verification step fails explicitly.
 
+A successful power result already contains fresh verification. The server's
+periodic `devices` inventory can briefly lag that result; it is not necessary
+to add a fixed sleep and rediscover the device after a successful operation.
+
 `--timeout` defaults to 30 seconds. Flight-controller operations include time
 queued behind another operation. The server stops early enough to return a
 partial result before either the client or its command manager expires.
-`values`, `errors`, and completed `changes` remain available on that path.
+Read/compare `values`, apply `before`, `errors`, and completed `changes` remain
+available on that path.
 A write marked `unverified` has an unknown outcome and must be read back before
 retrying. Disconnection of the CLI does not undo an already accepted command.
 
@@ -60,6 +66,10 @@ Compare and apply fetch current values and types. Apply validates every desired
 value for that drone before its first write, skips unchanged values, writes in
 selection/file order, and verifies each changed value with a fresh read. Integer
 values that cannot survive the MAVLink float representation exactly are rejected.
+Apply labels its pre-write snapshot `before` and its original differences
+`initial_differences`. Each changed parameter's `changes[].actual` is its fresh
+readback; a successful apply already verifies those values. Do not interpret
+the pre-write snapshot as the resulting configuration.
 A fresh armed heartbeat blocks each write. A failure stops subsequent writes on
 that drone and reports earlier changes; there is no automatic rollback or fleet
 transaction. Another client can still change parameters or arm a vehicle, so

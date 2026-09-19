@@ -147,8 +147,8 @@ async def parameter_operation(
     if result is None:
         result = {}
     before = ParameterSnapshot()
+    result["before" if operation == "apply" else "values"] = before.values
     result.update(
-        values=before.values,
         types=before.types,
         errors=before.errors,
         complete=False,
@@ -166,7 +166,9 @@ async def parameter_operation(
         for name, value in expected.items()
         if before.values[name] != value
     }
-    result["differences"] = differences
+    result["initial_differences" if operation == "apply" else "differences"] = (
+        differences
+    )
     if operation == "compare":
         result["consistent"] = not differences
         return result

@@ -56,7 +56,9 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "telemetry", help="fresh flight-controller temperatures and heartbeat"
     )
-    p.add_argument("--uav", action="append", required=True)
+    p.add_argument(
+        "--uav", action="append", required=True, help="exact server UAV ID from devices"
+    )
     p.add_argument(
         "--sensor",
         action="append",
@@ -68,7 +70,12 @@ def parser() -> argparse.ArgumentParser:
     actions = p.add_subparsers(dest="operation", required=True)
     for action in ("read", "compare", "apply"):
         q = actions.add_parser(action)
-        q.add_argument("--uav", action="append", required=True)
+        q.add_argument(
+            "--uav",
+            action="append",
+            required=True,
+            help="exact server UAV ID from devices",
+        )
         q.add_argument("--name", action="append")
         q.add_argument("--profile", choices=["rc-switches"])
         if action != "read":

@@ -62,7 +62,7 @@ async def test_partial_reads_cannot_be_compared_or_applied():
     uav = UAV()
     result = await parameter_operation(uav, "apply", values={"A": 5, "MISSING": 9})
     assert not result["complete"]
-    assert result["values"] == {"A": 1}
+    assert result["before"] == {"A": 1}
     assert result["errors"] == {"MISSING": "missing parameter"}
     assert not uav.writes
 
@@ -71,6 +71,9 @@ async def test_apply_orders_only_changes_and_verifies_readback():
     uav = UAV()
     result = await parameter_operation(uav, "apply", values={"B": 5, "A": 1, "C": 0.1})
     assert result["complete"]
+    assert result["before"] == {"A": 1, "B": 2, "C": 3}
+    assert result["initial_differences"]["B"] == {"actual": 2, "expected": 5}
+    assert result["changes"][0]["actual"] == 5
     assert uav.writes == ["B", "C"]
     assert [row["status"] for row in result["changes"]] == [
         "applied",

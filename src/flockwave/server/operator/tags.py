@@ -23,7 +23,7 @@ def add_parsers(sub) -> None:
         "power", help="wake/sleep a mapped drone through the RTLS SDK"
     )
     targets = parser.add_mutually_exclusive_group(required=True)
-    targets.add_argument("--uav", help="server UAV ID")
+    targets.add_argument("--uav", help="exact server UAV ID from devices")
     targets.add_argument(
         "--fc-id", type=int, help="onboard FC system ID, including sleeping drones"
     )
@@ -36,7 +36,9 @@ def add_parsers(sub) -> None:
     parser = sub.add_parser(
         "geometry", help="compare actual fitted anchor tables for mapped drones"
     )
-    parser.add_argument("--uav", action="append", required=True)
+    parser.add_argument(
+        "--uav", action="append", required=True, help="exact server UAV ID from devices"
+    )
     parser.add_argument("--tolerance", type=float, default=0.05)
 
 
