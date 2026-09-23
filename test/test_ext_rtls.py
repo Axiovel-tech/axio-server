@@ -2184,11 +2184,13 @@ async def test_show_clock_repin_on_cluster_restart(extension, device):
     first_pin = extension._show_clock.pin
     assert DEVICE_SYSID in extension._show_clock._pinned
 
-    # the cluster restarts: reported time drops far below the prediction
-    restarted = dict(CLUSTER_STATS, clks=2.0)
+    # the cluster restarts: reported time drops far below the prediction and
+    # stays there, so the second report confirms it
     async with trio.open_nursery() as nursery:
         extension._nursery = nursery
-        await _feed_stats(extension, device, restarted, now=1.0)
+        await _feed_stats(extension, device, dict(CLUSTER_STATS, clks=2.0), now=1.0)
+        assert extension._show_clock.pin is first_pin
+        await _feed_stats(extension, device, dict(CLUSTER_STATS, clks=2.5), now=1.5)
     extension._nursery = None
 
     second_pin = extension._show_clock.pin
@@ -2235,6 +2237,45 @@ async def test_show_clock_ignores_repeated_accumulated_snapshot(
     async with trio.open_nursery() as nursery:
         extension._nursery = nursery
         await _feed_stats(extension, device, advanced, now=6.0)
+    extension._nursery = None
+    assert extension._show_clock.pin is first_pin
+
+
+async def test_show_clock_keeps_pin_across_a_torn_clock_pair(
+    extension, device, monkeypatch
+):
+    """clkh and clks are separate frames and the snapshot pairs the latest of
+    each. A lost clkh frame at a 4096 s boundary pairs the old clkh with the
+    new clks until the next report; crossing a boundary, the new clkh pairs
+    with the old clks until the clks frame arrives. Neither is a restart."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    t0 = 1_752_000_000.0
+    now = [t0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+    )
+    _add_pin_params(device)
+    extension._show_clock = ShowClockPinManager(extension)
+    await discover(extension, device)
+
+    async def report(at, clkh, clks):
+        now[0] = t0 + at
+        values = dict(CLUSTER_STATS, clkh=clkh, clks=clks)
+        if clkh is None:
+            del values["clkh"]
+        await _feed_stats(extension, device, values, now=at)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        await report(0.0, 0.0, 4095.0)
+        first_pin = extension._show_clock.pin
+        assert first_pin is not None
+
+        await report(1.0, None, 0.0)  # clkh frame lost at the boundary
+        await report(1.5, 4096.0, 0.5)
+        await report(4096.5, 4096.0, 4095.5)
+        await report(4097.0, 8192.0, 0.0)  # clkh lands before its clks
     extension._nursery = None
     assert extension._show_clock.pin is first_pin
 

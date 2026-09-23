@@ -129,6 +129,8 @@ class ShowClockPinManager:
         #: while the other fields in the cycle arrive (and while parameter
         #: writes temporarily delay the next clock frame).
         self._last_cluster_seconds: dict[int, float] = {}
+        #: Devices whose last distinct sample deviated from the pin; see on_stats.
+        self._deviating: set[int] = set()
         #: devices whose LAST push completed with every write accepted
         self._pinned: set[int] = set()
         #: devices with a push currently in flight (dedup guard)
@@ -141,6 +143,7 @@ class ShowClockPinManager:
     def reset(self) -> None:
         self._pin = None
         self._last_cluster_seconds.clear()
+        self._deviating.clear()
         self._pinned.clear()
         self._in_flight.clear()
 
@@ -148,6 +151,7 @@ class ShowClockPinManager:
         """A lost device must be re-pinned when it returns (it may have
         rebooted with default params)."""
         self._last_cluster_seconds.pop(system_id, None)
+        self._deviating.discard(system_id)
         self._pinned.discard(system_id)
 
     def on_stats(self, system_id: int, data: dict[str, Any], nursery) -> None:
@@ -167,7 +171,18 @@ class ShowClockPinManager:
 
         if self._pin is not None:
             predicted = self._pin.predicted_cluster_seconds(now_unix)
-            if abs(cluster_seconds - predicted) > RESTART_TOLERANCE_S:
+            if abs(cluster_seconds - predicted) <= RESTART_TOLERANCE_S:
+                self._deviating.discard(system_id)
+            elif system_id not in self._deviating:
+                # clkh and clks arrive in separate frames and the snapshot pairs
+                # the latest of each, so a report crossing a 4096 s boundary, or
+                # one whose clkh frame was lost, reads 4096 s off until the other
+                # half arrives. A restart persists: wait for the next distinct
+                # sample before invalidating every device's pin.
+                self._deviating.add(system_id)
+                return
+            else:
+                self._deviating.discard(system_id)
                 # The cluster no longer matches the pin (time-reference
                 # anchor restarted, or the pin is ancient): every
                 # distributed pin is invalid. Mint fresh, push everywhere.
