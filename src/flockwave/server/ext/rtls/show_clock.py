@@ -182,7 +182,8 @@ class ShowClockPinManager:
                 self._deviating.add(system_id)
                 return
             else:
-                self._deviating.discard(system_id)
+                # Every other device's pending deviation was against the old pin.
+                self._deviating.clear()
                 # The cluster no longer matches the pin (time-reference
                 # anchor restarted, or the pin is ancient): every
                 # distributed pin is invalid. Mint fresh, push everywhere.

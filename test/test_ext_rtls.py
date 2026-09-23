@@ -2280,6 +2280,40 @@ async def test_show_clock_keeps_pin_across_a_torn_clock_pair(
     assert extension._show_clock.pin is first_pin
 
 
+def test_show_clock_remint_clears_every_pending_deviation(monkeypatch):
+    """A deviation recorded against the old pin must not count as the first
+    of two against the new one: after a re-mint, another device's first
+    deviant sample waits for its confirmation like any other."""
+    from types import SimpleNamespace
+
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    now = [1_752_000_000.0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+    )
+    manager = ShowClockPinManager(SimpleNamespace(log=None))
+    nursery = SimpleNamespace(start_soon=lambda *args: None)
+
+    def sample(system_id, cluster_seconds):
+        manager.on_stats(
+            system_id,
+            {"clkok": 1.0, "clkh": 0.0, "clks": cluster_seconds},
+            nursery,
+        )
+
+    sample(1, 100.0)
+    first_pin = manager.pin
+    sample(2, 3000.0)  # device 2 deviates once against the first pin
+    sample(1, 2000.0)
+    sample(1, 2000.5)  # device 1 confirms a restart: re-mint
+    second_pin = manager.pin
+    assert second_pin is not first_pin
+
+    sample(2, 3500.0)  # device 2's first deviation against the new pin
+    assert manager.pin is second_pin
+
+
 async def test_show_clock_lost_device_repinned_on_return(extension, device):
     """A lost device is dropped from the pinned set, so its next fresh
     stats snapshot after rediscovery pushes the pin again (it may have
