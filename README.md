@@ -63,6 +63,9 @@ ports or endpoints are configured.
 
 ## Documentation
 
+- [Field operator CLI](doc/operator.md): verified power, selected FC parameters,
+  reference RC settings, fitted geometry, and fresh temperature snapshots.
+
 - API documentation: run `uv run python doc/make.py` to build the
   `doc/axio-server-docs-<date>.zip` archive from the source code (pdoc).
 

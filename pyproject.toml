@@ -48,10 +48,11 @@ dependencies = [
   "fastjsonschema>=2.21.1,<3.0.0",
   "orjson>=3.10.18,<4.0.0",
   "numpy>=2.2.6",
-  "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@ad026c8dc3c90983aa28236dc45bc561062c0d3a#subdirectory=py",
+  "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@6b8a540dc9e2fe6143e352a6bfc630dfd3f16683#subdirectory=py",
 ]
 
 [project.scripts]
+axio-operator = "flockwave.server.operator.cli:main"
 skybrushd = "flockwave.server.launcher:start"
 skybrush-gateway = "flockwave.gateway.launcher:start"
 skybrush-proxy = "flockwave.proxy.launcher:start"

@@ -1,6 +1,11 @@
 """Common exception classes used in many places throughout the server."""
 
-__all__ = ("CommandInvocationError", "FlockwaveError", "NotSupportedError")
+__all__ = (
+    "CommandInvocationError",
+    "FlockwaveError",
+    "NotSupportedError",
+    "ParameterWriteMismatchError",
+)
 
 
 class FlockwaveError(RuntimeError):
@@ -38,3 +43,14 @@ class NotSupportedError(FlockwaveError):
             message: the error message
         """
         super().__init__(message or "Operation not supported")
+
+
+class ParameterWriteMismatchError(FlockwaveError):
+    """Fresh parameter readback differs from the requested write value."""
+
+    def __init__(self, name: str, requested: float, actual: float):
+        self.actual = actual
+        super().__init__(
+            f"Failed to set parameter {name!r}, "
+            f"tried to set {requested!r}, got {actual!r}"
+        )
