@@ -22,6 +22,7 @@ from flockwave.concurrency import (
 )
 from trio import (
     BrokenResourceError,
+    CancelScope,
     TooSlowError,
     as_safe_channel,
     move_on_after,
@@ -445,20 +446,53 @@ class MAVFTP:
     """An iterator yielding sequence numbers for the connection."""
 
     @classmethod
-    def for_uav(cls, uav: MAVLinkUAV):
+    def for_uav(
+        cls,
+        uav: MAVLinkUAV,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ):
         """Constructs a MAVFTP connection object to the given UAV."""
         sender = partial(uav.driver.send_packet, target=uav)
-        return cls(sender)
+        return cls(sender, retry_policy=retry_policy)
 
-    def __init__(self, sender: UAVBoundPacketSenderFn):
+    @classmethod
+    @asynccontextmanager
+    async def use_for_uav(
+        cls,
+        uav: MAVLinkUAV,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ) -> AsyncIterator[MAVFTP]:
+        """Use the UAV's single exclusive MAVFTP connection.
+
+        Closing a MAVFTP connection resets every remote session, so two local
+        connections to one UAV cannot safely overlap.
+        """
+        async with uav.mavftp_lock:
+            ftp = cls.for_uav(uav, retry_policy=retry_policy)
+            try:
+                yield ftp
+            finally:
+                with CancelScope(shield=True):
+                    await ftp.aclose()
+
+    def __init__(
+        self,
+        sender: UAVBoundPacketSenderFn,
+        *,
+        retry_policy: RetryPolicy | None = None,
+    ):
         """Constructor."""
         self._closed = False
         self._closing = False
 
-        self._retry_policy = AdaptiveExponentialBackoffPolicy(
-            max_retries=600,
-            base_timeout=0.1,
-            max_timeout=3,
+        self._retry_policy = (
+            retry_policy
+            if retry_policy is not None
+            else AdaptiveExponentialBackoffPolicy(
+                max_retries=600, base_timeout=0.1, max_timeout=3
+            )
         )
 
         self._path = PurePosixPath("/")
@@ -693,6 +727,15 @@ class MAVFTP:
         """Removes a file at the given path in the MAVFTP session."""
         path = self._resolve(path)
         message = MAVFTPMessage(MAVFTPOpCode.REMOVE_FILE, data=path)
+        await self._send_and_wait(message)
+
+    async def rename(self, source: FTPPath, destination: FTPPath) -> None:
+        """Atomically renames a file on the remote filesystem."""
+        source = self._resolve(source)
+        destination = self._resolve(destination)
+        message = MAVFTPMessage(
+            MAVFTPOpCode.RENAME, data=source + b"\x00" + destination
+        )
         await self._send_and_wait(message)
 
     @asynccontextmanager

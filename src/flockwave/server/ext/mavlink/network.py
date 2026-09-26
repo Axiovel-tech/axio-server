@@ -785,6 +785,7 @@ class MAVLinkNetwork:
             "DATA96": self._handle_message_data,
             "FENCE_STATUS": nop,
             "FILE_TRANSFER_PROTOCOL": nop,
+            "EXTENDED_SYS_STATE": self._handle_message_extended_sys_state,
             "GLOBAL_POSITION_INT": self._handle_message_global_position_int,
             "GPS_GLOBAL_ORIGIN": nop,
             "GPS_RAW_INT": self._handle_message_gps_raw_int,
@@ -934,6 +935,13 @@ class MAVLinkNetwork:
         uav = self._find_uav_from_message(message, address)
         if uav:
             uav.handle_message_global_position_int(message)
+
+    def _handle_message_extended_sys_state(
+        self, message: MAVLinkMessage, *, connection_id: str, address: Any
+    ):
+        uav = self._find_uav_from_message(message, address)
+        if uav:
+            uav.handle_message_extended_sys_state(message)
 
     def _handle_message_gps_raw_int(
         self, message: MAVLinkMessage, *, connection_id: str, address: Any
