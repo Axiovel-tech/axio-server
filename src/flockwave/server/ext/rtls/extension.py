@@ -51,7 +51,7 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .fc_identity import FlightController, flight_controller_claims
+from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .show_clock import ShowClockPinManager
 
 if TYPE_CHECKING:
@@ -345,12 +345,13 @@ class RtlsExtension(Extension):
         #: the presence config (the hello interval paces passive mode)
         self._refill_interval = max(DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL)
         #: lazy proxy of the mavlink extension's API (``None`` when the
-        #: extension module is unavailable); source of the UAV source
-        #: addresses the tag<->drone association joins against
+        #: extension module is unavailable); resolves the MAVLink system id
+        #: each tag reports for its flight controller to a server UAV id
         self._mavlink_api = None
-        #: current device->UAV association: system_id -> flockwave UAV id.
-        #: Derived state, recomputed continuously by :meth:`_poll_uav_map`
-        #: from the live device and UAV source addresses -- never persisted
+        #: each device's flight-controller claim and the server UAV it names
+        #: (system_id -> flockwave UAV id), recomputed continuously by
+        #: :meth:`_poll_uav_map` -- never persisted
+        self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
 
     async def run(self, app, configuration, logger):
@@ -477,6 +478,7 @@ class RtlsExtension(Extension):
             self._sleeping.clear()
             self._sleep_pins.clear()
             self._mavlink_api = None
+            self._fc_claims.clear()
             self._uav_map.clear()
             self._beacon_api = None
             self._clear_anchor_beacons()
@@ -491,9 +493,8 @@ class RtlsExtension(Extension):
                 logger.warning(f"rtls: device sysid {event.system_id} lost")
                 self._handle_lost(event)
 
-            # re-join the tag<->drone association against the UAVs' current
-            # source addresses (DHCP churn, UAVs appearing/disappearing);
-            # a change pushes the (throttled) device list
+            # re-resolve each tag's flight-controller claim against the known
+            # UAVs; a change pushes the (throttled) device list
             await self._poll_uav_map(now)
 
             # re-request identity params a lossy discovery dump left out
@@ -1421,51 +1422,48 @@ class RtlsExtension(Extension):
 
     # ---- tag<->drone association ----
 
-    def _uav_source_addresses(self) -> dict[str, tuple[str, int]]:
-        """The connected MAVLink UAVs' last-heard-from source addresses,
-        keyed by flockwave UAV id, from the mavlink extension's API (empty
-        while the extension is not loaded). Tests override this seam."""
+    def _uav_ids_by_system_id(self) -> dict[int, str]:
+        """The flockwave id of every UAV the mavlink extension has heard
+        from, connected or not, keyed by MAVLink system id, from the mavlink
+        extension's API (empty while the extension is not loaded). Tests
+        override this seam."""
         api = self._mavlink_api
         if api is None or not getattr(api, "loaded", False):
             return {}
         try:
-            return api.get_uav_source_addresses()
+            return api.get_uav_ids_by_system_id()
         except Exception:
             return {}
 
-    def _refresh_uav_map(self) -> bool:
-        """Recompute the device->UAV association and return whether it
-        changed.
-
-        A drone's flight controller reaches the server through its tag's
-        WiFi-UART bridge, so the UAV's UDP source IP equals the tag's
-        management IP -- the join is on that IP. Purely derived state:
-        a device or UAV that disappears (or moves to another IP on a DHCP
-        renewal) drops out of the mapping on the next recompute. An IP
-        claimed by more than one UAV yields no mapping for its devices
-        (better unmapped than mis-attributed -- mis-attribution is the
-        operator incident this exists to prevent)."""
-        mapping: dict[int, str] = {}
+    def _associations(self) -> tuple[dict[int, FlightController], dict[int, str]]:
+        """Each device's flight-controller claim (see :mod:`.fc_identity`)
+        and the server UAV that claim names."""
         devices = self._protocol.devices if self._protocol else {}
-        if devices:
-            uav_by_ip: dict[str, Optional[str]] = {}
-            for uav_id, address in self._uav_source_addresses().items():
-                ip = address[0]
-                # None marks an ambiguous IP (multiple UAVs behind it)
-                uav_by_ip[ip] = uav_id if ip not in uav_by_ip else None
-            for system_id, device in devices.items():
-                uav_id = uav_by_ip.get(device.address[0])
-                if uav_id is not None:
-                    mapping[system_id] = uav_id
-        if mapping == self._uav_map:
+        claims = flight_controller_claims(
+            {
+                device.system_id: (
+                    _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
+                    bool(getattr(device, "sleeping", False)),
+                )
+                for device in devices.values()
+            }
+        )
+        return claims, uav_ids_for_claims(claims, self._uav_ids_by_system_id())
+
+    def _refresh_uav_map(self) -> bool:
+        """Recompute the claims and the device->UAV association and return
+        whether either changed."""
+        claims, mapping = self._associations()
+        if claims == self._fc_claims and mapping == self._uav_map:
             return False
-        self._uav_map = mapping
+        self._fc_claims, self._uav_map = claims, mapping
         return True
 
     async def _poll_uav_map(self, now: float) -> None:
-        """One pass of the association loop: recompute the mapping and, when
-        it changed, push the (throttled) X-RTLS-INF device list so clients
-        re-render the tag<->drone pairing without polling."""
+        """One pass of the association loop: recompute the claims and the
+        mapping and, when either changed, push the (throttled) X-RTLS-INF
+        device list so clients re-render the tag<->drone pairing without
+        polling."""
         if self._refresh_uav_map():
             await self._on_inf_change(now)
 
@@ -1953,24 +1951,20 @@ class RtlsExtension(Extension):
         by system id (as string). Shared by the query response and the
         gained/lost broadcast so both carry the same body shape."""
         devices = self._protocol.devices if self._protocol else {}
-        claims = flight_controller_claims(
-            {
-                device.system_id: (
-                    _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
-                    bool(getattr(device, "sleeping", False)),
-                )
-                for device in devices.values()
-            }
-        )
+        claims, uav_ids = self._associations()
         return {
             str(device.system_id): self._device_json(
-                device, now, claims.get(device.system_id)
+                device, now, claims.get(device.system_id), uav_ids.get(device.system_id)
             )
             for device in devices.values()
         }
 
     def _device_json(
-        self, device, now: float, flight_controller: FlightController | None
+        self,
+        device,
+        now: float,
+        flight_controller: FlightController | None,
+        uav_id: str | None,
     ) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
         params = _decoded_device_params(device)
@@ -2002,10 +1996,6 @@ class RtlsExtension(Extension):
             body["sleeping"] = bool(getattr(device, "sleeping", False))
         if "uptimeMs" in adv:
             body["uptimeMs"] = adv["uptimeMs"]
-        # the drone whose flight controller talks through this device's
-        # WiFi-UART bridge (source-IP join, see _refresh_uav_map); absent
-        # for unassociated devices (anchors, spares, bridge-less tags)
-        uav_id = self._uav_map.get(device.system_id)
         if uav_id is not None:
             body["uav"] = uav_id
         if flight_controller is not None:

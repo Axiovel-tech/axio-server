@@ -1,6 +1,9 @@
 import pytest
 
-from flockwave.server.ext.rtls.fc_identity import flight_controller_claims
+from flockwave.server.ext.rtls.fc_identity import (
+    flight_controller_claims,
+    uav_ids_for_claims,
+)
 
 LIVE, REMEMBERED, AMBIGUOUS = 1, 2, 3
 
@@ -102,3 +105,14 @@ def test_shared_identity_without_a_single_live_holder_is_ambiguous_everywhere(
     assert claims[199]["reason"] == (
         "flight controller 17 is also claimed by tags 222, 250"
     )
+
+
+def test_claim_names_the_server_uav_with_its_system_id():
+    claims = claims_of(
+        (194, 1, LIVE), (196, 2, REMEMBERED), (197, 6, AMBIGUOUS), (198, 4, LIVE)
+    )
+
+    assert uav_ids_for_claims(claims, {1: "01", 2: "02", 6: "06"}) == {
+        194: "01",
+        196: "02",
+    }

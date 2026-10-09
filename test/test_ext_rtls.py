@@ -1721,92 +1721,105 @@ async def test_inf_no_rebroadcast_without_devices(extension, device):
     assert len(_inf_broadcasts(extension)) == 2
 
 
-# ---- tag<->drone association (source-IP join) ---------------------------
+# ---- tag<->drone association (the tag's flight-controller claim) --------
 
 
-def _set_uav_addresses(extension, addresses):
-    """Install a fake UAV source-address feed (the seam through which the
+def _set_uav_ids(extension, uav_ids):
+    """Install a fake UAV-id-by-system-id feed (the seam through which the
     extension reads the mavlink extension's API)."""
-    extension._uav_source_addresses = lambda: addresses
+    extension._uav_ids_by_system_id = lambda: uav_ids
 
 
-async def test_uav_mapping_appears_in_inf(extension, device, builder, hub):
-    await discover(extension, device)
+def _claim_flight_controller(device, system_id, state):
+    set_fake_param(device, "FC_SYS_ID", system_id, "uint8")
+    set_fake_param(device, "FC_STATE", state, "uint8")
 
-    # before any UAV shares the tag's IP the device is unassociated
+
+async def _inf_entry(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
-
-    # a connected UAV heard from the tag's bridge IP associates with it
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
-    assert extension._refresh_uav_map() is True
-
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body["status"][str(DEVICE_SYSID)]["uav"] == "05"
+    return response.body["status"][str(DEVICE_SYSID)]
 
 
-async def test_uav_mapping_clears_on_ip_change(extension, device, builder, hub):
+async def test_uav_is_the_drone_the_tag_names(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 1)
     await discover(extension, device)
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+
+    # the server has not heard from that drone yet
+    assert "uav" not in await _inf_entry(extension, builder, hub)
+
+    _set_uav_ids(extension, {5: "05", 6: "06"})
     assert extension._refresh_uav_map() is True
 
-    # a DHCP renewal moves the UAV's source IP off the tag: the mapping
-    # must clear on the next recompute, never persist
-    _set_uav_addresses(extension, {"05": ("192.168.4.99", 14550)})
-    assert extension._refresh_uav_map() is True
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+    entry = await _inf_entry(extension, builder, hub)
+    assert entry["uav"] == "05"
+    assert entry["flightController"] == {"systemId": 5, "state": "live"}
 
 
-async def test_uav_mapping_ambiguous_ip_maps_nothing(extension, device, builder, hub):
+async def test_uav_stays_while_the_drone_sleeps(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 1)
+    _set_uav_ids(extension, {5: "05"})
     await discover(extension, device)
-    # two UAVs claiming one source IP cannot be told apart; mapping either
-    # would risk exactly the mis-attribution this feature exists to prevent
-    _set_uav_addresses(
-        extension,
-        {"05": (DEVICE_ADDRESS[0], 14550), "06": (DEVICE_ADDRESS[0], 14551)},
+
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    await extension._process_datagram(
+        device.heartbeat(), device.address, time.monotonic()
     )
-    assert extension._refresh_uav_map() is False
 
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+    entry = await _inf_entry(extension, builder, hub)
+    assert entry["sleeping"] is True
+    assert entry["uav"] == "05"
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
 
 
-async def test_uav_mapping_change_pushes_inf(extension, device):
+async def test_ambiguous_claim_names_no_uav(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 3)
+    _set_uav_ids(extension, {5: "05"})
+    await discover(extension, device)
+
+    entry = await _inf_entry(extension, builder, hub)
+    assert "uav" not in entry
+    assert entry["flightController"]["state"] == "ambiguous"
+
+
+async def test_association_change_pushes_inf(extension, device):
+    _claim_flight_controller(device, 5, 1)
     await _feed_heartbeat(extension, device, now=0.0)
     assert len(_inf_broadcasts(extension)) == 1
 
-    # the association appearing is a mapping change: the poll in the
+    # the drone becoming known is a mapping change: the poll in the
     # protocol loop pushes the device list (throttled, like gained/lost)
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+    _set_uav_ids(extension, {5: "05"})
     await extension._poll_uav_map(now=2.0)
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 2
     assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["uav"] == "05"
 
-    # an unchanged mapping stays quiet
+    # an unchanged association stays quiet
     await extension._poll_uav_map(now=4.0)
     assert len(_inf_broadcasts(extension)) == 2
 
-    # the UAV disappearing clears the mapping and pushes again
-    _set_uav_addresses(extension, {})
+    # a claim change alone pushes too
+    _claim_flight_controller(device, 5, 2)
+    await extension._process_datagram(
+        device._param_value("FC_STATE", list(device.params).index("FC_STATE")),
+        device.address,
+        5.0,
+    )
     await extension._poll_uav_map(now=6.0)
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 3
-    assert "uav" not in broadcasts[-1]["status"][str(DEVICE_SYSID)]
+    entry = broadcasts[-1]["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
 
 
-def test_uav_addresses_empty_without_mavlink_api(extension):
+def test_uav_ids_empty_without_mavlink_api(extension):
     # no mavlink extension (or one that is not loaded) leaves every device
     # unassociated instead of failing
     assert extension._mavlink_api is None
-    assert extension._uav_source_addresses() == {}
+    assert extension._uav_ids_by_system_id() == {}
     extension._mavlink_api = SimpleNamespace(loaded=False)
-    assert extension._uav_source_addresses() == {}
+    assert extension._uav_ids_by_system_id() == {}
 
 
 @requires_sleep_sdk

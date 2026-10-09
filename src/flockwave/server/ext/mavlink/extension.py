@@ -131,7 +131,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 self.log.info("Flight controller firmware: PX4")
             case "skybrush":
                 autopilot_factory = ArduPilotWithSkybrush
-                self.log.info("Flight controller firmware: drone show firmware on ArduPilot")
+                self.log.info(
+                    "Flight controller firmware: drone show firmware on ArduPilot"
+                )
             case _:
                 autopilot_factory = None
                 self.log.warning(
@@ -157,28 +159,24 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     def exports(self) -> dict[str, Any]:
         return {
             "find_network_by_id": self._find_network_by_id,
-            "get_uav_source_addresses": self._get_uav_source_addresses,
+            "get_uav_ids_by_system_id": self._get_uav_ids_by_system_id,
             "use_mavlink_message_channel_factory": use_mavlink_message_channel_factory,
         }
 
-    def _get_uav_source_addresses(self) -> dict[str, tuple[str, int]]:
-        """Returns a mapping from the IDs of the connected UAVs to the
-        ``(host, port)`` source address each UAV was last heard from, across
-        all the networks managed by this extension.
-
-        UAVs that are not currently connected, or whose last source address
-        is not a host-port pair (e.g. UAVs on a serial link), are omitted.
+    def _get_uav_ids_by_system_id(self) -> dict[int, str]:
+        """Returns the IDs of every UAV the networks of this extension have
+        heard from, connected or not, keyed by MAVLink system ID. A system ID
+        that appears in more than one network maps to none of its UAVs.
         """
-        result: dict[str, tuple[str, int]] = {}
+        result: dict[int, str] = {}
+        shared: set[int] = set()
         for network in (self._networks or {}).values():
-            for uav, address in network.uav_addresses().items():
-                if (
-                    uav.is_connected
-                    and isinstance(address, tuple)
-                    and len(address) == 2
-                    and isinstance(address[0], str)
-                ):
-                    result[uav.id] = address
+            for uav in network.uavs():
+                if uav.system_id in result:
+                    shared.add(uav.system_id)
+                result[uav.system_id] = uav.id
+        for system_id in shared:
+            del result[system_id]
         return result
 
     def _find_network_by_id(self, network_id: str) -> MAVLinkNetwork | None:

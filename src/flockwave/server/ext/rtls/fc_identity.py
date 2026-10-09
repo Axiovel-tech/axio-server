@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Literal, Mapping, TypedDict
 
-__all__ = ("FlightController", "flight_controller_claims")
+__all__ = ("FlightController", "flight_controller_claims", "uav_ids_for_claims")
 
 
 class _FlightControllerState(TypedDict):
@@ -41,6 +41,19 @@ def flight_controller_claims(
             claims[system_id] = claim
     _contest_shared_identities(claims)
     return claims
+
+
+def uav_ids_for_claims(
+    claims: Mapping[int, FlightController], uav_ids: Mapping[int, str]
+) -> dict[int, str]:
+    """The server UAV id each device's claim names: a live or remembered
+    claim on a system id the server has heard from. An ambiguous claim
+    names none."""
+    return {
+        device: uav_ids[claim["systemId"]]
+        for device, claim in claims.items()
+        if claim["state"] != "ambiguous" and claim["systemId"] in uav_ids
+    }
 
 
 def _claim(identity: object, state: object, sleeping: bool) -> FlightController | None:
