@@ -51,6 +51,7 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
+from .fc_identity import FlightController, flight_controller_claims
 from .show_clock import ShowClockPinManager
 
 if TYPE_CHECKING:
@@ -1952,12 +1953,25 @@ class RtlsExtension(Extension):
         by system id (as string). Shared by the query response and the
         gained/lost broadcast so both carry the same body shape."""
         devices = self._protocol.devices if self._protocol else {}
+        claims = flight_controller_claims(
+            {
+                device.system_id: (
+                    _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
+                    bool(getattr(device, "sleeping", False)),
+                )
+                for device in devices.values()
+            }
+        )
         return {
-            str(device.system_id): self._device_json(device, now)
+            str(device.system_id): self._device_json(
+                device, now, claims.get(device.system_id)
+            )
             for device in devices.values()
         }
 
-    def _device_json(self, device, now: float) -> dict[str, Any]:
+    def _device_json(
+        self, device, now: float, flight_controller: FlightController | None
+    ) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
         params = _decoded_device_params(device)
         # the state advertisement re-announces version/role every
@@ -1994,6 +2008,8 @@ class RtlsExtension(Extension):
         uav_id = self._uav_map.get(device.system_id)
         if uav_id is not None:
             body["uav"] = uav_id
+        if flight_controller is not None:
+            body["flightController"] = flight_controller
         if role is not None:
             body["role"] = role
         name = _device_name(device.system_id, params, role)
@@ -2396,15 +2412,18 @@ def _configured_devices(
     return targets, smp_ports
 
 
-def _decoded_device_params(device) -> dict[str, Any]:
-    """Decode a device's cached raw params into plain Python values, keyed by
-    name. Parameters whose type is not yet known are skipped."""
+def _decoded_device_params(
+    device, names: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    """Decode a device's cached raw params (all of them, or only ``names``)
+    into plain Python values, keyed by name. Parameters whose type is not
+    yet known are skipped."""
     params: dict[str, Any] = {}
-    for name, value in device.params.items():
+    for name in device.params if names is None else names:
         param_type = device.param_types.get(name)
-        if param_type is None:
+        if param_type is None or name not in device.params:
             continue
-        params[name] = decode_param_value(value, param_type)
+        params[name] = decode_param_value(device.params[name], param_type)
     return params
 
 

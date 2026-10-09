@@ -243,6 +243,7 @@ plus a site-level `anchors` list:
       "otaStatus": null,
       "sleeping": false,
       "uav": "05",
+      "flightController": {"systemId": 5, "state": "live"},
       "role": "tag",
       "name": "RTLS tag 42",
       "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
@@ -301,6 +302,18 @@ plus a site-level `anchors` list:
   clears it) and an IP claimed by more than one UAV maps to none —
   better unmapped than mis-attributed. An `X-RTLS-INF` notification is
   pushed (throttled) whenever a device's mapping changes.
+- `flightController` — the autopilot this device itself reports through
+  its `FC_SYS_ID` / `FC_STATE` parameters, which its state advertisement
+  carries also while it sleeps: `systemId` is that autopilot's MAVLink
+  system id and `state` is `"live"` (heard on the device's UART now),
+  `"remembered"` (the persisted id of the last confirmed autopilot, not
+  heard now; always so while the device sleeps) or `"ambiguous"` (with a
+  `reason`: the device hears conflicting heartbeats, reports inconsistent
+  values, or another device claims the same `systemId` — only a single
+  device hearing it `"live"` keeps it). `systemId` may be absent only when
+  ambiguous. Absent on devices without an identity (anchors,
+  never-associated tags, firmware without the parameters). Unlike `uav`
+  it does not require the autopilot to reach the server.
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
   `"disabled"`, from the latest state advertisement or the device's
   `UWB_ROLE` parameter; absent when the device exposes neither.

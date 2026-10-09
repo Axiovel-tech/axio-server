@@ -2354,17 +2354,17 @@ ADV_SOURCE = (DEVICE_ADDRESS[0], 49321)
 
 
 def make_advertisement(device, *, uptime_ms=120_000):
-    """One state-advertisement datagram as lib/net/phone_home_advert.cpp
+    """One state-advertisement datagram as lib/management/src/phone_home_advert.cpp
     packs it: HEARTBEAT first, then SYSTEM_TIME (uptime) and the
-    PARAM_EXT_VALUE frames for FW_VERSION and UWB_ROLE (when present),
-    back to back in one datagram."""
+    PARAM_EXT_VALUE frames for FW_VERSION, UWB_ROLE, FC_SYS_ID and FC_STATE
+    (when present), back to back in one datagram."""
     d = device.dialect
     frames = [device.heartbeat()]
     system_time = d.MAVLink_system_time_message(
         time_unix_usec=0, time_boot_ms=uptime_ms
     )
     frames.append(bytes(system_time.pack(device._mav)))
-    for name in ("FW_VERSION", "UWB_ROLE"):
+    for name in ("FW_VERSION", "UWB_ROLE", "FC_SYS_ID", "FC_STATE"):
         if name in device.params:
             frames.append(device._param_value(name, list(device.params).index(name)))
     return b"".join(frames)
@@ -2474,6 +2474,62 @@ async def test_advertisement_discovers_device_and_broadcasts_inf(
     assert entry["role"] == "tag"
     assert entry["uptimeMs"] == 120_000
     assert entry["sleeping"] is False
+
+
+async def test_sleeping_tag_advertisement_reports_its_flight_controller(
+    extension, device, builder, hub
+):
+    """A drone asleep since before the server started is known only from its
+    advertisements; they alone must name the flight controller it carries."""
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    set_fake_param(device, "FC_SYS_ID", 8, "uint8")
+    set_fake_param(device, "FC_STATE", 2, "uint8")
+    device.respond_to_list = False
+    extension._parse_advertisement = stub_advertisement_parser(sleeping=True)
+
+    await extension._process_advertisement(make_advertisement(device), ADV_SOURCE, 0.0)
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["sleeping"] is True
+    assert "uav" not in entry
+    assert entry["flightController"] == {"systemId": 8, "state": "remembered"}
+
+
+async def test_flight_controller_reads_remembered_once_the_tag_sleeps(
+    extension, device, builder, hub
+):
+    set_fake_param(device, "FC_SYS_ID", 8, "uint8")
+    set_fake_param(device, "FC_STATE", 1, "uint8")
+    await discover(extension, device)
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 8, "state": "live"}
+
+    # the cached FC_STATE still says live until the next advertisement
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    await extension._process_datagram(
+        device.heartbeat(), device.address, time.monotonic()
+    )
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 8, "state": "remembered"}
+
+
+async def test_tag_without_flight_controller_identity_omits_it(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert "flightController" not in response.body["status"][str(DEVICE_SYSID)]
 
 
 async def test_advertisement_refreshes_known_device(extension, device):
