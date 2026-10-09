@@ -243,6 +243,7 @@ plus a site-level `anchors` list:
       "otaStatus": null,
       "sleeping": false,
       "uav": "05",
+      "flightController": {"systemId": 5, "state": "live"},
       "role": "tag",
       "name": "RTLS tag 42",
       "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
@@ -291,16 +292,25 @@ plus a site-level `anchors` list:
   contradicting in-flight heartbeats (the firmware acks the `SLEEP`
   write before its power task cuts over) are overridden until a
   heartbeat confirms the new state or the pin expires.
-- `uav` — the flockwave id of the drone this device is associated with,
-  or absent when there is none (anchors, spare tags, tags without a
-  WiFi-UART bridge). The association is **derived, never configured**: a
-  drone's flight-controller MAVLink reaches the server through its tag's
-  WiFi-UART bridge, so a connected UAV whose UDP source IP equals a
-  device's management IP is that device's drone. It is recomputed
-  continuously (DHCP renewals move it, a disappearing UAV or device
-  clears it) and an IP claimed by more than one UAV maps to none —
-  better unmapped than mis-attributed. An `X-RTLS-INF` notification is
-  pushed (throttled) whenever a device's mapping changes.
+- `uav` — the flockwave id of the drone this device belongs to: the UAV
+  whose MAVLink system id is the `systemId` of this device's
+  `flightController` claim (live or remembered, never ambiguous). It
+  therefore stays while the drone sleeps, provided the server has heard
+  from that drone since it started. Absent otherwise (anchors, spare
+  tags, a drone the server has not heard from yet). An `X-RTLS-INF`
+  notification is pushed (throttled) whenever a device's `uav` or
+  `flightController` changes.
+- `flightController` — the autopilot this device itself reports through
+  its `FC_SYS_ID` / `FC_STATE` parameters, which its state advertisement
+  carries also while it sleeps: `systemId` is that autopilot's MAVLink
+  system id and `state` is `"live"` (heard on the device's UART now),
+  `"remembered"` (the persisted id of the last confirmed autopilot, not
+  heard now; always so while the device sleeps) or `"ambiguous"` (with a
+  `reason`: the device hears conflicting heartbeats, reports inconsistent
+  values, or another device claims the same `systemId` — only a single
+  device hearing it `"live"` keeps it). `systemId` may be absent only when
+  ambiguous. Absent on devices without an identity (anchors,
+  never-associated tags, firmware without the parameters).
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
   `"disabled"`, from the latest state advertisement or the device's
   `UWB_ROLE` parameter; absent when the device exposes neither.
