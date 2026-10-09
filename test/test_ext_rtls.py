@@ -1878,6 +1878,20 @@ async def test_inf_sleeping_omitted_when_latch_stale(extension, device):
     assert status[str(DEVICE_SYSID)]["sleeping"] is False
 
 
+@requires_sleep_sdk
+async def test_live_claim_reads_remembered_when_heartbeats_go_stale(extension, device):
+    _claim_flight_controller(device, 5, 1)
+    await _feed_heartbeat(extension, device, now=0.0)
+    entry = extension._inf_status(now=1.0)[str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "live"}
+
+    # heartbeats (and the advertisements carrying FC_STATE) go silent while
+    # other traffic keeps the device alive
+    extension._protocol.devices[DEVICE_SYSID].last_seen = 100.0
+    entry = extension._inf_status(now=100.0)[str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
+
+
 # ---- X-RTLS-STATS health telemetry --------------------------------------
 
 

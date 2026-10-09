@@ -31,12 +31,13 @@ def flight_controller_claims(
     devices: Mapping[int, tuple[Mapping[str, object], bool]],
 ) -> dict[int, FlightController]:
     """Maps each device id to its ``flightController`` entry, given its
-    decoded parameters and sleep flag. Devices without an identity are left
-    out; an identity claimed by more than one device is ambiguous on every
-    device except the single one that hears it live."""
+    decoded parameters and whether a cached "live" may be out of date (the
+    device sleeps, or its sleep state is no longer known). Devices without
+    an identity are left out; an identity claimed by more than one device is
+    ambiguous on every device except the single one that hears it live."""
     claims: dict[int, FlightController] = {}
-    for system_id, (params, sleeping) in devices.items():
-        claim = _claim(params.get("FC_SYS_ID"), params.get("FC_STATE"), sleeping)
+    for system_id, (params, outdated) in devices.items():
+        claim = _claim(params.get("FC_SYS_ID"), params.get("FC_STATE"), outdated)
         if claim is not None:
             claims[system_id] = claim
     _contest_shared_identities(claims)
@@ -56,7 +57,7 @@ def uav_ids_for_claims(
     }
 
 
-def _claim(identity: object, state: object, sleeping: bool) -> FlightController | None:
+def _claim(identity: object, state: object, outdated: bool) -> FlightController | None:
     if identity is None or state is None:
         return None
     if not isinstance(identity, int) or not 0 <= identity <= 255:
@@ -72,9 +73,9 @@ def _claim(identity: object, state: object, sleeping: bool) -> FlightController 
             claim["systemId"] = identity
         return claim
     if state in (_LIVE, _REMEMBERED) and identity:
-        # the advertisement that carried "live" may predate the sleep flip,
-        # and a sleeping drone's flight controller is unpowered
-        live = state == _LIVE and not sleeping
+        # a sleeping drone's flight controller is unpowered, and the
+        # advertisement that carried "live" may predate the sleep flip
+        live = state == _LIVE and not outdated
         return FlightController(
             systemId=identity, state="live" if live else "remembered"
         )

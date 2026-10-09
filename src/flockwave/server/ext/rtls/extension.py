@@ -1443,7 +1443,8 @@ class RtlsExtension(Extension):
             {
                 device.system_id: (
                     _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
-                    bool(getattr(device, "sleeping", False)),
+                    bool(getattr(device, "sleeping", False))
+                    or not self._sleep_state_known(device),
                 )
                 for device in devices.values()
             }
@@ -1959,6 +1960,14 @@ class RtlsExtension(Extension):
             for device in devices.values()
         }
 
+    def _sleep_state_known(self, device) -> bool:
+        """Whether a heartbeat has latched the device's sleep state within
+        the device timeout; past it (passive mode, where any traffic keeps a
+        device alive) the latch, and the FC_STATE that arrived with it, are
+        guesses. Both stamps come from the feed clock."""
+        latch = self._sleeping.get(device.system_id)
+        return latch is None or device.last_seen - latch[1] <= self._device_timeout
+
     def _device_json(
         self,
         device,
@@ -1990,8 +1999,7 @@ class RtlsExtension(Extension):
         # a guess -- omit the key so clients render "unknown" instead of a
         # stale definite state. Both stamps come from the feed clock, so
         # the comparison is immune to the query-time clock.
-        latch = self._sleeping.get(device.system_id)
-        if latch is None or device.last_seen - latch[1] <= self._device_timeout:
+        if self._sleep_state_known(device):
             # getattr: tolerate an SDK that predates sleep mode
             body["sleeping"] = bool(getattr(device, "sleeping", False))
         if "uptimeMs" in adv:
