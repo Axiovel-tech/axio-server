@@ -25,7 +25,12 @@ class FakeOutput:
         if self.failures:
             self.failures -= 1
             raise RuntimeError("device busy")
-        stream = SimpleNamespace(session=session, closed=False, description="fake")
+        stream = SimpleNamespace(
+            session=session,
+            closed=False,
+            description="fake",
+            calibrate=lambda: None,
+        )
 
         async def aclose():
             stream.closed = True

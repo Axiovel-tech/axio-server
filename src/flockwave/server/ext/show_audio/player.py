@@ -350,6 +350,8 @@ class ShowAudioPlayer:
                 return self._retry_at - now
             return await self._arm(target)
 
+        if self._stream is not None:
+            self._stream.calibrate()
         self._log_start(session)
         if session.finished:
             self._set_state(PlayerState.FINISHED)
@@ -386,7 +388,6 @@ class ShowAudioPlayer:
                 target.start_time,
                 target.sample0_time,
                 extra=self.extra_output,
-                clock=self._clock,
             )
             stream = await self._open_stream(session, self._device)
         except Exception as ex:

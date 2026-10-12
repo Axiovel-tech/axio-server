@@ -4,6 +4,7 @@ track's sample 0 on the DAC at a wall-clock time.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from time import time
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ __all__ = (
     "ExtraOutput",
     "PlaybackSession",
     "Stream",
+    "StreamClock",
     "open_output_stream",
 )
 
@@ -30,6 +32,10 @@ OUTPUT_LATENCY = 0.2
 Python callback survives the event loop holding the GIL for a while; the
 schedule compensates it through the DAC timestamps.
 """
+
+STREAM_CLOCK_WINDOW = 32
+"""Number of recent clock readings among which `StreamClock` picks the one
+read with the least delay."""
 
 
 ChannelWriter = Callable[[np.ndarray, float], None]
@@ -58,7 +64,36 @@ class ExtraOutput(Protocol):
 class Stream(Protocol):
     description: str
 
+    def calibrate(self) -> None:
+        """Reads the stream clock and the wall clock once more and updates the
+        session's mapping between them."""
+        ...
+
     async def aclose(self) -> None: ...
+
+
+class StreamClock:
+    """Maps PortAudio stream time to wall-clock time. Both clocks are read
+    back to back; a reading interrupted between the two (e.g. by another
+    thread taking the GIL) has a long delay, so the offset comes from the
+    reading with the least delay among the most recent ones.
+    """
+
+    offset: float | None
+    """Wall-clock time minus stream time; ``None`` before the first reading."""
+
+    def __init__(self):
+        self.offset = None
+        self._readings: deque[tuple[float, float]] = deque(maxlen=STREAM_CLOCK_WINDOW)
+
+    def add(self, wall_before: float, stream_time: float, wall_after: float) -> float:
+        """Adds a reading of the stream clock taken between two readings of
+        the wall clock and returns the updated offset."""
+        self._readings.append(
+            (wall_after - wall_before, (wall_before + wall_after) / 2 - stream_time)
+        )
+        self.offset = min(self._readings)[1]
+        return self.offset
 
 
 class PlaybackSession:
@@ -82,6 +117,10 @@ class PlaybackSession:
     underflows: int
     silenced: bool
 
+    stream_to_wall: float | None
+    """Wall-clock time minus PortAudio stream time; the session stays silent
+    until it is known."""
+
     def __init__(
         self,
         track: AudioTrack,
@@ -89,7 +128,6 @@ class PlaybackSession:
         sample0_time: float,
         *,
         extra: ExtraOutput | None = None,
-        clock: Callable[[], float] = time,
     ):
         if extra is not None and extra.channel < track.channels:
             raise ValueError(
@@ -103,12 +141,12 @@ class PlaybackSession:
         self.extra = extra
         self.underflows = 0
         self.silenced = False
+        self.stream_to_wall = None
 
         self._write_extra = (
             extra.create_writer(track.sample_rate) if extra is not None else None
         )
 
-        self._clock = clock
         self._position = -1
         self._joined_at = -1
         self._blocks = 0
@@ -166,17 +204,16 @@ class PlaybackSession:
         if status.output_underflow:
             self.underflows += 1
 
-        # PortAudio reports the DAC time on the stream's own clock; its offset
-        # from the stream's current time is the remaining output latency.
-        dac_time = self._clock() + (
-            time_info.outputBufferDacTime - time_info.currentTime
-        )
-        sample_rate = self.track.sample_rate
-        samples = self.track.samples
-
-        if self.silenced:
+        stream_to_wall = self.stream_to_wall
+        if self.silenced or stream_to_wall is None:
             outdata.fill(0)
             return
+
+        # The wall clock is not read here: the callback may run well after
+        # PortAudio took its timestamps if it had to wait for the GIL.
+        dac_time = time_info.outputBufferDacTime + stream_to_wall
+        sample_rate = self.track.sample_rate
+        samples = self.track.samples
 
         position = self._position
         lead = 0
@@ -249,18 +286,28 @@ def _start_portaudio_stream(
         latency=OUTPUT_LATENCY,
         callback=session.callback,
     )
+    wrapper = _PortAudioStream(stream, f"{info['name']!r} ({host_api})", session)
     try:
+        for _ in range(STREAM_CLOCK_WINDOW):
+            wrapper.calibrate()
         stream.start()
     except BaseException:
         stream.close()
         raise
-    return _PortAudioStream(stream, f"{info['name']!r} ({host_api})")
+    return wrapper
 
 
 class _PortAudioStream:
-    def __init__(self, stream, description: str):
+    def __init__(self, stream, description: str, session: PlaybackSession):
         self._stream = stream
+        self._session = session
+        self._clock = StreamClock()
         self.description = description
+
+    def calibrate(self) -> None:
+        wall_before = time()
+        stream_time = self._stream.time
+        self._session.stream_to_wall = self._clock.add(wall_before, stream_time, time())
 
     async def aclose(self) -> None:
         await trio.to_thread.run_sync(self._stream.close)

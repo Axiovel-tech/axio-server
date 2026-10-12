@@ -1,11 +1,17 @@
 import hashlib
+from types import SimpleNamespace
 
 import numpy as np
 from pytest import approx, mark, raises
 from show_audio_support import EPOCH, encode, make_track, run_block
 
 from flockwave.server.ext.show.config import DroneShowConfiguration
-from flockwave.server.ext.show_audio.session import STATS_BLOCKS, PlaybackSession
+from flockwave.server.ext.show_audio import session as session_module
+from flockwave.server.ext.show_audio.session import (
+    STATS_BLOCKS,
+    PlaybackSession,
+    StreamClock,
+)
 from flockwave.server.ext.show_audio.timing import (
     Phase,
     followed_start_time,
@@ -78,6 +84,28 @@ def test_session_puts_sample_0_on_the_scheduled_frame():
     for i in range(1, STATS_BLOCKS):
         run_block(session, 1000, wall=EPOCH + i)
     assert session.start_error() == approx(0.0, abs=1e-6)
+
+
+def test_session_places_sample_0_by_the_stream_clock_however_late_it_runs(
+    monkeypatch,
+):
+    clock = StreamClock()
+    clock.add(EPOCH, 49.0, EPOCH)
+    clock.add(EPOCH + 0.5, 50.495, EPOCH + 0.51)
+    session = PlaybackSession(make_track(), EPOCH, EPOCH + 1.5)
+    session.stream_to_wall = clock.offset
+
+    monkeypatch.setattr(session_module, "time", lambda: EPOCH + 1.005)
+    out = np.full((1000, 1), np.nan, dtype=np.float32)
+    session.callback(
+        out,
+        1000,
+        SimpleNamespace(currentTime=50.0, outputBufferDacTime=50.2),
+        SimpleNamespace(output_underflow=False),
+    )
+
+    assert out[:300, 0].tolist() == [0] * 300
+    assert out[300, 0] == 1
 
 
 def test_session_joins_late_at_the_matching_position():

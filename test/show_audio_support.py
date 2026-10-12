@@ -39,7 +39,7 @@ def encode(seconds: float, sample_rate: int, format: str) -> bytes:
 
 def run_block(session, frames, *, wall, latency=0.2, underflow=False):
     out = np.full((frames, session.channels), np.nan, dtype=np.float32)
-    session._clock = lambda: wall
+    session.stream_to_wall = wall - 50.0
     session.callback(
         out,
         frames,
