@@ -16,6 +16,7 @@ from flockwave.server.ext.show.config import StartMethod
 from flockwave.server.ext.show.types import ShowExtensionAPI
 from flockwave.server.ext.signals import SignalsExtensionAPI
 
+from .ltc_output import LtcOutput
 from .player import PlaybackCommittedError, ShowAudioPlayer
 from .timing import followed_start_time
 from .track import TrackUpload, decode_track
@@ -60,6 +61,16 @@ class ShowAudioExtension(Extension):
             point_of_no_return_s=show.get_point_of_no_return_seconds,
         )
         player.on_change = self._broadcast_inf_if_changed
+
+        ltc_config = configuration.get("ltc_output")
+        if ltc_config:
+            try:
+                ltc_output = LtcOutput.from_json(ltc_config)
+            except (KeyError, TypeError, ValueError) as ex:
+                logger.error(f"Invalid ltc_output configuration, no LTC output: {ex}")
+            else:
+                player.extra_output = ltc_output
+                logger.info(ltc_output.describe())
 
         handlers = {
             "X-SHOW-AUDIO-CLEAR": self._handle_CLEAR,
@@ -266,6 +277,40 @@ schema = {
                 "How long before the scheduled first sample the audio output is opened"
             ),
             "default": 5,
+        },
+        "ltc_output": {
+            "type": ["object", "null"],
+            "title": "LTC output",
+            "description": (
+                "Writes LTC on an extra channel of the music output, from the "
+                "preroll before show T0 to the end of the track; empty for none"
+            ),
+            "properties": {
+                "channel": {
+                    "type": "integer",
+                    "title": "Output channel",
+                    "description": "Channel carrying the LTC, numbered from 1",
+                },
+                "fps": {
+                    "type": "number",
+                    "title": "Frame rate",
+                    "description": "24, 25, 29.97 (drop-frame) or 30",
+                    "default": 25,
+                },
+                "start": {
+                    "type": "string",
+                    "title": "Timecode at show T0",
+                    "default": "01:00:00:00",
+                },
+                "preroll_s": {
+                    "type": "number",
+                    "title": "Preroll (s)",
+                    "description": "How long before show T0 the LTC starts",
+                    "default": 10,
+                },
+            },
+            "required": ["channel"],
+            "default": None,
         },
     }
 }

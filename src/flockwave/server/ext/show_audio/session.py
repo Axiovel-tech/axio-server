@@ -32,22 +32,26 @@ schedule compensates it through the DAC timestamps.
 """
 
 
+ChannelWriter = Callable[[np.ndarray, float], None]
+"""Fills one block of an extra output channel, given the block's samples and
+the show clock time at which its first sample reaches the DAC. Runs on the
+audio thread, so it must not block or lock."""
+
+
 class ExtraOutput(Protocol):
-    """Writes one extra output channel of the music stream (e.g. LTC) from its
+    """An extra output channel of the music stream (e.g. LTC), written from its
     own lead-in before show T0 until the end of the track.
     """
 
     channel: int
-    """Index of the output channel to write; above the track's channels."""
+    """Index of the output channel to write, from 0; above the track's
+    channels."""
 
     lead_s: float
     """How long before show T0 the channel needs the stream running."""
 
-    def fill(self, out: np.ndarray, show_time: float, sample_rate: int) -> None:
-        """Fills one block of the channel whose first frame reaches the DAC at
-        ``show_time`` seconds on the show clock. Runs on the audio thread, so
-        it must not block, lock or allocate buffers.
-        """
+    def create_writer(self, sample_rate: int) -> ChannelWriter:
+        """Returns the writer of the channel for one new output stream."""
         ...
 
 
@@ -87,12 +91,22 @@ class PlaybackSession:
         extra: ExtraOutput | None = None,
         clock: Callable[[], float] = time,
     ):
+        if extra is not None and extra.channel < track.channels:
+            raise ValueError(
+                f"Output channel {extra.channel + 1} is taken by the "
+                f"{track.channels}-channel track"
+            )
+
         self.track = track
         self.start_time = start_time
         self.sample0_time = sample0_time
         self.extra = extra
         self.underflows = 0
         self.silenced = False
+
+        self._write_extra = (
+            extra.create_writer(track.sample_rate) if extra is not None else None
+        )
 
         self._clock = clock
         self._position = -1
@@ -170,7 +184,7 @@ class PlaybackSession:
             lead = frames_until(self.sample0_time, dac_time, sample_rate)
             if lead >= frames:
                 outdata.fill(0)
-                self._fill_extra(outdata, dac_time)
+                self._write_extra_channel(outdata, dac_time)
                 return
             if lead < 0:
                 position, lead = -lead, 0
@@ -179,27 +193,23 @@ class PlaybackSession:
             self._joined_at = position
 
         self._position = render_block(outdata, samples, position, lead)
-        if position < samples.shape[0]:
-            error = (
-                dac_time
-                + lead / sample_rate
-                - self.sample0_time
-                - position / sample_rate
-            )
-            if self._blocks < STATS_BLOCKS:
-                self._first_errors[self._blocks] = error
-            self._recent_errors[self._blocks % STATS_BLOCKS] = error
-            self._blocks += 1
+        if position >= samples.shape[0]:
+            return
 
-        self._fill_extra(outdata, dac_time)
+        error = (
+            dac_time + lead / sample_rate - self.sample0_time - position / sample_rate
+        )
+        if self._blocks < STATS_BLOCKS:
+            self._first_errors[self._blocks] = error
+        self._recent_errors[self._blocks % STATS_BLOCKS] = error
+        self._blocks += 1
 
-    def _fill_extra(self, outdata: np.ndarray, dac_time: float) -> None:
-        extra = self.extra
-        if extra is not None:
-            extra.fill(
-                outdata[:, extra.channel],
-                dac_time - self.start_time,
-                self.track.sample_rate,
+        self._write_extra_channel(outdata, dac_time)
+
+    def _write_extra_channel(self, outdata: np.ndarray, dac_time: float) -> None:
+        if self._write_extra is not None and self.extra is not None:
+            self._write_extra(
+                outdata[:, self.extra.channel], dac_time - self.start_time
             )
 
 

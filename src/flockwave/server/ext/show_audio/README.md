@@ -23,6 +23,7 @@ state `error` ("PortAudio library not found").
 | `device`     | `null`  | ALSA output device name (or part of it) or PortAudio index; `null` = system default output |
 | `offset_ms`  | `0`     | Initial playback offset; positive = music later            |
 | `arm_lead_s` | `5`     | How long before sample 0 the output stream is opened       |
+| `ltc_output` | `null`  | LTC on an extra output channel, see below                  |
 
 Use PortAudio's ALSA host API. On a PipeWire host the default device goes
 through PipeWire's ALSA plugin, whose DAC timestamps put the music within
@@ -31,6 +32,21 @@ devices put it ~50 ms early and are refused. To play on another PipeWire
 sink, keep `device` at `null` and start the server with
 `PIPEWIRE_NODE=<sink node name>` (if that sink is missing, PipeWire falls
 back to the default one).
+
+`ltc_output: {channel, fps, start, preroll_s}` writes LTC on output
+`channel` (numbered from 1, above the track's channels) of the same stream:
+the frame labelled `start` (default `01:00:00:00`) begins on the sample that
+reaches the DAC at show T0. It runs at `fps` (24, 25, 29.97 drop-frame or 30;
+default 25) from `preroll_s` (default 10) before T0 to the end of the track,
+and is anchored on the stream's own sample clock: before T0 it follows a moved
+show start, after T0 it never jumps. The output stream opens 1 s before the
+preroll so the anchor rests on settled DAC timestamps.
+
+On a PipeWire host, start the server with
+`PIPEWIRE_PROPS='{ stream.dont-remix=true }'` so the stream's channels map
+one to one onto the interface's: by default PipeWire remixes them to the
+sink's layout (a 3-channel stream into a 4-channel sink came out as a stereo
+downmix, LTC mixed into the music).
 
 ## When it plays
 
@@ -44,7 +60,8 @@ back to the default one).
   it, and track uploads, `X-SHOW-AUDIO-CLEAR` and `X-SHOW-AUDIO-SETCFG` are
   rejected.
 - A start time already in the past joins mid-track at the matching
-  position, unless the operator stopped the music for that start.
+  position, unless the operator stopped the music for that start. A stop
+  holds until the start is cleared or moves by more than 1 s.
 - Sample 0 is placed using PortAudio's `outputBufferDacTime`, mapped to
   `time.time()` in the audio callback; the track then plays without
   re-seeking. The log reports the measured start error and the

@@ -380,14 +380,14 @@ class ShowAudioPlayer:
             )
 
     async def _arm(self, target: _Target) -> float:
-        session = PlaybackSession(
-            target.track,
-            target.start_time,
-            target.sample0_time,
-            extra=self.extra_output,
-            clock=self._clock,
-        )
         try:
+            session = PlaybackSession(
+                target.track,
+                target.start_time,
+                target.sample0_time,
+                extra=self.extra_output,
+                clock=self._clock,
+            )
             stream = await self._open_stream(session, self._device)
         except Exception as ex:
             message = f"Cannot open the audio output: {ex}"

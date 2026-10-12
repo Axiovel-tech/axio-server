@@ -110,24 +110,39 @@ def test_session_counts_underflows_and_silences_on_request():
     assert not run_block(session, 100, wall=EPOCH + 0.1).any()
 
 
-def test_session_extra_output_gets_its_channel_and_the_show_time():
-    class Extra:
-        channel = 2
-        lead_s = 10.0
-        show_times = []
+class FakeExtra:
+    def __init__(self, channel):
+        self.channel = channel
+        self.lead_s = 10.0
+        self.show_times = []
 
-        def fill(self, out, show_time, sample_rate):
+    def create_writer(self, sample_rate):
+        def write(out, show_time):
             self.show_times.append(show_time)
             out[:] = -1
 
-    extra = Extra()
-    session = PlaybackSession(make_track(), EPOCH, EPOCH + 1, extra=extra)
+        return write
+
+
+def test_session_extra_output_gets_its_channel_until_the_track_ends():
+    extra = FakeExtra(channel=2)
+    session = PlaybackSession(make_track(seconds=1), EPOCH, EPOCH + 1, extra=extra)
     assert session.channels == 3
 
     out = run_block(session, 100, wall=EPOCH - 10)
     assert extra.show_times == [approx(-9.8)]
     assert (out[:, 2] == -1).all()
     assert not out[:, :2].any()
+
+    run_block(session, 1000, wall=EPOCH + 0.9)
+    out = run_block(session, 1000, wall=EPOCH + 1.9)
+    assert extra.show_times[1:] == [approx(1.1)]
+    assert not out.any()
+
+
+def test_session_refuses_an_extra_channel_taken_by_the_track():
+    with raises(ValueError):
+        PlaybackSession(make_track(channels=2), EPOCH, EPOCH, extra=FakeExtra(1))
 
 
 # Tracks and uploads
