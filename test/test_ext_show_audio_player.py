@@ -151,6 +151,28 @@ async def test_player_joins_late_and_stays_stopped_until_rescheduled(
     assert len(output.open_streams) == 1
 
 
+async def test_player_stop_holds_until_the_start_is_cleared_or_moves_by_1_s(
+    output, player, autojump_clock
+):
+    player.follow(EPOCH - 3)
+    await sleep_until(0.05)
+    assert len(output.open_streams) == 1
+
+    player.stop()
+    await sleep_until(0.2)
+    assert output.open_streams == []
+
+    player.follow(EPOCH - 3 + 0.004)
+    player.follow(EPOCH - 3 - 0.9)
+    await sleep_until(0.4)
+    assert output.open_streams == []
+    assert player.state is PlayerState.IDLE
+
+    player.follow(EPOCH - 3 + 1.5)
+    await sleep_until(0.6)
+    assert len(output.open_streams) == 1
+
+
 async def test_player_finishes_the_track(output, player, autojump_clock):
     player.set_track(make_track(seconds=2))
     player.follow(EPOCH + 10)

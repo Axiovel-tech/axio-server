@@ -38,6 +38,10 @@ POLL_INTERVAL = 0.1
 RETRY_INTERVAL = 1.0
 """Delay before retrying to open an output stream that failed to open."""
 
+STOP_RELEASE = 1.0
+"""An operator stop holds until the followed show start is cleared or moves
+further than this, in seconds; timecode re-anchoring moves it by far less."""
+
 
 class PlaybackCommittedError(RuntimeError):
     """Raised when a change would disturb music committed to a running show."""
@@ -112,7 +116,7 @@ class ShowAudioPlayer:
         self._track: AudioTrack | None = None
         self._followed: float | None = None
         self._committed: _Target | None = None
-        self._stopped = False
+        self._stopped_at: float | None = None
         self._finished_start_time: float | None = None
 
         self._session: PlaybackSession | None = None
@@ -162,7 +166,10 @@ class ShowAudioPlayer:
         self._commit_if_due(self._clock())
         if start_time != self._followed:
             self._followed = start_time
-            self._stopped = False
+            if self._stopped_at is not None and (
+                start_time is None or abs(start_time - self._stopped_at) > STOP_RELEASE
+            ):
+                self._stopped_at = None
             self._wake()
 
     def set_offset_ms(self, offset_ms: float) -> None:
@@ -187,13 +194,14 @@ class ShowAudioPlayer:
         self._wake()
 
     def stop(self) -> None:
-        """Stops the playback now and does not resume it for the followed show
-        start.
+        """Stops the playback now and keeps it stopped for the followed show
+        start until that start is cleared or moves by more than
+        `STOP_RELEASE`.
         """
         if self._session is not None:
             self._session.silenced = True
             self._log.warning("Show music stopped by the operator")
-        self._stopped = True
+        self._stopped_at = self._followed
         self._committed = None
         self._wake()
 
@@ -222,7 +230,7 @@ class ShowAudioPlayer:
             self._committed is not None
             or self._followed is None
             or self._track is None
-            or self._stopped
+            or self._stopped_at is not None
         ):
             return
 
@@ -263,7 +271,11 @@ class ShowAudioPlayer:
     def _current_target(self) -> _Target | None:
         if self._committed is not None:
             return self._committed
-        if self._followed is None or self._track is None or self._stopped:
+        if (
+            self._followed is None
+            or self._track is None
+            or self._stopped_at is not None
+        ):
             return None
         return _Target(self._followed, self._offset_ms, self._track)
 
