@@ -61,10 +61,12 @@ downmix, LTC mixed into the music).
   rejected.
 - A start time already in the past joins mid-track at the matching
   position, unless the operator stopped the music for that start. A stop
-  holds until the start is cleared or moves by more than 1 s.
+  holds, and the state reads `stopped`, until the start is cleared or moves
+  by more than 1 s.
 - Sample 0 is placed using PortAudio's `outputBufferDacTime`, mapped to
-  `time.time()` in the audio callback; the track then plays without
-  re-seeking. The log reports the measured start error and the
+  `time.time()` through readings of PortAudio's stream clock taken together
+  with the wall clock outside the audio callback; the track then plays
+  without re-seeking. The log reports the measured start error and the
   end-of-track drift of the output device against the wall clock.
 
 ## Messages
@@ -75,7 +77,8 @@ downmix, LTC mixed into the music).
   the current one once complete, its SHA-256 matches and it decodes.
 - `X-SHOW-AUDIO-CLEAR` `{}` — unloads the track.
 - `X-SHOW-AUDIO-INF` `{}` — `{track: {sha256, name, mediaType, duration} |
-  null, state: "idle" | "armed" | "playing" | "finished" | "error",
+  null, state: "idle" | "armed" | "playing" | "finished" | "stopped" |
+  "error",
   startTime, offsetMs, device, error}`. Also broadcast as a notification
   whenever it changes.
 - `X-SHOW-AUDIO-STOP` `{}` — stops playback now (operator abort).

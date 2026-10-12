@@ -58,6 +58,9 @@ class PlayerState(Enum):
     ARMED = "armed"
     PLAYING = "playing"
     FINISHED = "finished"
+    STOPPED = "stopped"
+    """An operator stop holds for the followed show start."""
+
     ERROR = "error"
 
 
@@ -295,7 +298,9 @@ class ShowAudioPlayer:
         if target is None:
             await self._close_session()
             self._error = None
-            self._set_state(PlayerState.IDLE)
+            self._set_state(
+                PlayerState.IDLE if self._stopped_at is None else PlayerState.STOPPED
+            )
             return inf
 
         arm_lead = self._arm_lead(target)

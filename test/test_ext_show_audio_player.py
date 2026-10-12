@@ -166,16 +166,23 @@ async def test_player_stop_holds_until_the_start_is_cleared_or_moves_by_1_s(
     player.stop()
     await sleep_until(0.2)
     assert output.open_streams == []
+    assert player.json["state"] == "stopped"
 
     player.follow(EPOCH - 3 + 0.004)
     player.follow(EPOCH - 3 - 0.9)
     await sleep_until(0.4)
     assert output.open_streams == []
-    assert player.state is PlayerState.IDLE
+    assert player.state is PlayerState.STOPPED
 
     player.follow(EPOCH - 3 + 1.5)
     await sleep_until(0.6)
     assert len(output.open_streams) == 1
+    assert player.state is PlayerState.ARMED
+
+    player.stop()
+    player.follow(None)
+    await sleep_until(0.8)
+    assert player.state is PlayerState.IDLE
 
 
 async def test_player_finishes_the_track(output, player, autojump_clock):
