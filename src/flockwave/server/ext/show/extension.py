@@ -352,6 +352,13 @@ class DroneShowExtension(Extension):
                     self._end_clock_sync.synchronize_to(primary_clock, end_time)
                 else:
                     self._end_clock_sync.disable_and_stop()
+            elif time is not None and self._clock_sync.is_freewheeling_on(
+                clock_id, time
+            ):
+                self.log.warning(
+                    f"Clock {clock_id!r} is gone; the show clock keeps "
+                    f"freewheeling on the server clock"
+                )
             else:
                 self._clock_sync.disable_and_stop()
                 self._end_clock_sync.disable_and_stop()

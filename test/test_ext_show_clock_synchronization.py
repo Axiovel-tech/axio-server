@@ -1,8 +1,13 @@
+import logging
 from time import time
+from types import SimpleNamespace
 
 from pytest import fixture, raises
 
+from flockwave.server.ext.clocks import ClockRegistry
 from flockwave.server.ext.show.clock import ClockSynchronizationHandler, ShowClock
+from flockwave.server.ext.show.extension import DroneShowExtension
+from flockwave.server.model.clock import TimeElapsedSinceReferenceClock
 
 ClockPair = tuple[ShowClock, ShowClock]
 
@@ -261,3 +266,41 @@ def test_primary_clock_followed_again_after_end_of_show(
     # again, e.g. when the timecode is rewound for another run
     primary.start_time = now + 60
     assert secondary.ticks_given_time(now) == -250
+
+
+def test_show_keeps_freewheeling_when_the_timecode_clock_is_gone():
+    """The timecode extension is down after T-10 s when Control re-sends the
+    unchanged configuration: the show clock keeps running. A different start
+    or a cancellation still stops it."""
+    registry = ClockRegistry()
+    timecode = TimeElapsedSinceReferenceClock(id="mtc")
+    timecode.reference_time = time() - 100
+    registry.add(timecode)
+
+    extension = DroneShowExtension()
+    extension.log = logging.getLogger("test")
+    extension.app = SimpleNamespace(  # type: ignore
+        import_api=lambda name: SimpleNamespace(registry=registry)
+    )
+    show_clock = ShowClock()
+    extension._clock = show_clock
+    extension._clock_sync.point_of_no_return_seconds = -10
+    extension._clock_sync.secondary_clock = show_clock
+
+    extension._sync_show_clocks_to("mtc", 105, 60)
+    start_time = show_clock.start_time
+    assert start_time is not None
+
+    registry.remove(timecode)
+    extension._sync_show_clocks_to("mtc", 105, 60)
+    assert show_clock.running
+    assert show_clock.start_time == start_time
+
+    extension._sync_show_clocks_to("mtc", 110, 60)
+    assert not show_clock.running
+
+    registry.add(timecode)
+    extension._sync_show_clocks_to("mtc", 105, 60)
+    registry.remove(timecode)
+    extension._sync_show_clocks_to("mtc", None, 60)
+    assert not show_clock.running

@@ -144,6 +144,18 @@ class ClockSynchronizationHandler:
             self.end_of_show_seconds is None or seconds < self.end_of_show_seconds
         )
 
+    def is_freewheeling_on(self, clock_id: str, seconds: float) -> bool:
+        """Whether the secondary clock is freewheeling on a synchronization to
+        the clock with the given ID that puts zero seconds on the secondary
+        clock at the given number of seconds on that clock.
+        """
+        return (
+            self.freewheeling
+            and self._primary_clock is not None
+            and self._primary_clock.id == clock_id
+            and self._primary_seconds_for_zero_secondary_seconds == seconds
+        )
+
     @property
     def primary_clock(self) -> Clock | None:
         """The primary clock; ``None`` means that it has not been assigned yet and
@@ -196,12 +208,7 @@ class ClockSynchronizationHandler:
             seconds: the number of seconds on the primary clock that should
                 belong to zero seconds in the secondary clock
         """
-        if (
-            self.freewheeling
-            and self._primary_clock is not None
-            and self._primary_clock.id == clock.id
-            and self._primary_seconds_for_zero_secondary_seconds == seconds
-        ):
+        if self.is_freewheeling_on(clock.id, seconds):
             self._primary_clock = clock
             self._subscribe_to_or_unsubscribe_from_primary_clock()
             return
