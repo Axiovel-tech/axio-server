@@ -316,13 +316,15 @@ class ShowAudioPlayer:
             if self._session is not None and self._session.started:
                 self._finished_start_time = target.start_time
             await self._close_session()
-            if self._committed is target:
-                self._committed = None
             self._set_state(
                 PlayerState.FINISHED
                 if self._finished_start_time == target.start_time
                 else PlayerState.IDLE
             )
+            if self._committed is target:
+                # The followed start may have moved on while committed
+                self._committed = None
+                return 0
             return inf
 
         return await self._play(target, now)

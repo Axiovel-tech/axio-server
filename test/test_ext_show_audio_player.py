@@ -196,6 +196,19 @@ async def test_player_finishes_the_track(output, player, autojump_clock):
     assert player.state is PlayerState.IDLE
 
 
+async def test_player_follows_a_start_set_while_committed_music_played(
+    output, player, autojump_clock
+):
+    player.follow(EPOCH + 1)
+    await sleep_until(25)
+    player.follow(EPOCH + 60)
+
+    await sleep_until(55.5)
+    streams = output.open_streams
+    assert len(streams) == 1
+    assert streams[0].session.sample0_time == EPOCH + 60
+
+
 async def test_player_reports_output_errors_and_retries(output, player, autojump_clock):
     output.failures = 1
     player.follow(EPOCH + 10)
