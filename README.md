@@ -38,7 +38,10 @@ for the rtls-link UWB indoor positioning system:
   id `mtc`, so a show can be scheduled on and follow the master timecode of
   a larger production. `source` selects the input: `ltc_audio` decodes LTC
   from an audio input channel (`device`, `channel`, `fps`), `udp` receives
-  one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default).
+  one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default). From
+  the show's point of no return (T−10 s) to its end, the show clock
+  freewheels on the server clock: a timecode dropout or jump is logged and
+  reported to the operator but never stops or moves a running show.
   `ltc_audio` needs the PortAudio library (`sudo apt install libportaudio2`)
   and precise ADC timestamps, which PortAudio's ALSA devices provide. On a
   PipeWire desktop use the `default` (or `pipewire`) device with the LTC

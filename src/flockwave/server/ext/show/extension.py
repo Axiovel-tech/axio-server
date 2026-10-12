@@ -11,6 +11,7 @@ from trio_util import periodic
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.model.clock import Clock
+from flockwave.server.model.log import Severity
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
@@ -129,6 +130,9 @@ class DroneShowExtension(Extension):
         self._end_clock = ShowEndClock()
 
         self._clock_sync.log = logger
+        self._clock_sync.notify = lambda message: app.request_to_send_SYS_MSG_message(
+            message, severity=Severity.WARNING
+        )
         self._end_clock_sync.log = logger
 
         handlers = {
@@ -159,7 +163,7 @@ class DroneShowExtension(Extension):
             "Default show start method: %s", self._config.start_method.describe()
         )
         self.log.info(
-            "Timecode synchronization suspends at T = %d seconds",
+            "Show clock stops following the timecode from T = %d seconds to the end of the show",
             point_of_no_return_seconds,
         )
 
@@ -320,6 +324,8 @@ class DroneShowExtension(Extension):
         end_time = time if time is not None else None
         if end_time is not None and duration is not None:
             end_time += duration
+
+        self._clock_sync.end_of_show_seconds = duration or None
 
         if self.app is None:
             self._clock_sync.disable_and_stop()

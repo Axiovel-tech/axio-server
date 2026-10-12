@@ -171,6 +171,7 @@ def test_clock_adjustment_beyond_point_of_no_return(
     primary, secondary = clocks
 
     mock_logger = MockLogger()
+    notifications = []
 
     now = time()
     primary.start_time = now
@@ -178,6 +179,7 @@ def test_clock_adjustment_beyond_point_of_no_return(
     # Configure the handler
     handler.secondary_clock = secondary
     handler.log = mock_logger  # type: ignore
+    handler.notify = notifications.append
     handler.synchronize_to(primary, 5)
     assert secondary.running
     assert secondary.ticks_given_time(now) == -50
@@ -200,21 +202,62 @@ def test_clock_adjustment_beyond_point_of_no_return(
     assert mock_logger.messages[0][0] == "warning"
     mock_logger.messages.clear()
 
-    # Stop the primary clock -- the secondary clock should also be stopped as
-    # it is not an adjustment
+    # Stop the primary clock -- the secondary clock freewheels
     primary.start_time = None
-    assert not secondary.running
-    assert secondary.ticks_given_time(now) == 0
-    assert secondary.ticks_given_time(now + 5) == 0
-    assert not mock_logger.messages
-
-    # Simulate an adjustment to the primary clock again -- now it should work
-    primary.start_time = now - 10
     assert secondary.running
-    assert secondary.ticks_given_time(now + 5) == 100
+    assert secondary.ticks_given_time(now + 5) == 0
+    assert len(mock_logger.messages) == 1
+    assert mock_logger.messages[0][0] == "warning"
+    assert "stopped" in notifications[-1]
+
+    # Synchronizing again to the same start keeps the secondary clock untouched
+    handler.synchronize_to(primary, 5)
+    assert secondary.running
+    assert secondary.ticks_given_time(now + 5) == 0
+
+    # A different start is an explicit decision and applies
+    primary.start_time = now - 10
+    handler.synchronize_to(primary, 6)
+    assert secondary.running
+    assert secondary.ticks_given_time(now + 5) == 90
 
     # Disable the synchronization, then adjust the primary clock again
     handler.disable()
     primary.start_time = now
     assert secondary.running
-    assert secondary.ticks_given_time(now + 5) == 100
+    assert secondary.ticks_given_time(now + 5) == 90
+
+
+def test_primary_clock_stop_before_point_of_no_return(
+    clocks: ClockPair, handler_with_point_of_no_return: ClockSynchronizationHandler
+):
+    handler = handler_with_point_of_no_return
+    primary, secondary = clocks
+
+    now = time()
+    primary.start_time = now
+    handler.secondary_clock = secondary
+    handler.synchronize_to(primary, 60)
+    assert secondary.running
+
+    primary.start_time = None
+    assert not secondary.running
+
+
+def test_primary_clock_followed_again_after_end_of_show(
+    clocks: ClockPair, handler_with_point_of_no_return: ClockSynchronizationHandler
+):
+    handler = handler_with_point_of_no_return
+    primary, secondary = clocks
+
+    now = time()
+    primary.start_time = now
+    handler.secondary_clock = secondary
+    handler.end_of_show_seconds = 30
+    handler.synchronize_to(primary, -35)
+    assert secondary.ticks_given_time(now) == 350
+
+    # Past the end of the show the secondary clock follows the primary clock
+    # again, e.g. when the timecode is rewound for another run
+    primary.start_time = now + 60
+    assert secondary.ticks_given_time(now) == -250
