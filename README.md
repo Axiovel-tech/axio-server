@@ -48,6 +48,10 @@ for the rtls-link UWB indoor positioning system:
   interface as the system's default input and `sample_rate` set to the
   graph rate (48000 by default); PortAudio's PulseAudio devices time
   blocks only to tens of milliseconds.
+- **`show_audio` extension** — plays the show music from the `.skyc` on an
+  audio output of the server host, sample-aligned with the show clock. It
+  needs the system PortAudio library; see
+  [`src/flockwave/server/ext/show_audio/README.md`](src/flockwave/server/ext/show_audio/README.md).
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
 reference configuration for indoor shows. The MAVLink ingest convention for

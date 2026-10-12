@@ -50,6 +50,7 @@ dependencies = [
   "numpy>=2.2.6",
   "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@ad026c8dc3c90983aa28236dc45bc561062c0d3a#subdirectory=py",
   "sounddevice>=0.5.2,<0.6.0",
+  "soundfile>=0.13.1,<0.14.0",
 ]
 
 [project.scripts]

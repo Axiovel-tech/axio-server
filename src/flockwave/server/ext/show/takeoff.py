@@ -43,7 +43,16 @@ __all__ = (
     "SimpleScheduledTakeoffManager",
     "SimpleScheduledTakeoffManagerBase",
     "TakeoffConfiguration",
+    "split_start_time",
 )
+
+
+def split_start_time(start_time: float) -> tuple[int, int]:
+    """Splits a UNIX timestamp into whole seconds and the millisecond part
+    (0-999), rounded to the nearest millisecond.
+    """
+    seconds, msec = divmod(round(start_time * 1000), 1000)
+    return int(seconds), int(msec)
 
 
 @dataclass
@@ -61,9 +70,10 @@ class TakeoffConfiguration:
     `takeoff_time` property of this object.
     """
 
-    takeoff_time: int | None = None
-    """The desired takeoff time of the swarm; `None` if the takeoff time should
-    be cleared. Ignored if `should_update_takeoff_time` is set to `False`.
+    takeoff_time: float | None = None
+    """The desired takeoff time of the swarm as a UNIX timestamp; `None` if the
+    takeoff time should be cleared. Ignored if `should_update_takeoff_time` is
+    set to `False`.
     """
 
     @classmethod
@@ -101,7 +111,7 @@ class TakeoffConfiguration:
                 # User has a show clock and the show clock has a scheduled
                 # start time so we want to use that
                 return cls(
-                    takeoff_time=int(start_time), authorization_scope=desired_auth_scope
+                    takeoff_time=start_time, authorization_scope=desired_auth_scope
                 )
             else:
                 # User has no show clock or the show clock is stopped, so we
@@ -144,9 +154,25 @@ class TakeoffConfiguration:
 
         Returns:
             -1 if the takeoff time should not be updated, `None` if the takeoff
-            time should be cleared, or the real takeoff time otherwise
+            time should be cleared, or the takeoff time in whole seconds
+            otherwise
         """
-        return self.takeoff_time if self.should_update_takeoff_time else -1
+        return (
+            self.takeoff_time_in_whole_seconds
+            if self.should_update_takeoff_time
+            else -1
+        )
+
+    @property
+    def takeoff_time_in_whole_seconds(self) -> int | None:
+        """Returns the whole-second part of the desired takeoff time, which is
+        what the drones report back and what the ``SHOW_START_TIME`` parameter
+        can hold; `None` if the takeoff time should be cleared.
+        """
+        if self.takeoff_time is None:
+            return None
+        seconds, _ = split_start_time(self.takeoff_time)
+        return seconds
 
 
 TUAV = TypeVar("TUAV", bound="UAV")
