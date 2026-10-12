@@ -156,11 +156,13 @@ async def test_ltc_audio_source_stamps_frames_with_adc_time(monkeypatch):
     device = {
         "index": 3,
         "name": "fake",
+        "hostapi": 0,
         "max_input_channels": 2,
         "default_samplerate": sample_rate,
     }
     fake = SimpleNamespace(
         query_devices=lambda device_, kind: device,
+        query_hostapis=lambda index: {"name": "ALSA"},
         InputStream=lambda **kwds: _FakeInputStream(signal, wall_clock, **kwds),
         PortAudioError=OSError,
     )

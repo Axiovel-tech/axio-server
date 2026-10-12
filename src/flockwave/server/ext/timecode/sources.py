@@ -104,6 +104,11 @@ async def _decode_audio_input(
             f"(channels are numbered from 1)"
         )
     sample_rate = float(sample_rate or info["default_samplerate"])
+    if sounddevice.query_hostapis(info["hostapi"])["name"] == "PulseAudio":
+        log.warning(
+            f"{info['name']!r} is a PulseAudio device; PortAudio times its "
+            "input only to tens of milliseconds, choose an ALSA device"
+        )
 
     token = trio.lowlevel.current_trio_token()
     sender, receiver = trio.open_memory_channel[tuple[np.ndarray, float, bool]](64)
