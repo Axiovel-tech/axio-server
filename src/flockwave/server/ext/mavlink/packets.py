@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, ClassVar
 from flockwave.gps.time import gps_time_of_week_to_utc, unix_to_gps_time_of_week
 
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.ext.show.takeoff import split_start_time
 from flockwave.server.ext.show.time import BinaryTimeAxisConfiguration
 from flockwave.server.model.gps import GPSFixType as OurGPSFixType
 
@@ -110,25 +111,30 @@ def create_start_time_configuration_packet(
             updated on the swarm; set this to `False` if you do not want to
             change the start time, only the authorization flag
     """
+    start_time_msec = 0
     if not should_update_takeoff_time:
         # do not touch; this is expressed by a value larger than 604800 seconds
         # on the drone's side.
-        start_time = 0x7FFFFFFF
+        start_time_tow = 0x7FFFFFFF
         msec_until_start = 0x7FFFFFFF
     elif start_time is None or start_time < 0:
         # clear start time; this is expressed by a value smaller than -604800
         # seconds on the drone's side
-        start_time = -0x80000000
+        start_time_tow = -0x80000000
         msec_until_start = -0x80000000
     else:
-        # convert from UNIX timestamp to GPS time-of-week
-        msec_until_start = int(1000 * (start_time - time()))
+        msec_until_start = round(1000 * (start_time - time()))
         msec_until_start = min(max(msec_until_start, -MSEC_IN_WEEK), MSEC_IN_WEEK)
-        _, start_time = unix_to_gps_time_of_week(int(start_time))
+        start_time_sec, start_time_msec = split_start_time(start_time)
+        _, start_time_tow = unix_to_gps_time_of_week(start_time_sec)
 
+    # Firmware that predates the trailing millisecond field ignores it
     scope_value = authorization_scope_to_int(authorization_scope)
     return create_custom_data_packet(
-        type=1, payload=pack("<iBi", start_time, scope_value, msec_until_start)
+        type=1,
+        payload=pack(
+            "<iBiH", start_time_tow, scope_value, msec_until_start, start_time_msec
+        ),
     )
 
 

@@ -12,6 +12,7 @@ from flockwave.server.ext.show.takeoff import (
     ScheduledTakeoffManager,
     SimpleScheduledTakeoffManager,
     TakeoffConfiguration,
+    split_start_time,
 )
 from flockwave.server.model.uav import UAVBase
 
@@ -567,3 +568,19 @@ async def test_simple_scheduled_takeoff_manager(
     await sleep(1.6)
     assert counter == 6
     assert last_config is not None
+
+
+def test_takeoff_configuration_keeps_the_sub_second_start_time(
+    config: DroneShowConfiguration,
+):
+    takeoff = TakeoffConfiguration.from_show_config(config, 1_760_000_012.75)
+
+    assert takeoff.takeoff_time == 1_760_000_012.75
+    assert takeoff.takeoff_time_in_whole_seconds == 1_760_000_012
+    assert takeoff.takeoff_time_in_legacy_format == 1_760_000_012
+
+
+def test_split_start_time():
+    assert split_start_time(1_760_000_012.0) == (1_760_000_012, 0)
+    assert split_start_time(1_760_000_012.123) == (1_760_000_012, 123)
+    assert split_start_time(1_760_000_012.9996) == (1_760_000_013, 0)

@@ -102,7 +102,7 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             # Takeoff time must be cleared (None) or set to a specific
             # value; we need an update if it is different from what
             # we have on the UAV
-            return uav.scheduled_takeoff_time != config.takeoff_time
+            return uav.scheduled_takeoff_time != config.takeoff_time_in_whole_seconds
 
         # Auth scope is the same and the takeoff time does not
         # need to change
