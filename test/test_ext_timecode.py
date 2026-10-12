@@ -87,6 +87,22 @@ def test_clock_jump_and_drift():
     assert all(-0.15 < delta < -0.125 for delta in deltas)
 
 
+def test_clock_follows_a_short_rewind_at_once():
+    """A rewind shorter than the jump threshold moves the clock right away;
+    the pre-rewind frames would otherwise hold the estimate for its window."""
+    clock = TimecodeClock(FPS_25)
+    signals = _Signals(clock)
+    for i in range(50):
+        clock.feed(_frame(100 + i / 25, T0 + i / 25))
+
+    for i in range(50, 60):
+        clock.feed(_frame(100 + (i - 3) / 25, T0 + i / 25))
+
+    assert signals.events[-1] == ("changed", pytest.approx(-3))
+    seconds = clock.ticks_given_time(T0 + 60 / 25) / 25
+    assert seconds == pytest.approx(100 + 57 / 25, abs=0.001)
+
+
 def test_clock_stops_and_freezes_when_frames_stop():
     clock = TimecodeClock(FPS_25, freshness=1.0)
     signals = _Signals(clock)

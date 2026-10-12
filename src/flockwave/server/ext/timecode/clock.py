@@ -13,7 +13,9 @@ from .timecode import FrameRate, Timecode
 __all__ = ("TimecodeClock", "TimecodeFrame")
 
 #: A frame further than this from the one before it (after accounting for
-#: the wall time between them) is a jump in the timecode, not jitter.
+#: the wall time between them) is a jump in the timecode, not jitter. A label
+#: lower than the one before it is always a jump: the estimate keeps the
+#: earliest start of the timecode, so it would miss a short rewind.
 JUMP_TOLERANCE_FRAMES = 3
 
 #: The clock is re-anchored when its estimate drifts further than this.
@@ -112,6 +114,7 @@ class TimecodeClock(ClockBase):
         )
         if (
             frame.rate != self._rate
+            or frame.seconds < previous.seconds
             or abs(step) * self._rate.fps > JUMP_TOLERANCE_FRAMES
         ):
             self._rate = frame.rate
