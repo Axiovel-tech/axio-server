@@ -34,10 +34,17 @@ for the rtls-link UWB indoor positioning system:
   for the full client message API (`X-RTLS-*`) and configuration. The
   extension is *not* in the default extension list; enable it in your
   configuration file.
-- **`ltc_timecode` extension** — an SMPTE timecode clock registered under
-  the id `mtc`, fed by a network LTC stream (one `HH:MM:SS:FF` timecode
-  per UDP datagram, port 5005 by default), so a show can be scheduled on
-  and follow the master timecode of a larger production.
+- **`timecode` extension** — an SMPTE timecode clock registered under the
+  id `mtc`, so a show can be scheduled on and follow the master timecode of
+  a larger production. `source` selects the input: `ltc_audio` decodes LTC
+  from an audio input channel (`device`, `channel`, `fps`), `udp` receives
+  one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default).
+  `ltc_audio` needs the PortAudio library (`sudo apt install libportaudio2`)
+  and precise ADC timestamps, which PortAudio's ALSA devices provide. On a
+  PipeWire desktop use the `default` (or `pipewire`) device with the LTC
+  interface as the system's default input and `sample_rate` set to the
+  graph rate (48000 by default); PortAudio's PulseAudio devices time
+  blocks only to tens of milliseconds.
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
 reference configuration for indoor shows. The MAVLink ingest convention for
