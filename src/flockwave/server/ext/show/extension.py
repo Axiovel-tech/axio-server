@@ -67,6 +67,7 @@ class DroneShowExtension(Extension):
             "get_configuration": self._get_configuration,
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
             "get_light_configuration": self._get_light_configuration,
+            "get_point_of_no_return_seconds": self._get_point_of_no_return_seconds,
             "schedule_start": self._schedule_start,
         }
 
@@ -246,6 +247,12 @@ class DroneShowExtension(Extension):
     def _get_last_uploaded_show_metadata(self):
         """Returns the metadata of the last uploaded show."""
         return self._log_middleware.last_show_metadata if self._log_middleware else None
+
+    def _get_point_of_no_return_seconds(self) -> float | None:
+        """Returns the show clock time after which a started show no longer
+        follows changes of the clock it is synchronized to.
+        """
+        return self._clock_sync.point_of_no_return_seconds
 
     def _get_light_configuration(self) -> LightConfiguration:
         """Returns a copy of the current LED lgiht configuration."""
