@@ -171,19 +171,24 @@ safe with self-heartbeating boards (see above).
 
 Tags recover a shared absolute cluster time from the UWB anchor cluster
 and report it in their health stats (`clkh`/`clks` cluster seconds, with
-a `clkok` freshness flag). On the first fresh sample the extension mints
-a *pin* — "at cluster tick C0 the GPS time is (week, tow)" — by pairing
-the reported cluster time with the server's own wall clock, and
+a `clkok` freshness flag). The extension estimates the offset between
+cluster time and its own wall clock from these reports, mints a *pin* —
+"at cluster tick C0 the GPS time is (week, tow)" — from it, and
 distributes the **identical** pin to every tag as the `GPS_PIN_WEEK` /
 `GPS_PIN_TOW_MS` / `GPS_PIN_C0_HI` / `GPS_PIN_C0_LO` parameters. Each
-tag then synthesizes the same GPS time from its own cluster clock and
-feeds it to its autopilot as GPS_INPUT, so ArduPilot's native
-GPS-synchronized show scheduler self-triggers in lockstep across the
-fleet with no go-time packet. Inter-drone agreement rides entirely on
-the shared cluster clock; the pin's absolute accuracy (server clock +
-stats latency, tens of ms) only offsets the show against wall clock,
-equally for every drone.
+tag then derives the same GPS time from its own cluster clock and streams
+it to its flight controller as the show clock, against which the
+scheduled show start is resolved. Inter-drone agreement rides entirely on
+the shared cluster clock; the pin's absolute accuracy only offsets the
+show against the server's wall clock (and the music it plays), equally
+for every drone.
 
+- Every report arrives some latency after the tag sampled its cluster
+  time, so the offset estimate is the smallest wall-minus-cluster time
+  over the last 20 s across all tags (the least delayed report). The
+  first pin is minted from the first fresh report; when the estimate
+  drifts more than 5 ms from the distributed pin, a fresh pin is minted
+  and pushed to every device, at most once a minute.
 - Writes follow the firmware's ordering contract: `GPS_PIN_WEEK` is
   zeroed first and written with the real week **last**, so a
   half-applied pin reads as disabled on the tag instead of mixing old

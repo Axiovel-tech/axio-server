@@ -2341,6 +2341,80 @@ def test_show_clock_remint_clears_every_pending_deviation(monkeypatch):
     assert manager.pin is second_pin
 
 
+def _pin_manager_driver(monkeypatch):
+    """A pin manager without device I/O and a function feeding it one
+    cluster-clock report received at a given wall time."""
+    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+
+    now = [0.0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+    )
+    manager = ShowClockPinManager(SimpleNamespace(log=None))
+    nursery = SimpleNamespace(start_soon=lambda *args: None)
+
+    def report(system_id, cluster_seconds, received_at):
+        now[0] = received_at
+        hi = float(int(cluster_seconds // 4096) * 4096)
+        manager.on_stats(
+            system_id,
+            {"clkok": 1.0, "clkh": hi, "clks": cluster_seconds - hi},
+            nursery,
+        )
+
+    return manager, report
+
+
+def test_show_clock_pin_follows_least_delayed_report(monkeypatch):
+    """Reports from three tags arrive with a varying latency. The first pin
+    carries the first report's latency; a minute later the pin is re-minted
+    from the least delayed report of the last 20 s and pushed everywhere."""
+    import random
+
+    manager, report = _pin_manager_driver(monkeypatch)
+    rng = random.Random(3)
+    wall_minus_cluster = 1_752_000_000.0
+    mints = []
+
+    for step in range(3 * 75):
+        sampled_at = wall_minus_cluster + 100.0 + step / 3
+        latency = 0.08 if step == 0 else 0.004 + rng.expovariate(1 / 0.04)
+        report(step % 3 + 1, sampled_at - wall_minus_cluster, sampled_at + latency)
+        if not mints or manager.pin is not mints[-1][1]:
+            mints.append((sampled_at, manager.pin))
+        if step == 3:
+            manager._pinned.update({1, 2, 3})
+
+    assert len(mints) == 2
+    assert mints[1][0] - mints[0][0] >= 60
+    assert mints[0][1].offset == pytest.approx(wall_minus_cluster + 0.08, abs=1e-6)
+    assert 0.004 <= mints[1][1].offset - wall_minus_cluster < 0.006
+    assert not manager._pinned
+
+
+def test_show_clock_repins_on_drift_at_most_once_a_minute(monkeypatch):
+    """The cluster clock runs 50 ppm fast against the server clock: the pin
+    is re-minted whenever the estimate is more than 5 ms off, but never
+    sooner than a minute after the previous one."""
+    manager, report = _pin_manager_driver(monkeypatch)
+    start = 1_752_000_000.0
+    mint_times = []
+
+    for second in range(600):
+        wall = start + second
+        report(1, 100.0 + second * 1.00005, wall + 0.003)
+        if manager.pin is not None and (
+            not mint_times or manager.pin.wall_unix != mint_times[-1][1]
+        ):
+            mint_times.append((wall, manager.pin.wall_unix))
+
+    intervals = [b[0] - a[0] for a, b in zip(mint_times, mint_times[1:])]
+    assert len(intervals) == 5
+    assert all(interval >= 60 for interval in intervals)
+    expected_offset = start + 599 + 0.003 - (100.0 + 599 * 1.00005)
+    assert abs(manager.pin.offset - expected_offset) <= 0.0065
+
+
 async def test_show_clock_lost_device_repinned_on_return(extension, device):
     """A lost device is dropped from the pinned set, so its next fresh
     stats snapshot after rediscovery pushes the pin again (it may have
