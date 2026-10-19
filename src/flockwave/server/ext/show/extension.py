@@ -11,13 +11,19 @@ from trio_util import periodic
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.model.clock import Clock
+from flockwave.server.model.messages import FlockwaveMessage, FlockwaveResponse
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
 from .config import DroneShowConfiguration, LightConfiguration, StartMethod
 from .logging import ShowUploadLoggingMiddleware
+from .rth import RTHPlan, RTHPlanRegistry, RTHRequestRefused, plan_rth_dispatch
 
 __all__ = ("construct", "dependencies", "description")
+
+DEFAULT_RTH_COMMAND_LATENCY_MS = 1000
+"""Default margin between the current show time and the earliest branch time
+that an RTH command may name, in milliseconds."""
 
 
 class DroneShowExtension(Extension):
@@ -40,6 +46,9 @@ class DroneShowExtension(Extension):
 
     _log_middleware: ShowUploadLoggingMiddleware | None
 
+    _rth_plans: RTHPlanRegistry
+    _rth_command_latency_us: int
+
     _nursery: Nursery | None
     _show_tasks: CancellableTaskGroup | None
 
@@ -60,6 +69,9 @@ class DroneShowExtension(Extension):
         self._config = DroneShowConfiguration()
         self._lights = LightConfiguration()
 
+        self._rth_plans = RTHPlanRegistry()
+        self._rth_command_latency_us = DEFAULT_RTH_COMMAND_LATENCY_MS * 1000
+
     def exports(self) -> dict[str, Any]:
         return {
             "get_clock": self._get_clock,
@@ -67,6 +79,8 @@ class DroneShowExtension(Extension):
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
             "get_light_configuration": self._get_light_configuration,
             "schedule_start": self._schedule_start,
+            "clear_rth_plan": self._rth_plans.clear,
+            "set_rth_plan": self._set_rth_plan,
         }
 
     def handle_SHOW_CFG(self, message, sender, hub):
@@ -117,6 +131,67 @@ class DroneShowExtension(Extension):
         except Exception as ex:
             return hub.acknowledge(message, outcome=False, reason=str(ex))
 
+    async def handle_SHOW_RTH(
+        self, message: FlockwaveMessage, sender, hub
+    ) -> FlockwaveResponse:
+        """Sends the requested drones home along their certified RTH paths
+        (AxioStack ``contracts/gdm-ground-rth.md``).
+        """
+        assert self.app is not None
+
+        body = message.body
+        if body.get("all") is True and "ids" not in body:
+            # "All" means the drones of the show, as Control assigned them;
+            # without an assignment, every drone that holds a plan.
+            target_ids = [
+                uav_id for uav_id in self._config.uav_ids if uav_id is not None
+            ] or self._rth_plans.uav_ids
+        elif "all" not in body and isinstance(body.get("ids"), list):
+            target_ids = [str(uav_id) for uav_id in body["ids"]]
+        else:
+            return hub.acknowledge(
+                message,
+                outcome=False,
+                reason="Request either 'ids' or 'all': true",
+            )
+
+        try:
+            dispatch = plan_rth_dispatch(
+                self._rth_plans,
+                target_ids,
+                show_time_us=self._get_show_time_us(),
+                latency_us=self._rth_command_latency_us,
+            )
+        except RTHRequestRefused as ex:
+            self.log.warning(f"RTH refused: {ex}")
+            return hub.acknowledge(message, outcome=False, reason=str(ex))
+
+        self.log.warning(
+            f"RTH at show time {dispatch.branch_time_us / 1e6:.3f} s for "
+            f"{len(dispatch.uav_ids)} drone(s): {', '.join(dispatch.uav_ids)}"
+        )
+
+        response = hub.create_response_or_notification(
+            body={"branchTimeUs": dispatch.branch_time_us}, in_response_to=message
+        )
+        for uav_id, reason in dispatch.errors.items():
+            response.add_error(uav_id, reason)
+
+        await self.app.dispatch_driver_method(
+            self.app.sort_uavs_by_drivers(dispatch.uav_ids, response),
+            "send_show_rth_signal",
+            {"branch_time_us": dispatch.branch_time_us},
+            response,
+            sender,
+        )
+        return response
+
+    def handle_SHOW_RTH_INF(self, message, sender, hub):
+        """Lists the drones that hold a certified RTH plan."""
+        return hub.create_response_or_notification(
+            body={"ids": self._rth_plans.uav_ids}, in_response_to=message
+        )
+
     def handle_SHOW_SETLIGHTS(self, message, sender, hub):
         try:
             self._lights.update_from_json(message.body.get("configuration", {}))
@@ -136,6 +211,8 @@ class DroneShowExtension(Extension):
             "SHOW-LIGHTS": self.handle_SHOW_LIGHTS,
             "SHOW-SETCFG": self.handle_SHOW_SETCFG,
             "SHOW-SETLIGHTS": self.handle_SHOW_SETLIGHTS,
+            "X-SHOW-RTH": self.handle_SHOW_RTH,
+            "X-SHOW-RTH-INF": self.handle_SHOW_RTH_INF,
         }
 
         self._config.start_method = StartMethod(
@@ -154,6 +231,21 @@ class DroneShowExtension(Extension):
             point_of_no_return_seconds = -10
 
         self._clock_sync.point_of_no_return_seconds = point_of_no_return_seconds
+
+        try:
+            rth_command_latency_ms = int(
+                configuration.get(
+                    "rth_command_latency_ms", DEFAULT_RTH_COMMAND_LATENCY_MS
+                )
+            )
+        except ValueError:
+            self.log.warning(
+                "Invalid value for 'rth_command_latency_ms' in configuration, "
+                f"using default value of {DEFAULT_RTH_COMMAND_LATENCY_MS} ms"
+            )
+            rth_command_latency_ms = DEFAULT_RTH_COMMAND_LATENCY_MS
+
+        self._rth_command_latency_us = max(rth_command_latency_ms, 0) * 1000
 
         self.log.info(
             "Default show start method: %s", self._config.start_method.describe()
@@ -215,6 +307,25 @@ class DroneShowExtension(Extension):
     def _get_clock(self) -> ShowClock | None:
         """Returns a reference to the show clock."""
         return self._clock
+
+    def _get_show_time_us(self) -> int | None:
+        """Returns the current show time in microseconds, or ``None`` if the
+        show clock is not running.
+        """
+        if self._clock is None or not self._clock.running:
+            return None
+        return int(self._clock.seconds * 1_000_000)
+
+    def _set_rth_plan(self, uav_id: str, show_hash: str, times_us: list[int]) -> None:
+        """Records the RTH plan of the `.gdm` show that the given UAV holds.
+
+        Called by the `.gdm` upload path once the `.gdmb` of the UAV is
+        verified on the vehicle (AxioStack ``contracts/gdm-format.md`` §9.2).
+
+        Raises:
+            ValueError: if the branch times are not a valid RTH plan
+        """
+        self._rth_plans.set(uav_id, RTHPlan(show_hash, tuple(times_us)))
 
     def _schedule_start(self, start_time: float) -> None:
         """Schedules the show start at the given UNIX timestamp through the
@@ -455,6 +566,18 @@ schema = {
                 "to a negative value."
             ),
             "default": -10,
+        },
+        "rth_command_latency_ms": {
+            "type": "integer",
+            "title": "RTH command latency (milliseconds)",
+            "description": (
+                "How far ahead of the current show time the branch time of a "
+                "certified RTH must be, so that the command reaches every "
+                "selected drone before it. The server sends the first branch "
+                "time of the show at least this far ahead."
+            ),
+            "minimum": 0,
+            "default": DEFAULT_RTH_COMMAND_LATENCY_MS,
         },
     }
 }

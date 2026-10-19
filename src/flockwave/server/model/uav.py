@@ -937,6 +937,36 @@ class UAVDriver(Generic[TUAV], ABC):
             transport=transport,
         )
 
+    def send_show_rth_signal(self, uavs: list[TUAV], *, branch_time_us: int):
+        """Asks the driver to send the given UAVs home along the certified
+        return path of their loaded `.gdm` show, leaving the show at the given
+        branch time.
+
+        Each UAV holds one precomputed path per branch time (AxioStack
+        ``contracts/gdm-format.md`` §6.7). The UAV keeps flying the show until
+        the branch time, then flies the path to its RTH position and lands.
+        UAVs that are not addressed keep flying the show.
+
+        Typically, you don't need to override this method when implementing
+        a driver; override ``_send_show_rth_signal_single()`` instead.
+
+        Parameters:
+            uavs: the UAVs to address with this request
+            branch_time_us: the branch time, in microseconds of show time. It
+                is one of the entry times of the RTH plan that the UAVs hold.
+
+        Returns:
+            dict mapping UAVs to the corresponding results (which may also be
+            errors or awaitables; it is the responsibility of the caller to
+            evaluate errors and wait for awaitables)
+        """
+        return self._dispatch_request(
+            uavs,
+            "show RTH signal",
+            self._send_show_rth_signal_single,
+            branch_time_us=branch_time_us,
+        )
+
     def send_shutdown_signal(
         self, uavs: list[TUAV], transport: TransportOptions | None = None
     ):
@@ -1507,6 +1537,33 @@ class UAVDriver(Generic[TUAV], ABC):
         Parameters:
             uav: the UAV to address with this request.
             transport: transport options for sending the signal
+
+        Raises:
+            NotImplementedError: if the operation is not supported by the
+                driver yet, but there are plans to implement it
+            NotSupportedError: if the operation is not supported by the
+                driver and will not be supported in the future either
+        """
+        raise NotImplementedError
+
+    def _send_show_rth_signal_single(
+        self, uav: TUAV, *, branch_time_us: int
+    ) -> None | Awaitable[None]:
+        """Asks the driver to send a single UAV managed by this driver home
+        along the certified return path that starts at the given branch time
+        of its loaded `.gdm` show.
+
+        May return an awaitable if sending the signal takes a longer time.
+
+        The function follows the "samurai principle", i.e. "return victorious,
+        or not at all". It means that if it returns, the operation succeeded,
+        i.e. the UAV accepted the branch time. Raise an exception if the
+        operation cannot be executed for any reason; a RuntimeError is
+        typically sufficient.
+
+        Parameters:
+            uav: the UAV to address with this request.
+            branch_time_us: the branch time, in microseconds of show time
 
         Raises:
             NotImplementedError: if the operation is not supported by the
