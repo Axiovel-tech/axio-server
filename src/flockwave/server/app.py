@@ -624,6 +624,38 @@ class SkybrushServer(DaemonApp):
         parameters = transform_message_body(transformer, parameters)
 
         # Ask each affected driver to send the message to the UAV
+        await self.dispatch_driver_method(
+            uavs_by_drivers, method_name, parameters, response, sender
+        )
+
+        return response
+
+    async def dispatch_driver_method(
+        self,
+        uavs_by_drivers: dict[UAVDriver, list[UAV]],
+        method_name: str | None,
+        parameters: dict[str, Any],
+        response: FlockwaveResponse,
+        sender: Client,
+    ) -> None:
+        """Calls a method of the given UAV drivers for their UAVs and records
+        the outcome for each UAV in the given response.
+
+        This is the common tail of ``dispatch_to_uavs()``, exposed so that
+        extensions that resolve their target UAVs themselves can forward a
+        request to the drivers with the same result, error and receipt
+        handling.
+
+        Parameters:
+            uavs_by_drivers: mapping of UAV drivers to the UAVs to address
+            method_name: name of the driver method to call with the list of
+                UAVs and the keyword arguments in ``parameters``
+            parameters: keyword arguments of the driver method
+            response: the response in which the outcome for each UAV is
+                recorded (``result``, ``error`` and ``receipt`` keys)
+            sender: the client to notify when an asynchronous operation
+                completes
+        """
         for driver, uavs in uavs_by_drivers.items():
             # Look up the method in the driver
             common_error, results = None, None
@@ -688,8 +720,6 @@ class SkybrushServer(DaemonApp):
                             )
                         else:
                             response.add_result(uav.id, result)
-
-        return response
 
     def find_uav_by_id(
         self,

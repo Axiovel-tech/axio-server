@@ -962,6 +962,16 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if not success:
             raise RuntimeError("Return to home command failed")
 
+    def _send_show_rth_signal_single(
+        self, uav: "MAVLinkUAV", *, branch_time_us: int
+    ) -> None:
+        # The vehicle side of `.gdm` RTH (AxioStack contracts/gdm-format.md
+        # §9.1) is deliberately written last, after the planned move from
+        # ArduPilot to Betaflight. Until a firmware binding defines the
+        # command, refuse it here so that the operator sees which drones
+        # did not take the return path.
+        raise NotImplementedError
+
     async def _send_shutdown_signal_broadcast(self, *, transport=None) -> None:
         channel = transport_options_to_channel(transport)
         await self._send_motor_start_stop_signal_broadcast(
