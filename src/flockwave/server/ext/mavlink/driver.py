@@ -2676,6 +2676,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
+        # A new show may only be written once the loaded one is gone, whatever
+        # its format; otherwise a drone holding a .gdmb would keep flying it
+        await self._remove_loaded_show_before_upload()
+
         # Upload show file
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await ftp.put(data, "/collmot/show.skyb")
@@ -2702,12 +2706,33 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         altitude_reference = get_altitude_reference_from_show_specification(config)
         geofence = get_geofence_configuration_from_show_specification(config)
 
+        await self._remove_loaded_show_before_upload()
+
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await upload_gdmb(ftp, data)
 
         await self._configure_show_frame_and_reload(
             coordinate_system, altitude_reference, geofence
         )
+
+    async def _remove_loaded_show_before_upload(self) -> None:
+        """Asks the drone to remove the show it holds before a new one is
+        written, so that an upload can never leave an older show of another
+        format loaded. Firmware with the `.gdmb` loader removes both
+        `/axio/show.gdmb` and `/collmot/show.skyb`; older firmware removes the
+        `.skyb` only, which is all it can load.
+
+        Raises:
+            RuntimeError: if the drone did not remove its show (it refuses
+                while armed); nothing has been written to it then
+        """
+        try:
+            await self.remove_show()
+        except Exception as ex:
+            raise RuntimeError(
+                "Cannot replace the show: the drone refused to remove the "
+                f"loaded show (is it armed?): {ex}"
+            ) from ex
 
     async def _configure_show_frame_and_reload(
         self,
