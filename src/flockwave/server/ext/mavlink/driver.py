@@ -93,7 +93,7 @@ from .enums import (
     SkybrushUserCommand,
 )
 from .ftp import MAVFTP
-from .gdm_upload import decode_gdm_upload_request, upload_gdmb
+from .gdm_upload import decode_gdm_upload_request
 from .log_download import MAVLinkLogDownloader
 from .packets import (
     DroneShowExecutionStage,
@@ -103,6 +103,11 @@ from .packets import (
     create_rc_override_packet,
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
+from .show_slot import (
+    SHOW_SLOT_VERSION_PARAMETER,
+    check_show_slot_version,
+    write_show_slot,
+)
 from .types import MAVLinkMessage, PacketBroadcasterFn, PacketSenderFn, spec
 from .utils import (
     can_communicate_infer_from_heartbeat,
@@ -2676,21 +2681,14 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
-        # A new show may only be written once the loaded one is gone, whatever
-        # its format; otherwise a drone holding a .gdmb would keep flying it
-        await self._remove_loaded_show_before_upload()
-
-        # Upload show file
-        async with aclosing(MAVFTP.for_uav(self)) as ftp:
-            await ftp.put(data, "/collmot/show.skyb")
-
+        await self._replace_show_in_slot(data)
         await self._configure_show_frame_and_reload(
             coordinate_system, altitude_reference, geofence
         )
 
     async def upload_gdm_show(self, data: bytes, config: ShowSpecification) -> None:
-        """Uploads a validated `.gdmb` to `/axio/show.gdmb`, then configures
-        the show frame and the geofence and reloads the show, as
+        """Uploads a validated `.gdmb` to the drone's show slot, then
+        configures the show frame and the geofence and reloads the show, as
         `upload_show()` does for `.skyb`.
 
         Parameters:
@@ -2706,26 +2704,29 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         altitude_reference = get_altitude_reference_from_show_specification(config)
         geofence = get_geofence_configuration_from_show_specification(config)
 
-        await self._remove_loaded_show_before_upload()
-
-        async with aclosing(MAVFTP.for_uav(self)) as ftp:
-            await upload_gdmb(ftp, data)
-
+        await self._replace_show_in_slot(data)
         await self._configure_show_frame_and_reload(
             coordinate_system, altitude_reference, geofence
         )
 
-    async def _remove_loaded_show_before_upload(self) -> None:
-        """Asks the drone to remove the show it holds before a new one is
-        written, so that an upload can never leave an older show of another
-        format loaded. Firmware with the `.gdmb` loader removes both
-        `/axio/show.gdmb` and `/collmot/show.skyb`; older firmware removes the
-        `.skyb` only, which is all it can load.
+    async def _replace_show_in_slot(self, data: bytes) -> None:
+        """Replaces the show on the drone with the given `.skyb` or `.gdmb`
+        file, in the drone's single show slot `/axio/show.bin`.
+
+        1. Check that the firmware advertises the show slot (`SHOW_SLOT_VER`).
+           Older firmware reads `/collmot/show.skyb` and would silently keep
+           flying its previous show.
+        2. Ask the drone to remove the show it holds. A new show may only be
+           written once the loaded one is gone.
+        3. Write the slot with an atomic replace (`write_show_slot()`).
 
         Raises:
-            RuntimeError: if the drone did not remove its show (it refuses
-                while armed); nothing has been written to it then
+            RuntimeError: if the firmware lacks the slot or the drone refuses
+                to remove its show (it does while armed); nothing has been
+                written to the drone then
         """
+        await self._ensure_show_slot_supported()
+
         try:
             await self.remove_show()
         except Exception as ex:
@@ -2733,6 +2734,22 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 "Cannot replace the show: the drone refused to remove the "
                 f"loaded show (is it armed?): {ex}"
             ) from ex
+
+        async with aclosing(MAVFTP.for_uav(self)) as ftp:
+            await write_show_slot(ftp, data)
+
+    async def _ensure_show_slot_supported(self) -> None:
+        """Refuses to go on unless the firmware advertises the show slot this
+        server writes.
+
+        MAVLink cannot tell a missing parameter from a lost reply, so a drone
+        that does not answer is treated as not supporting the slot.
+        """
+        try:
+            version = await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
+        except Exception:
+            version = None
+        check_show_slot_version(version)
 
     async def _configure_show_frame_and_reload(
         self,
