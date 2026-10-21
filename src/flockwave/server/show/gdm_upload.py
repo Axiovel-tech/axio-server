@@ -3,8 +3,8 @@
 Axio Control sends each UAV its precompiled, certified `.gdmb` together with
 the show hash of the `.gdm` it came from. Axio Server never re-encodes the
 payload (ADR 0002 decision D2): it validates it against AxioStack
-`contracts/gdm-format.md` §7.1, then writes it to the vehicle with an atomic
-replace into the drone's show slot (`show_slot.py`).
+`contracts/gdm-format.md` §7.1 here, and the UAV driver then writes it to the
+vehicle (for MAVLink, `ext/mavlink/show_slot.py`).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 from base64 import b64decode
 from binascii import Error as BinasciiError
 
-from flockwave.server.show.gdmb import (
+from .gdmb import (
     GDMB_MAX_SIZE,
     GdmbSummary,
     GdmbValidationError,

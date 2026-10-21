@@ -689,17 +689,6 @@ class MAVFTP:
 
         yield Progress(percentage=100)
 
-    async def rename(self, old_path: FTPPath, new_path: FTPPath) -> None:
-        """Renames a file in the MAVFTP session.
-
-        Whether an existing file at the new path is replaced depends on the
-        filesystem of the remote side: ArduPilot's FATFS backend refuses to
-        rename onto an existing file, while POSIX (SITL) replaces it.
-        """
-        data = self._resolve(old_path) + b"\x00" + self._resolve(new_path)
-        message = MAVFTPMessage(MAVFTPOpCode.RENAME, data=data)
-        await self._send_and_wait(message)
-
     async def rm(self, path: FTPPath) -> None:
         """Removes a file at the given path in the MAVFTP session."""
         path = self._resolve(path)

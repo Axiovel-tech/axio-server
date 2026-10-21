@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pytest import raises
 
-from flockwave.server.ext.mavlink.gdm_upload import decode_gdm_upload_request
+from flockwave.server.show.gdm_upload import decode_gdm_upload_request
 from flockwave.server.show.gdmb import GDMB_MAX_SIZE, GdmbValidationError
 
 VECTORS = Path(__file__).parent / "fixtures" / "gdm-vectors"

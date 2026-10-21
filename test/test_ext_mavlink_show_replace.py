@@ -1,7 +1,7 @@
 """Tests that every show upload, `.skyc` and `.gdm` alike, writes the drone's
-single show slot `/axio/show.bin`: only on firmware that advertises the slot,
-only after the loaded show was removed, and nothing at all if either check
-fails.
+single show slot `/axio/show.bin` with the flow of AxioStack#89 decision 1:
+refuse if armed, check SHOW_SLOT_VER, remove the slot and the legacy file,
+put the slot, then configure and reload. Nothing is written if a check fails.
 """
 
 import json
@@ -13,7 +13,16 @@ from trio import TooSlowError
 
 from flockwave.server.ext.mavlink import driver as driver_module
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.show_slot import SHOW_SLOT_PATH, SHOW_SLOT_TEMP_PATH
+from flockwave.server.ext.mavlink.enums import MAVModeFlag
+from flockwave.server.ext.mavlink.ftp import (
+    MAVFTPErrorCode,
+    OperationNotAcknowledgedError,
+)
+from flockwave.server.ext.mavlink.show_slot import (
+    LEGACY_SHOW_PATH,
+    SHOW_SLOT_PATH,
+    ShowUploadRefusedError,
+)
 
 VECTORS = Path(__file__).parent / "fixtures" / "gdm-vectors"
 FLAT = (VECTORS / "flat-single" / "d01.gdmb").read_bytes()
@@ -57,24 +66,46 @@ class RecordingFTP:
 
     async def rm(self, path):
         self.calls.append(("rm", path))
-        self.files.pop(path, None)
-
-    async def rename(self, old_path, new_path):
-        self.calls.append(("rename", old_path, new_path))
-        self.files[new_path] = self.files.pop(old_path)
-
-    async def crc32(self, path):
-        from flockwave.server.show.utils import crc32_mavftp
-
-        return crc32_mavftp(self.files[path])
+        if path not in self.files:
+            raise OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_NOT_FOUND)
+        del self.files[path]
 
 
 SLOT_WRITE = [
-    ("mkdir", "/axio"),
-    ("put", SHOW_SLOT_TEMP_PATH),
     ("rm", SHOW_SLOT_PATH),
-    ("rename", SHOW_SLOT_TEMP_PATH, SHOW_SLOT_PATH),
+    ("rm", LEGACY_SHOW_PATH),
+    ("mkdir", "/axio"),
+    ("put", SHOW_SLOT_PATH),
 ]
+
+
+class FakeDrone:
+    """What the tested UAV reads from its drone: the latest heartbeat and
+    parameters. A parameter mapped to `None` gets no reply, like a parameter
+    the firmware does not have or a lost packet.
+    """
+
+    def __init__(self, calls: list[tuple]):
+        self.calls = calls
+        self.armed = False
+        self.heartbeat = True
+        self.parameters: dict[str, float | None] = {
+            "SHOW_SLOT_VER": 1.0,
+            "SHOW_ORIENTATION": 1.0,
+        }
+
+    def get_last_message(self, type):
+        if not self.heartbeat:
+            return None
+        mode = MAVModeFlag.SAFETY_ARMED.value if self.armed else 0
+        return SimpleNamespace(base_mode=mode)
+
+    async def get_parameter(self, name, fetch=False):
+        self.calls.append(("param", name))
+        value = self.parameters.get(name)
+        if value is None:
+            raise TooSlowError()
+        return value
 
 
 @fixture
@@ -88,12 +119,13 @@ def ftp(calls) -> RecordingFTP:
 
 
 @fixture
-def uav(calls, ftp, monkeypatch) -> MAVLinkUAV:
-    uav = MAVLinkUAV("01", driver=SimpleNamespace(autopilot_factory=None))
+def drone(calls) -> FakeDrone:
+    return FakeDrone(calls)
 
-    async def get_parameter(name, fetch=False):
-        calls.append(("check", name))
-        return 1.0
+
+@fixture
+def uav(calls, ftp, drone, monkeypatch) -> MAVLinkUAV:
+    uav = MAVLinkUAV("01", driver=SimpleNamespace(autopilot_factory=None))
 
     async def remove_show():
         calls.append(("remove",))
@@ -101,35 +133,14 @@ def uav(calls, ftp, monkeypatch) -> MAVLinkUAV:
     async def configure_and_reload(coordinate_system, altitude_reference, geofence):
         calls.append(("configure+reload",))
 
-    monkeypatch.setattr(uav, "get_parameter", get_parameter)
+    monkeypatch.setattr(uav, "get_last_message", drone.get_last_message)
+    monkeypatch.setattr(uav, "get_parameter", drone.get_parameter)
     monkeypatch.setattr(uav, "remove_show", remove_show)
     monkeypatch.setattr(uav, "_configure_show_frame_and_reload", configure_and_reload)
     monkeypatch.setattr(
         driver_module.MAVFTP, "for_uav", classmethod(lambda cls, _: ftp)
     )
     return uav
-
-
-def refuse_remove(uav: MAVLinkUAV, calls: list[tuple], monkeypatch) -> None:
-    async def remove_show():
-        calls.append(("remove",))
-        raise RuntimeError("Failed to remove show file")
-
-    monkeypatch.setattr(uav, "remove_show", remove_show)
-
-
-def report_slot_version(uav: MAVLinkUAV, calls: list[tuple], monkeypatch, value):
-    """Makes the drone report `value` for SHOW_SLOT_VER; `None` means that
-    the drone never answers, as for a parameter it does not have.
-    """
-
-    async def get_parameter(name, fetch=False):
-        calls.append(("check", name))
-        if value is None:
-            raise TooSlowError()
-        return value
-
-    monkeypatch.setattr(uav, "get_parameter", get_parameter)
 
 
 async def upload(uav: MAVLinkUAV, kind: str) -> None:
@@ -139,19 +150,24 @@ async def upload(uav: MAVLinkUAV, kind: str) -> None:
         await uav.upload_show(json.loads(json.dumps(SKYC_SHOW)))
 
 
-@mark.parametrize("kind", ["gdm", "skyc"])
-async def test_upload_checks_removes_writes_slot_then_reloads(uav, calls, kind):
+KINDS = mark.parametrize("kind", ["gdm", "skyc"])
+
+
+@KINDS
+async def test_upload_flow(uav, calls, kind):
     await upload(uav, kind)
 
+    # No REMOVE_SHOW command: the MAVFTP removals replace it
     assert calls == [
-        ("check", "SHOW_SLOT_VER"),
-        ("remove",),
+        ("param", "SHOW_SLOT_VER"),
         *SLOT_WRITE,
         ("configure+reload",),
     ]
 
 
 async def test_both_formats_land_in_the_same_slot(uav, ftp):
+    ftp.files[LEGACY_SHOW_PATH] = b"skyb from the old server"
+
     await upload(uav, "gdm")
     assert ftp.files == {SHOW_SLOT_PATH: FLAT}
 
@@ -160,28 +176,61 @@ async def test_both_formats_land_in_the_same_slot(uav, ftp):
     assert ftp.files[SHOW_SLOT_PATH].startswith(b"skyb\x02")
 
 
-@mark.parametrize("kind", ["gdm", "skyc"])
-@mark.parametrize("version", [None, 0.0, 2.0])
-async def test_upload_refused_without_show_slot_support(
-    uav, calls, monkeypatch, kind, version
-):
-    report_slot_version(uav, calls, monkeypatch, version)
+@KINDS
+async def test_upload_refused_while_armed(uav, calls, drone, kind):
+    drone.armed = True
 
-    with raises(RuntimeError, match="does not support the /axio show slot"):
+    with raises(ShowUploadRefusedError, match="armed") as info:
         await upload(uav, kind)
 
-    # Nothing reached the drone beyond the parameter read
-    assert calls == [("check", "SHOW_SLOT_VER")]
+    assert info.value.code == "E_ARMED"
+    assert calls == []
 
 
-@mark.parametrize("kind", ["gdm", "skyc"])
-async def test_upload_writes_nothing_if_remove_fails(uav, calls, monkeypatch, kind):
-    refuse_remove(uav, calls, monkeypatch)
+async def test_upload_refused_without_heartbeat(uav, calls, drone):
+    drone.heartbeat = False
 
-    with raises(RuntimeError, match="refused to remove the loaded show"):
+    with raises(RuntimeError, match="No heartbeat") as info:
+        await upload(uav, "gdm")
+
+    # Retryable: once the drone is heard from, the upload may go ahead
+    assert not isinstance(info.value, ShowUploadRefusedError)
+    assert calls == []
+
+
+@KINDS
+async def test_firmware_without_show_slot_is_refused_for_good(uav, calls, drone, kind):
+    drone.parameters["SHOW_SLOT_VER"] = None
+
+    with raises(ShowUploadRefusedError, match="firmware is too old") as info:
         await upload(uav, kind)
 
-    assert calls == [("check", "SHOW_SLOT_VER"), ("remove",)]
+    assert info.value.code == "E_SHOW_SLOT_UNSUPPORTED"
+    # SHOW_ORIENTATION answered, so the link works and the parameter is missing
+    assert calls == [("param", "SHOW_SLOT_VER"), ("param", "SHOW_ORIENTATION")]
+
+
+@mark.parametrize("version", [0.0, 2.0])
+async def test_other_show_slot_version_is_refused_for_good(uav, calls, drone, version):
+    drone.parameters["SHOW_SLOT_VER"] = version
+
+    with raises(ShowUploadRefusedError, match="show slot version") as info:
+        await upload(uav, "gdm")
+
+    assert info.value.code == "E_SHOW_SLOT_UNSUPPORTED"
+    assert calls == [("param", "SHOW_SLOT_VER")]
+
+
+@KINDS
+async def test_no_reply_is_a_link_problem_and_retryable(uav, calls, drone, kind):
+    drone.parameters["SHOW_SLOT_VER"] = None
+    drone.parameters["SHOW_ORIENTATION"] = None
+
+    with raises(RuntimeError, match="No reply from the drone") as info:
+        await upload(uav, kind)
+
+    assert not isinstance(info.value, ShowUploadRefusedError)
+    assert calls == [("param", "SHOW_SLOT_VER"), ("param", "SHOW_ORIENTATION")]
 
 
 async def test_invalid_config_fails_before_touching_the_drone(uav, calls):

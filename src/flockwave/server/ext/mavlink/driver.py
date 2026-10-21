@@ -64,6 +64,7 @@ from flockwave.server.show import (
     get_trajectory_from_show_specification,
 )
 from flockwave.server.show.formats import SkybrushBinaryShowFile
+from flockwave.server.show.gdm_upload import decode_gdm_upload_request
 from flockwave.server.types import GCSLogMessageSender
 from flockwave.server.utils import color_to_rgb8_triplet, to_uppercase_string
 from flockwave.server.utils.generic import nop
@@ -93,7 +94,6 @@ from .enums import (
     SkybrushUserCommand,
 )
 from .ftp import MAVFTP
-from .gdm_upload import decode_gdm_upload_request
 from .log_download import MAVLinkLogDownloader
 from .packets import (
     DroneShowExecutionStage,
@@ -105,6 +105,7 @@ from .packets import (
 from .rssi import RSSIMode, rtcm_counter_to_rssi
 from .show_slot import (
     SHOW_SLOT_VERSION_PARAMETER,
+    ShowUploadRefusedError,
     check_show_slot_version,
     write_show_slot,
 )
@@ -2711,44 +2712,60 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
     async def _replace_show_in_slot(self, data: bytes) -> None:
         """Replaces the show on the drone with the given `.skyb` or `.gdmb`
-        file, in the drone's single show slot `/axio/show.bin`.
-
-        1. Check that the firmware advertises the show slot (`SHOW_SLOT_VER`).
-           Older firmware reads `/collmot/show.skyb` and would silently keep
-           flying its previous show.
-        2. Ask the drone to remove the show it holds. A new show may only be
-           written once the loaded one is gone.
-        3. Write the slot with an atomic replace (`write_show_slot()`).
+        file, in the drone's single show slot `/axio/show.bin` (see
+        `show_slot.py` for the sequence and why).
 
         Raises:
-            RuntimeError: if the firmware lacks the slot or the drone refuses
-                to remove its show (it does while armed); nothing has been
-                written to the drone then
+            ShowUploadRefusedError: if the drone is armed or its firmware does
+                not support the show slot; nothing has been written then.
+                Retrying cannot fix these.
+            RuntimeError: if the drone's state or `SHOW_SLOT_VER` could not be
+                read; nothing has been written then either
         """
+        self._ensure_disarmed_for_show_upload()
         await self._ensure_show_slot_supported()
-
-        try:
-            await self.remove_show()
-        except Exception as ex:
-            raise RuntimeError(
-                "Cannot replace the show: the drone refused to remove the "
-                f"loaded show (is it armed?): {ex}"
-            ) from ex
 
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await write_show_slot(ftp, data)
 
-    async def _ensure_show_slot_supported(self) -> None:
-        """Refuses to go on unless the firmware advertises the show slot this
-        server writes.
+    def _ensure_disarmed_for_show_upload(self) -> None:
+        """Refuses a show upload unless the latest heartbeat says that the
+        motors are disarmed.
+        """
+        heartbeat = self.get_last_message(MAVMessageType.HEARTBEAT)
+        if heartbeat is None:
+            raise RuntimeError(
+                "No heartbeat from the drone yet; cannot tell whether it is armed"
+            )
+        if heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value:
+            raise ShowUploadRefusedError(
+                "E_ARMED", "The drone is armed; disarm it before uploading a show."
+            )
 
-        MAVLink cannot tell a missing parameter from a lost reply, so a drone
-        that does not answer is treated as not supporting the slot.
+    async def _ensure_show_slot_supported(self) -> None:
+        """Refuses to go on unless the firmware implements the show slot this
+        server writes (`SHOW_SLOT_VER`).
+
+        MAVLink has no "unknown parameter" reply: ArduPilot ignores a request
+        for a parameter it does not have, which looks exactly like a lost
+        packet. When `SHOW_SLOT_VER` gets no reply, `SHOW_ORIENTATION` is read
+        instead, which every drone show firmware has (the `.skyb` upload has
+        always configured it). If that answers, the link works and the
+        firmware really lacks the slot; if not, it is the link.
+        (`SYSID_THISMAV` would not do: ArduPilot 4.7 renamed it.)
         """
         try:
             version = await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
-        except Exception:
+        except TooSlowError:
+            try:
+                await self.get_parameter("SHOW_ORIENTATION")
+            except TooSlowError:
+                raise RuntimeError(
+                    f"No reply from the drone when reading "
+                    f"{SHOW_SLOT_VERSION_PARAMETER}; check the link and try again."
+                ) from None
             version = None
+
         check_show_slot_version(version)
 
     async def _configure_show_frame_and_reload(
