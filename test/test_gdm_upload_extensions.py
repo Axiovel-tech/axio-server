@@ -73,7 +73,7 @@ async def test_virtual_uav_validates_and_stores_gdmb():
         uav, gdmb=b64encode(FLAT).decode(), showHash=FLAT_HASH, config=CONFIG
     )
 
-    assert "Stored .gdmb (1190 bytes" in result
+    assert "Stored .gdmb (542 bytes" in result
     assert uav._gdmb == FLAT
     assert not uav.has_trajectory
 

@@ -1,0 +1,61 @@
+{
+  "mode": "provisional",
+  "reject": [
+    {
+      "file": "envelope-misaligned.gdmb.hex",
+      "code": "E_ENVELOPE",
+      "description": "first envelope record starts 1 us late"
+    },
+    {
+      "file": "rth-branch-time.gdmb.hex",
+      "code": "E_RTH",
+      "description": "rth[1] branch time 1 us after the show joint"
+    },
+    {
+      "file": "rth-off-target.gdmb.hex",
+      "code": "E_RTH",
+      "description": "RTH target x moved 0.1 mm: paths no longer end on it"
+    },
+    {
+      "file": "rth-branch-c2.gdmb.hex",
+      "code": "E_C2",
+      "description": "rth[1] brake leg x.P1 moved by +5 cm (velocity jump at the branch)"
+    },
+    {
+      "file": "maneuver-flag-clear.gdmb.hex",
+      "code": "E_FEATURES",
+      "description": "MANEUVER feature and capability bits cleared"
+    },
+    {
+      "file": "hemisphere.gdmb.hex",
+      "code": "E_QUAT",
+      "description": "q[4] negated (q[3]\u00b7q[4] < 0)"
+    },
+    {
+      "file": "negative-thrust.gdmb.hex",
+      "code": "E_THRUST",
+      "description": "thrust[4] = -1 mm/s2 without REVERSIBLE_THRUST"
+    },
+    {
+      "file": "discontinuous-exit.gdmb.hex",
+      "code": "E_CONTINUITY",
+      "description": "FLAT block after the maneuver starts 0.1 mm off in x"
+    },
+    {
+      "file": "regime-attitude.gdmb.hex",
+      "code": "E_REGIME",
+      "description": "q[0..2] yawed by 0.1 rad: entry attitude != FLAT attitude"
+    },
+    {
+      "file": "maneuver-duration.gdmb.hex",
+      "code": "E_DURATION",
+      "description": "maneuver duration_us != (n_ctrl - 3) * knot_us"
+    },
+    {
+      "file": "unknown-abort.gdmb.hex",
+      "code": "E_ABORT",
+      "description": "abort action 9"
+    }
+  ],
+  "accept": []
+}

@@ -11,6 +11,12 @@ violation (fail closed).
 The error codes in `GdmbValidationError.code` are the stable identifiers of
 §7.1. The golden vectors in AxioStack `contracts/gdm-vectors/` name the code
 each reject vector must produce.
+
+v1 conformance covers FLAT trajectories, LIGHTS, EVENTS and COMMENT. The
+MANEUVER, RTH_PLAN and ENVELOPES layouts are provisional (§4.11): by default
+this validator refuses them, as a v1 reader must. `provisional=True` checks
+them against their current layouts instead; nothing on the upload path uses
+that mode.
 """
 
 from __future__ import annotations
@@ -33,7 +39,13 @@ GDMB_MAX_SIZE = 262_144
 
 GDMB_MAGIC = b"GDMB"
 GDMB_VERSION = 1
+"""The newest `.gdmb` version this reader implements; it accepts every
+version from 1 up to this one (§1.8).
+"""
 GDMB_HEADER_LENGTH = 48
+"""Length of the header defined by this version. Later versions may extend
+it; a reader skips the bytes it does not know (§4.1).
+"""
 
 _CRC_OFFSET = 8
 _SHOW_HASH_OFFSET = 12
@@ -43,6 +55,7 @@ FEATURE_CRC32 = 0x01
 FEATURE_MANEUVER = 0x02
 FEATURE_REVERSIBLE_THRUST = 0x04
 _FEATURES_DEFINED = FEATURE_CRC32 | FEATURE_MANEUVER | FEATURE_REVERSIBLE_THRUST
+_FEATURES_PROVISIONAL = FEATURE_MANEUVER
 
 CAPABILITY_MANEUVER = 0x01
 CAPABILITY_REVERSIBLE_THRUST = 0x02
@@ -50,6 +63,7 @@ CAPABILITY_HIGH_TILT = 0x04
 _CAPABILITIES_DEFINED = (
     CAPABILITY_MANEUVER | CAPABILITY_REVERSIBLE_THRUST | CAPABILITY_HIGH_TILT
 )
+_CAPABILITIES_PROVISIONAL = CAPABILITY_MANEUVER
 
 BLOCK_FLAT_TRAJECTORY = 0x01
 BLOCK_LIGHTS = 0x02
@@ -64,7 +78,11 @@ _ABORT_LEVEL_HOLD_LAND = 1
 _EVENT_TYPE_PYRO = 1
 _EVENT_PAYLOADS = (0x00000000, 0xFFFFFFFF)
 
-_MIN_DURATION_US = 1_000
+_MIN_SEGMENT_US = 100_000
+"""Shortest FLAT segment (§4.5): below it the §7.3 tolerances stop meaning
+anything.
+"""
+_MIN_KNOT_US = 1_000
 _MAX_TIMELINE_US = 2**32 - 1
 
 #: Rank of each known block type in the canonical order of §4.4. Motion
@@ -82,6 +100,9 @@ _BLOCK_RANK = {
 #: Block types that are never valid in version 1 (0x05 is the `.skyb`
 #: YAW_CONTROL block; `.gdmb` keeps yaw inside FLAT segments).
 _FORBIDDEN_BLOCK_TYPES = (0x00, 0x05)
+
+#: Provisional block types (§4.11), reserved in v1
+_PROVISIONAL_BLOCK_TYPES = (BLOCK_RTH_PLAN, BLOCK_MANEUVER, BLOCK_ENVELOPES)
 
 # Quanta and scales (§1.5)
 _POS_SCALE = 10_000.0
@@ -255,9 +276,9 @@ def _read_segment(r: _Reader, *, reversible: bool, where: str) -> _Segment:
             "E_SIGMA", f"{where}: inverted segment without REVERSIBLE_THRUST"
         )
     duration = r.u32()
-    if duration < _MIN_DURATION_US:
+    if duration < _MIN_SEGMENT_US:
         raise GdmbValidationError(
-            "E_DURATION", f"{where}: duration {duration} us is below 1000 us"
+            "E_DURATION", f"{where}: duration {duration} us is below 100 ms"
         )
     ctrl = tuple(r.i32s(d) for d in degrees)
     return _Segment(duration_us=duration, sigma=sigma, ctrl=ctrl)
@@ -463,8 +484,9 @@ def _flat_attitude(
     z_b = _scale(f_hat, sigma)
     z_b_dot = _scale(_sub(jerk, _scale(f_hat, _dot(f_hat, jerk))), sigma / f_norm)
 
-    x_c = (cos(yaw), sin(yaw), 0.0)
-    x_c_dot = (-sin(yaw) * yaw_rate, cos(yaw) * yaw_rate, 0.0)
+    # ψ is clockwise-positive (§1.2), so the heading is a rotation by -ψ
+    x_c = (cos(yaw), -sin(yaw), 0.0)
+    x_c_dot = (-sin(yaw) * yaw_rate, -cos(yaw) * yaw_rate, 0.0)
 
     y = _cross(z_b, x_c)
     y_dot = _add(_cross(z_b_dot, x_c), _cross(z_b, x_c_dot))
@@ -660,7 +682,7 @@ def _parse_maneuver_block(
         raise GdmbValidationError("E_ENVELOPE", f"{where}: zero envelope")
     if count < 4:
         raise GdmbValidationError("E_MANEUVER", f"{where}: {count} control points")
-    if knot < _MIN_DURATION_US or duration != (count - 3) * knot:
+    if knot < _MIN_KNOT_US or duration != (count - 3) * knot:
         raise GdmbValidationError(
             "E_DURATION", f"{where}: duration is not (N - 3) * knot_us"
         )
@@ -810,7 +832,9 @@ def _check_rth_plan(
 # ---------------------------------------------------------------------------
 
 
-def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary:
+def validate_gdmb(
+    data: bytes, *, show_hash: bytes | None = None, provisional: bool = False
+) -> GdmbSummary:
     """Validates a `.gdmb` file against every rule of §7.1.
 
     Parameters:
@@ -818,6 +842,9 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
         show_hash: the show hash of the `.gdm` that the file belongs to. When
             given, the header must carry exactly this hash (``E_SHOW_HASH``).
             The ground path always passes it.
+        provisional: whether to check the provisional MANEUVER, RTH_PLAN and
+            ENVELOPES layouts (§4.11) instead of refusing them as a v1 reader
+            must. Outside v1 conformance; the upload path never sets it.
 
     Returns:
         a summary of the file
@@ -836,13 +863,20 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
         )
     if data[:4] != GDMB_MAGIC:
         raise GdmbValidationError("E_MAGIC", "not a .gdmb file")
-    if data[4] != GDMB_VERSION:
-        raise GdmbValidationError("E_VERSION", f"unsupported version {data[4]}")
+    if not 1 <= data[4] <= GDMB_VERSION:
+        raise GdmbValidationError(
+            "E_VERSION",
+            f"version {data[4]} is not between 1 and {GDMB_VERSION}",
+        )
     features = data[5]
     (header_length,) = _U16.unpack_from(data, 6)
-    if header_length != GDMB_HEADER_LENGTH:
+    if not GDMB_HEADER_LENGTH <= header_length <= size:
+        # Longer headers belong to later versions; their extra bytes are
+        # skipped below (§1.8, §4.1)
         raise GdmbValidationError(
-            "E_HEADER", f"header length {header_length} is not {GDMB_HEADER_LENGTH}"
+            "E_HEADER",
+            f"header length {header_length} is not between "
+            f"{GDMB_HEADER_LENGTH} and the file size",
         )
     (stored_crc,) = _U32.unpack_from(data, _CRC_OFFSET)
     crc = crc32_mavftp(
@@ -854,6 +888,10 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
         )
     if features & ~_FEATURES_DEFINED:
         raise GdmbValidationError("E_RESERVED", "reserved feature bits are set")
+    if not provisional and features & _FEATURES_PROVISIONAL:
+        raise GdmbValidationError(
+            "E_RESERVED", "MANEUVER feature bit is reserved in v1 (provisional)"
+        )
     if not features & FEATURE_CRC32:
         raise GdmbValidationError("E_FEATURES", "CRC32 feature bit is clear")
 
@@ -864,6 +902,10 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
     (caps,) = _U32.unpack_from(data, _CAPS_OFFSET)
     if caps & ~_CAPABILITIES_DEFINED:
         raise GdmbValidationError("E_CAPS", "undefined capability bits are set")
+    if not provisional and caps & _CAPABILITIES_PROVISIONAL:
+        raise GdmbValidationError(
+            "E_CAPS", "MANEUVER capability bit is reserved in v1 (provisional)"
+        )
     if bool(caps & CAPABILITY_MANEUVER) != bool(features & FEATURE_MANEUVER):
         raise GdmbValidationError(
             "E_CAPS", "MANEUVER capability disagrees with the feature flag"
@@ -878,7 +920,7 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
 
     # Block framing (§4.4)
     blocks: list[tuple[int, int, int]] = []  # (type, payload offset, length)
-    pos = GDMB_HEADER_LENGTH
+    pos = header_length
     while pos < size:
         if pos + _BLOCK_HEADER.size > size:
             raise GdmbValidationError("E_FRAMING", f"truncated block header at {pos}")
@@ -891,6 +933,12 @@ def validate_gdmb(data: bytes, *, show_hash: bytes | None = None) -> GdmbSummary
         if block_type in _FORBIDDEN_BLOCK_TYPES:
             raise GdmbValidationError(
                 "E_BLOCK_TYPE", f"block type 0x{block_type:02x} is not valid"
+            )
+        if not provisional and block_type in _PROVISIONAL_BLOCK_TYPES:
+            # Refused whatever its SKIPPABLE flag says (§4.11)
+            raise GdmbValidationError(
+                "E_BLOCK_TYPE",
+                f"block type 0x{block_type:02x} is reserved in v1 (provisional)",
             )
         if block_type in _BLOCK_RANK:
             blocks.append((block_type, payload, length))

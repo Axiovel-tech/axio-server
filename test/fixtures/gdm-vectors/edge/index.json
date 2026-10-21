@@ -1,4 +1,5 @@
 {
+  "mode": "v1",
   "reject": [
     {
       "file": "bad-crc.gdmb.hex",
@@ -13,12 +14,12 @@
     {
       "file": "bad-version.gdmb.hex",
       "code": "E_VERSION",
-      "description": "version byte 2"
+      "description": "version byte 2 (newer than this reader)"
     },
     {
-      "file": "bad-header-length.gdmb.hex",
+      "file": "short-header-length.gdmb.hex",
       "code": "E_HEADER",
-      "description": "header_length 52"
+      "description": "header_length 44 (< 48)"
     },
     {
       "file": "reserved-feature-bit.gdmb.hex",
@@ -58,7 +59,7 @@
     {
       "file": "short-duration.gdmb.hex",
       "code": "E_DURATION",
-      "description": "seg[1] duration 999 us"
+      "description": "seg[1] duration 99 999 us (< 100 ms)"
     },
     {
       "file": "unknown-block.gdmb.hex",
@@ -81,59 +82,24 @@
       "description": "COMMENT length one byte too long"
     },
     {
-      "file": "envelope-misaligned.gdmb.hex",
-      "code": "E_ENVELOPE",
-      "description": "first envelope record starts 1 us late"
+      "file": "provisional-envelopes.gdmb.hex",
+      "code": "E_BLOCK_TYPE",
+      "description": "flat-single plus the ENVELOPES block of provisional/flat-rth"
     },
     {
-      "file": "rth-branch-time.gdmb.hex",
-      "code": "E_RTH",
-      "description": "rth[1] branch time 1 us after the show joint"
+      "file": "provisional-rth.gdmb.hex",
+      "code": "E_BLOCK_TYPE",
+      "description": "provisional/flat-rth read by a v1 reader (RTH_PLAN block)"
     },
     {
-      "file": "rth-off-target.gdmb.hex",
-      "code": "E_RTH",
-      "description": "RTH target x moved 0.1 mm: paths no longer end on it"
+      "file": "provisional-maneuver.gdmb.hex",
+      "code": "E_RESERVED",
+      "description": "provisional/maneuver-single read by a v1 reader (MANEUVER feature bit)"
     },
     {
-      "file": "rth-branch-c2.gdmb.hex",
-      "code": "E_C2",
-      "description": "rth[1] brake leg x.P1 moved by +5 cm (velocity jump at the branch)"
-    },
-    {
-      "file": "maneuver-flag-clear.gdmb.hex",
-      "code": "E_FEATURES",
-      "description": "MANEUVER feature and capability bits cleared"
-    },
-    {
-      "file": "hemisphere.gdmb.hex",
-      "code": "E_QUAT",
-      "description": "q[4] negated (q[3]\u00b7q[4] < 0)"
-    },
-    {
-      "file": "negative-thrust.gdmb.hex",
-      "code": "E_THRUST",
-      "description": "thrust[4] = -1 mm/s2 without REVERSIBLE_THRUST"
-    },
-    {
-      "file": "discontinuous-exit.gdmb.hex",
-      "code": "E_CONTINUITY",
-      "description": "FLAT block after the maneuver starts 0.1 mm off in x"
-    },
-    {
-      "file": "regime-attitude.gdmb.hex",
-      "code": "E_REGIME",
-      "description": "q[0..2] yawed by 0.1 rad: entry attitude != FLAT attitude"
-    },
-    {
-      "file": "maneuver-duration.gdmb.hex",
-      "code": "E_DURATION",
-      "description": "maneuver duration_us != (n_ctrl - 3) * knot_us"
-    },
-    {
-      "file": "unknown-abort.gdmb.hex",
-      "code": "E_ABORT",
-      "description": "abort action 9"
+      "file": "provisional-maneuver-capability.gdmb.hex",
+      "code": "E_CAPS",
+      "description": "flat-single with the maneuver capability bit set"
     },
     {
       "file": null,
@@ -144,11 +110,11 @@
   "accept": [
     {
       "file": "skippable-unknown-block.gdmb.hex",
-      "description": "flat-single plus a skippable block of unknown type 0x20; decodes to the same show"
+      "description": "flat-single plus a skippable block of unknown type 0x20"
+    },
+    {
+      "file": "header-extension.gdmb.hex",
+      "description": "flat-single with header_length 52: 4 extra header bytes a v1 reader skips"
     }
-  ],
-  "show_hash": {
-    "flat-single": "9bd80a84951ceba9520434fc311f00e91024cd658cd4ea72c66dd343c8fc33f8",
-    "maneuver-single": "eee6028cc4d2385fd87a35a8102256daf84f8b1be4f0dcb085572507e7cc754d"
-  }
+  ]
 }

@@ -14,9 +14,9 @@ FLAT = (VECTORS / "flat-single" / "d01.gdmb").read_bytes()
 FLAT_HASH = json.loads((VECTORS / "flat-single" / "expected.json").read_text())[
     "show_hash"
 ]
-MANEUVER_HASH = json.loads((VECTORS / "maneuver-single" / "expected.json").read_text())[
-    "show_hash"
-]
+OTHER_HASH = json.loads(
+    (VECTORS / "provisional" / "flat-rth" / "expected.json").read_text()
+)["show_hash"]
 
 
 def test_decode_valid_request():
@@ -27,7 +27,7 @@ def test_decode_valid_request():
 
 def test_decode_rejects_show_hash_mismatch():
     with raises(GdmbValidationError) as info:
-        decode_gdm_upload_request(b64encode(FLAT).decode(), MANEUVER_HASH)
+        decode_gdm_upload_request(b64encode(FLAT).decode(), OTHER_HASH)
     assert info.value.code == "E_SHOW_HASH"
 
 
