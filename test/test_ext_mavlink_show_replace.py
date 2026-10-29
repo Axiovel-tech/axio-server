@@ -5,9 +5,11 @@ put the slot, then configure and reload. Nothing is written if a check fails.
 """
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+from flockwave.spec.errors import FlockwaveErrorCode
 from pytest import fixture, mark, raises
 from trio import TooSlowError
 
@@ -125,7 +127,11 @@ def drone(calls) -> FakeDrone:
 
 @fixture
 def uav(calls, ftp, drone, monkeypatch) -> MAVLinkUAV:
-    uav = MAVLinkUAV("01", driver=SimpleNamespace(autopilot_factory=None))
+    uav = MAVLinkUAV(
+        "01",
+        driver=SimpleNamespace(autopilot_factory=None, log=logging.getLogger("t")),
+    )
+    uav.notify_updated = lambda: None
 
     async def remove_show():
         calls.append(("remove",))
@@ -240,3 +246,64 @@ async def test_invalid_config_fails_before_touching_the_drone(uav, calls):
         await uav.upload_gdm_show(FLAT, config)
 
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Partial flash: drones without the show slot are flagged on connection
+# ---------------------------------------------------------------------------
+
+INCOMPATIBLE = FlockwaveErrorCode.HW_SW_INCOMPATIBLE
+
+
+@fixture
+def no_boot_delay(monkeypatch):
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr(driver_module, "sleep", no_sleep)
+
+
+async def test_drone_without_show_slot_is_flagged_on_connection(
+    uav, drone, no_boot_delay, caplog
+):
+    drone.parameters["SHOW_SLOT_VER"] = None
+
+    with caplog.at_level(logging.WARNING):
+        await uav._check_show_slot_support()
+
+    assert INCOMPATIBLE in uav.status.errors
+    assert "no SHOW_SLOT_VER" in caplog.text
+
+
+async def test_drone_with_show_slot_is_not_flagged(uav, no_boot_delay):
+    await uav._check_show_slot_support()
+    assert INCOMPATIBLE not in uav.status.errors
+
+
+async def test_flag_clears_after_the_drone_is_flashed(uav, drone, no_boot_delay):
+    drone.parameters["SHOW_SLOT_VER"] = None
+    await uav._check_show_slot_support()
+    assert INCOMPATIBLE in uav.status.errors
+
+    drone.parameters["SHOW_SLOT_VER"] = 1.0
+    await uav._check_show_slot_support()
+    assert INCOMPATIBLE not in uav.status.errors
+
+
+async def test_no_reply_leaves_the_flag_alone(uav, drone, no_boot_delay):
+    drone.parameters["SHOW_SLOT_VER"] = None
+    await uav._check_show_slot_support()
+
+    drone.parameters["SHOW_ORIENTATION"] = None
+    await uav._check_show_slot_support()
+
+    assert INCOMPATIBLE in uav.status.errors
+
+
+async def test_refused_upload_flags_the_drone(uav, drone):
+    drone.parameters["SHOW_SLOT_VER"] = 2.0
+
+    with raises(ShowUploadRefusedError):
+        await upload(uav, "gdm")
+
+    assert INCOMPATIBLE in uav.status.errors

@@ -104,6 +104,7 @@ from .packets import (
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
 from .show_slot import (
+    SHOW_SLOT_VERSION,
     SHOW_SLOT_VERSION_PARAMETER,
     ShowUploadRefusedError,
     check_show_slot_version,
@@ -2745,6 +2746,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def _ensure_show_slot_supported(self) -> None:
         """Refuses to go on unless the firmware implements the show slot this
         server writes (`SHOW_SLOT_VER`).
+        """
+        version = await self._read_show_slot_version()
+        self._report_show_slot_support(version)
+        check_show_slot_version(version)
+
+    async def _read_show_slot_version(self) -> float | None:
+        """Reads `SHOW_SLOT_VER` from the drone.
 
         MAVLink has no "unknown parameter" reply: ArduPilot ignores a request
         for a parameter it does not have, which looks exactly like a lost
@@ -2753,9 +2761,15 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         always configured it). If that answers, the link works and the
         firmware really lacks the slot; if not, it is the link.
         (`SYSID_THISMAV` would not do: ArduPilot 4.7 renamed it.)
+
+        Returns:
+            the slot version, or `None` if the firmware has no such parameter
+
+        Raises:
+            RuntimeError: if the drone answered neither parameter
         """
         try:
-            version = await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
+            return await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
         except TooSlowError:
             try:
                 await self.get_parameter("SHOW_ORIENTATION")
@@ -2764,9 +2778,48 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                     f"No reply from the drone when reading "
                     f"{SHOW_SLOT_VERSION_PARAMETER}; check the link and try again."
                 ) from None
-            version = None
+            return None
 
-        check_show_slot_version(version)
+    async def _check_show_slot_support(self) -> None:
+        """Reads `SHOW_SLOT_VER` after the drone (re)connected, so that
+        drones whose firmware lacks the show slot are flagged before anyone
+        tries to upload a show (a partially flashed fleet shows up in the UAV
+        list instead of failing one upload at a time).
+
+        A drone that does not answer keeps its previous state: a lost reply
+        is not evidence either way.
+        """
+        # Give the drone time to boot before asking, like the mandatory custom
+        # mode does
+        await sleep(5)
+        try:
+            version = await self._read_show_slot_version()
+        except Exception:
+            return
+        self._report_show_slot_support(version)
+
+    def _report_show_slot_support(self, version: float | None) -> None:
+        """Flags the drone with `HW_SW_INCOMPATIBLE` while its firmware lacks
+        the show slot this server writes, and logs it once when it is found.
+        """
+        supported = version == SHOW_SLOT_VERSION
+        code = FlockwaveErrorCode.HW_SW_INCOMPATIBLE
+        was_flagged = code in self._status.errors
+        if was_flagged == (not supported):
+            return
+
+        self.ensure_error(code, present=not supported)
+        self.update_status()
+        self.notify_updated()
+
+        if not supported:
+            found = "no" if version is None else f"version {version:g} of"
+            self.driver.log.warning(
+                f"Firmware has {found} {SHOW_SLOT_VERSION_PARAMETER}, not "
+                f"{SHOW_SLOT_VERSION}: this drone refuses show uploads until it "
+                f"is flashed with show slot support",
+                extra={"id": log_id_for_uav(self)},
+            )
 
     async def _configure_show_frame_and_reload(
         self,
@@ -3120,6 +3173,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
                 self._first_connection = False
                 self._handle_reboot()
+
+            # Flag firmware without the show slot before anyone uploads a
+            # show. Every (re)connection re-reads it: the drone may have been
+            # reflashed while it was away
+            self.driver.run_in_background(self._check_show_slot_support)
 
             # Send "connected" event to listeners
             event = self._connected_event
