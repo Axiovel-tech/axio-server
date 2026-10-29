@@ -19,6 +19,12 @@ __all__ = ("ShowClock", "ShowEndClock")
 #: ignored silently while freewheeling (drift corrections, not jumps).
 REPORTED_ADJUSTMENT = 0.1
 
+#: A start that becomes known through the primary clock (e.g. timecode that
+#: starts rolling) less than this many seconds before it is reported: the
+#: drones schedule a start that reaches them after it for the next week, and
+#: they prepare for takeoff ten seconds before it.
+MIN_START_LEAD = 15.0
+
 
 class ShowClock(TimeElapsedSinceReferenceClock):
     """Clock that shows the number of seconds elapsed since the scheduled start
@@ -273,6 +279,25 @@ class ClockSynchronizationHandler:
         else:
             self._update_secondary_clock()
 
+    def _report_late_start(self, lead: float) -> None:
+        primary, secondary = self._primary_clock, self._secondary_clock
+        if (
+            self.notify is None
+            or primary is None
+            or secondary is None
+            or lead >= MIN_START_LEAD
+        ):
+            return
+
+        when = f"{lead:.1f} s before" if lead >= 0 else f"{-lead:.1f} s after"
+        message = (
+            f"Clock {primary.id!r} gave the start of clock {secondary.id!r} only "
+            f"{when} it; drones need it at least {MIN_START_LEAD:.0f} s ahead"
+        )
+        if self.log:
+            self.log.warning(message)
+        self.notify(message)
+
     def _report_ignored_change(self, delta: float | None) -> None:
         primary, secondary = self._primary_clock, self._secondary_clock
         if primary is None or secondary is None:
@@ -356,4 +381,7 @@ class ClockSynchronizationHandler:
         else:
             reference_time = now - time_on_secondary_clock
 
+        start_was_known = self._secondary_clock.reference_time is not None
         self._secondary_clock.reference_time = reference_time if should_run else None
+        if should_run and reference_time is not None and not start_was_known:
+            self._report_late_start(reference_time - now)
