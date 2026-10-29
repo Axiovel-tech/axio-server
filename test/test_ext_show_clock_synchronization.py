@@ -189,7 +189,10 @@ def test_clock_adjustment_beyond_point_of_no_return(
     assert secondary.running
     assert secondary.ticks_given_time(now) == -50
     assert secondary.ticks_given_time(now + 5) == 0
-    assert not mock_logger.messages
+    # A start 5 s away is already too late for the drones
+    [(level, message)] = mock_logger.messages
+    assert level == "warning" and "only 5.0 s before" in message
+    mock_logger.messages.clear()
 
     # Now simulate an adjustment to the primary clock
     primary.start_time = now - 10
@@ -304,3 +307,28 @@ def test_show_keeps_freewheeling_when_the_timecode_clock_is_gone():
     registry.remove(timecode)
     extension._sync_show_clocks_to("mtc", None, 60)
     assert not show_clock.running
+
+
+def test_start_known_too_late_through_the_primary_clock_is_reported(
+    clocks: ClockPair, handler: ClockSynchronizationHandler
+):
+    primary, secondary = clocks
+    messages = []
+    handler.notify = messages.append
+    handler.secondary_clock = secondary
+    handler.synchronize_to(primary, 100)
+    assert not secondary.running
+
+    # Timecode starts rolling at 70 s: the start is 30 s away
+    primary.start_time = time() - 70
+    assert secondary.running
+    assert messages == []
+
+    primary.start_time = None
+    assert not secondary.running
+
+    # Timecode starts rolling at 95 s: the start is 5 s away
+    primary.start_time = time() - 95
+    assert secondary.running
+    [message] = messages
+    assert "only 5.0 s before" in message

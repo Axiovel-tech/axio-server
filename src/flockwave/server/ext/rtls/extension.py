@@ -354,6 +354,16 @@ class RtlsExtension(Extension):
         self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
 
+    def _scheduled_show_start(self) -> float | None:
+        """The scheduled start of the show as a UNIX timestamp; ``None`` if
+        no start is scheduled or the show extension is not loaded."""
+        try:
+            return (
+                self.app.import_api("clocks").registry.find_by_id("show").reference_time
+            )
+        except (AttributeError, KeyError, RuntimeError):
+            return None
+
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
         # framework sets ``self.app`` before calling run(), and every
@@ -376,7 +386,9 @@ class RtlsExtension(Extension):
         )
         register_beacons = bool(configuration.get("register_beacons", True))
         if bool(configuration.get("show_clock_pin", True)):
-            self._show_clock = ShowClockPinManager(self)
+            self._show_clock = ShowClockPinManager(
+                self, scheduled_start=self._scheduled_show_start
+            )
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         # Lazy import: the proxy resolves once the mavlink extension loads

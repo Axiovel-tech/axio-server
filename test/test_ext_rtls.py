@@ -2341,7 +2341,7 @@ def test_show_clock_remint_clears_every_pending_deviation(monkeypatch):
     assert manager.pin is second_pin
 
 
-def _pin_manager_driver(monkeypatch):
+def _pin_manager_driver(monkeypatch, scheduled_start=lambda: None):
     """A pin manager without device I/O and a function feeding it one
     cluster-clock report received at a given wall time."""
     from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
@@ -2350,7 +2350,9 @@ def _pin_manager_driver(monkeypatch):
     monkeypatch.setattr(
         "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
     )
-    manager = ShowClockPinManager(SimpleNamespace(log=None))
+    manager = ShowClockPinManager(
+        SimpleNamespace(log=None), scheduled_start=scheduled_start
+    )
     nursery = SimpleNamespace(start_soon=lambda *args: None)
 
     def report(system_id, cluster_seconds, received_at):
@@ -2413,6 +2415,25 @@ def test_show_clock_repins_on_drift_at_most_once_a_minute(monkeypatch):
     assert all(interval >= 60 for interval in intervals)
     expected_offset = start + 599 + 0.003 - (100.0 + 599 * 1.00005)
     assert abs(manager.pin.offset - expected_offset) <= 0.0065
+
+
+def test_show_clock_holds_drift_repins_in_the_minute_before_a_start(monkeypatch):
+    """The same 50 ppm drift with a show starting at second 400: no drift
+    re-pin is minted in the minute before it, the next one comes right
+    after the start."""
+    start = 1_752_000_000.0
+    show_start = start + 400
+    manager, report = _pin_manager_driver(monkeypatch, lambda: show_start)
+    mint_times = []
+
+    for second in range(600):
+        wall = start + second
+        report(1, 100.0 + second * 1.00005, wall + 0.003)
+        if not mint_times or manager.pin.wall_unix != mint_times[-1][1]:
+            mint_times.append((wall, manager.pin.wall_unix))
+
+    assert not [w for w, _ in mint_times if show_start - 60 <= w <= show_start]
+    assert any(show_start < w <= show_start + 2 for w, _ in mint_times)
 
 
 async def test_show_clock_lost_device_repinned_on_return(extension, device):

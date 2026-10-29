@@ -188,7 +188,10 @@ for every drone.
   over the last 20 s across all tags (the least delayed report). The
   first pin is minted from the first fresh report; when the estimate
   drifts more than 5 ms from the distributed pin, a fresh pin is minted
-  and pushed to every device, at most once a minute.
+  and pushed to every device, at most once a minute and never in the
+  minute before a scheduled show start (the drones freeze their start
+  10 s before it; a re-pin arriving tag by tag then would split the
+  fleet between the old and the new pin).
 - Writes follow the firmware's ordering contract: `GPS_PIN_WEEK` is
   zeroed first and written with the real week **last**, so a
   half-applied pin reads as disabled on the tag instead of mixing old

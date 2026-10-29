@@ -39,7 +39,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from flockwave.gps.time import unix_to_gps_time_of_week
 from rtlslink import TICK_SECONDS
@@ -64,6 +64,11 @@ REPIN_DRIFT_S = 0.005
 
 #: ...but at most this often.
 REPIN_INTERVAL_S = 60.0
+
+#: ...and not in this many seconds before a scheduled show start: the drones
+#: freeze their start ten seconds before it, and a re-pin reaching the tags
+#: one by one around then would freeze part of the fleet on the old pin.
+REPIN_HOLD_BEFORE_START_S = 60.0
 
 #: Parameter names, in the REQUIRED write order for a (re-)pin.
 _PIN_PARAM_TYPES = {
@@ -147,8 +152,14 @@ class ShowClockPinManager:
     extension's nursery so the protocol loop never blocks on parameter
     round-trips."""
 
-    def __init__(self, ext: "RtlsExtension"):
+    def __init__(
+        self,
+        ext: "RtlsExtension",
+        scheduled_start: Callable[[], Optional[float]] = lambda: None,
+    ):
         self._ext = ext
+        #: The scheduled show start as a UNIX timestamp, if any.
+        self._scheduled_start = scheduled_start
         self._pin: Optional[GpsPin] = None
         #: Wall time when the current pin was minted.
         self._minted_at = 0.0
@@ -273,6 +284,9 @@ class ShowClockPinManager:
         assert self._pin is not None
         offset = self.offset_estimate
         if offset is None or now_unix - self._minted_at < REPIN_INTERVAL_S:
+            return
+        start = self._scheduled_start()
+        if start is not None and 0 <= start - now_unix <= REPIN_HOLD_BEFORE_START_S:
             return
         drift = offset - self._pin.offset
         if abs(drift) > REPIN_DRIFT_S:
