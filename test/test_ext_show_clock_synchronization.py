@@ -189,10 +189,7 @@ def test_clock_adjustment_beyond_point_of_no_return(
     assert secondary.running
     assert secondary.ticks_given_time(now) == -50
     assert secondary.ticks_given_time(now + 5) == 0
-    # A start 5 s away is already too late for the drones
-    [(level, message)] = mock_logger.messages
-    assert level == "warning" and "only 5.0 s before" in message
-    mock_logger.messages.clear()
+    assert not mock_logger.messages
 
     # Now simulate an adjustment to the primary clock
     primary.start_time = now - 10
@@ -314,7 +311,7 @@ def test_start_known_too_late_through_the_primary_clock_is_reported(
 ):
     primary, secondary = clocks
     messages = []
-    handler.notify = messages.append
+    handler.notify_late_start = messages.append
     handler.secondary_clock = secondary
     handler.synchronize_to(primary, 100)
     assert not secondary.running
@@ -332,3 +329,25 @@ def test_start_known_too_late_through_the_primary_clock_is_reported(
     assert secondary.running
     [message] = messages
     assert "only 5.0 s before" in message
+
+
+def test_late_start_is_reported_only_when_the_server_starts_the_show():
+    sent = []
+    extension = DroneShowExtension()
+    extension.app = SimpleNamespace(  # type: ignore
+        request_to_send_SYS_MSG_message=lambda message, severity: sent.append(message)
+    )
+
+    extension._config.update_from_json({"start": {"method": "rc", "authorized": True}})
+    extension._notify_late_start("late")
+    extension._config.update_from_json(
+        {"start": {"method": "auto", "authorized": False}}
+    )
+    extension._notify_late_start("late")
+    assert sent == []
+
+    extension._config.update_from_json(
+        {"start": {"method": "auto", "authorized": True}}
+    )
+    extension._notify_late_start("late")
+    assert sent == ["late"]
