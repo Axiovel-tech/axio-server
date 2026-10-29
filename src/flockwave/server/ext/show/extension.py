@@ -159,6 +159,14 @@ class DroneShowExtension(Extension):
             )
             point_of_no_return_seconds = -10
 
+        if point_of_no_return_seconds > -10:
+            # The drones freeze their start 10 s before it; timecode moving the
+            # start after that would only move the server and the music
+            self.log.warning(
+                "'point_of_no_return_seconds' must be -10 or earlier, using -10"
+            )
+            point_of_no_return_seconds = -10
+
         self._clock_sync.point_of_no_return_seconds = point_of_no_return_seconds
 
         self.log.info(
