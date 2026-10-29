@@ -47,40 +47,61 @@ async def test_update_uav_writes_the_milliseconds_of_the_start():
 def test_start_agreement_check_warns_about_each_uav_out_of_sync():
     in_sync = make_uav(1_760_000_012, 750, id="1")
     stale = make_uav(1_760_000_012, 500, id="2")
+    # The start moved by 5 ms (timecode re-anchored); the next broadcast follows
+    moved = make_uav(1_760_000_012, 745, id="4")
     no_clock = make_uav(
         1_760_000_012, 750, id="3", errors=[FlockwaveErrorCode.TIMESYNC_ERROR.value]
     )
-    for uav in (in_sync, stale, no_clock):
+    for uav in (in_sync, stale, no_clock, moved):
         uav.send_log_message_to_gcs = lambda message, severity, uav=uav: (
             uav.messages.append((message, severity))
         )
 
     manager = MAVLinkScheduledTakeoffManager.__new__(MAVLinkScheduledTakeoffManager)
     manager._log = None
-    manager.iter_uavs_to_schedule = lambda: iter((in_sync, stale, no_clock))  # type: ignore[method-assign]
+    manager.iter_uavs_to_schedule = lambda: iter((in_sync, stale, no_clock, moved))  # type: ignore[method-assign]
 
     manager.check_start_agreement(CONFIG)
 
     assert in_sync.messages == []
+    assert moved.messages == []
     assert [severity for _, severity in stale.messages] == [Severity.WARNING]
     assert "differs" in stale.messages[0][0]
     assert "show clock" in no_clock.messages[0][0]
 
 
-async def test_fallback_writes_show_start_msec_only_when_it_changes():
+async def test_fallback_writes_show_start_msec_with_every_start():
     from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 
     writes = []
+    warnings = []
 
     async def set_parameter(name, value):
         writes.append((name, value))
 
-    uav = SimpleNamespace(_scheduled_takeoff_time_msec=0, set_parameter=set_parameter)
+    uav = SimpleNamespace(
+        id="1",
+        set_parameter=set_parameter,
+        driver=SimpleNamespace(
+            log=SimpleNamespace(warning=lambda *a, **k: warnings.append(a))
+        ),
+    )
 
     await MAVLinkUAV.set_scheduled_takeoff_time(uav, 1_760_000_012)  # type: ignore[arg-type]
-    assert [name for name, _ in writes] == ["SHOW_START_TIME"]
+    assert writes[0] == ("SHOW_START_MSEC", 0)
+    assert writes[1][0] == "SHOW_START_TIME"
 
     writes.clear()
+    await MAVLinkUAV.set_scheduled_takeoff_time(uav, None)  # type: ignore[arg-type]
+    assert writes == [("SHOW_START_TIME", -1)]
+
+    # Firmware without SHOW_START_MSEC still gets the whole seconds
+    async def set_parameter_without_msec(name, value):
+        if name == "SHOW_START_MSEC":
+            raise RuntimeError("unknown parameter")
+        writes.append((name, value))
+
+    uav.set_parameter = set_parameter_without_msec
     await MAVLinkUAV.set_scheduled_takeoff_time(uav, 1_760_000_012, 750)  # type: ignore[arg-type]
-    assert [name for name, _ in writes] == ["SHOW_START_MSEC", "SHOW_START_TIME"]
-    assert writes[0] == ("SHOW_START_MSEC", 750)
+    assert writes[-1][0] == "SHOW_START_TIME"
+    assert len(warnings) == 1

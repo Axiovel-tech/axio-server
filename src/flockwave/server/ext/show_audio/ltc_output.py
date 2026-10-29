@@ -114,6 +114,9 @@ class _LtcWriter:
         out[:] = self._encoder.render(self._next_sample, frames)
         self._next_sample += frames
 
+    def shift(self, frames: int) -> None:
+        self._next_sample += frames
+
     def _anchor(self, t0_sample: float) -> None:
         output = self._output
         self._t0_sample = t0_sample

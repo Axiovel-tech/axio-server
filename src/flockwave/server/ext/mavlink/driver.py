@@ -2296,10 +2296,16 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             dt = datetime.fromtimestamp(int(seconds), tz=timezone.utc)
             _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
 
-        # SHOW_START_MSEC is written only when it changes so that firmware
-        # without it still accepts whole-second starts
-        if gps_time_of_week >= 0 and msec != self._scheduled_takeoff_time_msec:
-            await self.set_parameter("SHOW_START_MSEC", msec)
+        # The firmware reads SHOW_START_MSEC with SHOW_START_TIME, so it is
+        # written with every start: a value left over from an earlier start
+        # would move this one. Firmware without it still gets whole seconds.
+        if gps_time_of_week >= 0:
+            try:
+                await self.set_parameter("SHOW_START_MSEC", msec)
+            except Exception as ex:
+                self.driver.log.warning(
+                    f"Could not set SHOW_START_MSEC: {ex}", extra={"id": self.id}
+                )
         await self.set_parameter("SHOW_START_TIME", gps_time_of_week)
 
     async def set_led_color(

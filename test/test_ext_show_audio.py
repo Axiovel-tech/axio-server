@@ -208,13 +208,20 @@ class FakeExtra:
         self.channel = channel
         self.lead_s = 10.0
         self.show_times = []
+        self.shifts = []
 
     def create_writer(self, sample_rate):
-        def write(out, show_time):
-            self.show_times.append(show_time)
-            out[:] = -1
+        extra = self
 
-        return write
+        class Writer:
+            def __call__(self, out, show_time):
+                extra.show_times.append(show_time)
+                out[:] = -1
+
+            def shift(self, frames):
+                extra.shifts.append(frames)
+
+        return Writer()
 
 
 def test_session_extra_output_gets_its_channel_until_the_track_ends():
@@ -231,6 +238,22 @@ def test_session_extra_output_gets_its_channel_until_the_track_ends():
     out = run_block(session, 1000, wall=EPOCH + 1.9)
     assert extra.show_times[1:] == [approx(1.1)]
     assert not out.any()
+
+
+def test_session_moves_the_extra_channel_with_the_track_when_resyncing():
+    extra = FakeExtra(channel=1)
+    session = PlaybackSession(make_track(seconds=30), EPOCH, EPOCH, extra=extra)
+    for i in range(10):
+        run_block(session, 100, wall=EPOCH - 0.2 + 0.1 * i)
+    assert extra.shifts == []
+
+    # 200 ms starvation: the track skips 200 frames ahead, and so does LTC
+    run_block(session, 100, wall=EPOCH - 0.2 + 1.2, underflow=True)
+    assert extra.shifts == [200]
+
+    # 30 ms early after an underflow: 30 frames of silence, LTC held back
+    run_block(session, 100, wall=EPOCH - 0.2 + 1.27, underflow=True)
+    assert extra.shifts == [200, -30]
 
 
 def test_session_refuses_an_extra_channel_taken_by_the_track():

@@ -100,3 +100,21 @@ def test_ltc_follows_a_moved_start_before_t0_but_never_jumps_after():
 
     assert starts["01:00:00:00"] == approx(moved, abs=0.1)
     assert starts["01:00:02:00"] == approx(moved + 2 * SAMPLE_RATE, abs=0.1)
+
+
+def test_ltc_output_shift_moves_the_timeline_after_t0():
+    output = ltc_output(preroll_s=0)
+    writer = output.create_writer(SAMPLE_RATE)
+    stream = np.zeros(40 * BLOCK, dtype=np.float32)
+    for index in range(40):
+        if index == 20:
+            # The track skipped one block ahead: LTC skips it too
+            writer.shift(BLOCK)
+        show_time = (index * BLOCK) / SAMPLE_RATE
+        writer(stream[index * BLOCK : (index + 1) * BLOCK], show_time)
+
+    frames = decode(stream)
+    # 25 fps, 1920 samples a frame: before the shift labels sit on their own
+    # sample, after it one block (50 ms) earlier in the stream
+    assert frames["01:00:00:20"] == approx(20 * 1920, abs=2)
+    assert frames["01:00:01:02"] == approx(27 * 1920 - BLOCK, abs=2)

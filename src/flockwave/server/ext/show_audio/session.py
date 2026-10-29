@@ -5,7 +5,6 @@ track's sample 0 on the DAC at a wall-clock time.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
 from time import time
 from typing import Any, Protocol
 
@@ -46,10 +45,20 @@ STREAM_CLOCK_WINDOW = 32
 read with the least delay."""
 
 
-ChannelWriter = Callable[[np.ndarray, float], None]
-"""Fills one block of an extra output channel, given the block's samples and
-the show clock time at which its first sample reaches the DAC. Runs on the
-audio thread, so it must not block or lock."""
+class ChannelWriter(Protocol):
+    """Fills the blocks of an extra output channel. Runs on the audio thread,
+    so it must not block or lock."""
+
+    def __call__(self, out: np.ndarray, show_time: float) -> None:
+        """Fills one block, given the block's samples and the show clock time
+        at which its first sample reaches the DAC."""
+        ...
+
+    def shift(self, frames: int) -> None:
+        """Moves the channel's timeline by the given number of frames together
+        with the track when the track is moved back on schedule (positive =
+        the track skipped ahead)."""
+        ...
 
 
 class ExtraOutput(Protocol):
@@ -252,9 +261,12 @@ class PlaybackSession:
             self._joined_at = position
             self._sample0_stream_time = self.sample0_time - stream_to_wall
         else:
-            position, lead = self._resync(
+            resynced, lead = self._resync(
                 position, time_info.outputBufferDacTime, frames, sample_rate
             )
+            if self._write_extra is not None and (resynced != position or lead):
+                self._write_extra.shift(resynced - position - lead)
+            position = resynced
 
         self._position = render_block(outdata, samples, position, lead)
         if position >= samples.shape[0]:

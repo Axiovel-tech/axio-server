@@ -87,7 +87,7 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
 
     def check_start_agreement(self, config: TakeoffConfiguration) -> None:
         for uav in self.iter_uavs_to_schedule():
-            if self.uav_needs_update(uav, config):
+            if _start_differs(uav, config):
                 problem = "its start time or authorization differs from the server's"
             elif FlockwaveErrorCode.TIMESYNC_ERROR.value in uav.status.errors:
                 problem = "it has no valid show clock"
@@ -182,3 +182,22 @@ class ScheduledTakeoffSignalDispatcher(SimpleScheduledTakeoffManagerBase):
         finally:
             self._signal = old_signal
             self._log = old_log
+
+
+START_AGREEMENT_TOLERANCE = 0.02
+"""Seconds by which a drone's reported start may differ from the server's in
+the start agreement check: the start may move by a few milliseconds shortly
+before it (e.g. when the timecode clock is re-anchored), and the drones follow
+it at the next broadcast."""
+
+
+def _start_differs(uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
+    if config.authorization_scope != uav.scheduled_takeoff_authorization_scope:
+        return True
+    if not config.should_update_takeoff_time:
+        return False
+    desired, reported = config.takeoff_time, uav.scheduled_takeoff_time
+    if desired is None or reported is None:
+        return desired != reported
+    reported_time = reported + uav.scheduled_takeoff_time_msec / 1000
+    return abs(reported_time - desired) > START_AGREEMENT_TOLERANCE

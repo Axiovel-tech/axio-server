@@ -68,7 +68,7 @@ downmix, LTC mixed into the music).
   with the wall clock outside the audio callback. From sample 0 on the track
   follows PortAudio's stream clock, not later wall-clock adjustments: after an
   output underflow it is moved back on schedule once it is more than 5 ms
-  off, and at any time once it is more than 50 ms off (each move is logged).
+  off, and at any time once it is more than 50 ms off (each move is logged); the LTC output channel moves with it.
   The log reports the measured start error and the end-of-track drift of the
   output device against the wall clock.
 

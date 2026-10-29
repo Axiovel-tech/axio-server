@@ -602,5 +602,15 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
 
     start_time = time() + manager.start_agreement_lead - 1
     manager.notify_start_time_changed(start_time)
-    await sleep(5)
+    await sleep(2)
     assert [config.takeoff_time for config in checked] == [start_time]
+
+    # Moved by a few milliseconds (timecode re-anchored): the same start
+    manager.notify_start_time_changed(start_time + 0.005)
+    await sleep(2)
+    assert len(checked) == 1
+
+    # Moved by seconds: a new start, checked again
+    manager.notify_start_time_changed(start_time - 3)
+    await sleep(2)
+    assert [config.takeoff_time for config in checked] == [start_time, start_time - 3]

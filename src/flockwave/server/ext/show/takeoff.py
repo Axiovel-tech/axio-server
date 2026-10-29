@@ -232,7 +232,8 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
     """
 
     _start_agreement_checked_for: float | None = None
-    """The takeoff time that the last start agreement check was run for."""
+    """The takeoff time that the last start agreement check was run for; a
+    start within a second of it is the same start, moved slightly."""
 
     start_agreement_lead: float = 15
     """Number of seconds before the takeoff when the UAVs are checked once
@@ -426,7 +427,11 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
                         and takeoff_config.authorized
                         and takeoff_config.is_takeoff_in_the_future
                         and takeoff_time - time() <= self.start_agreement_lead
-                        and takeoff_time != self._start_agreement_checked_for
+                        and (
+                            self._start_agreement_checked_for is None
+                            or abs(takeoff_time - self._start_agreement_checked_for)
+                            >= 1
+                        )
                     ):
                         self._start_agreement_checked_for = takeoff_time
                         self.check_start_agreement(takeoff_config)
