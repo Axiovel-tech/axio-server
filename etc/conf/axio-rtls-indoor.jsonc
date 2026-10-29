@@ -62,7 +62,7 @@
       "enabled": true,
       "device": null,
       "offset_ms": 0,
-      "arm_lead_s": 5
+      "arm_lead_s": 15
     },
 
     // The server schedules the start; "rc" selects the RC-switch start

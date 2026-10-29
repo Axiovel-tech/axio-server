@@ -485,6 +485,13 @@ class DroneShowStatus:
         return bool(self.flags & DroneShowStatusFlag.HAS_HIGH_ESC_ERROR_RATE.value)
 
     @property
+    def has_scheduled_start(self) -> bool:
+        """Returns whether the drone has scheduled the start on its own clock
+        (as opposed to holding a start time it could not schedule yet).
+        """
+        return bool(self.flags & DroneShowStatusFlag.HAS_START_TIME.value)
+
+    @property
     def has_start_time(self) -> bool:
         """Returns whether there is a valid start time in the drone show status
         message.

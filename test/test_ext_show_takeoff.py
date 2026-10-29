@@ -600,7 +600,7 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
     await sleep(3)
     assert checked == []
 
-    start_time = time() + manager.start_agreement_lead - 1
+    start_time = time() + max(manager.start_agreement_leads) - 1
     manager.notify_start_time_changed(start_time)
     await sleep(2)
     assert [config.takeoff_time for config in checked] == [start_time]
@@ -614,3 +614,11 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
     manager.notify_start_time_changed(start_time - 3)
     await sleep(2)
     assert [config.takeoff_time for config in checked] == [start_time, start_time - 3]
+
+    # The same start again after the drones commit, at 5 s
+    manager.notify_start_time_changed(start_time - 10)
+    await sleep(2)
+    assert len(checked) == 3
+    manager.notify_start_time_changed(start_time - 10.005)
+    await sleep(2)
+    assert len(checked) == 3

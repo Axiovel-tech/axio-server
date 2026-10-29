@@ -92,7 +92,9 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             elif FlockwaveErrorCode.TIMESYNC_ERROR.value in uav.status.errors:
                 problem = "it has no valid show clock"
             else:
-                continue
+                problem = _schedule_problem(uav, config)
+                if problem is None:
+                    continue
             message = f"Not in sync for the scheduled start: {problem}"
             if self._log:
                 self._log.warning(message, extra={"id": uav.id})
@@ -201,3 +203,29 @@ def _start_differs(uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
         return desired != reported
     reported_time = reported + uav.scheduled_takeoff_time_msec / 1000
     return abs(reported_time - desired) > START_AGREEMENT_TOLERANCE
+
+
+SCHEDULE_TOLERANCE = 1.5
+"""Seconds by which the time to the start on a drone's own clock may differ
+from the server's; the drone reports whole seconds."""
+
+
+def _schedule_problem(uav: MAVLinkUAV, config: TakeoffConfiguration) -> str | None:
+    """Checks the start as the drone scheduled it on its own clock, which may
+    differ from the start time it holds (e.g. resolved to the next week, or
+    not scheduled because its show clock was invalid when the start arrived).
+    """
+    takeoff_time = config.takeoff_time
+    if not config.should_update_takeoff_time or takeoff_time is None:
+        return None
+    show_status = uav.show_status
+    if show_status is None:
+        return "it reports no show status"
+    status, received_at = show_status
+    if not status.has_scheduled_start:
+        return "it has not scheduled the start on its own clock"
+    # elapsed_time is floored to whole seconds
+    off = (received_at - takeoff_time) - (status.elapsed_time + 0.5)
+    if abs(off) > SCHEDULE_TOLERANCE:
+        return f"its own clock puts the start {off:+.1f} s from the server's"
+    return None

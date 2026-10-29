@@ -12,13 +12,20 @@ CONFIG = TakeoffConfiguration(
 )
 
 
-def make_uav(seconds, msec, *, errors=(), **kwds):
+def make_uav(seconds, msec, *, errors=(), scheduled=True, elapsed=None, **kwds):
+    # Status received 10.2 s before the start; the drone floors its elapsed time
+    received_at = CONFIG.takeoff_time - 10.2
+    status = SimpleNamespace(
+        has_scheduled_start=scheduled,
+        elapsed_time=-11 if elapsed is None else elapsed,
+    )
     return SimpleNamespace(
         id=kwds.get("id", "1"),
         scheduled_takeoff_authorization_scope=AuthorizationScope.LIVE,
         scheduled_takeoff_time=seconds,
         scheduled_takeoff_time_msec=msec,
         status=SimpleNamespace(errors=set(errors)),
+        show_status=(status, received_at),
         messages=[],
     )
 
@@ -52,14 +59,18 @@ def test_start_agreement_check_warns_about_each_uav_out_of_sync():
     no_clock = make_uav(
         1_760_000_012, 750, id="3", errors=[FlockwaveErrorCode.TIMESYNC_ERROR.value]
     )
-    for uav in (in_sync, stale, no_clock, moved):
+    # Holds the right start but did not schedule it, or scheduled it a week on
+    unscheduled = make_uav(1_760_000_012, 750, id="5", scheduled=False)
+    next_week = make_uav(1_760_000_012, 750, id="6", elapsed=-32768)
+    uavs = (in_sync, stale, no_clock, moved, unscheduled, next_week)
+    for uav in uavs:
         uav.send_log_message_to_gcs = lambda message, severity, uav=uav: (
             uav.messages.append((message, severity))
         )
 
     manager = MAVLinkScheduledTakeoffManager.__new__(MAVLinkScheduledTakeoffManager)
     manager._log = None
-    manager.iter_uavs_to_schedule = lambda: iter((in_sync, stale, no_clock, moved))  # type: ignore[method-assign]
+    manager.iter_uavs_to_schedule = lambda: iter(uavs)  # type: ignore[method-assign]
 
     manager.check_start_agreement(CONFIG)
 
@@ -68,6 +79,8 @@ def test_start_agreement_check_warns_about_each_uav_out_of_sync():
     assert [severity for _, severity in stale.messages] == [Severity.WARNING]
     assert "differs" in stale.messages[0][0]
     assert "show clock" in no_clock.messages[0][0]
+    assert "not scheduled" in unscheduled.messages[0][0]
+    assert "own clock puts the start" in next_week.messages[0][0]
 
 
 async def test_fallback_writes_show_start_msec_with_every_start():
@@ -105,3 +118,14 @@ async def test_fallback_writes_show_start_msec_with_every_start():
     await MAVLinkUAV.set_scheduled_takeoff_time(uav, 1_760_000_012, 750)  # type: ignore[arg-type]
     assert writes[-1][0] == "SHOW_START_TIME"
     assert len(warnings) == 1
+
+
+def test_reported_start_resolves_to_the_nearest_gps_week():
+    from flockwave.server.ext.mavlink.driver import nearest_week
+
+    week = 604_800
+    now = 1_760_000_000.0
+    assert nearest_week(now + 30, now) == now + 30
+    # Saturday 23:59:50 -> start at Sunday 00:00:20, read in the current week
+    assert nearest_week(now + 30 - week, now) == now + 30
+    assert nearest_week(now - 30 + week, now) == now - 30

@@ -116,7 +116,6 @@ async def test_player_is_committed_after_the_point_of_no_return(
     player.follow(EPOCH + 60)
 
     await sleep_until(50.5)
-    player.follow(None)
     with raises(PlaybackCommittedError):
         player.set_track(None)
     with raises(PlaybackCommittedError):
@@ -127,11 +126,40 @@ async def test_player_is_committed_after_the_point_of_no_return(
     assert stream.session.sample0_time == EPOCH + 60
     assert player.json["startTime"] == EPOCH + 60
 
+    # After T0 a cleared start no longer stops the music
+    await sleep_until(60.5)
+    player.follow(None)
+    await sleep_until(61)
+    assert output.open_streams == [stream]
+
     player.stop()
-    await sleep_until(56)
+    await sleep_until(61.5)
     assert output.open_streams == []
     assert player.state is PlayerState.IDLE
     player.set_track(None)
+
+
+async def test_player_follows_a_start_moved_or_cleared_before_t0(
+    output, player, autojump_clock
+):
+    player.follow(EPOCH + 60)
+    await sleep_until(55.5)
+    [stream] = output.open_streams
+
+    # The operator delays the start at T-4.5 s: the drones hold, so does the music
+    player.follow(EPOCH + 120)
+    await sleep_until(56)
+    assert output.open_streams == []
+    assert player.json["startTime"] == EPOCH + 120
+
+    await sleep_until(115.5)
+    [stream] = output.open_streams
+    assert stream.session.sample0_time == EPOCH + 120
+
+    # Cleared at T-4.5 s: no music
+    player.follow(None)
+    await sleep_until(116)
+    assert output.open_streams == []
 
 
 async def test_player_joins_late_and_stays_stopped_until_rescheduled(

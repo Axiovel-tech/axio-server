@@ -57,7 +57,7 @@ class ShowAudioExtension(Extension):
             log=logger,
             device=None if device == "" else device,
             offset_ms=float(configuration.get("offset_ms", 0)),
-            arm_lead_s=float(configuration.get("arm_lead_s", 5)),
+            arm_lead_s=float(configuration.get("arm_lead_s", 15)),
             point_of_no_return_s=show.get_point_of_no_return_seconds,
         )
         player.on_change = self._broadcast_inf_if_changed
@@ -274,9 +274,11 @@ schema = {
             "type": "number",
             "title": "Arming lead time (s)",
             "description": (
-                "How long before the scheduled first sample the audio output is opened"
+                "How long before the scheduled first sample the audio output is "
+                "opened; above 10 s an output failure shows before the drones "
+                "commit to the start"
             ),
-            "default": 5,
+            "default": 15,
         },
         "ltc_output": {
             "type": ["object", "null"],

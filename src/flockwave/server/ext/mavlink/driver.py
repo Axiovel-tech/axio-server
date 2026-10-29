@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
 from math import inf, isfinite
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Sequence
 
 from colour import Color
@@ -132,6 +132,20 @@ def transport_options_to_channel(options: TransportOptions | None) -> str:
         return Channel.SECONDARY
     else:
         return Channel.PRIMARY
+
+
+SECONDS_IN_HALF_WEEK = 302_400
+
+
+def nearest_week(timestamp: float, now: float) -> float:
+    """Moves a timestamp resolved in the current GPS week by a week if that
+    puts it nearer to ``now``: a start across the week boundary is in the
+    previous or the next week."""
+    if timestamp - now > SECONDS_IN_HALF_WEEK:
+        return timestamp - 2 * SECONDS_IN_HALF_WEEK
+    if now - timestamp > SECONDS_IN_HALF_WEEK:
+        return timestamp + 2 * SECONDS_IN_HALF_WEEK
+    return timestamp
 
 
 class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
@@ -1175,6 +1189,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     sent one.
     """
 
+    _last_skybrush_status_received_at: float = 0.0
+    """When the last firmware-specific status packet arrived, as a UNIX
+    timestamp."""
+
     _preflight_status: PreflightCheckInfo
     """The status of the preflight checks on the drone"""
 
@@ -1608,6 +1626,14 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
+    def show_status(self) -> tuple[DroneShowStatus, float] | None:
+        """The last drone show status of the UAV and when it was received (UNIX
+        timestamp); ``None`` if none was received yet."""
+        if self._last_skybrush_status_info is None:
+            return None
+        return self._last_skybrush_status_info, self._last_skybrush_status_received_at
+
+    @property
     def scheduled_takeoff_time_msec(self) -> int:
         """Returns the millisecond part (0-999) of the scheduled takeoff time
         of the UAV; zero if the UAV is not scheduled for an automatic takeoff.
@@ -1800,6 +1826,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         data = DroneShowStatus.from_mavlink_message(message)
 
         self._last_skybrush_status_info = data
+        self._last_skybrush_status_received_at = time()
 
         # Process the basic part of the packet that is always present (both with
         # the standard and the compact telemetry profile)
@@ -1815,7 +1842,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 self._scheduled_takeoff_time = None
             else:
                 self._scheduled_takeoff_time = int(
-                    gps_time_of_week_to_utc(gps_start_time).timestamp()
+                    nearest_week(
+                        gps_time_of_week_to_utc(gps_start_time).timestamp(), time()
+                    )
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope

@@ -22,7 +22,7 @@ state `error` ("PortAudio library not found").
 |--------------|---------|------------------------------------------------------------|
 | `device`     | `null`  | ALSA output device name (or part of it) or PortAudio index; `null` = system default output |
 | `offset_ms`  | `0`     | Initial playback offset; positive = music later            |
-| `arm_lead_s` | `5`     | How long before sample 0 the output stream is opened       |
+| `arm_lead_s` | `15`    | How long before sample 0 the output stream is opened; above 10 s an output failure shows before the drones commit |
 | `ltc_output` | `null`  | LTC on an extra output channel, see below                  |
 
 Use PortAudio's ALSA host API. On a PipeWire host the default device goes

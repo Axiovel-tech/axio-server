@@ -168,7 +168,22 @@ class ShowAudioPlayer:
         """Sets the show start to follow: the UNIX timestamp of show T0 when
         the server will start the show by itself, ``None`` otherwise.
         """
-        self._commit_if_due(self._clock())
+        now = self._clock()
+        self._commit_if_due(now)
+        committed = self._committed
+        if (
+            committed is not None
+            and start_time != committed.start_time
+            and now < committed.start_time
+        ):
+            # The drones take a start moved or cleared by the operator until
+            # T0, after their own commit, so the music does too
+            self._committed = None
+            self._log.warning(
+                "Show music released from the start at "
+                f"{format_timestamp_nicely(committed.start_time)}: the start "
+                "changed before T0"
+            )
         if start_time != self._followed:
             self._followed = start_time
             if self._stopped_at is not None and (

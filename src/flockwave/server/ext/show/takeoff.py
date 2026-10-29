@@ -231,14 +231,17 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
     the UNIX epoch.
     """
 
-    _start_agreement_checked_for: float | None = None
-    """The takeoff time that the last start agreement check was run for; a
-    start within a second of it is the same start, moved slightly."""
+    _start_agreement_start: float | None = None
+    """The takeoff time that the start agreement checks are run for; a start
+    within a second of it is the same start, moved slightly."""
 
-    start_agreement_lead: float = 15
-    """Number of seconds before the takeoff when the UAVs are checked once
-    for a start time that differs from the desired one, before the drones
-    commit to their start ten seconds before the takeoff.
+    _start_agreement_due: list[float]
+    """Leads of `start_agreement_leads` not checked yet for that start."""
+
+    start_agreement_leads: tuple[float, ...] = (15, 5)
+    """Numbers of seconds before the takeoff when the UAVs are checked for a
+    start that differs from the desired one: once before the drones commit
+    to their start ten seconds before the takeoff, and once after.
     """
 
     _uavs_to_update: set[TUAV]
@@ -275,6 +278,7 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
         self._parking_lot = ParkingLot()
         self._uavs_to_update = set()
         self._uavs_last_updated_at = WeakKeyDictionary()
+        self._start_agreement_due = []
 
     @abstractmethod
     async def broadcast_takeoff_configuration(
@@ -328,9 +332,9 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
         ...
 
     def check_start_agreement(self, config: TakeoffConfiguration) -> None:
-        """Called once per scheduled takeoff, `start_agreement_lead` seconds
-        before it, to warn about UAVs that are not ready to start with the
-        rest of the fleet. The default implementation logs the UAVs that would
+        """Called at each of `start_agreement_leads` seconds before a scheduled
+        takeoff to warn about UAVs that are not ready to start with the rest
+        of the fleet. The default implementation logs the UAVs that would
         still need an individual update.
         """
         uav_ids = [
@@ -342,6 +346,20 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
             self._log.warning(
                 f"UAVs not in agreement with the scheduled start: {', '.join(uav_ids)}"
             )
+
+    def _check_start_agreement_if_due(
+        self, config: TakeoffConfiguration, takeoff_time: float
+    ) -> None:
+        start = self._start_agreement_start
+        if start is None or abs(takeoff_time - start) >= 1:
+            self._start_agreement_start = takeoff_time
+            self._start_agreement_due = sorted(self.start_agreement_leads)
+        lead = takeoff_time - time()
+        if any(lead <= due for due in self._start_agreement_due):
+            self._start_agreement_due = [
+                due for due in self._start_agreement_due if lead > due
+            ]
+            self.check_start_agreement(config)
 
     @property
     def config(self) -> DroneShowConfiguration | None:
@@ -426,15 +444,8 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
                         takeoff_time is not None
                         and takeoff_config.authorized
                         and takeoff_config.is_takeoff_in_the_future
-                        and takeoff_time - time() <= self.start_agreement_lead
-                        and (
-                            self._start_agreement_checked_for is None
-                            or abs(takeoff_time - self._start_agreement_checked_for)
-                            >= 1
-                        )
                     ):
-                        self._start_agreement_checked_for = takeoff_time
-                        self.check_start_agreement(takeoff_config)
+                        self._check_start_agreement_if_due(takeoff_config, takeoff_time)
 
                     # First we scan the _uavs array and find all UAVs that need to
                     # be configured. The actual configuration will take place in a
