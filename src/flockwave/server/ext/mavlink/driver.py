@@ -16,7 +16,11 @@ from typing import Any, Sequence
 from colour import Color
 from flockwave.concurrency import FutureCancelled, delayed
 from flockwave.gps.time import datetime_to_gps_time_of_week, gps_time_of_week_to_utc
-from flockwave.gps.vectors import GPSCoordinate, VelocityNED
+from flockwave.gps.vectors import (
+    FlatEarthToGPSCoordinateTransformation,
+    GPSCoordinate,
+    VelocityNED,
+)
 from flockwave.spec.errors import FlockwaveErrorCode
 from trio import Event, TooSlowError, fail_after, move_on_after, sleep
 from trio_util import periodic
@@ -60,6 +64,7 @@ from flockwave.server.show import (
     get_trajectory_from_show_specification,
 )
 from flockwave.server.show.formats import SkybrushBinaryShowFile
+from flockwave.server.show.gdm_upload import decode_gdm_upload_request
 from flockwave.server.types import GCSLogMessageSender
 from flockwave.server.utils import color_to_rgb8_triplet, to_uppercase_string
 from flockwave.server.utils.generic import nop
@@ -98,6 +103,13 @@ from .packets import (
     create_rc_override_packet,
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
+from .show_slot import (
+    SHOW_SLOT_VERSION,
+    SHOW_SLOT_VERSION_PARAMETER,
+    ShowUploadRefusedError,
+    check_show_slot_version,
+    write_show_slot,
+)
 from .types import MAVLinkMessage, PacketBroadcasterFn, PacketSenderFn, spec
 from .utils import (
     can_communicate_infer_from_heartbeat,
@@ -407,6 +419,41 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         except Exception as ex:
             self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
             raise
+
+    async def handle_command___gdm_upload(
+        self,
+        uav: "MAVLinkUAV",
+        *,
+        gdmb: str,
+        showHash: str,  # noqa: N803 (Flockwave keyword argument)
+        config: ShowSpecification,
+    ):
+        """Handles a `.gdm` show upload request for the given UAV.
+
+        The `.gdmb` arrives precompiled and certified by the trajectory engine;
+        it is validated (AxioStack `contracts/gdm-format.md` §7.1) but never
+        re-encoded. The show frame and the geofence are configured exactly as
+        for `__show_upload`.
+
+        Parameters:
+            gdmb: the UAV's `.gdmb` payload, base64-encoded
+            showHash: the show hash of the `.gdm`, as 64 hexadecimal digits;
+                the `.gdmb` header must carry the same hash
+            config: the show-level settings of `__show_upload` that do not
+                come from the show file: `coordinateSystem`, `amslReference`,
+                `geofence` and `mission`
+        """
+        try:
+            data, summary = decode_gdm_upload_request(gdmb, showHash)
+            await uav.upload_gdm_show(data, config)
+        except Exception as ex:
+            self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
+            raise
+
+        return (
+            f"Uploaded .gdmb ({summary.size} bytes, show "
+            f"{summary.show_hash.hex()[:12]})"
+        )
 
     async def send_command_int(
         self,
@@ -2636,10 +2683,154 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             await show_file.finalize()
             data = show_file.get_contents()
 
-        # Upload show file
-        async with aclosing(MAVFTP.for_uav(self)) as ftp:
-            await ftp.put(data, "/collmot/show.skyb")
+        await self._replace_show_in_slot(data)
+        await self._configure_show_frame_and_reload(
+            coordinate_system, altitude_reference, geofence
+        )
 
+    async def upload_gdm_show(self, data: bytes, config: ShowSpecification) -> None:
+        """Uploads a validated `.gdmb` to the drone's show slot, then
+        configures the show frame and the geofence and reloads the show, as
+        `upload_show()` does for `.skyb`.
+
+        Parameters:
+            data: the `.gdmb` bytes, already validated against the show hash
+            config: show-level settings with `coordinateSystem`,
+                `amslReference` and `geofence`, as in a `__show_upload`
+                specification
+        """
+        # Parse everything before touching the vehicle
+        coordinate_system = get_coordinate_system_from_show_specification(config)
+        if coordinate_system.type != "nwu":
+            raise RuntimeError("Only NWU coordinate systems are supported")
+        altitude_reference = get_altitude_reference_from_show_specification(config)
+        geofence = get_geofence_configuration_from_show_specification(config)
+
+        await self._replace_show_in_slot(data)
+        await self._configure_show_frame_and_reload(
+            coordinate_system, altitude_reference, geofence
+        )
+
+    async def _replace_show_in_slot(self, data: bytes) -> None:
+        """Replaces the show on the drone with the given `.skyb` or `.gdmb`
+        file, in the drone's single show slot `/axio/show.bin` (see
+        `show_slot.py` for the sequence and why).
+
+        Raises:
+            ShowUploadRefusedError: if the drone is armed or its firmware does
+                not support the show slot; nothing has been written then.
+                Retrying cannot fix these.
+            RuntimeError: if the drone's state or `SHOW_SLOT_VER` could not be
+                read; nothing has been written then either
+        """
+        self._ensure_disarmed_for_show_upload()
+        await self._ensure_show_slot_supported()
+
+        async with aclosing(MAVFTP.for_uav(self)) as ftp:
+            await write_show_slot(ftp, data)
+
+    def _ensure_disarmed_for_show_upload(self) -> None:
+        """Refuses a show upload unless the latest heartbeat says that the
+        motors are disarmed.
+        """
+        heartbeat = self.get_last_message(MAVMessageType.HEARTBEAT)
+        if heartbeat is None:
+            raise RuntimeError(
+                "No heartbeat from the drone yet; cannot tell whether it is armed"
+            )
+        if heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value:
+            raise ShowUploadRefusedError(
+                "E_ARMED", "The drone is armed; disarm it before uploading a show."
+            )
+
+    async def _ensure_show_slot_supported(self) -> None:
+        """Refuses to go on unless the firmware implements the show slot this
+        server writes (`SHOW_SLOT_VER`).
+        """
+        version = await self._read_show_slot_version()
+        self._report_show_slot_support(version)
+        check_show_slot_version(version)
+
+    async def _read_show_slot_version(self) -> float | None:
+        """Reads `SHOW_SLOT_VER` from the drone.
+
+        MAVLink has no "unknown parameter" reply: ArduPilot ignores a request
+        for a parameter it does not have, which looks exactly like a lost
+        packet. When `SHOW_SLOT_VER` gets no reply, `SHOW_ORIENTATION` is read
+        instead, which every drone show firmware has (the `.skyb` upload has
+        always configured it). If that answers, the link works and the
+        firmware really lacks the slot; if not, it is the link.
+        (`SYSID_THISMAV` would not do: ArduPilot 4.7 renamed it.)
+
+        Returns:
+            the slot version, or `None` if the firmware has no such parameter
+
+        Raises:
+            RuntimeError: if the drone answered neither parameter
+        """
+        try:
+            return await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
+        except TooSlowError:
+            try:
+                await self.get_parameter("SHOW_ORIENTATION")
+            except TooSlowError:
+                raise RuntimeError(
+                    f"No reply from the drone when reading "
+                    f"{SHOW_SLOT_VERSION_PARAMETER}; check the link and try again."
+                ) from None
+            return None
+
+    async def _check_show_slot_support(self) -> None:
+        """Reads `SHOW_SLOT_VER` after the drone (re)connected, so that
+        drones whose firmware lacks the show slot are flagged before anyone
+        tries to upload a show (a partially flashed fleet shows up in the UAV
+        list instead of failing one upload at a time).
+
+        A drone that does not answer keeps its previous state: a lost reply
+        is not evidence either way.
+        """
+        # Give the drone time to boot before asking, like the mandatory custom
+        # mode does
+        await sleep(5)
+        try:
+            version = await self._read_show_slot_version()
+        except Exception:
+            return
+        self._report_show_slot_support(version)
+
+    def _report_show_slot_support(self, version: float | None) -> None:
+        """Flags the drone with `HW_SW_INCOMPATIBLE` while its firmware lacks
+        the show slot this server writes, and logs it once when it is found.
+        """
+        supported = version == SHOW_SLOT_VERSION
+        code = FlockwaveErrorCode.HW_SW_INCOMPATIBLE
+        was_flagged = code in self._status.errors
+        if was_flagged == (not supported):
+            return
+
+        self.ensure_error(code, present=not supported)
+        self.update_status()
+        self.notify_updated()
+
+        if not supported:
+            found = "no" if version is None else f"version {version:g} of"
+            self.driver.log.warning(
+                f"Firmware has {found} {SHOW_SLOT_VERSION_PARAMETER}, not "
+                f"{SHOW_SLOT_VERSION}: this drone refuses show uploads until it "
+                f"is flashed with show slot support",
+                extra={"id": log_id_for_uav(self)},
+            )
+
+    async def _configure_show_frame_and_reload(
+        self,
+        coordinate_system: FlatEarthToGPSCoordinateTransformation,
+        altitude_reference: float | None,
+        geofence: GeofenceConfigurationRequest,
+    ) -> None:
+        """Configures the show origin, orientation, altitude reference and
+        geofence after a show file was uploaded, then asks the drone to
+        reload its show.
+        """
         # We give some time for the filesystem to flush caches etc before
         # asking the drone to reload the show file. There were some reports
         # that sometimes the show file was read only partially, and I suspect
@@ -2982,6 +3173,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
 
                 self._first_connection = False
                 self._handle_reboot()
+
+            # Flag firmware without the show slot before anyone uploads a
+            # show. Every (re)connection re-reads it: the drone may have been
+            # reflashed while it was away
+            self.driver.run_in_background(self._check_show_slot_support)
 
             # Send "connected" event to listeners
             event = self._connected_event
