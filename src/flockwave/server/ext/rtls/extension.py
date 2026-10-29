@@ -354,15 +354,17 @@ class RtlsExtension(Extension):
         self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
 
-    def _scheduled_show_start(self) -> float | None:
-        """The scheduled start of the show as a UNIX timestamp; ``None`` if
-        no start is scheduled or the show extension is not loaded."""
+    def _scheduled_show(self) -> tuple[float | None, float | None]:
+        """The scheduled start and end of the show as UNIX timestamps; ``None``
+        where unknown or when the show extension is not loaded."""
         try:
+            registry = self.app.import_api("clocks").registry
             return (
-                self.app.import_api("clocks").registry.find_by_id("show").reference_time
+                registry.find_by_id("show").reference_time,
+                registry.find_by_id("end_of_show").reference_time,
             )
         except (AttributeError, KeyError, RuntimeError):
-            return None
+            return None, None
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -387,7 +389,7 @@ class RtlsExtension(Extension):
         register_beacons = bool(configuration.get("register_beacons", True))
         if bool(configuration.get("show_clock_pin", True)):
             self._show_clock = ShowClockPinManager(
-                self, scheduled_start=self._scheduled_show_start
+                self, scheduled_show=self._scheduled_show
             )
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 

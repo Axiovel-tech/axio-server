@@ -2341,7 +2341,7 @@ def test_show_clock_remint_clears_every_pending_deviation(monkeypatch):
     assert manager.pin is second_pin
 
 
-def _pin_manager_driver(monkeypatch, scheduled_start=lambda: None):
+def _pin_manager_driver(monkeypatch, scheduled_show=lambda: (None, None)):
     """A pin manager without device I/O and a function feeding it one
     cluster-clock report received at a given wall time."""
     from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
@@ -2351,7 +2351,7 @@ def _pin_manager_driver(monkeypatch, scheduled_start=lambda: None):
         "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
     )
     manager = ShowClockPinManager(
-        SimpleNamespace(log=None), scheduled_start=scheduled_start
+        SimpleNamespace(log=None), scheduled_show=scheduled_show
     )
     nursery = SimpleNamespace(start_soon=lambda *args: None)
 
@@ -2417,13 +2417,16 @@ def test_show_clock_repins_on_drift_at_most_once_a_minute(monkeypatch):
     assert abs(manager.pin.offset - expected_offset) <= 0.0065
 
 
-def test_show_clock_holds_drift_repins_in_the_minute_before_a_start(monkeypatch):
-    """The same 50 ppm drift with a show starting at second 400: no drift
-    re-pin is minted in the minute before it, the next one comes right
-    after the start."""
+def test_show_clock_holds_drift_repins_from_a_minute_before_a_show_to_its_end(
+    monkeypatch,
+):
+    """The same 50 ppm drift with a show from second 400 to 480: no drift
+    re-pin is minted from a minute before it to its end, the next one comes
+    right after the end."""
     start = 1_752_000_000.0
     show_start = start + 400
-    manager, report = _pin_manager_driver(monkeypatch, lambda: show_start)
+    show_end = start + 480
+    manager, report = _pin_manager_driver(monkeypatch, lambda: (show_start, show_end))
     mint_times = []
 
     for second in range(600):
@@ -2432,8 +2435,8 @@ def test_show_clock_holds_drift_repins_in_the_minute_before_a_start(monkeypatch)
         if not mint_times or manager.pin.wall_unix != mint_times[-1][1]:
             mint_times.append((wall, manager.pin.wall_unix))
 
-    assert not [w for w, _ in mint_times if show_start - 60 <= w <= show_start]
-    assert any(show_start < w <= show_start + 2 for w, _ in mint_times)
+    assert not [w for w, _ in mint_times if show_start - 60 <= w < show_end]
+    assert any(show_end <= w <= show_end + 2 for w, _ in mint_times)
 
 
 async def test_show_clock_lost_device_repinned_on_return(extension, device):
