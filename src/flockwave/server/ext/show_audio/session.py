@@ -33,6 +33,14 @@ Python callback survives the event loop holding the GIL for a while; the
 schedule compensates it through the DAC timestamps.
 """
 
+RESYNC_AFTER_UNDERFLOW_S = 0.005
+"""Offset from the schedule above which the track is moved back on schedule
+after an output underflow."""
+
+RESYNC_ALWAYS_S = 0.05
+"""Offset from the schedule above which the track is moved back on schedule
+even without a reported underflow."""
+
 STREAM_CLOCK_WINDOW = 32
 """Number of recent clock readings among which `StreamClock` picks the one
 read with the least delay."""
@@ -117,6 +125,12 @@ class PlaybackSession:
     underflows: int
     silenced: bool
 
+    resyncs: int
+    last_resync: float
+    """Number of times the track was moved back on schedule after it started,
+    and the size of the last move in seconds (positive = the track was late).
+    """
+
     stream_to_wall: float | None
     """Wall-clock time minus PortAudio stream time; the session stays silent
     until it is known."""
@@ -142,6 +156,13 @@ class PlaybackSession:
         self.underflows = 0
         self.silenced = False
         self.stream_to_wall = None
+        self.resyncs = 0
+        self.last_resync = 0.0
+
+        # Stream time of sample 0, fixed when the track starts: from then on the
+        # track follows the stream clock, not later wall-clock adjustments
+        self._sample0_stream_time: float | None = None
+        self._resync_pending = False
 
         self._write_extra = (
             extra.create_writer(track.sample_rate) if extra is not None else None
@@ -203,6 +224,7 @@ class PlaybackSession:
     def callback(self, outdata: np.ndarray, frames: int, time_info: Any, status: Any):
         if status.output_underflow:
             self.underflows += 1
+            self._resync_pending = True
 
         stream_to_wall = self.stream_to_wall
         if self.silenced or stream_to_wall is None:
@@ -228,6 +250,11 @@ class PlaybackSession:
             else:
                 position = 0
             self._joined_at = position
+            self._sample0_stream_time = self.sample0_time - stream_to_wall
+        else:
+            position, lead = self._resync(
+                position, time_info.outputBufferDacTime, frames, sample_rate
+            )
 
         self._position = render_block(outdata, samples, position, lead)
         if position >= samples.shape[0]:
@@ -242,6 +269,27 @@ class PlaybackSession:
         self._blocks += 1
 
         self._write_extra_channel(outdata, dac_time)
+
+    def _resync(
+        self, position: int, dac_stream_time: float, frames: int, sample_rate: int
+    ) -> tuple[int, int]:
+        """Returns the track position and the number of silent lead frames for
+        a block that reaches the DAC at the given stream time, moving the track
+        back on schedule if a gap in the output (e.g. an underflow) put it off.
+        """
+        assert self._sample0_stream_time is not None
+        late = (dac_stream_time - self._sample0_stream_time) * sample_rate - position
+        late_s = late / sample_rate
+        limit = RESYNC_AFTER_UNDERFLOW_S if self._resync_pending else RESYNC_ALWAYS_S
+        if abs(late_s) <= limit:
+            self._resync_pending = False
+            return position, 0
+
+        self.resyncs += 1
+        self.last_resync = late_s
+        if late > 0:
+            return position + round(late), 0
+        return position, min(round(-late), frames)
 
     def _write_extra_channel(self, outdata: np.ndarray, dac_time: float) -> None:
         if self._write_extra is not None and self.extra is not None:

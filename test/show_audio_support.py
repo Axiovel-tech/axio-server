@@ -37,13 +37,21 @@ def encode(seconds: float, sample_rate: int, format: str) -> bytes:
     return buffer.getvalue()
 
 
+STREAM_TO_WALL = EPOCH - 50.0
+"""Wall-clock time minus stream time in the tests: the stream clock reads 50 s
+at EPOCH and runs with the wall clock."""
+
+
 def run_block(session, frames, *, wall, latency=0.2, underflow=False):
     out = np.full((frames, session.channels), np.nan, dtype=np.float32)
-    session.stream_to_wall = wall - 50.0
+    session.stream_to_wall = STREAM_TO_WALL
+    stream_time = wall - STREAM_TO_WALL
     session.callback(
         out,
         frames,
-        SimpleNamespace(currentTime=50.0, outputBufferDacTime=50.0 + latency),
+        SimpleNamespace(
+            currentTime=stream_time, outputBufferDacTime=stream_time + latency
+        ),
         SimpleNamespace(output_underflow=underflow),
     )
     return out

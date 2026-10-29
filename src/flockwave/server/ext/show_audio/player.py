@@ -126,6 +126,7 @@ class ShowAudioPlayer:
         self._stream: Stream | None = None
         self._start_logged = False
         self._start_error_logged = False
+        self._resyncs_logged = 0
 
         self._state = PlayerState.IDLE
         self._error: str | None = None
@@ -144,6 +145,7 @@ class ShowAudioPlayer:
             "offsetMs": self._offset_ms,
             "device": self._device,
             "error": self._error,
+            "underflows": self._session.underflows if self._session else 0,
         }
 
     @property
@@ -360,6 +362,7 @@ class ShowAudioPlayer:
         if self._stream is not None:
             self._stream.calibrate()
         self._log_start(session)
+        self._log_resyncs(session)
         if session.finished:
             self._set_state(PlayerState.FINISHED)
         elif session.started:
@@ -388,6 +391,16 @@ class ShowAudioPlayer:
                 f"(median of {STATS_BLOCKS} blocks)"
             )
 
+    def _log_resyncs(self, session: PlaybackSession) -> None:
+        if session.resyncs != self._resyncs_logged:
+            self._resyncs_logged = session.resyncs
+            self._log.warning(
+                f"Show music moved back on schedule by {_format_ms(session.last_resync)} "
+                f"({session.underflows} output underflow(s) so far)"
+            )
+            if self.on_change:
+                self.on_change()
+
     async def _arm(self, target: _Target) -> float:
         try:
             session = PlaybackSession(
@@ -408,6 +421,7 @@ class ShowAudioPlayer:
 
         self._session, self._stream = session, stream
         self._start_logged = self._start_error_logged = False
+        self._resyncs_logged = 0
         self._error = None
         self._retry_at = -inf
         self._log.info(

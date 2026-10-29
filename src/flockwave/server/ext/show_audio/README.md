@@ -65,9 +65,12 @@ downmix, LTC mixed into the music).
   by more than 1 s.
 - Sample 0 is placed using PortAudio's `outputBufferDacTime`, mapped to
   `time.time()` through readings of PortAudio's stream clock taken together
-  with the wall clock outside the audio callback; the track then plays
-  without re-seeking. The log reports the measured start error and the
-  end-of-track drift of the output device against the wall clock.
+  with the wall clock outside the audio callback. From sample 0 on the track
+  follows PortAudio's stream clock, not later wall-clock adjustments: after an
+  output underflow it is moved back on schedule once it is more than 5 ms
+  off, and at any time once it is more than 50 ms off (each move is logged).
+  The log reports the measured start error and the end-of-track drift of the
+  output device against the wall clock.
 
 ## Messages
 
@@ -79,7 +82,8 @@ downmix, LTC mixed into the music).
 - `X-SHOW-AUDIO-INF` `{}` — `{track: {sha256, name, mediaType, duration} |
   null, state: "idle" | "armed" | "playing" | "finished" | "stopped" |
   "error",
-  startTime, offsetMs, device, error}`. Also broadcast as a notification
+  startTime, offsetMs, device, error, underflows}`; `underflows` counts the
+  output underflows of the current stream. Also broadcast as a notification
   whenever it changes.
 - `X-SHOW-AUDIO-STOP` `{}` — stops playback now (operator abort).
 - `X-SHOW-AUDIO-SETCFG` `{offsetMs}` — sets the playback offset

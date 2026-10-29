@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from pytest import approx, mark, raises
-from show_audio_support import EPOCH, encode, make_track, run_block
+from show_audio_support import EPOCH, STREAM_TO_WALL, encode, make_track, run_block
 
 from flockwave.server.ext.show.config import DroneShowConfiguration
 from flockwave.server.ext.show_audio import session as session_module
@@ -122,11 +122,76 @@ def test_session_measures_drift_of_the_dac_against_the_wall_clock():
     run_block(session, 1000, wall=EPOCH - 0.2)
 
     # The device consumes 1000 frames per 0.999 s of wall-clock time
-    for i in range(1, 80):
+    for i in range(1, 45):
         run_block(session, 1000, wall=EPOCH - 0.2 + 0.999 * i)
 
     assert session.start_error() == approx(-0.0155, abs=1e-6)
-    assert session.end_drift() == approx(-0.0635, abs=1e-6)
+    assert session.end_drift() == approx(-0.0285, abs=1e-6)
+    assert session.resyncs == 0
+
+
+def test_session_pulls_a_drifting_track_back_on_schedule_beyond_the_limit():
+    session = PlaybackSession(make_track(seconds=100), EPOCH, EPOCH)
+    run_block(session, 1000, wall=EPOCH - 0.2)
+
+    # 1000 frames per 0.999 s: the track runs 1 ms early per block
+    for i in range(1, 80):
+        run_block(session, 1000, wall=EPOCH - 0.2 + 0.999 * i)
+
+    assert session.resyncs == 1
+    assert session.last_resync == approx(-0.051, abs=1e-6)
+    assert abs(session.end_drift()) < 0.03
+
+
+def test_session_moves_the_track_back_on_schedule_after_an_underflow():
+    session = PlaybackSession(make_track(seconds=30), EPOCH, EPOCH)
+    for i in range(10):
+        run_block(session, 100, wall=EPOCH - 0.2 + 0.1 * i)
+
+    # The device starved for 200 ms: the next block reaches the DAC 0.3 s
+    # after the previous one instead of 0.1 s
+    out = run_block(session, 100, wall=EPOCH - 0.2 + 1.2, underflow=True)
+
+    assert session.resyncs == 1
+    assert session.last_resync == approx(0.2, abs=1e-6)
+    # Block due at T0 + 1.2 s starts with sample 1200 (values are index + 1)
+    assert out[0, 0] == 1201
+    out = run_block(session, 100, wall=EPOCH - 0.2 + 1.3)
+    assert out[0, 0] == 1301
+
+
+def test_session_corrects_a_small_offset_only_after_an_underflow():
+    session = PlaybackSession(make_track(seconds=30), EPOCH, EPOCH)
+    for i in range(10):
+        run_block(session, 100, wall=EPOCH - 0.2 + 0.1 * i)
+
+    # A 20 ms gap without a reported underflow stays (jitter, drift)
+    run_block(session, 100, wall=EPOCH - 0.2 + 1.02)
+    assert session.resyncs == 0
+
+    run_block(session, 100, wall=EPOCH - 0.2 + 1.12, underflow=True)
+    assert session.resyncs == 1
+    assert session.last_resync == approx(0.02, abs=1e-6)
+
+
+def test_session_track_follows_the_stream_clock_not_wall_clock_steps():
+    session = PlaybackSession(make_track(seconds=30), EPOCH, EPOCH)
+    for i in range(10):
+        run_block(session, 100, wall=EPOCH - 0.2 + 0.1 * i)
+
+    # The wall clock steps by a second; the stream clock does not
+    out = np.full((100, 1), np.nan, dtype=np.float32)
+    session.stream_to_wall = STREAM_TO_WALL + 1.0
+    stream_time = EPOCH - 0.2 + 1.0 - STREAM_TO_WALL
+    session.callback(
+        out,
+        100,
+        SimpleNamespace(currentTime=stream_time, outputBufferDacTime=stream_time + 0.2),
+        SimpleNamespace(output_underflow=True),
+    )
+
+    assert session.resyncs == 0
+    assert out[0, 0] == 1001
 
 
 def test_session_counts_underflows_and_silences_on_request():

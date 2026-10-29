@@ -203,6 +203,22 @@ async def test_player_finishes_the_track(output, player, autojump_clock):
     assert player.state is PlayerState.IDLE
 
 
+async def test_player_reports_underflows_and_resyncs(output, player, autojump_clock):
+    changes = []
+    player.on_change = lambda: changes.append(player.json["underflows"])
+    player.follow(EPOCH + 10)
+
+    await sleep_until(10.1)
+    [stream] = output.open_streams
+    run_block(stream.session, 100, wall=wall_clock())
+    run_block(stream.session, 100, wall=wall_clock() + 0.3, underflow=True)
+    assert stream.session.resyncs == 1
+
+    await sleep_until(10.5)
+    assert player.json["underflows"] == 1
+    assert 1 in changes
+
+
 async def test_player_follows_a_start_set_while_committed_music_played(
     output, player, autojump_clock
 ):
