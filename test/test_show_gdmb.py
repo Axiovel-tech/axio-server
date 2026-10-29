@@ -80,10 +80,10 @@ def _gdmb_files_of(vector: str) -> tuple[bytes, dict[str, bytes]]:
 
 def test_edge_index_is_the_v1_set():
     # Guards against a vector set that silently shrinks: the spec's v1 gate
-    # has 21 reject vectors (20 files and the oversize recipe) and 2 accepts.
+    # has 31 reject vectors (30 files and the oversize recipe) and 2 accepts.
     assert EDGE_INDEX["mode"] == "v1"
-    assert len(EDGE_INDEX["reject"]) == 21
-    assert len([e for e in EDGE_INDEX["reject"] if e.get("file")]) == 20
+    assert len(EDGE_INDEX["reject"]) == 31
+    assert len([e for e in EDGE_INDEX["reject"] if e.get("file")]) == 30
     assert len(EDGE_INDEX["accept"]) == 2
 
 
@@ -148,14 +148,15 @@ def test_header_extension_is_skipped():
 
 
 def test_rejects_oversize_file():
-    # Recipe from edge/index.json: flat-single plus a skippable COMMENT padded
-    # with spaces so that the file is one byte over the limit.
+    # Recipe from edge/index.json: flat-single plus a skippable block of
+    # unknown type 0x20 padded with spaces so that the file is one byte over
+    # the limit (a single fault: no second COMMENT).
     (recipe,) = [e for e in EDGE_INDEX["reject"] if not e.get("file")]
     assert recipe["code"] == "E_SIZE"
 
     data = bytearray((VECTORS / "flat-single" / "d01.gdmb").read_bytes())
     pad = GDMB_MAX_SIZE + 1 - len(data) - 6
-    data += struct.pack("<BBI", 0x03, 0x01, pad) + b" " * pad
+    data += struct.pack("<BBI", 0x20, 0x01, pad) + b" " * pad
     data = _recrc(data)
     assert len(data) == GDMB_MAX_SIZE + 1
 

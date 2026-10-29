@@ -60,9 +60,9 @@ _FEATURES_PROVISIONAL = FEATURE_MANEUVER
 CAPABILITY_MANEUVER = 0x01
 CAPABILITY_REVERSIBLE_THRUST = 0x02
 CAPABILITY_HIGH_TILT = 0x04
-_CAPABILITIES_DEFINED = (
-    CAPABILITY_MANEUVER | CAPABILITY_REVERSIBLE_THRUST | CAPABILITY_HIGH_TILT
-)
+"""Reserved: certification refuses tilt above the normal-executor bound
+until a high-tilt executor exists, so no v1 file sets it (E_CAPS)."""
+_CAPABILITIES_DEFINED = CAPABILITY_MANEUVER | CAPABILITY_REVERSIBLE_THRUST
 _CAPABILITIES_PROVISIONAL = CAPABILITY_MANEUVER
 
 BLOCK_FLAT_TRAJECTORY = 0x01
@@ -1056,6 +1056,8 @@ def validate_gdmb(
             "E_DURATION", "the timeline is longer than 2^32 - 1 us"
         )
 
+    _check_rest_at_timeline_ends(items)
+
     # Ancillary blocks
     rth_times: tuple[int, ...] = ()
     for block_type, offset, length in blocks:
@@ -1081,6 +1083,60 @@ def validate_gdmb(
         num_maneuvers=num_maneuvers,
         rth_branch_times_us=rth_times,
     )
+
+
+def _check_rest_at_timeline_ends(items: list[_FlatBlock | _ManeuverBlock]) -> None:
+    """E_REST: the reference is at rest at t = 0 and at the end of the
+    timeline, where it meets the rest of §6.1. Velocity, acceleration and yaw
+    rate must be zero within the one-sided §7.3 tolerance (what rounding alone
+    can leave, plus the fixed slack).
+    """
+    first, last = items[0], items[-1]
+    # The timeline starts and ends with FLAT blocks (E_BLOCK_ORDER)
+    assert isinstance(first, _FlatBlock) and isinstance(last, _FlatBlock)
+
+    end_start: tuple[int, ...] = last.start
+    for seg in last.segments[:-1]:
+        end_start = seg.end(end_start)
+
+    for where, start, seg, at_end in (
+        ("start", first.start, first.segments[0], False),
+        ("end", end_start, last.segments[-1], True),
+    ):
+        seconds = seg.duration_us / 1e6
+        for k in range(4):
+            is_yaw = k == 3
+            scale = _YAW_SCALE if is_yaw else _POS_SCALE
+            quantum = _Q_YAW if is_yaw else _Q_POS
+            n = len(seg.ctrl[k])
+            name = "xyzψ"[k]
+
+            velocity = (
+                _endpoint_derivative(start[k], seg.ctrl[k], 1, at_end, seg.duration_us)
+                / scale
+            )
+            tol_v = quantum * n / seconds + (_SLACK_YAW_RATE if is_yaw else _SLACK_V)
+            if abs(velocity) > tol_v:
+                raise GdmbValidationError(
+                    "E_REST",
+                    f"timeline {where}: d{name}/dt = {velocity:.6g} "
+                    f"(tolerance {tol_v:.3g})",
+                )
+
+            if is_yaw:
+                continue
+
+            acceleration = (
+                _endpoint_derivative(start[k], seg.ctrl[k], 2, at_end, seg.duration_us)
+                / scale
+            )
+            tol_a = 2 * quantum * n * (n - 1) / seconds**2 + _SLACK_A
+            if abs(acceleration) > tol_a:
+                raise GdmbValidationError(
+                    "E_REST",
+                    f"timeline {where}: d²{name}/dt² = {acceleration:.6g} "
+                    f"(tolerance {tol_a:.3g})",
+                )
 
 
 def _check_events(data: bytes, offset: int, length: int) -> None:

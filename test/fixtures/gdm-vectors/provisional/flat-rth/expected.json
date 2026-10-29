@@ -1,12 +1,12 @@
 {
   "provisional": true,
-  "show_hash": "87b15d3157f8274732b664c49151a778f4189f8a991d33bffead99b57e56a451",
+  "show_hash": "9e53d945a8f63063696ba9a2a3505d4c1ae5ce826d34a05c2720f279bc7b1da1",
   "gdmb": {
     "d01": {
       "size": 1201,
-      "sha256": "dda365ef21f1622ac5ddeeff4be43192183531debd2ee18f747a0d31dd082a49",
-      "crc32": "0x1c1593b5",
-      "mavftp_file_crc32": "0xd5cddbbb"
+      "sha256": "740cb49aaf54c2810a28552d4239d82b31316480b47fb33859fa3f57b9e6844c",
+      "crc32": "0xf536322f",
+      "mavftp_file_crc32": "0x357e7e6c"
     }
   },
   "samples": {

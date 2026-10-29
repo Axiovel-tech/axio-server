@@ -1,11 +1,11 @@
 # `.gdm` / `.gdmb` golden vectors (vendored)
 
 Copied byte for byte from AxioStack `contracts/gdm-vectors/` at commit
-`62c1601` (branch `docs/gdm-format-spec`, AxioStack PR #84), which also holds
+`36d72f2` (branch `docs/gdm-format-spec`, AxioStack PR #84), which also holds
 the normative spec `contracts/gdm-format.md` and the generator `gdm_ref.py`.
 
-- **v1 conformance** (spec §10): `flat-single/` and `edge/`: 21 reject vectors
-  (20 files and the oversize recipe in `edge/index.json`) and 2 accept
+- **v1 conformance** (spec §10): `flat-single/` and `edge/`: 31 reject vectors
+  (30 files and the oversize recipe in `edge/index.json`) and 2 accept
   vectors.
 - **Provisional** (spec §4.11, not part of conformance): `provisional/`
   exercises the MANEUVER, RTH_PLAN and ENVELOPES layouts that a v1 reader
