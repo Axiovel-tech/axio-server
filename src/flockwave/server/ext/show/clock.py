@@ -106,6 +106,12 @@ class ClockSynchronizationHandler:
     primary clock is ignored because the secondary clock is freewheeling.
     """
 
+    notify_late_start: Callable[[str], None] | None = None
+    """Function that forwards a warning to the operator when the start becomes
+    known through the primary clock less than `MIN_START_LEAD` seconds before
+    it; ``None`` if no one needs the start that early.
+    """
+
     point_of_no_return_seconds: float | None = None
     """The number of seconds on the secondary clock that correspond to the
     so-called "point of no return".
@@ -282,7 +288,7 @@ class ClockSynchronizationHandler:
     def _report_late_start(self, lead: float) -> None:
         primary, secondary = self._primary_clock, self._secondary_clock
         if (
-            self.notify is None
+            self.notify_late_start is None
             or primary is None
             or secondary is None
             or lead >= MIN_START_LEAD
@@ -296,7 +302,7 @@ class ClockSynchronizationHandler:
         )
         if self.log:
             self.log.warning(message)
-        self.notify(message)
+        self.notify_late_start(message)
 
     def _report_ignored_change(self, delta: float | None) -> None:
         primary, secondary = self._primary_clock, self._secondary_clock

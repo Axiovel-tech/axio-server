@@ -133,6 +133,7 @@ class DroneShowExtension(Extension):
         self._clock_sync.notify = lambda message: app.request_to_send_SYS_MSG_message(
             message, severity=Severity.WARNING
         )
+        self._clock_sync.notify_late_start = self._notify_late_start
         self._end_clock_sync.log = logger
 
         handlers = {
@@ -215,6 +216,16 @@ class DroneShowExtension(Extension):
                     self._end_clock_sync.use_secondary_clock(self._end_clock)
                 )
                 await sleep_forever()
+
+    def _notify_late_start(self, message: str) -> None:
+        """Warns the operator about a start that reaches the drones too late,
+        if the server is going to start the show by itself."""
+        if (
+            self.app is not None
+            and self._config.start_method is StartMethod.AUTO
+            and self._config.authorized_to_start
+        ):
+            self.app.request_to_send_SYS_MSG_message(message, severity=Severity.WARNING)
 
     def _get_clock(self) -> ShowClock | None:
         """Returns a reference to the show clock."""
