@@ -65,9 +65,10 @@ REPIN_DRIFT_S = 0.005
 #: ...but at most this often.
 REPIN_INTERVAL_S = 60.0
 
-#: ...and not in this many seconds before a scheduled show start: the drones
-#: freeze their start ten seconds before it, and a re-pin reaching the tags
-#: one by one around then would freeze part of the fleet on the old pin.
+#: ...and not from this many seconds before a scheduled show start until the
+#: end of the show: the drones freeze their start ten seconds before it, a
+#: re-pin reaching the tags one by one around then would freeze part of the
+#: fleet on the old pin, and armed tags refuse the parameter writes.
 REPIN_HOLD_BEFORE_START_S = 60.0
 
 #: Parameter names, in the REQUIRED write order for a (re-)pin.
@@ -155,11 +156,13 @@ class ShowClockPinManager:
     def __init__(
         self,
         ext: "RtlsExtension",
-        scheduled_start: Callable[[], Optional[float]] = lambda: None,
+        scheduled_show: Callable[
+            [], tuple[Optional[float], Optional[float]]
+        ] = lambda: (None, None),
     ):
         self._ext = ext
-        #: The scheduled show start as a UNIX timestamp, if any.
-        self._scheduled_start = scheduled_start
+        #: The scheduled start and end of the show as UNIX timestamps, if any.
+        self._scheduled_show = scheduled_show
         self._pin: Optional[GpsPin] = None
         #: Wall time when the current pin was minted.
         self._minted_at = 0.0
@@ -285,8 +288,10 @@ class ShowClockPinManager:
         offset = self.offset_estimate
         if offset is None or now_unix - self._minted_at < REPIN_INTERVAL_S:
             return
-        start = self._scheduled_start()
-        if start is not None and 0 <= start - now_unix <= REPIN_HOLD_BEFORE_START_S:
+        start, end = self._scheduled_show()
+        if start is not None and (
+            start - REPIN_HOLD_BEFORE_START_S <= now_unix <= max(start, end or start)
+        ):
             return
         drift = offset - self._pin.offset
         if abs(drift) > REPIN_DRIFT_S:
