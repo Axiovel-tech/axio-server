@@ -336,6 +336,9 @@ class DroneShowStatus:
     if not set.
     """
 
+    start_time_msec: int = 0
+    """Millisecond part of the scheduled start time (0-999)."""
+
     elapsed_time: int = 0
     """Number of seconds elapsed in the drone show."""
 
@@ -400,6 +403,13 @@ class DroneShowStatus:
             secondary_rtcm_count_plus_one,
         ) = cls._struct.unpack(data[:14])
 
+        # The firmware packs the millisecond part of the start time above the
+        # 20 bits of the seconds of week
+        start_time_msec = 0
+        if start_time >= 0:
+            start_time_msec = (start_time >> 20) & 0x3FF
+            start_time &= 0xFFFFF
+
         # Merge flags, flags2 and flags3 into one byte. Lower 4 bits of flags2
         # is the execution stage. Lower 2 bits of flags3 is the boot count
         # modulo 4.
@@ -440,6 +450,7 @@ class DroneShowStatus:
 
         return cls(
             start_time=start_time,
+            start_time_msec=start_time_msec,
             elapsed_time=elapsed_time,
             light=light,
             flags=flags,

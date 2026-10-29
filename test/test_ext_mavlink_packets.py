@@ -37,7 +37,8 @@ def test_drone_show_status_from_bytes():
     # Legacy packet, length 9, no flags3 or elapsed_time field
     status = DroneShowStatus.from_bytes(b"\x01\x02\x03\x04\x05\x06\x07\x88\x19")
 
-    assert status.start_time == 67305985
+    assert status.start_time == 0x30201
+    assert status.start_time_msec == 0x40
     assert status.light == 1541
     assert status.flags == (
         DroneShowStatusFlag.GEOFENCE_BREACHED
@@ -63,7 +64,8 @@ def test_drone_show_status_from_bytes():
         b"\x01\x02\x03\x04\x05\x06\x07\x88\x19\xcf\x0a\x0b"
     )
 
-    assert status.start_time == 67305985
+    assert status.start_time == 0x30201
+    assert status.start_time_msec == 0x40
     assert status.light == 1541
     assert status.flags == (
         DroneShowStatusFlag.GEOFENCE_BREACHED
@@ -88,6 +90,18 @@ def _unpack_start_config(spec):
     data = fields["data"]
     assert data[0] == 1
     return unpack("<iBiH", data[1:12])
+
+
+def test_drone_show_status_unpacks_the_start_time_milliseconds():
+    # Firmware: seconds of week in the low 20 bits, milliseconds above them
+    packed = 414_531 | (750 << 20)
+    status = DroneShowStatus.from_bytes(packed.to_bytes(4, "little", signed=True))
+    assert status.start_time == 414_531
+    assert status.start_time_msec == 750
+
+    unset = DroneShowStatus.from_bytes((-1).to_bytes(4, "little", signed=True))
+    assert unset.start_time == -1
+    assert unset.start_time_msec == 0
 
 
 def test_start_config_packet_carries_the_sub_second_start_time(monkeypatch):

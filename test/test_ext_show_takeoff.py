@@ -584,3 +584,23 @@ def test_split_start_time():
     assert split_start_time(1_760_000_012.0) == (1_760_000_012, 0)
     assert split_start_time(1_760_000_012.123) == (1_760_000_012, 123)
     assert split_start_time(1_760_000_012.9996) == (1_760_000_013, 0)
+
+
+async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_start(
+    manager: MockScheduledTakeoffManager,
+    nursery,
+    autojump_clock,
+):
+    checked: list[TakeoffConfiguration] = []
+    manager.check_start_agreement = checked.append  # type: ignore[method-assign]
+
+    await nursery.start(manager.run)
+
+    manager.notify_start_time_changed(time() + 600)
+    await sleep(3)
+    assert checked == []
+
+    start_time = time() + manager.start_agreement_lead - 1
+    manager.notify_start_time_changed(start_time)
+    await sleep(5)
+    assert [config.takeoff_time for config in checked] == [start_time]

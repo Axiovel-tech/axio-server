@@ -1196,6 +1196,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     """Scheduled takeoff time of the drone, as a GPS time-of-week timestamp,
     in seconds"""
 
+    _scheduled_takeoff_time_msec: int = 0
+    """Millisecond part of the scheduled takeoff time of the drone"""
+
     _velocity: VelocityNED
     """Current velocity of the drone in NED coordinate system, m/sec"""
 
@@ -1605,6 +1608,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
+    def scheduled_takeoff_time_msec(self) -> int:
+        """Returns the millisecond part (0-999) of the scheduled takeoff time
+        of the UAV; zero if the UAV is not scheduled for an automatic takeoff.
+        """
+        return self._scheduled_takeoff_time_msec
+
+    @property
     def scheduled_takeoff_time_gps_time_of_week(self) -> int | None:
         """Returns the scheduled takeoff time of the UAV as a GPS time of week
         value, or `None` if the UAV is not scheduled for an automatic takeoff.
@@ -1796,6 +1806,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
 
         gps_start_time = data.start_time if data.start_time >= 0 else None
+        self._scheduled_takeoff_time_msec = (
+            data.start_time_msec if gps_start_time is not None else 0
+        )
         if gps_start_time != self._scheduled_takeoff_time_gps_time_of_week:
             self._scheduled_takeoff_time_gps_time_of_week = gps_start_time
             if gps_start_time is None:
@@ -2265,9 +2278,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         await self.set_parameter("SHOW_START_AUTH", authorization_scope_to_int(scope))
 
-    async def set_scheduled_takeoff_time(self, seconds: int | None) -> None:
+    async def set_scheduled_takeoff_time(
+        self, seconds: int | None, msec: int = 0
+    ) -> None:
         """Sets the scheduled takeoff time of the UAV to the given timestamp in
-        seconds. Only integer seconds are supported. Setting the takeoff time
+        whole seconds plus a millisecond part (0-999). Setting the takeoff time
         to `None` or a negative number will clear the takeoff time.
         """
         # The UAV needs GPS time of week so we convert it first. Note that we
@@ -2281,6 +2296,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             dt = datetime.fromtimestamp(int(seconds), tz=timezone.utc)
             _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
 
+        # SHOW_START_MSEC is written only when it changes so that firmware
+        # without it still accepts whole-second starts
+        if gps_time_of_week >= 0 and msec != self._scheduled_takeoff_time_msec:
+            await self.set_parameter("SHOW_START_MSEC", msec)
         await self.set_parameter("SHOW_START_TIME", gps_time_of_week)
 
     async def set_led_color(

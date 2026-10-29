@@ -6,6 +6,7 @@ from logging import Logger
 from typing import TYPE_CHECKING
 
 from blinker import Signal
+from flockwave.spec.errors import FlockwaveErrorCode
 
 from flockwave.server.ext.show.takeoff import (
     ScheduledTakeoffManager,
@@ -13,6 +14,7 @@ from flockwave.server.ext.show.takeoff import (
     TakeoffConfiguration,
 )
 from flockwave.server.ext.signals import SignalsExtensionAPI
+from flockwave.server.model.log import Severity
 
 from .channel import Channel
 from .packets import create_start_time_configuration_packet
@@ -83,6 +85,19 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             if uav.is_connected and uav.supports_scheduled_takeoff
         )
 
+    def check_start_agreement(self, config: TakeoffConfiguration) -> None:
+        for uav in self.iter_uavs_to_schedule():
+            if self.uav_needs_update(uav, config):
+                problem = "its start time or authorization differs from the server's"
+            elif FlockwaveErrorCode.TIMESYNC_ERROR.value in uav.status.errors:
+                problem = "it has no valid show clock"
+            else:
+                continue
+            message = f"Not in sync for the scheduled start: {problem}"
+            if self._log:
+                self._log.warning(message, extra={"id": uav.id})
+            uav.send_log_message_to_gcs(message, severity=Severity.WARNING)
+
     def uav_needs_update(self, uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
         """Returns whether the given UAV needs to be updated if the desired
         takeoff configuration is the one provided as `config`.
@@ -102,7 +117,10 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             # Takeoff time must be cleared (None) or set to a specific
             # value; we need an update if it is different from what
             # we have on the UAV
-            return uav.scheduled_takeoff_time != config.takeoff_time_in_whole_seconds
+            return (
+                uav.scheduled_takeoff_time != config.takeoff_time_in_whole_seconds
+                or uav.scheduled_takeoff_time_msec != config.takeoff_time_msec
+            )
 
         # Auth scope is the same and the takeoff time does not
         # need to change
@@ -112,10 +130,14 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         desired_auth_scope = config.authorization_scope
         desired_takeoff_time = config.takeoff_time_in_legacy_format
 
-        if (
-            desired_takeoff_time is None or desired_takeoff_time >= 0
-        ) and desired_takeoff_time != uav.scheduled_takeoff_time:
-            await uav.set_scheduled_takeoff_time(seconds=desired_takeoff_time)
+        desired_msec = config.takeoff_time_msec
+        if (desired_takeoff_time is None or desired_takeoff_time >= 0) and (
+            desired_takeoff_time != uav.scheduled_takeoff_time
+            or desired_msec != uav.scheduled_takeoff_time_msec
+        ):
+            await uav.set_scheduled_takeoff_time(
+                seconds=desired_takeoff_time, msec=desired_msec
+            )
 
         if desired_auth_scope != uav.scheduled_takeoff_authorization_scope:
             await uav.set_authorization_scope(desired_auth_scope)
