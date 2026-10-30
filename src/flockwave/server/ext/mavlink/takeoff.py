@@ -72,8 +72,11 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         return self._network.driver.show_schedule
 
     async def _broadcast_show_schedule(self) -> None:
-        """Broadcasts the show schedule next to the start configuration, more
-        often shortly before the start and at once when it changes.
+        """Sends the show schedule next to the start configuration, more often
+        shortly before the start and at once when it changes: broadcast, and to
+        every drone on its own address, because a wireless bridge (such as the
+        positioning tags' bridge to their autopilots) may not forward
+        broadcasts.
         """
         schedule = self._schedule
         while True:
@@ -87,8 +90,15 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
                         spec, channel=Channel.SHOW_CONTROL
                     )
                 except Exception:
-                    # The drones that missed it get it individually
                     pass
+                for uav in list(self.iter_uavs_to_schedule()):
+                    try:
+                        await self._network.send_packet(
+                            schedule.packet(now), uav, channel=Channel.SHOW_CONTROL
+                        )
+                    except Exception:
+                        # A drone that misses one gets the next
+                        pass
             with move_on_after(schedule.period(now)):
                 await changed.wait()
 

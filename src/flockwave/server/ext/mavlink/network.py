@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
+from functools import cache
 from logging import Logger
 from time import time_ns
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,7 @@ from flockwave.connections import (
     create_connection,
 )
 from flockwave.networking import find_interfaces_with_address
+from flockwave.protocols.mavlink.introspection import get_mavlink_message_class
 from trio import move_on_after, open_nursery, to_thread
 from trio.abc import ReceiveChannel
 from trio_util import periodic
@@ -642,11 +644,12 @@ class MAVLinkNetwork:
         # From this point onwards, spec is not None, i.e. we are definitely
         # sending something
 
-        spec[1].update(
-            target_system=target.system_id,
-            target_component=MAVComponent.AUTOPILOT1,
-            _mavlink_version=target.mavlink_version,
-        )
+        if _has_target_fields(spec[0]):
+            spec[1].update(
+                target_system=target.system_id,
+                target_component=MAVComponent.AUTOPILOT1,
+            )
+        spec[1].update(_mavlink_version=target.mavlink_version)
 
         if wait_for_response:
             response_type, response_fields = wait_for_response
@@ -1240,3 +1243,12 @@ def format_channel_ids(ids: Sequence[str]) -> str:
         if index < len(ids) - 1:
             parts.append(", " if index < len(ids) - 2 else " and ")
     return "".join(parts)
+
+
+@cache
+def _has_target_fields(message_type: str) -> bool:
+    """Returns whether a MAVLink message addresses a target system; the DATA*
+    messages carrying custom packets do not, and reach one drone only through
+    its own address."""
+    message_class = get_mavlink_message_class("ardupilotmega", message_type)
+    return "target_system" in message_class.fieldnames

@@ -235,7 +235,7 @@ def test_schedule_disagreement(schedule):
 # Takeoff manager
 
 
-def make_manager(schedule):
+def make_manager(schedule, uavs=()):
     sent = []
 
     async def broadcast_packet(spec, channel=None):
@@ -249,6 +249,7 @@ def make_manager(schedule):
         driver=SimpleNamespace(show_schedule=schedule),
         broadcast_packet=broadcast_packet,
         send_packet=send_packet,
+        uavs=lambda: list(uavs),
     )
     return MAVLinkScheduledTakeoffManager(network), sent  # type: ignore[arg-type]
 
@@ -322,6 +323,28 @@ async def test_schedule_broadcast_pace(schedule, monkeypatch, autojump_clock, nu
     times = [round(at, 1) for _, at, _, _ in sent]
     assert times[:15] == [11.5 + step for step in range(15)]
     assert times[15:] == [round(25.7 + 0.2 * step, 1) for step in range(72)]
+
+
+async def test_schedule_also_goes_to_every_drone_on_its_own_address(
+    schedule, monkeypatch, autojump_clock, nursery
+):
+    monkeypatch.setattr(takeoff, "time", lambda: EPOCH + trio.current_time())
+    drones = [make_uav(), make_uav()]
+    for index, drone in enumerate(drones):
+        drone.id = str(index)
+        drone.is_connected = True
+        drone.supports_scheduled_takeoff = True
+    manager, sent = make_manager(schedule, drones)
+    schedule.update(auto(EPOCH + 30))
+
+    nursery.start_soon(manager._broadcast_show_schedule)
+    await trio.sleep(0.5)
+    assert [(kind, target) for kind, target, _, _ in sent] == [
+        ("broadcast", 0.0),
+        ("unicast", "0"),
+        ("unicast", "1"),
+    ]
+    assert all(spec == schedule.packet(EPOCH) for _, _, spec, _ in sent)
 
 
 async def test_a_change_during_a_slow_broadcast_goes_out_at_once(
