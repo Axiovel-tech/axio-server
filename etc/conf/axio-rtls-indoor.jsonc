@@ -67,8 +67,9 @@
 
     // The server schedules the start; "rc" selects the RC-switch start
     // (RC option 248). With "auto" and no start time set, the server
-    // broadcasts a "clear start time" START_CONFIG at 1 Hz, which cancels an
-    // RC-switch countdown on the drones.
+    // broadcasts a show schedule without a start (and a "clear start time"
+    // START_CONFIG) at 1 Hz, which cancels an RC-switch countdown on the
+    // drones.
     "show": {
       "default_start_method": "auto"
     }

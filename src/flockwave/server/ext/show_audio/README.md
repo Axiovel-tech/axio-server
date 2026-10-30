@@ -56,9 +56,10 @@ downmix, LTC mixed into the music).
   the music needs the AUTO start and stays idle.
 - Before the show extension's point of no return (`point_of_no_return_seconds`,
   T−10 s by default) it follows reschedules and cancellations. After it the
-  playback is committed: only `X-SHOW-AUDIO-STOP` or a server shutdown stops
-  it, and track uploads, `X-SHOW-AUDIO-CLEAR` and `X-SHOW-AUDIO-SETCFG` are
-  rejected.
+  playback is committed, as the start is: the show extension refuses to move
+  it. Only an abort (the start cleared or the authorization revoked before
+  T0), `X-SHOW-AUDIO-STOP` or a server shutdown stops it, and track uploads,
+  `X-SHOW-AUDIO-CLEAR` and `X-SHOW-AUDIO-SETCFG` are rejected.
 - A start time already in the past joins mid-track at the matching
   position, unless the operator stopped the music for that start. A stop
   holds, and the state reads `stopped`, until the start is cleared or moves

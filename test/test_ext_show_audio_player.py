@@ -139,27 +139,26 @@ async def test_player_is_committed_after_the_point_of_no_return(
     player.set_track(None)
 
 
-async def test_player_follows_a_start_moved_or_cleared_before_t0(
+async def test_player_committed_music_ignores_a_moved_start_and_stops_on_abort(
     output, player, autojump_clock
 ):
     player.follow(EPOCH + 60)
     await sleep_until(55.5)
     [stream] = output.open_streams
 
-    # The operator delays the start at T-4.5 s: the drones hold, so does the music
+    # A moved start cannot reach the committed drones, so it does not move
+    # the music either
     player.follow(EPOCH + 120)
     await sleep_until(56)
-    assert output.open_streams == []
-    assert player.json["startTime"] == EPOCH + 120
+    assert output.open_streams == [stream]
+    assert stream.session.sample0_time == EPOCH + 60
+    assert player.json["startTime"] == EPOCH + 60
 
-    await sleep_until(115.5)
-    [stream] = output.open_streams
-    assert stream.session.sample0_time == EPOCH + 120
-
-    # Cleared at T-4.5 s: no music
+    # Cleared at T-4 s: the abort, no music
     player.follow(None)
-    await sleep_until(116)
+    await sleep_until(56.5)
     assert output.open_streams == []
+    assert player.state is PlayerState.IDLE
 
 
 async def test_player_joins_late_and_stays_stopped_until_rescheduled(
