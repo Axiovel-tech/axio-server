@@ -21,8 +21,7 @@ REPORTED_ADJUSTMENT = 0.1
 
 #: A start that becomes known through the primary clock (e.g. timecode that
 #: starts rolling) less than this many seconds before it is reported: the
-#: drones schedule a start that reaches them after it for the next week, and
-#: they prepare for takeoff ten seconds before it.
+#: drones refuse a start that reaches them less than ten seconds before it.
 MIN_START_LEAD = 15.0
 
 

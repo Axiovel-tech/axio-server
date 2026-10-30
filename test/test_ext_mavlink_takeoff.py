@@ -24,6 +24,7 @@ def make_uav(seconds, msec, *, errors=(), scheduled=True, elapsed=None, **kwds):
         scheduled_takeoff_authorization_scope=AuthorizationScope.LIVE,
         scheduled_takeoff_time=seconds,
         scheduled_takeoff_time_msec=msec,
+        show_schedule_status=None,
         status=SimpleNamespace(errors=set(errors)),
         show_status=(status, received_at),
         messages=[],

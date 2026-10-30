@@ -42,7 +42,7 @@ from .driver import MAVLinkDriver, MAVLinkUAV
 from .enums import MAVAutopilot, MAVComponent, MAVMessageType, MAVState, MAVType
 from .errors import InvalidSystemIdError
 from .led_lights import MAVLinkLEDLightConfigurationManager
-from .packets import DroneShowStatus
+from .packets import DroneShowStatus, ShowScheduleStatus
 from .rssi import RSSIMode
 from .rtk import RTKCorrectionPacketEncoder
 from .signing import MAVLinkSigningConfiguration
@@ -920,6 +920,10 @@ class MAVLinkNetwork:
             uav = self._find_uav_from_message(message, address)
             if uav:
                 uav.handle_message_drone_show_status(message)
+        elif message.type == ShowScheduleStatus.TYPE:
+            uav = self._find_uav_from_message(message, address)
+            if uav:
+                uav.handle_message_show_schedule_status(message)
 
     def _handle_message_global_position_int(
         self, message: MAVLinkMessage, *, connection_id: str, address: Any

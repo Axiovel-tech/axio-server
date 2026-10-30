@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, overload
 
 from flockwave.server.ext.base import UAVExtension
 from flockwave.server.ext.mavlink.fw_upload import FirmwareUpdateTarget
+from flockwave.server.ext.show.takeoff import TakeoffConfiguration
 from flockwave.server.ext.show.time import BinaryTimeAxisConfiguration
 from flockwave.server.ext.show.types import ShowExtensionAPI
 from flockwave.server.ext.signals import SignalsExtensionAPI
@@ -202,6 +203,19 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         # Get a handle to the signals extension that we will need
         signals = app.import_api("signals", SignalsExtensionAPI)
         status_summary_signal = signals.get("mavlink:status_summary")
+
+        # The drones count the show start in the UWB cluster time that the
+        # rtls extension relates to wall time
+        try:
+            rtls = app.import_api("rtls")
+        except (KeyError, RuntimeError):
+            rtls = None
+        schedule = self._driver.show_schedule
+        schedule.cluster_clock = lambda: (
+            rtls.cluster_clock if rtls is not None and rtls.loaded else None
+        )
+        show = app.import_api("show", ShowExtensionAPI)
+        schedule.is_locked = lambda: show.is_start_locked()
 
         # Create self._uavs only here and not in the constructor; this is to
         # ensure that we cannot accidentally register a UAV when the extension
@@ -650,6 +664,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 "configuration)"
             )
 
+        self._update_show_schedule()
+
     def _update_show_start_time_in_networks(self) -> None:
         """Updates the scheduled start times of the drones managed by this
         extension, based on the start time extracted from the show clock.
@@ -676,6 +692,23 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 "Failed to dispatch scheduled takeoff configuration change signal "
                 "to other extensions (reason of dispatch attempt: updated start time)"
             )
+
+        self._update_show_schedule()
+
+    def _update_show_schedule(self) -> None:
+        """Updates the show schedule of the drones from the start configuration
+        and the show clock of the `show` extension.
+        """
+        assert self.app is not None
+        assert self._driver is not None
+
+        show = self.app.import_api("show", ShowExtensionAPI)
+        clock = show.get_clock()
+        self._driver.show_schedule.update(
+            TakeoffConfiguration.from_show_config(
+                show.get_configuration(), clock.start_time if clock else None
+            )
+        )
 
     def _update_show_light_configuration_in_networks(
         self, config: LightConfiguration | None = None

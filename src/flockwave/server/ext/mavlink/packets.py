@@ -24,8 +24,10 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DroneShowStatus",
+    "ShowScheduleStatus",
     "create_led_control_packet",
     "create_rc_override_packet",
+    "create_show_schedule_packet",
     "create_start_time_configuration_packet",
     "create_time_axis_configuration_packet",
 )
@@ -143,6 +145,22 @@ def create_time_axis_configuration_packet(
 ) -> MAVLinkMessageSpecification:
     """Creates a time axis configuration packet used by our firmware."""
     return create_custom_data_packet(type=5, payload=config)
+
+
+SHOW_SCHEDULE_TYPE = 0x42
+"""First data byte of the Axio show schedule packet and of its echo."""
+
+
+def create_show_schedule_packet(
+    schedule_id: int, start_cluster_us: int
+) -> MAVLinkMessageSpecification:
+    """Creates an Axio show schedule packet: the show start in microseconds of
+    the UWB cluster clock (zero for no start, an abort after the drones have
+    committed to the start) and the ID of the schedule that it belongs to.
+    """
+    return create_custom_data_packet(
+        type=SHOW_SCHEDULE_TYPE, payload=pack("<HQB", schedule_id, start_cluster_us, 0)
+    )
 
 
 def create_led_control_packet(
@@ -711,3 +729,65 @@ class DroneShowStatusExtension:
 
         # TODO(ntamas): show ID, trajectory index
         return cls(lat, lng, alt, relative_alt, vx, vy, vz, heading, h_acc, v_acc)
+
+
+class ShowScheduleStatusFlag(IntFlag):
+    """Flags of the Axio show schedule echo."""
+
+    HAS_START = 1
+    COMMITTED = 2
+    CLOCK_VALID = 4
+    SET_BY_RC = 8
+
+
+@dataclass(frozen=True)
+class ShowScheduleStatus:
+    """The show schedule that a drone holds, echoed back after each drone show
+    status packet by firmware that counts the show start in cluster time.
+    """
+
+    schedule_id: int
+    """ID of the schedule of the start that the drone holds or last cleared;
+    zero for none or a start set by the RC."""
+
+    flags: ShowScheduleStatusFlag
+
+    start_cluster_us: int
+    """The start in microseconds of the cluster clock: exactly the received
+    value before the drone commits to it; after that, or when set by the RC,
+    the drone's own start mapped back to the cluster clock, which moves with
+    the drift of its crystal. Zero for no start."""
+
+    received_at: float
+    """When the echo arrived, as a UNIX timestamp."""
+
+    TYPE: ClassVar[int] = 0x5E
+    """Identifier of Axio drone-to-GCS DATA* packets."""
+
+    _struct: ClassVar[Struct] = Struct("<HBQ")
+
+    @classmethod
+    def from_mavlink_message(
+        cls, message: MAVLinkMessage, received_at: float
+    ) -> ShowScheduleStatus | None:
+        """Decodes an Axio DATA* packet; ``None`` if it is not a show schedule
+        echo."""
+        data = bytes(message.data[: message.len])
+        if len(data) < 1 + cls._struct.size or data[0] != SHOW_SCHEDULE_TYPE:
+            return None
+        schedule_id, flags, start_cluster_us = cls._struct.unpack_from(data, 1)
+        return cls(
+            schedule_id, ShowScheduleStatusFlag(flags), start_cluster_us, received_at
+        )
+
+    @property
+    def committed(self) -> bool:
+        return ShowScheduleStatusFlag.COMMITTED in self.flags
+
+    @property
+    def clock_valid(self) -> bool:
+        return ShowScheduleStatusFlag.CLOCK_VALID in self.flags
+
+    @property
+    def has_start(self) -> bool:
+        return ShowScheduleStatusFlag.HAS_START in self.flags
