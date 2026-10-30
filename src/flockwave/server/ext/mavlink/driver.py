@@ -31,6 +31,7 @@ from flockwave.server.command_handlers import (
 from flockwave.server.errors import NotSupportedError
 from flockwave.server.ext.rc import RCExtensionAPI
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.ext.show.takeoff import split_start_time
 from flockwave.server.model.battery import BatteryInfo
 from flockwave.server.model.commands import (
     Progress,
@@ -1195,10 +1196,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     sent one.
     """
 
-    _last_skybrush_status_received_at: float = 0.0
-    """When the last firmware-specific status packet arrived, as a UNIX
-    timestamp."""
-
     _preflight_status: PreflightCheckInfo
     """The status of the preflight checks on the drone"""
 
@@ -1636,14 +1633,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
-    def show_status(self) -> tuple[DroneShowStatus, float] | None:
-        """The last drone show status of the UAV and when it was received (UNIX
-        timestamp); ``None`` if none was received yet."""
-        if self._last_skybrush_status_info is None:
-            return None
-        return self._last_skybrush_status_info, self._last_skybrush_status_received_at
-
-    @property
     def scheduled_takeoff_time_msec(self) -> int:
         """Returns the millisecond part (0-999) of the scheduled takeoff time
         of the UAV; zero if the UAV is not scheduled for an automatic takeoff.
@@ -1842,7 +1831,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         data = DroneShowStatus.from_mavlink_message(message)
 
         self._last_skybrush_status_info = data
-        self._last_skybrush_status_received_at = time()
 
         # Process the basic part of the packet that is always present (both with
         # the standard and the compact telemetry profile)
@@ -1924,7 +1912,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             if echo.has_start
             else None
         )
-        self._scheduled_takeoff_time = None if start is None else int(start)
+        if start is None:
+            self._scheduled_takeoff_time = None
+            self._scheduled_takeoff_time_msec = 0
+        else:
+            seconds, msec = split_start_time(start)
+            self._scheduled_takeoff_time = seconds
+            self._scheduled_takeoff_time_msec = msec
 
     def handle_message_heartbeat(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink HEARTBEAT message targeted at this UAV."""

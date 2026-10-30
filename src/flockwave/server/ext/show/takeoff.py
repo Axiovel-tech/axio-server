@@ -331,11 +331,15 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
         """
         ...
 
-    def check_start_agreement(self, config: TakeoffConfiguration) -> None:
+    def check_start_agreement(self, config: TakeoffConfiguration, lead: float) -> None:
         """Called at each of `start_agreement_leads` seconds before a scheduled
         takeoff to warn about UAVs that are not ready to start with the rest
         of the fleet. The default implementation logs the UAVs that would
         still need an individual update.
+
+        Parameters:
+            config: the desired takeoff configuration
+            lead: the element of `start_agreement_leads` that came due
         """
         uav_ids = [
             uav.id
@@ -355,11 +359,12 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
             self._start_agreement_start = takeoff_time
             self._start_agreement_due = sorted(self.start_agreement_leads)
         lead = takeoff_time - time()
-        if any(lead <= due for due in self._start_agreement_due):
+        passed = [due for due in self._start_agreement_due if lead <= due]
+        if passed:
             self._start_agreement_due = [
                 due for due in self._start_agreement_due if lead > due
             ]
-            self.check_start_agreement(config)
+            self.check_start_agreement(config, min(passed))
 
     @property
     def config(self) -> DroneShowConfiguration | None:

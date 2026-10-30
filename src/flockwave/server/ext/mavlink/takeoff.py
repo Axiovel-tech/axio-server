@@ -7,7 +7,6 @@ from time import time
 from typing import TYPE_CHECKING
 
 from blinker import Signal
-from flockwave.spec.errors import FlockwaveErrorCode
 from trio import TASK_STATUS_IGNORED, move_on_after, open_nursery
 
 from flockwave.server.ext.show.takeoff import (
@@ -26,6 +25,7 @@ __all__ = ("ScheduledTakeoffManager",)
 if TYPE_CHECKING:
     from .driver import MAVLinkUAV
     from .network import MAVLinkNetwork
+    from .packets import ShowScheduleStatus
     from .schedule import ShowSchedule
     from .types import MAVLinkMessageSpecification
 
@@ -117,16 +117,33 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             if uav.is_connected and uav.supports_scheduled_takeoff
         )
 
-    def check_start_agreement(self, config: TakeoffConfiguration) -> None:
+    def check_start_agreement(self, config: TakeoffConfiguration, lead: float) -> None:
+        schedule = self._schedule
+        now = time()
         for uav in self.iter_uavs_to_schedule():
-            if _start_differs(uav, config):
-                problem = "its start time or authorization differs from the server's"
-            elif FlockwaveErrorCode.TIMESYNC_ERROR.value in uav.status.errors:
-                problem = "it has no valid show clock"
+            echo = uav.show_schedule_status
+            if echo is None:
+                problem = (
+                    "its start time or authorization differs from the server's"
+                    if _start_differs(uav, config)
+                    else None
+                )
+            elif (
+                config.authorization_scope != uav.scheduled_takeoff_authorization_scope
+            ):
+                problem = "its authorization differs from the server's"
+            elif lead > DRONE_COMMIT_LEAD:
+                problem = _problem_before_commit(echo, schedule, now)
             else:
-                problem = _schedule_problem(uav, config)
-                if problem is None:
-                    continue
+                problem = _problem_after_commit(echo, schedule)
+                if echo.has_start and self._log:
+                    offset = (echo.start_cluster_us - schedule.start_cluster_us) / 1000
+                    self._log.info(
+                        f"Start offset at T-{lead:.0f} s: {offset:+.2f} ms",
+                        extra={"id": uav.id},
+                    )
+            if problem is None:
+                continue
             message = f"Not in sync for the scheduled start: {problem}"
             if self._log:
                 self._log.warning(message, extra={"id": uav.id})
@@ -248,27 +265,49 @@ def _start_differs(uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
     return abs(reported_time - desired) > START_AGREEMENT_TOLERANCE
 
 
-SCHEDULE_TOLERANCE = 1.5
-"""Seconds by which the time to the start on a drone's own clock may differ
-from the server's; the drone reports whole seconds."""
+DRONE_COMMIT_LEAD = 10
+"""Number of seconds before the start when the drones commit to it."""
+
+ECHO_MAX_AGE = 3.0
+"""Seconds after which a drone's show schedule echo is out of date."""
+
+START_TOLERANCE_BEFORE_COMMIT_US = 1000
+"""Microseconds by which a drone's echoed start may differ from the sent one
+before the drones commit: one re-sent start may be on its way."""
+
+START_TOLERANCE_AFTER_COMMIT_US = 5000
+"""Microseconds by which a committed drone's start, which moves with the drift
+of its crystal, may differ from the frozen start."""
 
 
-def _schedule_problem(uav: MAVLinkUAV, config: TakeoffConfiguration) -> str | None:
-    """Checks the start as the drone scheduled it on its own clock, which may
-    differ from the start time it holds (e.g. resolved to the next week, or
-    not scheduled because its show clock was invalid when the start arrived).
-    """
-    takeoff_time = config.takeoff_time
-    if not config.should_update_takeoff_time or takeoff_time is None:
-        return None
-    show_status = uav.show_status
-    if show_status is None:
-        return "it reports no show status"
-    status, received_at = show_status
-    if not status.has_scheduled_start:
-        return "it has not scheduled the start on its own clock"
-    # elapsed_time is floored to whole seconds
-    off = (received_at - takeoff_time) - (status.elapsed_time + 0.5)
-    if abs(off) > SCHEDULE_TOLERANCE:
-        return f"its own clock puts the start {off:+.1f} s from the server's"
+def _problem_before_commit(
+    echo: ShowScheduleStatus, schedule: ShowSchedule, now: float
+) -> str | None:
+    if now - echo.received_at > ECHO_MAX_AGE:
+        return f"its show schedule echo is {now - echo.received_at:.0f} s old"
+    if not echo.clock_valid:
+        return "it has no valid show clock"
+    if echo.schedule_id != schedule.id:
+        return f"it holds schedule {echo.schedule_id}, not {schedule.id}"
+    if not echo.has_start:
+        return "it holds no start"
+    return _start_off(echo, schedule, START_TOLERANCE_BEFORE_COMMIT_US)
+
+
+def _problem_after_commit(
+    echo: ShowScheduleStatus, schedule: ShowSchedule
+) -> str | None:
+    if not echo.committed:
+        return "it has not committed to the start"
+    if echo.schedule_id != schedule.id:
+        return f"it holds schedule {echo.schedule_id}, not {schedule.id}"
+    return _start_off(echo, schedule, START_TOLERANCE_AFTER_COMMIT_US)
+
+
+def _start_off(
+    echo: ShowScheduleStatus, schedule: ShowSchedule, tolerance_us: int
+) -> str | None:
+    off = echo.start_cluster_us - schedule.start_cluster_us
+    if abs(off) > tolerance_us:
+        return f"its start is {off / 1000:+.1f} ms off the server's"
     return None

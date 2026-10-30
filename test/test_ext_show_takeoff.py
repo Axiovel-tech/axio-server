@@ -591,8 +591,10 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
     nursery,
     autojump_clock,
 ):
-    checked: list[TakeoffConfiguration] = []
-    manager.check_start_agreement = checked.append  # type: ignore[method-assign]
+    checked: list[tuple[float | None, float]] = []
+    manager.check_start_agreement = lambda config, lead: checked.append(  # type: ignore[method-assign]
+        (config.takeoff_time, lead)
+    )
 
     await nursery.start(manager.run)
 
@@ -603,7 +605,7 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
     start_time = time() + max(manager.start_agreement_leads) - 1
     manager.notify_start_time_changed(start_time)
     await sleep(2)
-    assert [config.takeoff_time for config in checked] == [start_time]
+    assert checked == [(start_time, 15)]
 
     # Moved by a few milliseconds (timecode re-anchored): the same start
     manager.notify_start_time_changed(start_time + 0.005)
@@ -613,12 +615,12 @@ async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_star
     # Moved by seconds: a new start, checked again
     manager.notify_start_time_changed(start_time - 3)
     await sleep(2)
-    assert [config.takeoff_time for config in checked] == [start_time, start_time - 3]
+    assert checked == [(start_time, 15), (start_time - 3, 15)]
 
     # The same start again after the drones commit, at 5 s
     manager.notify_start_time_changed(start_time - 10)
     await sleep(2)
-    assert len(checked) == 3
+    assert checked[-1] == (start_time - 10, 5)
     manager.notify_start_time_changed(start_time - 10.005)
     await sleep(2)
     assert len(checked) == 3

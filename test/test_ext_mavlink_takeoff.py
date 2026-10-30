@@ -1,7 +1,10 @@
+import logging
+from struct import pack
+from time import time
 from types import SimpleNamespace
 
-from flockwave.spec.errors import FlockwaveErrorCode
-
+from flockwave.server.ext.mavlink.packets import ShowScheduleStatus
+from flockwave.server.ext.mavlink.schedule import ShowSchedule
 from flockwave.server.ext.mavlink.takeoff import MAVLinkScheduledTakeoffManager
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.ext.show.takeoff import TakeoffConfiguration
@@ -12,21 +15,15 @@ CONFIG = TakeoffConfiguration(
 )
 
 
-def make_uav(seconds, msec, *, errors=(), scheduled=True, elapsed=None, **kwds):
-    # Status received 10.2 s before the start; the drone floors its elapsed time
-    received_at = CONFIG.takeoff_time - 10.2
-    status = SimpleNamespace(
-        has_scheduled_start=scheduled,
-        elapsed_time=-11 if elapsed is None else elapsed,
-    )
+def make_uav(seconds, msec, *, echo=None, **kwds):
     return SimpleNamespace(
         id=kwds.get("id", "1"),
-        scheduled_takeoff_authorization_scope=AuthorizationScope.LIVE,
+        scheduled_takeoff_authorization_scope=kwds.get(
+            "scope", AuthorizationScope.LIVE
+        ),
         scheduled_takeoff_time=seconds,
         scheduled_takeoff_time_msec=msec,
-        show_schedule_status=None,
-        status=SimpleNamespace(errors=set(errors)),
-        show_status=(status, received_at),
+        show_schedule_status=echo,
         messages=[],
     )
 
@@ -52,36 +49,93 @@ async def test_update_uav_writes_the_milliseconds_of_the_start():
     assert calls == [(1_760_000_012, 750)]
 
 
-def test_start_agreement_check_warns_about_each_uav_out_of_sync():
-    in_sync = make_uav(1_760_000_012, 750, id="1")
-    stale = make_uav(1_760_000_012, 500, id="2")
-    # The start moved by 5 ms (timecode re-anchored); the next broadcast follows
-    moved = make_uav(1_760_000_012, 745, id="4")
-    no_clock = make_uav(
-        1_760_000_012, 750, id="3", errors=[FlockwaveErrorCode.TIMESYNC_ERROR.value]
+SENT_START_US = 10_000_000_000
+
+
+def make_echo(schedule_id, start_offset_us=0, *, flags=0x01 | 0x04, age=0.5):
+    data = bytes([0x42]) + pack(
+        "<HBQ", schedule_id, flags, SENT_START_US + start_offset_us if flags & 1 else 0
     )
-    # Holds the right start but did not schedule it, or scheduled it a week on
-    unscheduled = make_uav(1_760_000_012, 750, id="5", scheduled=False)
-    next_week = make_uav(1_760_000_012, 750, id="6", elapsed=-32768)
-    uavs = (in_sync, stale, no_clock, moved, unscheduled, next_week)
+    message = SimpleNamespace(len=len(data), data=data)
+    return ShowScheduleStatus.from_mavlink_message(message, time() - age)
+
+
+def check_start_agreement(uavs, lead, schedule_id=5):
+    schedule = ShowSchedule()
+    schedule.id = schedule_id
+    schedule.start_cluster_us = SENT_START_US
     for uav in uavs:
         uav.send_log_message_to_gcs = lambda message, severity, uav=uav: (
             uav.messages.append((message, severity))
         )
 
     manager = MAVLinkScheduledTakeoffManager.__new__(MAVLinkScheduledTakeoffManager)
-    manager._log = None
+    manager._log = logging.getLogger("test_ext_mavlink_takeoff")
+    manager._network = SimpleNamespace(driver=SimpleNamespace(show_schedule=schedule))
     manager.iter_uavs_to_schedule = lambda: iter(uavs)  # type: ignore[method-assign]
+    manager.check_start_agreement(CONFIG, lead)
 
-    manager.check_start_agreement(CONFIG)
 
-    assert in_sync.messages == []
-    assert moved.messages == []
-    assert [severity for _, severity in stale.messages] == [Severity.WARNING]
-    assert "differs" in stale.messages[0][0]
-    assert "show clock" in no_clock.messages[0][0]
-    assert "not scheduled" in unscheduled.messages[0][0]
-    assert "own clock puts the start" in next_week.messages[0][0]
+def test_start_agreement_before_the_drones_commit():
+    uavs = {
+        "in sync": make_uav(None, 0, echo=make_echo(5, 800)),
+        "stale": make_uav(None, 0, echo=make_echo(5, age=4)),
+        "no clock": make_uav(None, 0, echo=make_echo(5, flags=0x01)),
+        "other schedule": make_uav(None, 0, echo=make_echo(4)),
+        "no start": make_uav(None, 0, echo=make_echo(5, flags=0x04)),
+        "start off": make_uav(None, 0, echo=make_echo(5, 1200)),
+        "authorization": make_uav(
+            None, 0, echo=make_echo(5), scope=AuthorizationScope.REHEARSAL
+        ),
+        # Without an echo: the start and the authorization only
+        "legacy": make_uav(1_760_000_012, 750),
+        "legacy off": make_uav(1_760_000_012, 500),
+    }
+    check_start_agreement(list(uavs.values()), 15)
+
+    problems = {
+        name: [message for message, _ in uav.messages] for name, uav in uavs.items()
+    }
+    assert problems["in sync"] == []
+    assert problems["legacy"] == []
+    for name, expected in {
+        "stale": "echo is 4 s old",
+        "no clock": "no valid show clock",
+        "other schedule": "holds schedule 4, not 5",
+        "no start": "holds no start",
+        "start off": "+1.2 ms off",
+        "authorization": "authorization differs",
+        "legacy off": "start time or authorization differs",
+    }.items():
+        [message] = problems[name]
+        assert message.startswith("Not in sync for the scheduled start: ")
+        assert expected in message
+    assert uavs["stale"].messages[0][1] is Severity.WARNING
+
+
+def test_start_agreement_after_the_drones_commit(caplog):
+    caplog.set_level(logging.INFO)
+    committed = 0x01 | 0x02 | 0x04
+    uavs = {
+        "drifting": make_uav(None, 0, echo=make_echo(5, -3000, flags=committed)),
+        "not committed": make_uav(None, 0, echo=make_echo(5)),
+        "other schedule": make_uav(None, 0, echo=make_echo(4, flags=committed)),
+        "start off": make_uav(None, 0, echo=make_echo(5, 6000, flags=committed)),
+    }
+    check_start_agreement(list(uavs.values()), 5)
+
+    assert uavs["drifting"].messages == []
+    assert "not committed" in uavs["not committed"].messages[0][0]
+    assert "holds schedule 4, not 5" in uavs["other schedule"].messages[0][0]
+    assert "+6.0 ms off" in uavs["start off"].messages[0][0]
+
+    offsets = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO
+    ]
+    assert "Start offset at T-5 s: -3.00 ms" in offsets
+    assert len(offsets) == 4
 
 
 async def test_fallback_writes_show_start_msec_with_every_start():

@@ -99,8 +99,6 @@ def test_drone_show_status_unpacks_the_start_time_milliseconds():
     assert status.start_time == 414_531
     assert status.start_time_msec == 750
 
-    assert not status.has_scheduled_start
-
     unset = DroneShowStatus.from_bytes((-1).to_bytes(4, "little", signed=True))
     assert unset.start_time == -1
     assert unset.start_time_msec == 0

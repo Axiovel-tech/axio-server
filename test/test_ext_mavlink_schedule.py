@@ -344,6 +344,7 @@ def test_reported_start_comes_from_the_echo(schedule):
     )
     assert uav.show_schedule_status is not None
     assert uav.scheduled_takeoff_time == int(start)
+    assert uav.scheduled_takeoff_time_msec == 250
 
     # Mode 2 reports no start in the status packet
     status = (-1).to_bytes(4, "little", signed=True).ljust(14, b"\0")
@@ -354,3 +355,4 @@ def test_reported_start_comes_from_the_echo(schedule):
 
     uav.handle_message_show_schedule_status(echo_message(4, 0x04, 0))
     assert uav.scheduled_takeoff_time is None
+    assert uav.scheduled_takeoff_time_msec == 0
