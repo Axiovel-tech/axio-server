@@ -151,22 +151,22 @@ class DroneShowExtension(Extension):
 
         try:
             point_of_no_return_seconds = int(
-                configuration.get("point_of_no_return_seconds", -10)
+                configuration.get("point_of_no_return_seconds", -12)
             )
         except ValueError:
             self.log.warning(
                 "Invalid value for 'point_of_no_return_seconds' in configuration, "
-                "using default value of -10 seconds"
+                "using default value of -12 seconds"
             )
-            point_of_no_return_seconds = -10
+            point_of_no_return_seconds = -12
 
-        if point_of_no_return_seconds > -10:
-            # The drones freeze their start 10 s before it; timecode moving the
-            # start after that would only move the server and the music
+        if point_of_no_return_seconds > -12:
+            # The drones freeze their start 10 s before it; the schedule they
+            # freeze must stop changing early enough to reach all of them
             self.log.warning(
-                "'point_of_no_return_seconds' must be -10 or earlier, using -10"
+                "'point_of_no_return_seconds' must be -12 or earlier, using -12"
             )
-            point_of_no_return_seconds = -10
+            point_of_no_return_seconds = -12
 
         self._clock_sync.point_of_no_return_seconds = point_of_no_return_seconds
 
@@ -271,6 +271,7 @@ class DroneShowExtension(Extension):
         if updated.start_time_on_clock is not None and (
             updated.clock != self._config.clock
             or updated.start_time_on_clock != self._config.start_time_on_clock
+            or updated.start_method != self._config.start_method
         ):
             point_of_no_return = self._clock_sync.point_of_no_return_seconds
             raise RuntimeError(
@@ -521,7 +522,7 @@ schema = {
                 "beyond the point of no return. Typically you want to set this "
                 "to a negative value."
             ),
-            "default": -10,
+            "default": -12,
         },
     }
 }
