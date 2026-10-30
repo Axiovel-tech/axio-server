@@ -85,7 +85,7 @@ EXTENSIONS = {
     },
     "show": {
         "default_start_method": "rc",  # set to "auto" if you typically start shows automatically and not via a remote controller
-        "point_of_no_return_seconds": -10,
+        "point_of_no_return_seconds": -12,
     },
     "show_pro": {},  # used to trigger auto-loading when the license is installed
     "sidekick": {},  # used to trigger auto-loading when the license is installed

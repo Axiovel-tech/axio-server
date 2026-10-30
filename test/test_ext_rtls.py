@@ -2098,19 +2098,7 @@ async def test_lost_device_stats_pruned_from_query(extension, device, builder, h
     assert DEVICE_SYSID not in extension._last_stats_sent
 
 
-# ---- show-clock pin (cluster -> GPS) ----
-
-
-def _add_pin_params(device):
-    """Give the fake device the GPS_PIN_* param slots the firmware defines."""
-    device.params.update(
-        {
-            "GPS_PIN_WEEK": (struct.pack("<H", 0), 4),  # MAV_PARAM_EXT_TYPE_UINT16
-            "GPS_PIN_TOW_MS": (struct.pack("<I", 0), 5),  # UINT32
-            "GPS_PIN_C0_HI": (struct.pack("<I", 0), 5),
-            "GPS_PIN_C0_LO": (struct.pack("<I", 0), 5),
-        }
-    )
+# ---- cluster clock estimate ----
 
 
 CLUSTER_STATS = {
@@ -2125,242 +2113,163 @@ CLUSTER_STATS = {
 }
 
 
-def test_show_clock_pin_pure():
-    """mint_pin pairs cluster seconds with wall UTC; pin_writes follows the
-    week-zero-first contract; the restart prediction tracks wall time."""
-    from rtlslink import TICK_SECONDS
+def _cluster_clock_driver(monkeypatch):
+    """A cluster clock estimate and a function feeding it one cluster-clock
+    report received at a given wall time."""
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
 
-    from flockwave.server.ext.rtls.show_clock import mint_pin, pin_writes
-
-    pin = mint_pin(120.5, now_unix=1_752_000_000.0)
-    assert pin.c0_ticks == round(120.5 / TICK_SECONDS)
-    assert 0 < pin.week < 4096
-    assert 0 <= pin.tow_ms < 604_800_000
-
-    writes = pin_writes(pin)
-    # week zeroed first, written last; C0 split into the two u32 halves
-    assert writes[0] == ("GPS_PIN_WEEK", 0, "uint16")
-    assert writes[-1] == ("GPS_PIN_WEEK", pin.week, "uint16")
-    assert ("GPS_PIN_C0_HI", (pin.c0_ticks >> 32) & 0xFFFFFFFF, "uint32") in writes
-    assert ("GPS_PIN_C0_LO", pin.c0_ticks & 0xFFFFFFFF, "uint32") in writes
-
-    # ten wall seconds later a live cluster should read ~10 s further
-    assert pin.predicted_cluster_seconds(1_752_000_010.0) == pytest.approx(130.5)
-
-
-async def test_show_clock_pin_distributed_on_fresh_stats(extension, device):
-    """A clkok stats snapshot mints the pin and pushes it to the device in
-    the contract order; the device ends up carrying the minted pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-        # nursery exit waits for the spawned push to complete
-    extension._nursery = None
-
-    pin = extension._show_clock.pin
-    assert pin is not None
-    assert DEVICE_SYSID in extension._show_clock._pinned
-
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
-    c0_hi = struct.unpack("<I", device.params["GPS_PIN_C0_HI"][0])[0]
-    c0_lo = struct.unpack("<I", device.params["GPS_PIN_C0_LO"][0])[0]
-    assert week == pin.week
-    assert tow == pin.tow_ms
-    assert (c0_hi << 32) | c0_lo == pin.c0_ticks
-
-
-async def test_show_clock_pin_not_minted_without_clkok(extension, device):
-    """Stale or missing cluster stats must never mint a pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    stale = dict(CLUSTER_STATS, clkok=0.0)
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, stale, now=0.0)
-    extension._nursery = None
-
-    assert extension._show_clock.pin is None
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    assert week == 0
-
-
-async def test_show_clock_repin_on_cluster_restart(extension, device):
-    """A cluster time far off the pin's prediction re-mints the pin and
-    redistributes it (the restart makes every distributed pin invalid)."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    extension._nursery = None
-    first_pin = extension._show_clock.pin
-    assert DEVICE_SYSID in extension._show_clock._pinned
-
-    # the cluster restarts: reported time drops far below the prediction and
-    # stays there, so the second report confirms it
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, dict(CLUSTER_STATS, clks=2.0), now=1.0)
-        assert extension._show_clock.pin is first_pin
-        await _feed_stats(extension, device, dict(CLUSTER_STATS, clks=2.5), now=1.5)
-    extension._nursery = None
-
-    second_pin = extension._show_clock.pin
-    assert second_pin is not first_pin
-    assert DEVICE_SYSID in extension._show_clock._pinned
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
-    assert (week, tow) == (second_pin.week, second_pin.tow_ms)
-
-
-async def test_show_clock_ignores_repeated_accumulated_snapshot(
-    extension, device, monkeypatch
-):
-    """Other NAMED_VALUE_FLOAT fields repeat the cached clkh/clks pair.
-    A parameter transaction can delay the next clock field beyond the restart
-    tolerance; that stale snapshot must not trigger a false re-pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    now = [1_752_000_000.0]
+    now = [0.0]
     monkeypatch.setattr(
-        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
     )
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
+    clock = ClusterClock()
 
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    first_pin = extension._show_clock.pin
-    assert first_pin is not None
+    def report(system_id, cluster_seconds, received_at, clkok=1.0):
+        now[0] = received_at
+        hi = float(int(cluster_seconds // 4096) * 4096)
+        clock.on_stats(
+            system_id, {"clkok": clkok, "clkh": hi, "clks": cluster_seconds - hi}
+        )
 
-    # The pin writes can occupy the management channel for longer than the
-    # five-second restart tolerance. The SDK still emits accumulated snapshots
-    # for non-clock stats, carrying the old clkh/clks pair.
-    now[0] += 6.0
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=6.0)
-    assert extension._show_clock.pin is first_pin
-
-    # A genuinely new sample is still evaluated and agrees with the pin.
-    advanced = dict(CLUSTER_STATS, clks=126.5)
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, advanced, now=6.0)
-    extension._nursery = None
-    assert extension._show_clock.pin is first_pin
+    return clock, report
 
 
-async def test_show_clock_keeps_pin_across_a_torn_clock_pair(
+async def test_cluster_clock_fed_by_fresh_stats_without_device_writes(
     extension, device, monkeypatch
 ):
+    """A clkok stats snapshot feeds the exported estimate; stale cluster time
+    does not, and nothing is written to the device."""
+    writes = []
+
+    async def set_param(*args, **kwds):
+        writes.append(args)
+
+    monkeypatch.setattr(extension, "set_param", set_param)
+    await discover(extension, device)
+    clock = extension.exports()["cluster_clock"]
+
+    await _feed_stats(extension, device, dict(CLUSTER_STATS, clkok=0.0), now=0.0)
+    assert clock.estimate() is None
+
+    before = time.time()
+    await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    after = time.time()
+    assert before - 120.5 <= clock.estimate() <= after - 120.5
+    assert writes == []
+
+
+def test_cluster_clock_follows_least_delayed_report(monkeypatch):
+    """Reports from three tags arrive with a varying latency: the estimate is
+    the least delayed report of the last 20 s, and maps wall time to cluster
+    microseconds and back."""
+    import random
+
+    clock, report = _cluster_clock_driver(monkeypatch)
+    rng = random.Random(3)
+    wall_minus_cluster = 1_752_000_000.0
+
+    for step in range(3 * 75):
+        sampled_at = wall_minus_cluster + 100.0 + step / 3
+        latency = 0.08 if step == 0 else 0.004 + rng.expovariate(1 / 0.04)
+        report(step % 3 + 1, sampled_at - wall_minus_cluster, sampled_at + latency)
+
+    assert 0.004 <= clock.estimate() - wall_minus_cluster < 0.006
+    assert clock.epoch == 0
+
+    wall = wall_minus_cluster + 200.0
+    cluster_us = clock.cluster_us_at(wall)
+    assert cluster_us == pytest.approx(200e6 - 5e3, abs=1e3)
+    assert clock.wall_at(cluster_us) == pytest.approx(wall, abs=1e-6)
+
+
+def test_cluster_clock_restart_starts_a_new_timebase(monkeypatch):
+    """A cluster time far off the estimate's prediction, confirmed by the
+    next distinct sample of the same device, re-seeds the estimate and bumps
+    the epoch."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 100.0, t0)
+    report(1, 101.0, t0 + 1)
+    assert clock.estimate() == pytest.approx(t0 - 100.0)
+
+    report(1, 2.0, t0 + 2)
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 100.0)
+
+    report(1, 2.5, t0 + 2.5)
+    assert clock.epoch == 1
+    assert clock.estimate() == pytest.approx(t0)
+
+
+def test_cluster_clock_restart_clears_every_pending_deviation(monkeypatch):
+    """A deviation recorded against the old timebase must not count as the
+    first of two against the new one."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 100.0, t0)
+    report(2, 3000.0, t0)  # device 2 deviates once against the first timebase
+    report(1, 2000.0, t0 + 0.5)
+    report(1, 2000.5, t0 + 1)  # device 1 confirms a restart
+    assert clock.epoch == 1
+
+    report(2, 3500.0, t0 + 1.5)  # device 2's first deviation against the new one
+    assert clock.epoch == 1
+
+
+def test_cluster_clock_ignores_repeated_accumulated_snapshot(monkeypatch):
+    """Other NAMED_VALUE_FLOAT fields repeat the cached clkh/clks pair; a
+    stale pair arriving long after its sample is not a deviation."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 120.5, t0)
+    report(1, 120.5, t0 + 6.0)
+    report(1, 120.5, t0 + 7.0)
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 120.5)
+
+
+def test_cluster_clock_keeps_its_timebase_across_a_torn_clock_pair(monkeypatch):
     """clkh and clks are separate frames and the snapshot pairs the latest of
     each. A lost clkh frame at a 4096 s boundary pairs the old clkh with the
     new clks until the next report; crossing a boundary, the new clkh pairs
     with the old clks until the clks frame arrives. Neither is a restart."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
 
     t0 = 1_752_000_000.0
     now = [t0]
     monkeypatch.setattr(
-        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
     )
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
+    clock = ClusterClock()
 
-    async def report(at, clkh, clks):
+    def report(at, clkh, clks):
         now[0] = t0 + at
-        values = dict(CLUSTER_STATS, clkh=clkh, clks=clks)
-        if clkh is None:
-            del values["clkh"]
-        await _feed_stats(extension, device, values, now=at)
+        clock.on_stats(1, {"clkok": 1.0, "clkh": clkh, "clks": clks})
 
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await report(0.0, 0.0, 4095.0)
-        first_pin = extension._show_clock.pin
-        assert first_pin is not None
-
-        await report(1.0, None, 0.0)  # clkh frame lost at the boundary
-        await report(1.5, 4096.0, 0.5)
-        await report(4096.5, 4096.0, 4095.5)
-        await report(4097.0, 8192.0, 0.0)  # clkh lands before its clks
-    extension._nursery = None
-    assert extension._show_clock.pin is first_pin
+    report(0.0, 0.0, 4095.0)
+    report(1.0, 0.0, 0.0)  # clkh frame lost at the boundary
+    report(1.5, 4096.0, 0.5)
+    report(4096.5, 4096.0, 4095.5)
+    report(4097.0, 8192.0, 4095.5)  # clkh lands before its clks
+    report(4097.2, 8192.0, 0.2)
+    assert clock.epoch == 0
 
 
-def test_show_clock_remint_clears_every_pending_deviation(monkeypatch):
-    """A deviation recorded against the old pin must not count as the first
-    of two against the new one: after a re-mint, another device's first
-    deviant sample waits for its confirmation like any other."""
-    from types import SimpleNamespace
-
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    now = [1_752_000_000.0]
-    monkeypatch.setattr(
-        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
-    )
-    manager = ShowClockPinManager(SimpleNamespace(log=None))
-    nursery = SimpleNamespace(start_soon=lambda *args: None)
-
-    def sample(system_id, cluster_seconds):
-        manager.on_stats(
-            system_id,
-            {"clkok": 1.0, "clkh": 0.0, "clks": cluster_seconds},
-            nursery,
-        )
-
-    sample(1, 100.0)
-    first_pin = manager.pin
-    sample(2, 3000.0)  # device 2 deviates once against the first pin
-    sample(1, 2000.0)
-    sample(1, 2000.5)  # device 1 confirms a restart: re-mint
-    second_pin = manager.pin
-    assert second_pin is not first_pin
-
-    sample(2, 3500.0)  # device 2's first deviation against the new pin
-    assert manager.pin is second_pin
-
-
-async def test_show_clock_lost_device_repinned_on_return(extension, device):
-    """A lost device is dropped from the pinned set, so its next fresh
-    stats snapshot after rediscovery pushes the pin again (it may have
-    rebooted with default params)."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
+async def test_cluster_clock_forgets_a_lost_device(extension, device):
+    """A lost device's last sample is dropped, so its first report after
+    rediscovery is evaluated even if it repeats the old pair."""
     await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    extension._nursery = None
-    assert DEVICE_SYSID in extension._show_clock._pinned
+    await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    clock = extension._cluster_clock
+    assert DEVICE_SYSID in clock._last_cluster_seconds
 
     events = extension._protocol.expire(time.monotonic() + 1000)
     for event in events:
         extension._handle_lost(event)
-    assert DEVICE_SYSID not in extension._show_clock._pinned
+    assert DEVICE_SYSID not in clock._last_cluster_seconds
 
 
 # ---- passive presence: state advertisements ------------------------------

@@ -2,7 +2,7 @@
 of the show, or the elapsed time into the show if it is already running.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from logging import Logger
 from time import time
@@ -14,6 +14,15 @@ from flockwave.server.model.clock import (
 )
 
 __all__ = ("ShowClock", "ShowEndClock")
+
+#: Adjustments of the primary clock smaller than this, in seconds, are
+#: ignored silently while freewheeling (drift corrections, not jumps).
+REPORTED_ADJUSTMENT = 0.1
+
+#: A start that becomes known through the primary clock (e.g. timecode that
+#: starts rolling) less than this many seconds before it is reported: the
+#: drones refuse a start that reaches them less than ten seconds before it.
+MIN_START_LEAD = 15.0
 
 
 class ShowClock(TimeElapsedSinceReferenceClock):
@@ -57,12 +66,12 @@ class ClockSynchronizationHandler:
 
     The clock synchronization handler has an optional concept called "the point
     of no return". This is a threshold on the number of seconds on the secondary
-    clock. When the secondary clock is _running_ and the primary clock is
-    _adjusted_ after the secondary clock has reached this point in seconds, no
-    adjustments will be done on the secondary clock.
-
-    Stopping the primary clock will still stop the secondary clock beyond the
-    point of no return.
+    clock. Once the running secondary clock has reached it, the secondary clock
+    freewheels on the server clock until the end of the show: the primary
+    clock stopping, losing its signal, jumping or restarting no longer stops or
+    moves it. Synchronizing again to the same primary clock and start keeps it
+    freewheeling; only a different start or clock, or stopping the
+    synchronization, changes it.
     """
 
     _enabled: bool = False
@@ -80,9 +89,26 @@ class ClockSynchronizationHandler:
     seconds on the secondary clock.
     """
 
+    end_of_show_seconds: float | None = None
+    """The number of seconds on the secondary clock when the show ends and the
+    secondary clock stops freewheeling; ``None`` if unknown, in which case it
+    freewheels until it is synchronized to a different start.
+    """
+
     log: Logger | None = None
     """Logger to use for logging messages. If ``None``, no logging will be done
     by the handler.
+    """
+
+    notify: Callable[[str], None] | None = None
+    """Function that forwards a warning to the operator when a change of the
+    primary clock is ignored because the secondary clock is freewheeling.
+    """
+
+    notify_late_start: Callable[[str], None] | None = None
+    """Function that forwards a warning to the operator when the start becomes
+    known through the primary clock less than `MIN_START_LEAD` seconds before
+    it; ``None`` if no one needs the start that early.
     """
 
     point_of_no_return_seconds: float | None = None
@@ -110,6 +136,36 @@ class ClockSynchronizationHandler:
         mechanism when it is disabled.
         """
         return self._enabled
+
+    @property
+    def freewheeling(self) -> bool:
+        """Whether the running secondary clock is between the point of no
+        return and the end of the show, where it ignores the primary clock.
+        """
+        clock = self._secondary_clock
+        if (
+            not self._enabled
+            or self.point_of_no_return_seconds is None
+            or clock is None
+            or not clock.running
+        ):
+            return False
+        seconds = clock.seconds
+        return seconds >= self.point_of_no_return_seconds and (
+            self.end_of_show_seconds is None or seconds < self.end_of_show_seconds
+        )
+
+    def is_freewheeling_on(self, clock_id: str, seconds: float) -> bool:
+        """Whether the secondary clock is freewheeling on a synchronization to
+        the clock with the given ID that puts zero seconds on the secondary
+        clock at the given number of seconds on that clock.
+        """
+        return (
+            self.freewheeling
+            and self._primary_clock is not None
+            and self._primary_clock.id == clock_id
+            and self._primary_seconds_for_zero_secondary_seconds == seconds
+        )
 
     @property
     def primary_clock(self) -> Clock | None:
@@ -163,6 +219,11 @@ class ClockSynchronizationHandler:
             seconds: the number of seconds on the primary clock that should
                 belong to zero seconds in the secondary clock
         """
+        if self.is_freewheeling_on(clock.id, seconds):
+            self._primary_clock = clock
+            self._subscribe_to_or_unsubscribe_from_primary_clock()
+            return
+
         self._enabled = True
         self._primary_clock = clock
         self._primary_seconds_for_zero_secondary_seconds = seconds
@@ -216,30 +277,59 @@ class ClockSynchronizationHandler:
         stopped, adjusted or reassigned.
 
         Updates the secondary clock to reflect the current state of the primary
-        clock, except when the secondary clock is running and has reached the
-        point of no return.
+        clock, except while the secondary clock is freewheeling.
         """
-        can_adjust = True
-        if (
-            self.point_of_no_return_seconds is not None
-            and self._secondary_clock is not None
-            and self._secondary_clock.running
-            and self._primary_clock is not None
-            and self._primary_clock.running
-        ):
-            # If the secondary clock is running, we should not adjust it if it
-            # has reached the point of no return
-            time_on_secondary_clock = self._secondary_clock.seconds
-            if time_on_secondary_clock >= self.point_of_no_return_seconds:
-                if self.log:
-                    self.log.warning(
-                        f"Clock {self._secondary_clock.id!r} clock has reached "
-                        f"the point of no return, skipping adjustment"
-                    )
-                can_adjust = False
-
-        if can_adjust:
+        if self.freewheeling:
+            self._report_ignored_change(kwds.get("delta"))
+        else:
             self._update_secondary_clock()
+
+    def _report_late_start(self, lead: float) -> None:
+        primary, secondary = self._primary_clock, self._secondary_clock
+        if (
+            self.notify_late_start is None
+            or primary is None
+            or secondary is None
+            or lead >= MIN_START_LEAD
+        ):
+            return
+
+        when = f"{lead:.1f} s before" if lead >= 0 else f"{-lead:.1f} s after"
+        message = (
+            f"Clock {primary.id!r} gave the start of clock {secondary.id!r} only "
+            f"{when} it; drones need it at least {MIN_START_LEAD:.0f} s ahead"
+        )
+        if self.log:
+            self.log.warning(message)
+        self.notify_late_start(message)
+
+    def _report_ignored_change(self, delta: float | None) -> None:
+        primary, secondary = self._primary_clock, self._secondary_clock
+        if primary is None or secondary is None:
+            return
+
+        if not primary.running:
+            change = "stopped"
+        elif delta is not None and (
+            abs(delta) / primary.ticks_per_second >= REPORTED_ADJUSTMENT
+        ):
+            change = f"jumped by {delta / primary.ticks_per_second:+.2f} s"
+        else:
+            if self.log:
+                self.log.info(
+                    f"Clock {secondary.id!r} is past the point of no return, "
+                    f"ignoring a change of clock {primary.id!r}"
+                )
+            return
+
+        message = (
+            f"Clock {primary.id!r} {change} after the point of no return; "
+            f"clock {secondary.id!r} keeps running on the server clock"
+        )
+        if self.log:
+            self.log.warning(message)
+        if self.notify:
+            self.notify(message)
 
     def _subscribe_to_or_unsubscribe_from_primary_clock(self):
         target_clock = self._primary_clock if self._enabled else None
@@ -296,4 +386,7 @@ class ClockSynchronizationHandler:
         else:
             reference_time = now - time_on_secondary_clock
 
+        start_was_known = self._secondary_clock.reference_time is not None
         self._secondary_clock.reference_time = reference_time if should_run else None
+        if should_run and reference_time is not None and not start_was_known:
+            self._report_late_start(reference_time - now)

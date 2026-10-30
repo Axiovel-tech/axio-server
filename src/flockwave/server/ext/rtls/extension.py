@@ -51,8 +51,8 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
+from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
-from .show_clock import ShowClockPinManager
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -276,9 +276,9 @@ class RtlsExtension(Extension):
         #: given cell id; lets us re-home a cell onto another live tag when the
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
-        #: cluster->GPS pin lifecycle for the UWB-timebase show clock
-        #: (``None`` when disabled via config ``show_clock_pin: false``)
-        self._show_clock: Optional[ShowClockPinManager] = None
+        #: wall-clock estimate of the UWB cluster clock that the drones count
+        #: the show start in
+        self._cluster_clock = ClusterClock()
         #: latest inter-anchor TWR telemetry per device:
         #: system_id -> {peer_mac: (measured_distance_m, harvest_monotonic_s)}.
         #: Surfaced in X-RTLS-INF (with a derived age); pruned on device loss.
@@ -375,8 +375,7 @@ class RtlsExtension(Extension):
             configuration.get("broadcast", ["255.255.255.255"]), port
         )
         register_beacons = bool(configuration.get("register_beacons", True))
-        if bool(configuration.get("show_clock_pin", True)):
-            self._show_clock = ShowClockPinManager(self)
+        self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         # Lazy import: the proxy resolves once the mavlink extension loads
@@ -1173,10 +1172,7 @@ class RtlsExtension(Extension):
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
         self._stats_at[system_id] = now
-        # the show-clock pin rides the same stats feed: fresh cluster time
-        # (clkok) mints/verifies the pin and unpinned devices get a push
-        if self._show_clock is not None and self._nursery is not None:
-            self._show_clock.on_stats(system_id, data, self._nursery)
+        self._cluster_clock.on_stats(system_id, data)
         # STATS_FIELDS is the SDK's required legacy set; newer stats (``slp``
         # sleep state, ``vbat`` battery voltage, the cluster clock) are optional
         # and must not gate the broadcast, or firmware without them would never
@@ -1344,8 +1340,7 @@ class RtlsExtension(Extension):
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
         # the network (lost + rediscovered) inside its pin window
-        if self._show_clock is not None:
-            self._show_clock.forget_device(event.system_id)
+        self._cluster_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
         self._refresh_anchor_cells()
         self._inf_pending = True
@@ -2263,6 +2258,7 @@ class RtlsExtension(Extension):
 
     def exports(self):
         return {
+            "cluster_clock": self._cluster_clock,
             "devices": self._get_devices,
             "protocol": lambda: self._protocol,
             "get_param": self.get_param,

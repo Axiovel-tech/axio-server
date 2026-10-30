@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
 from math import inf, isfinite
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Sequence
 
 from colour import Color
@@ -93,11 +93,13 @@ from .log_download import MAVLinkLogDownloader
 from .packets import (
     DroneShowExecutionStage,
     DroneShowStatus,
+    ShowScheduleStatus,
     authorization_scope_to_int,
     create_led_control_packet,
     create_rc_override_packet,
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
+from .schedule import ShowSchedule
 from .types import MAVLinkMessage, PacketBroadcasterFn, PacketSenderFn, spec
 from .utils import (
     can_communicate_infer_from_heartbeat,
@@ -180,6 +182,9 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     destination address in that medium.
     """
 
+    show_schedule: ShowSchedule
+    """The show start in cluster time, shared by every MAVLink network."""
+
     use_bulk_parameter_uploads: bool = False
     """Whether to use bulk parameter uploads instead of individual uploads if
     the autopilot supports bulk uploads.
@@ -202,6 +207,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         self.mandatory_custom_mode = None
         self.run_in_background = None  # type: ignore
         self.send_packet = None  # type: ignore
+        self.show_schedule = ShowSchedule()
 
         self._default_timeout = 2
         self._default_retries = 10
@@ -1192,6 +1198,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     _scheduled_takeoff_time: int | None = None
     """Scheduled takeoff time of the drone, as a UNIX timestamp, in seconds"""
 
+    _show_schedule_status: ShowScheduleStatus | None = None
+    """The last show schedule echo of the drone, if its firmware counts the
+    show start in cluster time."""
+
     _scheduled_takeoff_time_gps_time_of_week: int | None = None
     """Scheduled takeoff time of the drone, as a GPS time-of-week timestamp,
     in seconds"""
@@ -1605,6 +1615,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
+    def show_schedule_status(self) -> ShowScheduleStatus | None:
+        """The last show schedule echo of the UAV; ``None`` if its firmware
+        does not count the show start in cluster time."""
+        return self._show_schedule_status
+
+    @property
     def scheduled_takeoff_time_gps_time_of_week(self) -> int | None:
         """Returns the scheduled takeoff time of the UAV as a GPS time of week
         value, or `None` if the UAV is not scheduled for an automatic takeoff.
@@ -1796,7 +1812,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
 
         gps_start_time = data.start_time if data.start_time >= 0 else None
-        if gps_start_time != self._scheduled_takeoff_time_gps_time_of_week:
+        if (
+            self._show_schedule_status is None
+            and gps_start_time != self._scheduled_takeoff_time_gps_time_of_week
+        ):
             self._scheduled_takeoff_time_gps_time_of_week = gps_start_time
             if gps_start_time is None:
                 self._scheduled_takeoff_time = None
@@ -1849,6 +1868,20 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.update_status(**updates)
 
         self.notify_updated()
+
+    def handle_message_show_schedule_status(self, message: MAVLinkMessage) -> None:
+        """Handles an incoming show schedule echo of this UAV. The start that
+        the UAV reports comes from the echo from then on."""
+        echo = ShowScheduleStatus.from_mavlink_message(message, time())
+        if echo is None:
+            return
+        self._show_schedule_status = echo
+        start = (
+            self.driver.show_schedule.wall_at(echo.start_cluster_us)
+            if echo.has_start
+            else None
+        )
+        self._scheduled_takeoff_time = None if start is None else int(start)
 
     def handle_message_heartbeat(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink HEARTBEAT message targeted at this UAV."""

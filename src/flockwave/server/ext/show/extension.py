@@ -11,6 +11,7 @@ from trio_util import periodic
 
 from flockwave.server.ext.base import Extension
 from flockwave.server.model.clock import Clock
+from flockwave.server.model.log import Severity
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
@@ -66,6 +67,7 @@ class DroneShowExtension(Extension):
             "get_configuration": self._get_configuration,
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
             "get_light_configuration": self._get_light_configuration,
+            "is_start_locked": self._is_start_locked,
             "schedule_start": self._schedule_start,
         }
 
@@ -112,6 +114,7 @@ class DroneShowExtension(Extension):
                         "live" if authorized else "none"
                     )
 
+            self._ensure_start_not_moved(config)
             self._config.update_from_json(config)
             return hub.acknowledge(message)
         except Exception as ex:
@@ -129,6 +132,10 @@ class DroneShowExtension(Extension):
         self._end_clock = ShowEndClock()
 
         self._clock_sync.log = logger
+        self._clock_sync.notify = lambda message: app.request_to_send_SYS_MSG_message(
+            message, severity=Severity.WARNING
+        )
+        self._clock_sync.notify_late_start = self._notify_late_start
         self._end_clock_sync.log = logger
 
         handlers = {
@@ -144,14 +151,22 @@ class DroneShowExtension(Extension):
 
         try:
             point_of_no_return_seconds = int(
-                configuration.get("point_of_no_return_seconds", -10)
+                configuration.get("point_of_no_return_seconds", -12)
             )
         except ValueError:
             self.log.warning(
                 "Invalid value for 'point_of_no_return_seconds' in configuration, "
-                "using default value of -10 seconds"
+                "using default value of -12 seconds"
             )
-            point_of_no_return_seconds = -10
+            point_of_no_return_seconds = -12
+
+        if point_of_no_return_seconds > -12:
+            # The drones freeze their start 10 s before it; the schedule they
+            # freeze must stop changing early enough to reach all of them
+            self.log.warning(
+                "'point_of_no_return_seconds' must be -12 or earlier, using -12"
+            )
+            point_of_no_return_seconds = -12
 
         self._clock_sync.point_of_no_return_seconds = point_of_no_return_seconds
 
@@ -159,7 +174,7 @@ class DroneShowExtension(Extension):
             "Default show start method: %s", self._config.start_method.describe()
         )
         self.log.info(
-            "Timecode synchronization suspends at T = %d seconds",
+            "Show clock stops following the timecode from T = %d seconds to the end of the show",
             point_of_no_return_seconds,
         )
 
@@ -212,6 +227,16 @@ class DroneShowExtension(Extension):
                 )
                 await sleep_forever()
 
+    def _notify_late_start(self, message: str) -> None:
+        """Warns the operator about a start that reaches the drones too late,
+        if the server is going to start the show by itself."""
+        if (
+            self.app is not None
+            and self._config.start_method is StartMethod.AUTO
+            and self._config.authorized_to_start
+        ):
+            self.app.request_to_send_SYS_MSG_message(message, severity=Severity.WARNING)
+
     def _get_clock(self) -> ShowClock | None:
         """Returns a reference to the show clock."""
         return self._clock
@@ -223,16 +248,50 @@ class DroneShowExtension(Extension):
         and to connected clients). Switches the start method to AUTO: the
         caller (e.g. the RC start reflector) has turned an external trigger
         into a concrete scheduled start owned by the server."""
-        self._config.update_from_json(
-            {
-                "start": {
-                    "time": start_time,
-                    "clock": None,
-                    "method": "auto",
-                    "authorized": self._config.authorized_to_start,
-                    "authorizationScope": self._config.authorization_scope.value,
-                }
+        config = {
+            "start": {
+                "time": start_time,
+                "clock": None,
+                "method": "auto",
+                "authorized": self._config.authorized_to_start,
+                "authorizationScope": self._config.authorization_scope.value,
             }
+        }
+        self._ensure_start_not_moved(config)
+        self._config.update_from_json(config)
+
+    def _ensure_start_not_moved(self, config: Any) -> None:
+        """Raises an error if the given configuration update moves a locked
+        start. Clearing a locked start (aborting the show) is allowed.
+        """
+        if not self._is_start_locked() or not isinstance(config, dict):
+            return
+        updated = self._config.clone()
+        updated.update_from_json(config)
+        if updated.start_time_on_clock is not None and (
+            updated.clock != self._config.clock
+            or updated.start_time_on_clock != self._config.start_time_on_clock
+            or updated.start_method != self._config.start_method
+        ):
+            point_of_no_return = self._clock_sync.point_of_no_return_seconds
+            raise RuntimeError(
+                f"The start is locked from T{point_of_no_return:.0f} s; only "
+                "abort (clear the start) is possible"
+            )
+
+    def _is_start_locked(self) -> bool:
+        """Returns whether the show start is final: from the point of no
+        return to the end of the show. The drones commit to their start ten
+        seconds before it; only an abort (clearing the start) remains.
+        """
+        clock = self._clock
+        point_of_no_return = self._clock_sync.point_of_no_return_seconds
+        if clock is None or not clock.running or point_of_no_return is None:
+            return False
+        seconds = clock.seconds
+        duration = self._config.duration
+        return seconds >= point_of_no_return and (
+            duration is None or seconds < duration
         )
 
     def _get_configuration(self) -> DroneShowConfiguration:
@@ -321,6 +380,8 @@ class DroneShowExtension(Extension):
         if end_time is not None and duration is not None:
             end_time += duration
 
+        self._clock_sync.end_of_show_seconds = duration or None
+
         if self.app is None:
             self._clock_sync.disable_and_stop()
             self._end_clock_sync.disable_and_stop()
@@ -346,6 +407,13 @@ class DroneShowExtension(Extension):
                     self._end_clock_sync.synchronize_to(primary_clock, end_time)
                 else:
                     self._end_clock_sync.disable_and_stop()
+            elif time is not None and self._clock_sync.is_freewheeling_on(
+                clock_id, time
+            ):
+                self.log.warning(
+                    f"Clock {clock_id!r} is gone; the show clock keeps "
+                    f"freewheeling on the server clock"
+                )
             else:
                 self._clock_sync.disable_and_stop()
                 self._end_clock_sync.disable_and_stop()
@@ -454,7 +522,7 @@ schema = {
                 "beyond the point of no return. Typically you want to set this "
                 "to a negative value."
             ),
-            "default": -10,
+            "default": -12,
         },
     }
 }

@@ -28,16 +28,36 @@ for the rtls-link UWB indoor positioning system:
 
 - **`rtls` extension** — manages rtls-link devices over their MAVLink
   management channel (discovery/presence, parameters, sleep/wake, OTA,
-  health and position telemetry, anchor beacons) and distributes the
-  UWB-timebase show-clock GPS pin. See
+  health and position telemetry, anchor beacons) and estimates the UWB
+  cluster clock that the drones count the show start in. See
   [`src/flockwave/server/ext/rtls/README.md`](src/flockwave/server/ext/rtls/README.md)
   for the full client message API (`X-RTLS-*`) and configuration. The
   extension is *not* in the default extension list; enable it in your
   configuration file.
-- **`ltc_timecode` extension** — an SMPTE timecode clock registered under
-  the id `mtc`, fed by a network LTC stream (one `HH:MM:SS:FF` timecode
-  per UDP datagram, port 5005 by default), so a show can be scheduled on
-  and follow the master timecode of a larger production.
+- **Show start in cluster time** — drones whose firmware counts the show
+  in UWB cluster time (`SHOW_SYNC_MODE` 2) get the start from the `mavlink`
+  extension as an `AXIO_SHOW_SCHEDULE` packet (cluster microseconds under a
+  schedule ID that changes whenever the operator sets, moves or clears the
+  start), broadcast next to `START_CONFIG` every second, every 0.2 s in the
+  last 15 s before the start and at once on a change. They echo it back;
+  a drone whose echo disagrees gets it individually, never as
+  `SHOW_START_TIME` parameters. From the show's point of no return (T−12 s, 2 s before the drones freeze their start)
+  to its end the start is locked: `SHOW-SETCFG` refuses to move it, and
+  clearing it is the abort.
+- **`timecode` extension** — an SMPTE timecode clock registered under the
+  id `mtc`, so a show can be scheduled on and follow the master timecode of
+  a larger production. `source` selects the input: `ltc_audio` decodes LTC
+  from an audio input channel (`device`, `channel`, `fps`), `udp` receives
+  one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default). From
+  the show's point of no return (T−12 s) to its end, the show clock
+  freewheels on the server clock: a timecode dropout or jump is logged and
+  reported to the operator but never stops or moves a running show.
+  `ltc_audio` needs the PortAudio library (`sudo apt install libportaudio2`)
+  and precise ADC timestamps, which PortAudio's ALSA devices provide. On a
+  PipeWire desktop use the `default` (or `pipewire`) device with the LTC
+  interface as the system's default input and `sample_rate` set to the
+  graph rate (48000 by default); PortAudio's PulseAudio devices time
+  blocks only to tens of milliseconds.
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
 reference configuration for indoor shows. The MAVLink ingest convention for

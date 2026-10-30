@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from logging import Logger
+from time import time
 from typing import TYPE_CHECKING
 
 from blinker import Signal
+from trio import TASK_STATUS_IGNORED, move_on_after, open_nursery
 
 from flockwave.server.ext.show.takeoff import (
     ScheduledTakeoffManager,
@@ -22,6 +24,7 @@ __all__ = ("ScheduledTakeoffManager",)
 if TYPE_CHECKING:
     from .driver import MAVLinkUAV
     from .network import MAVLinkNetwork
+    from .schedule import ShowSchedule
     from .types import MAVLinkMessageSpecification
 
 
@@ -56,6 +59,46 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         """
         super().__init__(log=network.log)
         self._network = network
+
+    async def run(self, *, task_status=TASK_STATUS_IGNORED) -> None:
+        async with open_nursery() as nursery:
+            nursery.start_soon(self._broadcast_show_schedule)
+            await super().run(task_status=task_status)
+
+    @property
+    def _schedule(self) -> ShowSchedule:
+        return self._network.driver.show_schedule
+
+    async def _broadcast_show_schedule(self) -> None:
+        """Sends the show schedule next to the start configuration, more often
+        shortly before the start and at once when it changes: broadcast, and to
+        every drone on its own address, because a wireless bridge (such as the
+        positioning tags' bridge to their autopilots) may not forward
+        broadcasts.
+        """
+        schedule = self._schedule
+        while True:
+            changed = schedule.change_event()
+            now = time()
+            schedule.tick()
+            spec = schedule.packet(now)
+            if spec is not None:
+                try:
+                    await self._network.broadcast_packet(
+                        spec, channel=Channel.SHOW_CONTROL
+                    )
+                except Exception:
+                    pass
+                for uav in list(self.iter_uavs_to_schedule()):
+                    try:
+                        await self._network.send_packet(
+                            schedule.packet(now), uav, channel=Channel.SHOW_CONTROL
+                        )
+                    except Exception:
+                        # A drone that misses one gets the next
+                        pass
+            with move_on_after(schedule.period(now)):
+                await changed.wait()
 
     async def broadcast_takeoff_configuration(
         self, config: TakeoffConfiguration
@@ -98,6 +141,12 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
             # Auth scope is different so we definitely need an update
             return True
 
+        echo = uav.show_schedule_status
+        if echo is not None:
+            return self._schedule.packet(time()) is not None and (
+                self._schedule.disagrees_with(echo)
+            )
+
         if config.should_update_takeoff_time:
             # Takeoff time must be cleared (None) or set to a specific
             # value; we need an update if it is different from what
@@ -112,7 +161,12 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         desired_auth_scope = config.authorization_scope
         desired_takeoff_time = config.takeoff_time_in_legacy_format
 
-        if (
+        echo = uav.show_schedule_status
+        if echo is not None:
+            spec = self._schedule.packet(time())
+            if spec is not None and self._schedule.disagrees_with(echo):
+                await self._network.send_packet(spec, uav, channel=Channel.SHOW_CONTROL)
+        elif (
             desired_takeoff_time is None or desired_takeoff_time >= 0
         ) and desired_takeoff_time != uav.scheduled_takeoff_time:
             await uav.set_scheduled_takeoff_time(seconds=desired_takeoff_time)

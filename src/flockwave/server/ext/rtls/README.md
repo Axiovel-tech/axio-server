@@ -19,8 +19,8 @@ clients through the server's message hub:
 - **Telemetry**: the firmware's unsolicited health stats are cached and
   re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
   debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
-  `X-RTLS-INF`. The same stats feed drives the cluster->GPS show-clock
-  pin distribution (see below) and the fleet geometry agreement check
+  `X-RTLS-INF`. The same stats feed drives the cluster clock estimate
+  (see below) and the fleet geometry agreement check
   (`X-RTLS-GEOM`): every tag fits the cell itself at boot and streams
   its fit as stats, so the server never writes anchor tables.
 - **OTA**: MCUmgr/SMP upload → mark pending → reset, via
@@ -68,8 +68,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 - `extension.py` — the Trio/flockwave glue over the SDK: discovery
   loop, the awaitable parameter transactions, OTA jobs and the client
   message handlers documented below.
-- `show_clock.py` — the cluster->GPS show-clock pin manager (see
-  below).
+- `cluster_clock.py` — the wall-clock estimate of the UWB cluster clock
+  (see below).
 - `geometry_agreement.py` — the `X-RTLS-GEOM` fleet geometry agreement
   check: a pure function over the cached geometry stats (see below).
 - `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
@@ -91,8 +91,7 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
     "advertisement_port": 3343,        // state-advertisement listener (0 disables)
     "passive": false,                  // advertisement-driven presence (see below)
     "hello_interval": 60,              // active probe cadence in passive mode, s
-    "register_beacons": true,          // anchors as map beacons (see X-RTLS-INF)
-    "show_clock_pin": true             // cluster->GPS show-clock pin (see below)
+    "register_beacons": true           // anchors as map beacons (see X-RTLS-INF)
   }
 }
 ```
@@ -167,37 +166,31 @@ the listener and otherwise works exactly as before — `passive: true`
 then degrades to just the slow hello + 30 s timeout, which is only
 safe with self-heartbeating boards (see above).
 
-## Show-clock GPS pin (UWB-timebase show start)
+## Cluster clock (UWB-timebase show start)
 
 Tags recover a shared absolute cluster time from the UWB anchor cluster
 and report it in their health stats (`clkh`/`clks` cluster seconds, with
-a `clkok` freshness flag). On the first fresh sample the extension mints
-a *pin* — "at cluster tick C0 the GPS time is (week, tow)" — by pairing
-the reported cluster time with the server's own wall clock, and
-distributes the **identical** pin to every tag as the `GPS_PIN_WEEK` /
-`GPS_PIN_TOW_MS` / `GPS_PIN_C0_HI` / `GPS_PIN_C0_LO` parameters. Each
-tag then synthesizes the same GPS time from its own cluster clock and
-feeds it to its autopilot as GPS_INPUT, so ArduPilot's native
-GPS-synchronized show scheduler self-triggers in lockstep across the
-fleet with no go-time packet. Inter-drone agreement rides entirely on
-the shared cluster clock; the pin's absolute accuracy (server clock +
-stats latency, tens of ms) only offsets the show against wall clock,
-equally for every drone.
+a `clkok` freshness flag); each tag streams it to its flight controller as
+the show clock, in cluster microseconds. The drones count the show start
+in this cluster time, so inter-drone agreement rides entirely on the
+shared cluster clock. The extension is the only place that relates
+cluster time to wall time. It exports the estimate as `cluster_clock`
+(`estimate()`, `cluster_us_at(wall)`, `wall_at(cluster_us)`, `epoch`),
+which the `mavlink` extension uses to send the show start to the drones
+in cluster time and to read back the starts they hold. Nothing is written
+to the tags.
 
-- Writes follow the firmware's ordering contract: `GPS_PIN_WEEK` is
-  zeroed first and written with the real week **last**, so a
-  half-applied pin reads as disabled on the tag instead of mixing old
-  and new C0 halves.
-- Pushes ride the stats feed, so they retry until every write is
-  acknowledged; a device that is lost and rediscovered is re-pinned (it
-  may have rebooted with default parameters).
-- A cluster restart (a tag's reported cluster time deviating from the
-  pin's prediction by more than 5 s — e.g. the time-reference anchor
-  power-cycled) invalidates every distributed pin: the extension logs a
-  warning, mints a fresh pin and redistributes it to the whole fleet.
-
-Set `show_clock_pin: false` in the configuration to disable pin
-management entirely.
+- Every report arrives some latency after the tag sampled its cluster
+  time, so the estimate of wall minus cluster time is the smallest one
+  over the last 20 s across all tags (the least delayed report). Its
+  absolute accuracy only offsets the show against the server's wall clock
+  (and the music it plays), equally for every drone.
+- A cluster restart (a tag's cluster time deviating from the estimate's
+  prediction by more than 5 s in two consecutive distinct reports — e.g.
+  the time-reference anchor power-cycled) starts a new timebase: the
+  estimate is re-seeded, `epoch` is incremented and a warning is logged.
+  A single deviating report is a torn `clkh`/`clks` pair (the two arrive
+  in separate frames) and is ignored.
 
 ## Client message API
 
