@@ -55,7 +55,7 @@ downmix, LTC mixed into the music).
   and lights-only), start time set. With the RC start method it logs that
   the music needs the AUTO start and stays idle.
 - Before the show extension's point of no return (`point_of_no_return_seconds`,
-  T−10 s by default) it follows reschedules and cancellations. After it the
+  T−12 s by default) it follows reschedules and cancellations. After it the
   playback is committed, as the start is: the show extension refuses to move
   it. Only an abort (the start cleared or the authorization revoked before
   T0), `X-SHOW-AUDIO-STOP` or a server shutdown stops it, and track uploads,
