@@ -31,6 +31,7 @@ from flockwave.server.command_handlers import (
 from flockwave.server.errors import NotSupportedError
 from flockwave.server.ext.rc import RCExtensionAPI
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.ext.show.takeoff import split_start_time
 from flockwave.server.model.battery import BatteryInfo
 from flockwave.server.model.commands import (
     Progress,
@@ -134,6 +135,20 @@ def transport_options_to_channel(options: TransportOptions | None) -> str:
         return Channel.SECONDARY
     else:
         return Channel.PRIMARY
+
+
+SECONDS_IN_HALF_WEEK = 302_400
+
+
+def nearest_week(timestamp: float, now: float) -> float:
+    """Moves a timestamp resolved in the current GPS week by a week if that
+    puts it nearer to ``now``: a start across the week boundary is in the
+    previous or the next week."""
+    if timestamp - now > SECONDS_IN_HALF_WEEK:
+        return timestamp - 2 * SECONDS_IN_HALF_WEEK
+    if now - timestamp > SECONDS_IN_HALF_WEEK:
+        return timestamp + 2 * SECONDS_IN_HALF_WEEK
+    return timestamp
 
 
 class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
@@ -1206,6 +1221,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     """Scheduled takeoff time of the drone, as a GPS time-of-week timestamp,
     in seconds"""
 
+    _scheduled_takeoff_time_msec: int = 0
+    """Millisecond part of the scheduled takeoff time of the drone"""
+
     _velocity: VelocityNED
     """Current velocity of the drone in NED coordinate system, m/sec"""
 
@@ -1615,6 +1633,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
+    def scheduled_takeoff_time_msec(self) -> int:
+        """Returns the millisecond part (0-999) of the scheduled takeoff time
+        of the UAV; zero if the UAV is not scheduled for an automatic takeoff.
+        """
+        return self._scheduled_takeoff_time_msec
+
+    @property
     def show_schedule_status(self) -> ShowScheduleStatus | None:
         """The last show schedule echo of the UAV; ``None`` if its firmware
         does not count the show start in cluster time."""
@@ -1812,6 +1837,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
 
         gps_start_time = data.start_time if data.start_time >= 0 else None
+        if self._show_schedule_status is None:
+            self._scheduled_takeoff_time_msec = (
+                data.start_time_msec if gps_start_time is not None else 0
+            )
         if (
             self._show_schedule_status is None
             and gps_start_time != self._scheduled_takeoff_time_gps_time_of_week
@@ -1821,7 +1850,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 self._scheduled_takeoff_time = None
             else:
                 self._scheduled_takeoff_time = int(
-                    gps_time_of_week_to_utc(gps_start_time).timestamp()
+                    nearest_week(
+                        gps_time_of_week_to_utc(gps_start_time).timestamp(), time()
+                    )
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope
@@ -1881,7 +1912,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             if echo.has_start
             else None
         )
-        self._scheduled_takeoff_time = None if start is None else int(start)
+        if start is None:
+            self._scheduled_takeoff_time = None
+            self._scheduled_takeoff_time_msec = 0
+        else:
+            seconds, msec = split_start_time(start)
+            self._scheduled_takeoff_time = seconds
+            self._scheduled_takeoff_time_msec = msec
 
     def handle_message_heartbeat(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink HEARTBEAT message targeted at this UAV."""
@@ -2298,9 +2335,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         await self.set_parameter("SHOW_START_AUTH", authorization_scope_to_int(scope))
 
-    async def set_scheduled_takeoff_time(self, seconds: int | None) -> None:
+    async def set_scheduled_takeoff_time(
+        self, seconds: int | None, msec: int = 0
+    ) -> None:
         """Sets the scheduled takeoff time of the UAV to the given timestamp in
-        seconds. Only integer seconds are supported. Setting the takeoff time
+        whole seconds plus a millisecond part (0-999). Setting the takeoff time
         to `None` or a negative number will clear the takeoff time.
         """
         # The UAV needs GPS time of week so we convert it first. Note that we
@@ -2314,6 +2353,16 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             dt = datetime.fromtimestamp(int(seconds), tz=timezone.utc)
             _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
 
+        # The firmware reads SHOW_START_MSEC with SHOW_START_TIME, so it is
+        # written with every start: a value left over from an earlier start
+        # would move this one. Firmware without it still gets whole seconds.
+        if gps_time_of_week >= 0:
+            try:
+                await self.set_parameter("SHOW_START_MSEC", msec)
+            except Exception as ex:
+                self.driver.log.warning(
+                    f"Could not set SHOW_START_MSEC: {ex}", extra={"id": self.id}
+                )
         await self.set_parameter("SHOW_START_TIME", gps_time_of_week)
 
     async def set_led_color(

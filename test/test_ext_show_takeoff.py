@@ -12,6 +12,7 @@ from flockwave.server.ext.show.takeoff import (
     ScheduledTakeoffManager,
     SimpleScheduledTakeoffManager,
     TakeoffConfiguration,
+    split_start_time,
 )
 from flockwave.server.model.uav import UAVBase
 
@@ -567,3 +568,59 @@ async def test_simple_scheduled_takeoff_manager(
     await sleep(1.6)
     assert counter == 6
     assert last_config is not None
+
+
+def test_takeoff_configuration_keeps_the_sub_second_start_time(
+    config: DroneShowConfiguration,
+):
+    takeoff = TakeoffConfiguration.from_show_config(config, 1_760_000_012.75)
+
+    assert takeoff.takeoff_time == 1_760_000_012.75
+    assert takeoff.takeoff_time_in_whole_seconds == 1_760_000_012
+    assert takeoff.takeoff_time_in_legacy_format == 1_760_000_012
+
+
+def test_split_start_time():
+    assert split_start_time(1_760_000_012.0) == (1_760_000_012, 0)
+    assert split_start_time(1_760_000_012.123) == (1_760_000_012, 123)
+    assert split_start_time(1_760_000_012.9996) == (1_760_000_013, 0)
+
+
+async def test_scheduled_takeoff_manager_checks_start_agreement_once_before_start(
+    manager: MockScheduledTakeoffManager,
+    nursery,
+    autojump_clock,
+):
+    checked: list[tuple[float | None, float]] = []
+    manager.check_start_agreement = lambda config, lead: checked.append(  # type: ignore[method-assign]
+        (config.takeoff_time, lead)
+    )
+
+    await nursery.start(manager.run)
+
+    manager.notify_start_time_changed(time() + 600)
+    await sleep(3)
+    assert checked == []
+
+    start_time = time() + max(manager.start_agreement_leads) - 1
+    manager.notify_start_time_changed(start_time)
+    await sleep(2)
+    assert checked == [(start_time, 15)]
+
+    # Moved by a few milliseconds (timecode re-anchored): the same start
+    manager.notify_start_time_changed(start_time + 0.005)
+    await sleep(2)
+    assert len(checked) == 1
+
+    # Moved by seconds: a new start, checked again
+    manager.notify_start_time_changed(start_time - 3)
+    await sleep(2)
+    assert checked == [(start_time, 15), (start_time - 3, 15)]
+
+    # The same start again after the drones commit, at 5 s
+    manager.notify_start_time_changed(start_time - 10)
+    await sleep(2)
+    assert checked[-1] == (start_time - 10, 5)
+    manager.notify_start_time_changed(start_time - 10.005)
+    await sleep(2)
+    assert len(checked) == 3
