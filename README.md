@@ -41,7 +41,7 @@ for the rtls-link UWB indoor positioning system:
   start), broadcast next to `START_CONFIG` every second, every 0.2 s in the
   last 15 s before the start and at once on a change. They echo it back;
   a drone whose echo disagrees gets it individually, never as
-  `SHOW_START_TIME` parameters. From the show's point of no return (T−10 s)
+  `SHOW_START_TIME` parameters. From the show's point of no return (T−12 s, 2 s before the drones freeze their start)
   to its end the start is locked: `SHOW-SETCFG` refuses to move it, and
   clearing it is the abort.
 - **`timecode` extension** — an SMPTE timecode clock registered under the
@@ -49,7 +49,7 @@ for the rtls-link UWB indoor positioning system:
   a larger production. `source` selects the input: `ltc_audio` decodes LTC
   from an audio input channel (`device`, `channel`, `fps`), `udp` receives
   one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default). From
-  the show's point of no return (T−10 s) to its end, the show clock
+  the show's point of no return (T−12 s) to its end, the show clock
   freewheels on the server clock: a timecode dropout or jump is logged and
   reported to the operator but never stops or moves a running show.
   `ltc_audio` needs the PortAudio library (`sudo apt install libportaudio2`)

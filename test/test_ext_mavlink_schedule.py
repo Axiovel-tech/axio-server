@@ -324,6 +324,29 @@ async def test_schedule_broadcast_pace(schedule, monkeypatch, autojump_clock, nu
     assert times[15:] == [round(25.7 + 0.2 * step, 1) for step in range(72)]
 
 
+async def test_a_change_during_a_slow_broadcast_goes_out_at_once(
+    schedule, monkeypatch, autojump_clock, nursery
+):
+    monkeypatch.setattr(takeoff, "time", lambda: EPOCH + trio.current_time())
+    manager, sent = make_manager(schedule)
+    network = manager._network
+
+    async def slow_broadcast(spec, channel=None):
+        await trio.sleep(0.05)
+        sent.append(("broadcast", trio.current_time(), spec, channel))
+
+    network.broadcast_packet = slow_broadcast
+    schedule.update(auto(EPOCH + 30))
+    nursery.start_soon(manager._broadcast_show_schedule)
+    await trio.sleep(0.02)
+
+    # The abort arrives while the first broadcast is still being sent
+    schedule.update(auto(None))
+    await trio.sleep(0.2)
+    aborted = schedule.packet(EPOCH + trio.current_time())
+    assert [round(at, 2) for _, at, spec, _ in sent if spec == aborted] == [0.1]
+
+
 @fixture
 def autojump_clock():
     return trio.testing.MockClock(autojump_threshold=0)

@@ -146,9 +146,10 @@ class ShowSchedule:
         clock = self.cluster_clock()
         return clock.wall_at(cluster_us) if clock is not None else None
 
-    async def wait_for_change(self) -> None:
-        """Waits until the schedule ID changes."""
-        await self._changed.wait()
+    def change_event(self) -> Event:
+        """The event that is set when the schedule ID changes next. Take it
+        before sending, so that a change during the send is not missed."""
+        return self._changed
 
     def _derive(self) -> int | None:
         clock = self.cluster_clock()

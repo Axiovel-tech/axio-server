@@ -49,6 +49,11 @@ def test_start_moves_are_refused_from_the_point_of_no_return_to_the_end():
     assert setcfg(extension, {"time": start_time, "authorized": True}) == (True, None)
     assert extension._config.authorized_to_start
 
+    # Switching to the RC start would stop the music but not the drones
+    outcome, _ = setcfg(extension, {"time": start_time, "method": "rc"})
+    assert not outcome
+    assert extension._config.start_method.value == "auto"
+
     # The abort
     assert setcfg(extension, {"time": None}) == (True, None)
     assert extension._config.start_time_on_clock is None

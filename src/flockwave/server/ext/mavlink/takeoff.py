@@ -77,6 +77,7 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         """
         schedule = self._schedule
         while True:
+            changed = schedule.change_event()
             now = time()
             schedule.tick()
             spec = schedule.packet(now)
@@ -89,7 +90,7 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
                     # The drones that missed it get it individually
                     pass
             with move_on_after(schedule.period(now)):
-                await schedule.wait_for_change()
+                await changed.wait()
 
     async def broadcast_takeoff_configuration(
         self, config: TakeoffConfiguration
