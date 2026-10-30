@@ -28,12 +28,22 @@ for the rtls-link UWB indoor positioning system:
 
 - **`rtls` extension** — manages rtls-link devices over their MAVLink
   management channel (discovery/presence, parameters, sleep/wake, OTA,
-  health and position telemetry, anchor beacons) and distributes the
-  UWB-timebase show-clock GPS pin. See
+  health and position telemetry, anchor beacons) and estimates the UWB
+  cluster clock that the drones count the show start in. See
   [`src/flockwave/server/ext/rtls/README.md`](src/flockwave/server/ext/rtls/README.md)
   for the full client message API (`X-RTLS-*`) and configuration. The
   extension is *not* in the default extension list; enable it in your
   configuration file.
+- **Show start in cluster time** — drones whose firmware counts the show
+  in UWB cluster time (`SHOW_SYNC_MODE` 2) get the start from the `mavlink`
+  extension as an `AXIO_SHOW_SCHEDULE` packet (cluster microseconds under a
+  schedule ID that changes whenever the operator sets, moves or clears the
+  start), broadcast next to `START_CONFIG` every second, every 0.2 s in the
+  last 15 s before the start and at once on a change. They echo it back;
+  a drone whose echo disagrees gets it individually, never as
+  `SHOW_START_TIME` parameters. From the show's point of no return (T−10 s)
+  to its end the start is locked: `SHOW-SETCFG` refuses to move it, and
+  clearing it is the abort.
 - **`timecode` extension** — an SMPTE timecode clock registered under the
   id `mtc`, so a show can be scheduled on and follow the master timecode of
   a larger production. `source` selects the input: `ltc_audio` decodes LTC
