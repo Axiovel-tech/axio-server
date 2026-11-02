@@ -43,13 +43,12 @@ class FakeFTP:
         del self.files[path]
 
 
-async def test_write_removes_slot_and_legacy_file_then_puts_slot():
+async def test_write_overwrites_slot_and_removes_legacy_file():
     ftp = FakeFTP({SHOW_SLOT_PATH: b"old show", LEGACY_SHOW_PATH: b"older show"})
     await write_show_slot(ftp, FLAT)
 
     assert ftp.files == {SHOW_SLOT_PATH: FLAT}
     assert ftp.calls == [
-        ("rm", SHOW_SLOT_PATH),
         ("rm", LEGACY_SHOW_PATH),
         ("mkdir", "/axio"),
         ("put", SHOW_SLOT_PATH),
@@ -62,17 +61,16 @@ async def test_write_without_previous_show():
     assert ftp.files == {SHOW_SLOT_PATH: FLAT}
 
 
-async def test_write_propagates_unexpected_rm_errors_before_writing():
+async def test_write_goes_on_when_the_legacy_file_cannot_be_removed():
     class ProtectedFTP(FakeFTP):
         async def rm(self, path):
             self.calls.append(("rm", path))
             raise OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_PROTECTED)
 
-    ftp = ProtectedFTP({SHOW_SLOT_PATH: b"old show"})
-    with raises(OperationNotAcknowledgedError):
-        await write_show_slot(ftp, FLAT)
+    ftp = ProtectedFTP({LEGACY_SHOW_PATH: b"older show"})
+    await write_show_slot(ftp, FLAT)
 
-    assert ftp.calls == [("rm", SHOW_SLOT_PATH)]
+    assert ftp.files == {LEGACY_SHOW_PATH: b"older show", SHOW_SLOT_PATH: FLAT}
 
 
 async def test_write_propagates_crc_failure_of_put():

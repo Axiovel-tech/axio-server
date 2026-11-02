@@ -82,6 +82,7 @@ from .enums import (
     MAVFrame,
     MAVMessageType,
     MAVModeFlag,
+    MAVParamError,
     MAVProtocolCapability,
     MAVResult,
     MAVState,
@@ -93,6 +94,7 @@ from .enums import (
     RebootShutdownConditions,
     SkybrushUserCommand,
 )
+from .errors import MAVLinkExtensionError, ParameterNotFoundError
 from .ftp import MAVFTP
 from .log_download import MAVLinkLogDownloader
 from .packets import (
@@ -1460,9 +1462,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def get_parameter(self, name: str, fetch: bool = False) -> float:
         """Returns the value of a parameter from the UAV.
 
-        Due to the nature of the MAVLink protocol, we will not be able to
-        detect if a parameter does not exist as there will be no reply from
-        the drone -- which is indistinguishable from a lost packet.
+        Raises:
+            ParameterNotFoundError: if the drone replied with PARAM_ERROR that
+                the parameter does not exist. Firmware that predates PARAM_ERROR
+                does not reply at all, which looks like a lost packet.
+            TooSlowError: if the drone did not reply in time
         """
         response = await self._get_parameter(name)
         return self._autopilot.decode_param_from_wire_representation(
@@ -1475,12 +1479,23 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         the parameter.
         """
         param_id = name.encode("utf-8")[:16]
-        return await self.driver.send_packet_with_retries(
+        key, response = await self.driver.send_packet_with_retries(
             spec.param_request_read(param_id=param_id, param_index=-1),
             target=self,
-            wait_for_response=spec.param_value(param_id=param_id),
+            wait_for_one_of={
+                "value": spec.param_value(param_id=param_id),
+                "error": spec.param_error(param_id=param_id),
+            },
             timeout=0.7,
         )
+        if key == "error":
+            if response.error == MAVParamError.DOES_NOT_EXIST:
+                raise ParameterNotFoundError(name)
+            raise MAVLinkExtensionError(
+                f"Reading parameter {name} failed with PARAM_ERROR code "
+                f"{response.error}"
+            )
+        return response
 
     async def get_version_info(self) -> VersionInfo:
         """Returns a dictionary mapping component names of this UAV to the
@@ -2754,12 +2769,14 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     async def _read_show_slot_version(self) -> float | None:
         """Reads `SHOW_SLOT_VER` from the drone.
 
-        MAVLink has no "unknown parameter" reply: ArduPilot ignores a request
-        for a parameter it does not have, which looks exactly like a lost
-        packet. When `SHOW_SLOT_VER` gets no reply, `SHOW_ORIENTATION` is read
-        instead, which every drone show firmware has (the `.skyb` upload has
-        always configured it). If that answers, the link works and the
-        firmware really lacks the slot; if not, it is the link.
+        Firmware with the show slot answers a missing parameter with
+        PARAM_ERROR. Older firmware ignores a request for a parameter it does
+        not have, which looks exactly like a lost packet, and ArduPilot also
+        drops parameter requests while its request queue is full. So when
+        `SHOW_SLOT_VER` gets no reply, `SHOW_ORIENTATION` is read instead,
+        which every drone show firmware has (the `.skyb` upload has always
+        configured it), and then `SHOW_SLOT_VER` once more: only if the drone
+        answers the first and still not the second does it lack the slot.
         (`SYSID_THISMAV` would not do: ArduPilot 4.7 renamed it.)
 
         Returns:
@@ -2770,14 +2787,22 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         try:
             return await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
+        except ParameterNotFoundError:
+            return None
         except TooSlowError:
-            try:
-                await self.get_parameter("SHOW_ORIENTATION")
-            except TooSlowError:
-                raise RuntimeError(
-                    f"No reply from the drone when reading "
-                    f"{SHOW_SLOT_VERSION_PARAMETER}; check the link and try again."
-                ) from None
+            pass
+
+        try:
+            await self.get_parameter("SHOW_ORIENTATION")
+        except TooSlowError:
+            raise RuntimeError(
+                f"No reply from the drone when reading "
+                f"{SHOW_SLOT_VERSION_PARAMETER}; check the link and try again."
+            ) from None
+
+        try:
+            return await self.get_parameter(SHOW_SLOT_VERSION_PARAMETER)
+        except (ParameterNotFoundError, TooSlowError):
             return None
 
     async def _check_show_slot_support(self) -> None:

@@ -1,7 +1,8 @@
 """Tests that every show upload, `.skyc` and `.gdm` alike, writes the drone's
 single show slot `/axio/show.bin` with the flow of AxioStack#89 decision 1:
-refuse if armed, check SHOW_SLOT_VER, remove the slot and the legacy file,
-put the slot, then configure and reload. Nothing is written if a check fails.
+refuse if armed, check SHOW_SLOT_VER, remove the legacy file, put the slot
+(which truncates it), then configure and reload. Nothing is written if a check
+fails.
 """
 
 import json
@@ -15,7 +16,8 @@ from trio import TooSlowError
 
 from flockwave.server.ext.mavlink import driver as driver_module
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVModeFlag
+from flockwave.server.ext.mavlink.enums import MAVModeFlag, MAVParamError
+from flockwave.server.ext.mavlink.errors import ParameterNotFoundError
 from flockwave.server.ext.mavlink.ftp import (
     MAVFTPErrorCode,
     OperationNotAcknowledgedError,
@@ -55,12 +57,16 @@ class RecordingFTP:
     def __init__(self, calls: list[tuple]):
         self.calls = calls
         self.files: dict[str, bytes] = {}
+        #: NAK that every rm and mkdir gets instead of its own reply
+        self.nak: OperationNotAcknowledgedError | None = None
 
     async def aclose(self):
         pass
 
     async def mkdir(self, path, parents=False, exist_ok=False):
         self.calls.append(("mkdir", path))
+        if self.nak:
+            raise self.nak
 
     async def put(self, data, remote_path, *, parents=False, skip_crc_check=False):
         self.calls.append(("put", remote_path))
@@ -68,33 +74,40 @@ class RecordingFTP:
 
     async def rm(self, path):
         self.calls.append(("rm", path))
+        if self.nak:
+            raise self.nak
         if path not in self.files:
             raise OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_NOT_FOUND)
         del self.files[path]
 
 
 SLOT_WRITE = [
-    ("rm", SHOW_SLOT_PATH),
     ("rm", LEGACY_SHOW_PATH),
     ("mkdir", "/axio"),
     ("put", SHOW_SLOT_PATH),
 ]
 
 
+MISSING = "missing"
+"""A parameter the drone answers with PARAM_ERROR DOES_NOT_EXIST."""
+
+
 class FakeDrone:
     """What the tested UAV reads from its drone: the latest heartbeat and
     parameters. A parameter mapped to `None` gets no reply, like a parameter
-    the firmware does not have or a lost packet.
+    that firmware without PARAM_ERROR does not have, or a lost packet.
     """
 
     def __init__(self, calls: list[tuple]):
         self.calls = calls
         self.armed = False
         self.heartbeat = True
-        self.parameters: dict[str, float | None] = {
+        self.parameters: dict[str, float | str | None] = {
             "SHOW_SLOT_VER": 1.0,
             "SHOW_ORIENTATION": 1.0,
         }
+        #: Number of upcoming reads of each parameter that get no reply
+        self.lost: dict[str, int] = {}
 
     def get_last_message(self, type):
         if not self.heartbeat:
@@ -104,9 +117,14 @@ class FakeDrone:
 
     async def get_parameter(self, name, fetch=False):
         self.calls.append(("param", name))
+        if self.lost.get(name):
+            self.lost[name] -= 1
+            raise TooSlowError()
         value = self.parameters.get(name)
         if value is None:
             raise TooSlowError()
+        if value == MISSING:
+            raise ParameterNotFoundError(name)
         return value
 
 
@@ -212,8 +230,62 @@ async def test_firmware_without_show_slot_is_refused_for_good(uav, calls, drone,
         await upload(uav, kind)
 
     assert info.value.code == "E_SHOW_SLOT_UNSUPPORTED"
-    # SHOW_ORIENTATION answered, so the link works and the parameter is missing
-    assert calls == [("param", "SHOW_SLOT_VER"), ("param", "SHOW_ORIENTATION")]
+    # SHOW_ORIENTATION answered, so the link works, and SHOW_SLOT_VER still
+    # did not: the parameter is missing
+    assert calls == [
+        ("param", "SHOW_SLOT_VER"),
+        ("param", "SHOW_ORIENTATION"),
+        ("param", "SHOW_SLOT_VER"),
+    ]
+
+
+async def test_param_error_for_the_show_slot_is_refused_at_once(uav, calls, drone):
+    drone.parameters["SHOW_SLOT_VER"] = MISSING
+
+    with raises(ShowUploadRefusedError, match="firmware is too old"):
+        await upload(uav, "gdm")
+
+    assert calls == [("param", "SHOW_SLOT_VER")]
+
+
+async def test_a_lost_show_slot_reply_does_not_refuse_the_upload(uav, calls, drone):
+    """Bench 2026-11-02, drone 1: one SHOW_SLOT_VER read went unanswered
+    while SHOW_ORIENTATION was answered."""
+    drone.lost["SHOW_SLOT_VER"] = 1
+
+    await upload(uav, "gdm")
+
+    assert calls[:3] == [
+        ("param", "SHOW_SLOT_VER"),
+        ("param", "SHOW_ORIENTATION"),
+        ("param", "SHOW_SLOT_VER"),
+    ]
+    assert calls[3:] == [*SLOT_WRITE, ("configure+reload",)]
+    assert INCOMPATIBLE not in uav.status.errors
+
+
+@mark.parametrize("errno", [0, 34])
+async def test_upload_survives_naks_whose_errno_was_overwritten(uav, ftp, errno):
+    """Bench 2026-11-02, drone 8: REMOVE_FILE of a missing file came back as
+    FAIL_ERRNO with errno 34, then 0, instead of FILE_NOT_FOUND; CREATE_DIRECTORY
+    of an existing directory uses the same translation."""
+    ftp.nak = OperationNotAcknowledgedError(MAVFTPErrorCode.FAIL_ERRNO, errno)
+
+    await upload(uav, "gdm")
+
+    assert ftp.files == {SHOW_SLOT_PATH: FLAT}
+
+
+async def test_a_failing_slot_write_still_fails_the_upload(uav, ftp, monkeypatch):
+    ftp.nak = OperationNotAcknowledgedError(MAVFTPErrorCode.FAIL_ERRNO, 5)
+
+    async def put(data, remote_path, *, parents=False, skip_crc_check=False):
+        raise OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_NOT_FOUND)
+
+    monkeypatch.setattr(ftp, "put", put)
+
+    with raises(OperationNotAcknowledgedError):
+        await upload(uav, "gdm")
 
 
 @mark.parametrize("version", [0.0, 2.0])
@@ -307,3 +379,40 @@ async def test_refused_upload_flags_the_drone(uav, drone):
         await upload(uav, "gdm")
 
     assert INCOMPATIBLE in uav.status.errors
+
+
+# ---------------------------------------------------------------------------
+# Parameter reads answered with PARAM_ERROR
+# ---------------------------------------------------------------------------
+
+
+@mark.parametrize(
+    "reply,expected",
+    [
+        (("value", SimpleNamespace(param_value=1.0, param_type=9)), 1.0),
+        (("error", SimpleNamespace(error=MAVParamError.DOES_NOT_EXIST)), None),
+    ],
+)
+async def test_param_read_tells_a_missing_parameter_from_a_value(reply, expected):
+    sent = []
+
+    async def send_packet_with_retries(spec, target, **kwds):
+        sent.append(kwds)
+        return reply
+
+    uav = MAVLinkUAV(
+        "01",
+        driver=SimpleNamespace(
+            autopilot_factory=None,
+            log=logging.getLogger("t"),
+            send_packet_with_retries=send_packet_with_retries,
+        ),
+    )
+
+    if expected is None:
+        with raises(ParameterNotFoundError, match="SHOW_SLOT_VER"):
+            await uav.get_parameter("SHOW_SLOT_VER")
+    else:
+        assert await uav.get_parameter("SHOW_SLOT_VER") == expected
+
+    assert set(sent[0]["wait_for_one_of"]) == {"value", "error"}

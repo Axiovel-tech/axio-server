@@ -8,6 +8,7 @@ __all__ = (
     "InvalidSigningKeyError",
     "InvalidSystemIdError",
     "MissionAcknowledgmentError",
+    "ParameterNotFoundError",
 )
 
 
@@ -60,3 +61,13 @@ class MissionAcknowledgmentError(MAVLinkExtensionError):
         )
         message = f"{operation} returned {MAVMissionResult.describe(result)}"
         super().__init__(message)
+
+
+class ParameterNotFoundError(MAVLinkExtensionError):
+    """Error thrown when the UAV replied that it has no parameter with a given
+    name.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(f"The drone has no parameter named {name}")
+        self.name = name

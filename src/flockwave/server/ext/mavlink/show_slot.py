@@ -7,19 +7,22 @@ for both. Both show uploads (`__show_upload` and `__gdm_upload`) write the slot
 the same way (AxioStack#89, decision 1):
 
 1. refuse if the drone is armed, and check `SHOW_SLOT_VER`;
-2. remove `/axio/show.bin` and the legacy `/collmot/show.skyb`;
+2. remove the legacy `/collmot/show.skyb`, if the drone lets us;
 3. put `/axio/show.bin`, with the CRC read-back;
 4. configure the show origin, then reload the show.
 
-Removing the legacy file as well means that a drone that missed the reflash
-ends up with no show, never a stale one.
+Creating the slot file truncates it, so the previous show never survives into
+the new one. The removals and the directory creation do not rely on the error
+codes of the drone's replies: ArduPilot translates them from a process-wide
+errno on ChibiOS, which other threads overwrite, so a missing file can come
+back as a generic failure with errno 0 or 34.
 """
 
 from __future__ import annotations
 
 from typing import Protocol
 
-from .ftp import FTPPath, MAVFTPErrorCode, OperationNotAcknowledgedError
+from .ftp import FTPPath, OperationNotAcknowledgedError
 
 __all__ = (
     "LEGACY_SHOW_PATH",
@@ -38,7 +41,8 @@ SHOW_SLOT_PATH = "/axio/show.bin"
 """The show slot on the vehicle."""
 
 LEGACY_SHOW_PATH = "/collmot/show.skyb"
-"""Where `.skyb` shows lived before the show slot; removed by every upload."""
+"""Where `.skyb` shows lived before the show slot; the firmware with the slot
+never loads it, so every upload removes it as a courtesy only."""
 
 SHOW_SLOT_VERSION_PARAMETER = "SHOW_SLOT_VER"
 """Parameter with which the firmware advertises the show slot."""
@@ -105,28 +109,27 @@ def check_show_slot_version(version: float | None) -> None:
         )
 
 
-async def _remove_if_present(ftp: ShowFileTransfer, path: str) -> None:
-    try:
-        await ftp.rm(path)
-    except OperationNotAcknowledgedError as ex:
-        if ex.code != MAVFTPErrorCode.FILE_NOT_FOUND:
-            raise
-
-
 async def write_show_slot(ftp: ShowFileTransfer, data: bytes) -> None:
     """Writes a show file (`.skyb` or `.gdmb`) to the drone's show slot.
 
-    Removes the slot and the legacy `.skyb` first (a missing file is fine),
-    then writes the slot. `MAVFTP.put()` compares the vehicle's whole-file CRC
-    with the CRC of the bytes sent. Both formats carry their CRC in the
-    header, so a match proves that the stored file is intact *and* is this
-    show, not a leftover.
+    `MAVFTP.put()` creates the slot, which truncates the previous show, and
+    compares the vehicle's whole-file CRC with the CRC of the bytes sent. Both
+    formats carry their CRC in the header, so a match proves that the stored
+    file is intact *and* is this show, not a leftover.
 
     The caller must have checked that the drone is disarmed and supports the
     slot. An interrupted write leaves a partial slot, which the firmware
     rejects by its CRC: the drone then has no show, never a wrong one.
     """
-    await _remove_if_present(ftp, SHOW_SLOT_PATH)
-    await _remove_if_present(ftp, LEGACY_SHOW_PATH)
-    await ftp.mkdir(SHOW_SLOT_DIRECTORY, exist_ok=True)
+    try:
+        await ftp.rm(LEGACY_SHOW_PATH)
+    except OperationNotAcknowledgedError:
+        pass
+
+    # A real failure to create the directory makes the put below fail.
+    try:
+        await ftp.mkdir(SHOW_SLOT_DIRECTORY, exist_ok=True)
+    except OperationNotAcknowledgedError:
+        pass
+
     await ftp.put(data, SHOW_SLOT_PATH)
