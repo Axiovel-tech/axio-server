@@ -5,14 +5,16 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import pwd
 import re
-import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import trio
+
+from flockwave.server.errors import FlockwaveError
 
 from .download import VerificationError, fetch_file, write_json
 from .fc import ARMED, heartbeat, read_parameter, write_parameter
@@ -39,7 +41,7 @@ _FAILURES = (
 )
 
 
-class Refused(RuntimeError):
+class Refused(FlockwaveError):
     """A guard failed before the flight controller was changed."""
 
 
@@ -73,16 +75,21 @@ def _lock(path: Path, message: str, stack: ExitStack) -> None:
         raise Refused(message) from None
 
 
+LOCK_DIRECTORY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache" / "axio-fc-logs"
+"""Where the per-system locks live: the server and the direct-link CLI must
+find the same file whatever their environment (XDG_RUNTIME_DIR, TMPDIR)."""
+
+
 @contextmanager
 def exclusive(directory: Path, system_id: int) -> Iterator[None]:
     """One collection per output directory and per system ID on this host,
     across processes, so two runs never interleave LOG_DISARMED changes.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    LOCK_DIRECTORY.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         _lock(
-            runtime / f"axio-fc-logs-sysid-{system_id}.lock",
+            LOCK_DIRECTORY / f"sysid-{system_id}.lock",
             f"another collection is running for system {system_id}",
             stack,
         )

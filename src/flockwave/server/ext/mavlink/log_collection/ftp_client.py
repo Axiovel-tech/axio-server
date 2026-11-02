@@ -11,6 +11,7 @@ from struct import Struct
 import trio
 from trio.abc import ReceiveChannel
 
+from flockwave.server.errors import FlockwaveError
 from flockwave.server.ext.mavlink.ftp import MAVFTPErrorCode, MAVFTPOpCode
 
 from .transport import FCTransport, MAVLinkMessage
@@ -31,7 +32,7 @@ sending any MAVFTP reply; every reply, a NAK included, restarts the clock."""
 _BUSY_ATTEMPTS = 4
 
 
-class FTPError(RuntimeError):
+class FTPError(FlockwaveError):
     def __init__(self, operation: MAVFTPOpCode, code: int, errno: int | None):
         super().__init__(
             f"MAVFTP {operation.name} failed: {MAVFTPErrorCode.to_string(code, errno)}"

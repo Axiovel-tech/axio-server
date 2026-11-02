@@ -12,6 +12,7 @@ from flockwave.server.ext.mavlink.ftp import MAVFTPErrorCode, MAVFTPOpCode
 from flockwave.server.ext.mavlink.log_collection.cli import ServerSession
 from flockwave.server.ext.mavlink.log_collection.collect import (
     CollectRequest,
+    Refused,
     collect,
     exclusive,
     newest_first,
@@ -203,6 +204,19 @@ def request(tmp_path: Path, **kwds) -> CollectRequest:
 async def run(fc, tmp_path, **kwds):
     with exclusive(tmp_path / "03", fc.system_id):
         return await collect(fc, request(tmp_path, **kwds), Status("03"))
+
+
+def test_one_collection_per_system_whatever_the_environment(tmp_path, monkeypatch):
+    """The server and the direct-link CLI may run with different runtime and
+    temporary directories; they must still exclude each other."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "server-runtime"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "server-tmp"))
+    with exclusive(tmp_path / "server", 3):
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+        monkeypatch.setenv("TMPDIR", str(tmp_path / "cli-tmp"))
+        with pytest.raises(Refused, match="system 3"):
+            with exclusive(tmp_path / "usb", 3):
+                pass
 
 
 def test_crc_matches_ardupilot_definition():

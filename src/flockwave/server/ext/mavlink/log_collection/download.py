@@ -13,6 +13,8 @@ from typing import Protocol
 
 import trio
 
+from flockwave.server.errors import FlockwaveError
+
 from .ftp_client import CHUNK_SIZE, FTPClient
 
 __all__ = (
@@ -35,7 +37,7 @@ _CRC_BYTES_PER_SECOND = 128 * 1024
 _SMALL_GAP = 4 * CHUNK_SIZE
 
 
-class VerificationError(RuntimeError):
+class VerificationError(FlockwaveError):
     pass
 
 
