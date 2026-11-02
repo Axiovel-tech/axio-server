@@ -2258,6 +2258,56 @@ def test_cluster_clock_keeps_its_timebase_across_a_torn_clock_pair(monkeypatch):
     assert clock.epoch == 0
 
 
+@pytest.mark.parametrize("old_clks", [1753.1, 0.4])
+def test_cluster_clock_keeps_its_timebase_when_a_tag_resets_its_clock(
+    monkeypatch, old_clks
+):
+    """A tag whose estimator resets (geometry recalibration) sends clkh=0,
+    clks=0 and only then clkok=0, so two snapshots pair the zeroed halves
+    with the previous clkok=1. Seen on the bench as a -5849 s restart of the
+    whole estimate followed by a +5849 s one."""
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
+
+    t0 = 1_752_000_000.0
+    now = [t0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
+    )
+    clock = ClusterClock()
+
+    def report(at, system_id, clkh, clks, clkok=1.0):
+        now[0] = t0 + at
+        clock.on_stats(system_id, {"clkok": clkok, "clkh": clkh, "clks": clks})
+
+    report(0.0, 2, 4096.0, old_clks + 1.0)
+    report(0.5, 1, 4096.0, old_clks + 1.5)
+    report(1.5, 1, 0.0, old_clks + 1.5)
+    report(1.52, 1, 0.0, 0.0)
+    report(1.54, 1, 0.0, 0.0, clkok=0.0)
+    report(2.0, 2, 4096.0, old_clks + 3.0)
+    report(3.0, 1, 4096.0, old_clks + 4.0)
+
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 4096.0 - old_clks - 1.0)
+
+
+def test_cluster_clock_restart_needs_a_sample_that_kept_running(monkeypatch):
+    """Two deviating samples restart the timebase only if the second one
+    advanced from the first by the elapsed wall time."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 5000.0, t0)
+    report(1, 3.0, t0 + 1)
+    report(1, 1.0, t0 + 2)  # deviates again, but ran backwards
+    report(1, 900.0, t0 + 3)  # deviates again, but jumped ahead
+    assert clock.epoch == 0
+
+    report(1, 901.1, t0 + 4)
+    assert clock.epoch == 1
+    assert clock.estimate() == pytest.approx(t0 + 4 - 901.1)
+
+
 async def test_cluster_clock_forgets_a_lost_device(extension, device):
     """A lost device's last sample is dropped, so its first report after
     rediscovery is evaluated even if it repeats the old pair."""
