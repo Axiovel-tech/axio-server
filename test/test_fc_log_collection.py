@@ -201,7 +201,7 @@ def request(tmp_path: Path, **kwds) -> CollectRequest:
 
 
 async def run(fc, tmp_path, **kwds):
-    with exclusive(tmp_path / "03"):
+    with exclusive(tmp_path / "03", fc.system_id):
         return await collect(fc, request(tmp_path, **kwds), Status("03"))
 
 
@@ -367,7 +367,7 @@ async def test_battery_limit_refuses_and_stops(fc, tmp_path, autojump_clock):
 
     fc.on_read = drain
     stopped = await run(fc, tmp_path, min_battery_voltage=11.0)
-    assert "battery fell to 10.5 V" in stopped["error"]
+    assert "battery 10.5 V is below 11.0 V" in stopped["error"]
     assert fc.params["LOG_DISARMED"] == 1.0
 
 
@@ -420,8 +420,9 @@ async def test_status_snapshots_are_bounded_and_end_with_a_receipt(
 
 
 async def test_second_collection_of_a_vehicle_is_refused(fc, tmp_path, autojump_clock):
-    with exclusive(tmp_path / "03"):
-        async with collect_with_status(fc, request(tmp_path), "03", 1) as items:
+    other = CollectRequest(directory=tmp_path / "elsewhere", log_dir="logs")
+    with exclusive(tmp_path / "03", fc.system_id):
+        async with collect_with_status(fc, other, "03", 1) as items:
             events = [event async for event in items]
     assert events == [
         (
@@ -429,12 +430,24 @@ async def test_second_collection_of_a_vehicle_is_refused(fc, tmp_path, autojump_
             {
                 "uav": "03",
                 "complete": False,
-                "error": "another collection is running for this vehicle",
+                "error": "another collection is running for system 3",
             },
         )
     ]
     assert fc.param_writes == []
-    assert not (tmp_path / "03" / "status.json").exists()
+    assert not (tmp_path / "elsewhere" / "status.json").exists()
+
+
+async def test_manifest_omits_a_copy_that_no_longer_matches(
+    fc, tmp_path, autojump_clock
+):
+    assert (await run(fc, tmp_path, latest=2))["complete"]
+    directory = tmp_path / "03"
+    with (directory / "00000003.BIN").open("r+b") as stream:
+        stream.truncate(100)
+    assert not (await run(fc, tmp_path, latest=2))["complete"]
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert [f["file"] for f in manifest["files"]] == ["00000002.BIN"]
 
 
 def test_server_session_matches_early_async_messages_to_receipts(capsys):

@@ -192,7 +192,7 @@ async def _fill(ftp: FTPClient, part: PartialFile, progress: FileProgress) -> No
                 part.write(offset, data)
         else:
             await ftp.burst(start, part.write)
-        part.checkpoint()
+        await trio.to_thread.run_sync(part.checkpoint)
         progress.received(part.coverage.covered)
         stalls = 0 if part.coverage.covered > before else stalls + 1
         if stalls >= _STALLED_PASSES:
@@ -225,9 +225,10 @@ async def fetch_file(
         try:
             await _fill(ftp, part, progress)
         finally:
-            part.checkpoint()
-            with trio.CancelScope(shield=True), trio.move_on_after(5):
-                await ftp.terminate()
+            with trio.CancelScope(shield=True):
+                await trio.to_thread.run_sync(part.checkpoint)
+                with trio.move_on_after(5):
+                    await ftp.terminate()
         progress.verifying()
         remote_crc = await ftp.crc32(remote, 60 + size / _CRC_BYTES_PER_SECOND)
         local_crc, sha256 = await trio.to_thread.run_sync(digest, part.path)

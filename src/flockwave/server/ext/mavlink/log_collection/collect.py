@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import re
+import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -63,15 +65,32 @@ class CollectRequest:
         return {**asdict(self), "directory": str(self.directory)}
 
 
+def _lock(path: Path, message: str, stack: ExitStack) -> None:
+    lock = stack.enter_context(path.open("w"))
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refused(message) from None
+
+
 @contextmanager
-def exclusive(directory: Path) -> Iterator[None]:
-    """One collection per vehicle directory, across processes."""
+def exclusive(directory: Path, system_id: int) -> Iterator[None]:
+    """One collection per output directory and per system ID on this host,
+    across processes, so two runs never interleave LOG_DISARMED changes.
+    """
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / ".collect.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise Refused("another collection is running for this vehicle") from None
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    with ExitStack() as stack:
+        _lock(
+            runtime / f"axio-fc-logs-sysid-{system_id}.lock",
+            f"another collection is running for system {system_id}",
+            stack,
+        )
+        _lock(
+            directory / ".collect.lock",
+            "another collection is writing to this directory",
+            stack,
+        )
         yield
 
 
@@ -106,7 +125,7 @@ async def check_guards(
                     voltage = reported / 1000
         if voltage is None or voltage < minimum:
             raise Refused(
-                f"battery {'unreported' if voltage is None else voltage} V "
+                f"battery {'unreported' if voltage is None else f'{voltage} V'} "
                 f"is below {minimum} V"
             )
         result["battery_v"] = voltage
@@ -212,7 +231,7 @@ async def _watch_armed(
     with transport.subscribe("HEARTBEAT") as beats:
         async for beat in beats:
             if beat.base_mode & ARMED:
-                stop.append("the flight controller armed during collection")
+                stop.append("the flight controller is armed")
                 scope.cancel()
                 return
 
@@ -230,7 +249,7 @@ async def _watch_battery(
                 continue
             status.battery_voltage = message.voltage_battery / 1000
             if minimum is not None and status.battery_voltage < minimum:
-                stop.append(f"battery fell to {status.battery_voltage} V")
+                stop.append(f"battery {status.battery_voltage} V is below {minimum} V")
                 scope.cancel()
                 return
 
@@ -244,33 +263,27 @@ async def transfer(
     results: list[dict[str, object]],
 ) -> str | None:
     """Fetches the selected files in order; returns why it stopped early."""
-    stop: list[str] = []
-    async with trio.open_nursery() as nursery:
-        scope = nursery.cancel_scope
-        nursery.start_soon(_watch_armed, transport, stop, scope)
-        nursery.start_soon(
-            _watch_battery, transport, status, request.min_battery_voltage, stop, scope
-        )
-        for entry in selected:
-            try:
-                if results:
-                    await check_show_start(transport)
-                receipt = await fetch_file(
-                    ftp,
-                    f"{request.log_dir.rstrip('/')}/{entry.name}",
-                    request.directory / entry.name,
-                    status,
-                )
-            except (Refused, *_FAILURES) as error:
-                results.append(
-                    {"file": entry.name, "status": "failed", "error": str(error)}
-                )
-                stop.append(str(error))
-                break
-            results.append({**receipt, "status": "verified"})
-            status.end_file(entry.size)
-        scope.cancel()
-    return stop[0] if stop else None
+    for entry in selected:
+        try:
+            await check_show_start(transport)
+            receipt = await fetch_file(
+                ftp,
+                f"{request.log_dir.rstrip('/')}/{entry.name}",
+                request.directory / entry.name,
+                status,
+            )
+        except (Refused, *_FAILURES) as error:
+            results.append(
+                {"file": entry.name, "status": "failed", "error": str(error)}
+            )
+            return str(error)
+        results.append({**receipt, "status": "verified"})
+        status.end_file(entry.size)
+    return None
+
+
+def _size(path: Path) -> int | None:
+    return path.stat().st_size if path.is_file() else None
 
 
 def write_manifest(directory: Path, status: Status, system_id: int) -> None:
@@ -286,7 +299,7 @@ def write_manifest(directory: Path, status: Status, system_id: int) -> None:
             "files": [
                 receipt
                 for receipt in receipts
-                if (directory / str(receipt.get("file"))).exists()
+                if _size(directory / str(receipt.get("file"))) == receipt.get("bytes")
             ],
         },
     )
@@ -368,10 +381,26 @@ async def collect(
     record = RunRecord()
     switch = LoggingSwitch(transport, request.directory / "collect-state.json")
     path = request.directory / f"run-{started_at}.json".replace(":", "")
+    stop: list[str] = []
     try:
-        await _run(transport, request, status, record, switch)
-    except (Refused, *_FAILURES) as error:
-        record.error = str(error)
+        async with trio.open_nursery() as nursery:
+            scope = nursery.cancel_scope
+            nursery.start_soon(_watch_armed, transport, stop, scope)
+            nursery.start_soon(
+                _watch_battery,
+                transport,
+                status,
+                request.min_battery_voltage,
+                stop,
+                scope,
+            )
+            try:
+                await _run(transport, request, status, record, switch)
+            except (Refused, *_FAILURES) as error:
+                record.error = str(error)
+            scope.cancel()
+        if stop:
+            record.error = stop[0]
     finally:
         status.phase = "restoring"
         await _restore(switch, record)

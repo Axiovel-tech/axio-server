@@ -25,7 +25,7 @@ async def collect_with_status(
     """
     with ExitStack() as stack:
         try:
-            stack.enter_context(exclusive(request.directory))
+            stack.enter_context(exclusive(request.directory, transport.system_id))
         except Refused as error:
             yield "receipt", {"uav": uav, "complete": False, "error": str(error)}
             return

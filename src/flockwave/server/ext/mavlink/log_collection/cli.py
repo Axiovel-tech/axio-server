@@ -216,7 +216,7 @@ async def collect_through_server(args: argparse.Namespace) -> dict[str, dict]:
         "status_interval": args.status_interval,
     }
     async with await trio.open_tcp_stream(args.host, args.port) as stream:
-        session = ServerSession(stream, args.uav)
+        session = ServerSession(stream, list(dict.fromkeys(args.uav)))
         try:
             await session.run(kwds)
         except KeyboardInterrupt:
