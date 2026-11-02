@@ -408,6 +408,17 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             self.log.error(str(ex), extra={"id": log_id_for_uav(uav)})
             raise
 
+    async def handle_command___fc_log_collect(
+        self, uav: "MAVLinkUAV", **kwds: Any
+    ) -> AsyncIterator[Progress | dict[str, object]]:
+        """Collects verified flight-controller logs into a directory on the
+        server host. See ``axio-fc-logs collect --help`` for the arguments.
+        """
+        from .log_collection.server import collect_progress
+
+        async for item in collect_progress(uav, **kwds):
+            yield item
+
     async def send_command_int(
         self,
         target: "MAVLinkUAV",

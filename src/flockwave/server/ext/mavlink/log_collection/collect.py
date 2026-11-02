@@ -1,0 +1,389 @@
+"""Safe collection of flight-controller logs: guard, close, fetch, restore."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import trio
+
+from .download import VerificationError, fetch_file, write_json
+from .fc import ARMED, heartbeat, read_parameter, write_parameter
+from .ftp_client import FTPClient, FTPError, ListingEntry
+from .status import Status, now_utc, provenance
+from .transport import FCTransport
+
+__all__ = ("CollectRequest", "Refused", "collect", "exclusive")
+
+LOG_NAME = re.compile(r"^\d{8}\.BIN$", re.IGNORECASE)
+
+_UNKNOWN_VOLTAGE = 0xFFFF
+_RESTORE_TIMEOUT = 20
+_CLOSE_TIMEOUT = 60
+_STABLE_LISTINGS = 2
+
+_FAILURES = (
+    FTPError,
+    VerificationError,
+    trio.TooSlowError,
+    OSError,
+    RuntimeError,
+    ValueError,
+)
+
+
+class Refused(RuntimeError):
+    """A guard failed before the flight controller was changed."""
+
+
+@dataclass(frozen=True)
+class CollectRequest:
+    directory: Path
+    """Output directory of this vehicle."""
+
+    log_dir: str = "/APM/LOGS"
+    latest: int = 1
+    files: tuple[str, ...] = ()
+    min_battery_voltage: float | None = None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.latest <= 100:
+            raise ValueError("latest must be between 1 and 100")
+        if not all(LOG_NAME.match(name) for name in self.files):
+            raise ValueError("file names must look like 00000042.BIN")
+        if not self.log_dir or len(self.log_dir) > 200:
+            raise ValueError("invalid log directory")
+
+    def json(self) -> dict[str, object]:
+        return {**asdict(self), "directory": str(self.directory)}
+
+
+@contextmanager
+def exclusive(directory: Path) -> Iterator[None]:
+    """One collection per vehicle directory, across processes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".collect.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused("another collection is running for this vehicle") from None
+        yield
+
+
+async def check_show_start(transport: FCTransport) -> dict[str, float]:
+    auth, _ = await read_parameter(transport, "SHOW_START_AUTH")
+    start, _ = await read_parameter(transport, "SHOW_START_TIME")
+    if auth != 0:
+        raise Refused(f"a show start is authorized (SHOW_START_AUTH={auth:g})")
+    if start >= 0:
+        raise Refused(f"a show start is scheduled (SHOW_START_TIME={start:g})")
+    return {"SHOW_START_AUTH": auth, "SHOW_START_TIME": start}
+
+
+async def check_guards(
+    transport: FCTransport, request: CollectRequest
+) -> dict[str, object]:
+    beat = await heartbeat(transport)
+    if beat.base_mode & ARMED:
+        raise Refused("the flight controller is armed")
+    result: dict[str, object] = {
+        "system_id": transport.system_id,
+        "armed": False,
+        **await check_show_start(transport),
+    }
+    minimum = request.min_battery_voltage
+    if minimum is not None:
+        voltage = None
+        with transport.subscribe("SYS_STATUS") as health:
+            with trio.move_on_after(5):
+                reported = (await health.receive()).voltage_battery
+                if reported != _UNKNOWN_VOLTAGE:
+                    voltage = reported / 1000
+        if voltage is None or voltage < minimum:
+            raise Refused(
+                f"battery {'unreported' if voltage is None else voltage} V "
+                f"is below {minimum} V"
+            )
+        result["battery_v"] = voltage
+    return result
+
+
+class LoggingSwitch:
+    """Turns LOG_DISARMED off so the current log stops growing.
+
+    The original value is persisted before the change, so a run that dies
+    before restoring hands the true original to the next run.
+    """
+
+    NAME = "LOG_DISARMED"
+
+    def __init__(self, transport: FCTransport, state: Path):
+        self._transport = transport
+        self._state = state
+        self._original: float | None = None
+        self._type = 0
+
+    async def disable(self) -> dict[str, object]:
+        pending = json.loads(self._state.read_text()) if self._state.exists() else {}
+        current, self._type = await read_parameter(self._transport, self.NAME)
+        original = pending.get("log_disarmed_original", current)
+        write_json(self._state, {"log_disarmed_original": original, "since": now_utc()})
+        self._original = original
+        if current != 0:
+            await write_parameter(self._transport, self.NAME, 0, self._type)
+        return {
+            "original": original,
+            "found": current,
+            "recovered_from_interrupted_run": "log_disarmed_original" in pending,
+        }
+
+    async def restore(self) -> dict[str, object]:
+        if self._original is None:
+            return {}
+        await write_parameter(self._transport, self.NAME, self._original, self._type)
+        self._state.unlink(missing_ok=True)
+        return {"restored": self._original, "restore_verified": True}
+
+
+async def wait_until_closed(ftp: FTPClient, log_dir: str) -> None:
+    """Returns once the log listing has stayed the same for two seconds.
+
+    ArduPilot keeps logging for a while after a disarm and then flushes its
+    write buffer, so a single unchanged listing is not enough.
+    """
+    unchanged, previous = 0, None
+    with trio.fail_after(_CLOSE_TIMEOUT):
+        while unchanged < _STABLE_LISTINGS:
+            sizes = {entry.name: entry.size for entry in await ftp.listdir(log_dir)}
+            unchanged = unchanged + 1 if sizes == previous else 0
+            previous = sizes
+            if unchanged < _STABLE_LISTINGS:
+                await trio.sleep(1)
+
+
+async def newest_log_number(ftp: FTPClient, log_dir: str) -> int | None:
+    """ArduPilot's LASTLOG.TXT; log numbers wrap, so the highest is not the newest."""
+    try:
+        await ftp.open_read(f"{log_dir.rstrip('/')}/LASTLOG.TXT")
+        try:
+            text = (await ftp.read(0, 16)).strip()
+        finally:
+            with trio.CancelScope(shield=True), trio.move_on_after(5):
+                await ftp.terminate()
+    except (FTPError, trio.TooSlowError):
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def newest_first(entries: list[ListingEntry], newest: int | None) -> list[ListingEntry]:
+    def key(entry: ListingEntry) -> tuple[bool, int]:
+        number = int(entry.name[:8])
+        return (newest is None or number <= newest, number)
+
+    return sorted(entries, key=key, reverse=True)
+
+
+async def select_logs(ftp: FTPClient, request: CollectRequest) -> list[ListingEntry]:
+    logs = [
+        entry
+        for entry in await ftp.listdir(request.log_dir)
+        if entry.is_file and LOG_NAME.match(entry.name)
+    ]
+    if request.files:
+        by_name = {entry.name.upper(): entry for entry in logs}
+        missing = [name for name in request.files if name.upper() not in by_name]
+        if missing:
+            raise Refused(f"not on the flight controller: {', '.join(missing)}")
+        return [by_name[name.upper()] for name in request.files]
+    if not logs:
+        raise Refused(f"no logs in {request.log_dir}")
+    newest = await newest_log_number(ftp, request.log_dir)
+    return newest_first(logs, newest)[: request.latest]
+
+
+async def _watch_armed(
+    transport: FCTransport, stop: list[str], scope: trio.CancelScope
+):
+    with transport.subscribe("HEARTBEAT") as beats:
+        async for beat in beats:
+            if beat.base_mode & ARMED:
+                stop.append("the flight controller armed during collection")
+                scope.cancel()
+                return
+
+
+async def _watch_battery(
+    transport: FCTransport,
+    status: Status,
+    minimum: float | None,
+    stop: list[str],
+    scope: trio.CancelScope,
+):
+    with transport.subscribe("SYS_STATUS") as health:
+        async for message in health:
+            if message.voltage_battery == _UNKNOWN_VOLTAGE:
+                continue
+            status.battery_voltage = message.voltage_battery / 1000
+            if minimum is not None and status.battery_voltage < minimum:
+                stop.append(f"battery fell to {status.battery_voltage} V")
+                scope.cancel()
+                return
+
+
+async def transfer(
+    transport: FCTransport,
+    ftp: FTPClient,
+    request: CollectRequest,
+    selected: list[ListingEntry],
+    status: Status,
+    results: list[dict[str, object]],
+) -> str | None:
+    """Fetches the selected files in order; returns why it stopped early."""
+    stop: list[str] = []
+    async with trio.open_nursery() as nursery:
+        scope = nursery.cancel_scope
+        nursery.start_soon(_watch_armed, transport, stop, scope)
+        nursery.start_soon(
+            _watch_battery, transport, status, request.min_battery_voltage, stop, scope
+        )
+        for entry in selected:
+            try:
+                if results:
+                    await check_show_start(transport)
+                receipt = await fetch_file(
+                    ftp,
+                    f"{request.log_dir.rstrip('/')}/{entry.name}",
+                    request.directory / entry.name,
+                    status,
+                )
+            except (Refused, *_FAILURES) as error:
+                results.append(
+                    {"file": entry.name, "status": "failed", "error": str(error)}
+                )
+                stop.append(str(error))
+                break
+            results.append({**receipt, "status": "verified"})
+            status.end_file(entry.size)
+        scope.cancel()
+    return stop[0] if stop else None
+
+
+def write_manifest(directory: Path, status: Status, system_id: int) -> None:
+    receipts = [
+        json.loads(path.read_text()) for path in sorted(directory.glob("*.BIN.json"))
+    ]
+    write_json(
+        directory / "manifest.json",
+        {
+            "uav": status.uav,
+            "system_id": system_id,
+            "updated_at": now_utc(),
+            "files": [
+                receipt
+                for receipt in receipts
+                if (directory / str(receipt.get("file"))).exists()
+            ],
+        },
+    )
+
+
+@dataclass
+class RunRecord:
+    """The parts of a run receipt that the run fills in as it goes."""
+
+    guards: dict[str, object] = field(default_factory=dict)
+    log_disarmed: dict[str, object] = field(default_factory=dict)
+    selected: list[dict[str, object]] = field(default_factory=list)
+    files: list[dict[str, object]] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return bool(
+            self.error is None
+            and self.selected
+            and len(self.files) == len(self.selected)
+            and all(item.get("status") == "verified" for item in self.files)
+            and self.log_disarmed.get("restore_verified")
+        )
+
+
+async def _restore(switch: LoggingSwitch, record: RunRecord) -> None:
+    with trio.CancelScope(shield=True):
+        with trio.move_on_after(_RESTORE_TIMEOUT) as deadline:
+            try:
+                record.log_disarmed.update(await switch.restore())
+            except _FAILURES as error:
+                record.log_disarmed["restore_error"] = str(error)
+        if deadline.cancelled_caught:
+            record.log_disarmed["restore_error"] = "LOG_DISARMED restore timed out"
+
+
+async def _run(
+    transport: FCTransport,
+    request: CollectRequest,
+    status: Status,
+    record: RunRecord,
+    switch: LoggingSwitch,
+) -> None:
+    record.guards = await check_guards(transport, request)
+    status.phase = "closing"
+    record.log_disarmed = await switch.disable()
+    with transport.subscribe("FILE_TRANSFER_PROTOCOL") as replies:
+        ftp = FTPClient(transport, replies)
+        await wait_until_closed(ftp, request.log_dir)
+        status.phase = "listing"
+        selected = await select_logs(ftp, request)
+        record.selected = [{"file": e.name, "bytes": e.size} for e in selected]
+        status.files_total = len(selected)
+        status.bytes_total = sum(entry.size for entry in selected)
+        record.error = await transfer(
+            transport, ftp, request, selected, status, record.files
+        )
+
+
+async def collect(
+    transport: FCTransport, request: CollectRequest, status: Status
+) -> dict[str, object]:
+    """Runs one vehicle's collection and returns its run receipt.
+
+    Nothing on the flight controller changes until the guards pass, and
+    LOG_DISARMED is restored even when the run fails or is cancelled. The
+    caller holds the vehicle directory's `exclusive` lock.
+    """
+    started_at = now_utc()
+    header: dict[str, object] = {
+        "uav": status.uav,
+        "system_id": transport.system_id,
+        "transport": transport.description,
+        "request": request.json(),
+        "started_at": started_at,
+        "provenance": await trio.to_thread.run_sync(provenance),
+    }
+    record = RunRecord()
+    switch = LoggingSwitch(transport, request.directory / "collect-state.json")
+    path = request.directory / f"run-{started_at}.json".replace(":", "")
+    try:
+        await _run(transport, request, status, record, switch)
+    except (Refused, *_FAILURES) as error:
+        record.error = str(error)
+    finally:
+        status.phase = "restoring"
+        await _restore(switch, record)
+        write_manifest(request.directory, status, transport.system_id)
+        status.error = record.error
+        status.phase = "done" if record.complete else "failed"
+        receipt: dict[str, object] = {
+            **header,
+            **asdict(record),
+            "complete": record.complete,
+            "finished_at": now_utc(),
+        }
+        write_json(path, receipt)
+    receipt["receipt_path"] = str(path)
+    return receipt
