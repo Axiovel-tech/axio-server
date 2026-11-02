@@ -38,6 +38,9 @@ class ShowAudioExtension(Extension):
 
     _player: ShowAudioPlayer | None
     _upload: TrackUpload | None
+    _generation: int
+    """Bumped by every new upload and every clear; a decode that finishes
+    after either installs nothing."""
     _last_inf: dict[str, Any] | None
     _warned_about_rc_start: bool
 
@@ -45,6 +48,7 @@ class ShowAudioExtension(Extension):
         super().__init__()
         self._player = None
         self._upload = None
+        self._generation = 0
         self._last_inf = None
         self._warned_about_rc_start = False
 
@@ -146,6 +150,7 @@ class ShowAudioExtension(Extension):
         except PlaybackCommittedError as ex:
             return hub.reject(message, reason=str(ex))
         self._upload = None
+        self._generation += 1
         return hub.acknowledge(message)
 
     def _handle_INF(self, message: FlockwaveMessage, sender: Client, hub: MessageHub):
@@ -200,6 +205,7 @@ class ShowAudioExtension(Extension):
             if offset == 0:
                 self._player.ensure_not_committed()
                 self._upload = TrackUpload(sha256, name, media_type, size)
+                self._generation += 1
             elif self._upload is None or self._upload.sha256 != sha256.lower():
                 raise ValueError("No upload of this track in progress")
 
@@ -210,6 +216,7 @@ class ShowAudioExtension(Extension):
 
             self._upload = None
             data = upload.verified_data()
+            generation = self._generation
         except (ValueError, PlaybackCommittedError) as ex:
             return hub.reject(message, reason=str(ex))
 
@@ -223,6 +230,10 @@ class ShowAudioExtension(Extension):
                     media_type=upload.media_type,
                 )
             )
+            if generation != self._generation:
+                return hub.reject(
+                    message, reason="Superseded by a newer upload or a clear"
+                )
             self._player.set_track(track)
         except (RuntimeError, PlaybackCommittedError) as ex:
             return hub.reject(message, reason=str(ex))

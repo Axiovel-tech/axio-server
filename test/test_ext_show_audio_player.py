@@ -6,6 +6,7 @@ import trio
 from pytest import approx, fixture, raises
 from show_audio_support import EPOCH, encode, log, make_track, run_block
 
+from flockwave.server.ext.show_audio import extension as extension_module
 from flockwave.server.ext.show_audio.extension import ShowAudioExtension
 from flockwave.server.ext.show_audio.player import (
     PlaybackCommittedError,
@@ -364,6 +365,34 @@ async def test_upload_rejects_bad_chunks_and_keeps_the_current_track(extension):
     assert response["type"] == "ACK-NAK"
 
     assert extension._player.track is loaded
+
+
+async def test_a_clear_during_the_decode_wins(extension, monkeypatch):
+    decoding = trio.Event()
+    finish = trio.Event()
+    decode = extension_module.decode_track
+
+    def slow_decode(*args, **kwds):
+        trio.from_thread.run_sync(decoding.set)
+        trio.from_thread.run(finish.wait)
+        return decode(*args, **kwds)
+
+    monkeypatch.setattr(extension_module, "decode_track", slow_decode)
+    data = encode(0.5, 8000, "WAV")
+    responses = []
+
+    async def upload_track():
+        responses.extend(await upload(extension, data, len(data)))
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(upload_track)
+        await decoding.wait()
+        assert extension._handle_CLEAR(message(), None, FakeHub())["type"] == "ACK-ACK"
+        finish.set()
+
+    assert responses[-1]["type"] == "ACK-NAK"
+    assert "Superseded" in responses[-1]["reason"]
+    assert extension._player.track is None
 
 
 async def test_setcfg_and_stop(extension):
