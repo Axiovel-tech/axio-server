@@ -9,6 +9,7 @@ import pytest
 import trio
 
 from flockwave.server.ext.mavlink.ftp import MAVFTPErrorCode, MAVFTPOpCode
+from flockwave.server.ext.mavlink.log_collection import collect as collect_module
 from flockwave.server.ext.mavlink.log_collection.cli import ServerSession
 from flockwave.server.ext.mavlink.log_collection.collect import (
     CollectRequest,
@@ -16,6 +17,7 @@ from flockwave.server.ext.mavlink.log_collection.collect import (
     collect,
     exclusive,
     newest_first,
+    recovery_state,
 )
 from flockwave.server.ext.mavlink.log_collection.download import (
     Coverage,
@@ -187,6 +189,11 @@ def log_bytes(number: int, size: int) -> bytes:
     return bytes((number * 31 + i * 7) & 0xFF for i in range(size))
 
 
+@pytest.fixture(autouse=True)
+def lock_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(collect_module, "LOCK_DIRECTORY", tmp_path / "locks")
+
+
 @pytest.fixture
 def fc(nursery):
     controller = FakeFlightController(
@@ -259,7 +266,7 @@ async def test_collects_newest_logs_and_restores_logging(fc, tmp_path, autojump_
     manifest = json.loads((directory / "manifest.json").read_text())
     assert [f["file"] for f in manifest["files"]] == ["00000002.BIN", "00000003.BIN"]
     assert fc.param_writes == [("LOG_DISARMED", 0), ("LOG_DISARMED", 1.0)]
-    assert not (directory / "collect-state.json").exists()
+    assert not recovery_state(fc.system_id).exists()
     assert not list(directory.glob("*.part*"))
     assert receipt["provenance"]["tool"] == "axio-fc-logs"
 
@@ -351,7 +358,7 @@ async def test_cancellation_mid_transfer_still_restores(fc, tmp_path, autojump_c
     assert scope.cancelled_caught
     assert fc.params["LOG_DISARMED"] == 1.0
     directory = tmp_path / "03"
-    assert not (directory / "collect-state.json").exists()
+    assert not recovery_state(fc.system_id).exists()
     receipt = json.loads(next(directory.glob("run-*.json")).read_text())
     assert receipt["log_disarmed"]["restore_verified"]
     assert not receipt["complete"]
@@ -360,14 +367,16 @@ async def test_cancellation_mid_transfer_still_restores(fc, tmp_path, autojump_c
 async def test_original_from_an_interrupted_run_is_restored(
     fc, tmp_path, autojump_clock
 ):
-    directory = tmp_path / "03"
-    directory.mkdir()
-    (directory / "collect-state.json").write_text('{"log_disarmed_original": 1.0}')
+    """A run over another link writes to another directory; the original
+    saved by the run that died is found all the same."""
+    with exclusive(tmp_path / "wifi", fc.system_id):
+        recovery_state(fc.system_id).write_text('{"log_disarmed_original": 1.0}')
     fc.params["LOG_DISARMED"] = 0.0
     receipt = await run(fc, tmp_path)
     assert receipt["complete"], receipt
     assert receipt["log_disarmed"]["recovered_from_interrupted_run"]
     assert fc.params["LOG_DISARMED"] == 1.0
+    assert not recovery_state(fc.system_id).exists()
 
 
 async def test_battery_limit_refuses_and_stops(fc, tmp_path, autojump_clock):

@@ -22,9 +22,11 @@ SITL keeps its logs in `logs`, not `/APM/LOGS`: pass `--log-dir logs`.
    (`SHOW_START_TIME`) show start. With `--min-battery-voltage`, it also
    refuses on a low or unreported battery.
 2. Sets `LOG_DISARMED=0` so the open log stops growing, after saving the
-   original value to `collect-state.json`. A run killed before restoring
-   leaves that file, and the next run restores the saved original rather than
-   the current 0.
+   original value next to the system's lock
+   (`~/.cache/axio-fc-logs/sysid-<N>.state.json`). A run killed before
+   restoring leaves that file, and the next run for that system restores the
+   saved original rather than the current 0, whichever link and `--dest` it
+   uses.
 3. Picks the newest `--latest` logs (by `LASTLOG.TXT`, since log numbers wrap),
    or the named `--file`s.
 4. Downloads with MAVFTP burst reads into `<name>.part`, records received

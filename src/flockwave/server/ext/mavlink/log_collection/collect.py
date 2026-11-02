@@ -80,6 +80,13 @@ LOCK_DIRECTORY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".cache" / "axio-fc-lo
 find the same file whatever their environment (XDG_RUNTIME_DIR, TMPDIR)."""
 
 
+def recovery_state(system_id: int) -> Path:
+    """Where a run keeps the original LOG_DISARMED of a flight controller
+    until it is restored: next to the system's lock, so that the next run
+    finds it whichever output directory or link it uses."""
+    return LOCK_DIRECTORY / f"sysid-{system_id}.state.json"
+
+
 @contextmanager
 def exclusive(directory: Path, system_id: int) -> Iterator[None]:
     """One collection per output directory and per system ID on this host,
@@ -386,7 +393,7 @@ async def collect(
         "provenance": await trio.to_thread.run_sync(provenance),
     }
     record = RunRecord()
-    switch = LoggingSwitch(transport, request.directory / "collect-state.json")
+    switch = LoggingSwitch(transport, recovery_state(transport.system_id))
     path = request.directory / f"run-{started_at}.json".replace(":", "")
     stop: list[str] = []
     try:

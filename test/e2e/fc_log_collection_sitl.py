@@ -29,6 +29,10 @@ from pathlib import Path
 os.environ.setdefault("MAVLINK20", "1")
 from pymavlink import mavutil  # noqa: E402
 
+from flockwave.server.ext.mavlink.log_collection.collect import (  # noqa: E402
+    recovery_state,
+)
+
 SERVER_PORT = 25000
 MAVLINK_PORT = 24550
 VEHICLES = {"03": 0, "04": 1}
@@ -321,7 +325,7 @@ def scenarios(work: Path, sitl: dict[str, Path], side: dict[str, Side]) -> dict:
     args = ["collect", *direct, "--dest", str(dest), "--file", largest]
     crashed = cli(args, stop_when=halfway, stop_signal=signal.SIGKILL)
     left_off = side["03"].param("LOG_DISARMED")
-    state = json.loads((dest / "sysid-3" / "collect-state.json").read_text())
+    state = json.loads(recovery_state(3).read_text())
     part = dest / "sysid-3" / f"{largest}.part"
     with part.open("r+b") as stream:
         stream.seek(4096)
