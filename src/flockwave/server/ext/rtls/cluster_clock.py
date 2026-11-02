@@ -49,9 +49,9 @@ class ClusterClock:
         #: NAMED_VALUE_FLOAT frame, so the same clkh/clks pair is repeated
         #: while the other fields in the cycle arrive.
         self._last_cluster_seconds: dict[int, float] = {}
-        #: Devices whose last distinct sample deviated from the estimate; see
-        #: on_stats.
-        self._deviating: set[int] = set()
+        #: (receive wall time, cluster seconds) of each device's last distinct
+        #: sample that deviated from the estimate; see on_stats.
+        self._deviating: dict[int, tuple[float, float]] = {}
 
     def estimate(self) -> Optional[float]:
         """Wall time minus cluster time in seconds, from the least delayed
@@ -70,7 +70,7 @@ class ClusterClock:
 
     def forget_device(self, system_id: int) -> None:
         self._last_cluster_seconds.pop(system_id, None)
-        self._deviating.discard(system_id)
+        self._deviating.pop(system_id, None)
 
     def on_stats(self, system_id: int, data: dict[str, Any]) -> None:
         """Feeds one device stats snapshot."""
@@ -89,14 +89,15 @@ class ClusterClock:
         offset = self.estimate()
         deviation = 0.0 if offset is None else cluster_seconds - (now - offset)
         if abs(deviation) <= RESTART_TOLERANCE_S:
-            self._deviating.discard(system_id)
-        elif system_id not in self._deviating:
-            # clkh and clks arrive in separate frames and the snapshot pairs
-            # the latest of each, so a report crossing a 4096 s boundary, or
-            # one whose clkh frame was lost, reads 4096 s off until the other
-            # half arrives. A restart persists: wait for the next distinct
-            # sample before starting a new timebase.
-            self._deviating.add(system_id)
+            self._deviating.pop(system_id, None)
+        elif not self._continues(self._deviating.get(system_id), now, cluster_seconds):
+            # clkh, clks and clkok arrive in separate frames and the snapshot
+            # pairs the latest of each. Crossing a 4096 s boundary or losing a
+            # clkh frame reads 4096 s off until the other half arrives, and a
+            # tag that resets its clock sends a zeroed pair before its clkok=0.
+            # A restarted cluster clock keeps running from its new timebase:
+            # wait for a second sample that advanced with the wall clock.
+            self._deviating[system_id] = (now, cluster_seconds)
             return
         else:
             # Every other device's pending deviation was against the old
@@ -113,3 +114,15 @@ class ClusterClock:
         self._offsets.append((now, now - cluster_seconds))
         while self._offsets[0][0] < now - OFFSET_WINDOW_S:
             self._offsets.popleft()
+
+    @staticmethod
+    def _continues(
+        pending: Optional[tuple[float, float]], now: float, cluster_seconds: float
+    ) -> bool:
+        """Whether a deviating sample advanced from the device's previous one
+        by the wall time elapsed between them."""
+        if pending is None:
+            return False
+        received_at, previous = pending
+        advance = cluster_seconds - previous
+        return advance > 0 and abs(advance - (now - received_at)) <= RESTART_TOLERANCE_S
