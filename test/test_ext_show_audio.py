@@ -240,6 +240,17 @@ def test_session_extra_output_gets_its_channel_until_the_track_ends():
     assert not out.any()
 
 
+def test_session_does_not_resync_the_silence_after_the_track():
+    extra = FakeExtra(channel=1)
+    session = PlaybackSession(make_track(seconds=1), EPOCH, EPOCH, extra=extra)
+    for i in range(8):
+        run_block(session, 300, wall=EPOCH - 0.2 + 0.3 * i)
+
+    assert session.finished
+    assert session.resyncs == 0
+    assert extra.shifts == []
+
+
 def test_session_moves_the_extra_channel_with_the_track_when_resyncing():
     extra = FakeExtra(channel=1)
     session = PlaybackSession(make_track(seconds=30), EPOCH, EPOCH, extra=extra)

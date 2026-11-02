@@ -260,7 +260,7 @@ class PlaybackSession:
                 position = 0
             self._joined_at = position
             self._sample0_stream_time = self.sample0_time - stream_to_wall
-        else:
+        elif position < samples.shape[0]:
             resynced, lead = self._resync(
                 position, time_info.outputBufferDacTime, frames, sample_rate
             )
