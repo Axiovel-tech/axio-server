@@ -2740,6 +2740,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         self._ensure_disarmed_for_show_upload()
         await self._ensure_show_slot_supported()
+        # The version read can take several retries: check again before writing
+        self._ensure_disarmed_for_show_upload()
 
         async with aclosing(MAVFTP.for_uav(self)) as ftp:
             await write_show_slot(ftp, data)

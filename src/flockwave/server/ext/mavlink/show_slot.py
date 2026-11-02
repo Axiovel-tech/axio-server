@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from flockwave.server.errors import FlockwaveError
+
 from .ftp import FTPPath, OperationNotAcknowledgedError
 
 __all__ = (
@@ -51,7 +53,7 @@ SHOW_SLOT_VERSION = 1
 """The show slot version this server writes."""
 
 
-class ShowUploadRefusedError(RuntimeError):
+class ShowUploadRefusedError(FlockwaveError):
     """A show upload refused for a reason that retrying cannot fix.
 
     The message starts with a stable code (`E_ARMED`,

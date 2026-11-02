@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from math import acos, atan2, cos, sin, sqrt
 from struct import Struct
 
+from flockwave.server.errors import FlockwaveError
+
 from .utils import crc32_mavftp
 
 __all__ = (
@@ -133,7 +135,7 @@ _ENVELOPE = Struct("<IIHH")
 _MANEUVER_HEADER = Struct("<IIHHHBBiiii")
 
 
-class GdmbValidationError(ValueError):
+class GdmbValidationError(FlockwaveError, ValueError):
     """Raised when a `.gdmb` file violates a rule of §7.1."""
 
     code: str

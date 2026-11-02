@@ -211,6 +211,24 @@ async def test_upload_refused_while_armed(uav, calls, drone, kind):
     assert calls == []
 
 
+async def test_upload_refused_if_the_drone_arms_during_the_version_read(
+    uav, calls, drone, monkeypatch
+):
+    read = drone.get_parameter
+
+    async def arm_while_reading(name, fetch=False):
+        drone.armed = True
+        return await read(name, fetch)
+
+    monkeypatch.setattr(uav, "get_parameter", arm_while_reading)
+
+    with raises(ShowUploadRefusedError, match="armed") as info:
+        await upload(uav, "gdm")
+
+    assert info.value.code == "E_ARMED"
+    assert calls == [("param", "SHOW_SLOT_VER")]
+
+
 async def test_upload_refused_without_heartbeat(uav, calls, drone):
     drone.heartbeat = False
 

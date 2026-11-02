@@ -1,5 +1,7 @@
 """Error classes specific to the MAVLink extension."""
 
+from flockwave.server.errors import FlockwaveError
+
 from .enums import MAVMissionResult
 
 __all__ = (
@@ -12,7 +14,7 @@ __all__ = (
 )
 
 
-class MAVLinkExtensionError(RuntimeError):
+class MAVLinkExtensionError(FlockwaveError):
     """Base class for all error classes related to the MAVLink extension."""
 
     pass
