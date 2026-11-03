@@ -29,7 +29,15 @@ from flockwave.connections import (
 )
 from flockwave.networking import find_interfaces_with_address
 from flockwave.protocols.mavlink.introspection import get_mavlink_message_class
-from trio import move_on_after, open_nursery, to_thread
+from trio import (
+    MemoryReceiveChannel,
+    MemorySendChannel,
+    WouldBlock,
+    move_on_after,
+    open_memory_channel,
+    open_nursery,
+    to_thread,
+)
 from trio.abc import ReceiveChannel
 from trio_util import periodic
 
@@ -242,6 +250,9 @@ class MAVLinkNetwork:
 
         self.log = None  # type: ignore
         self._matchers = None  # type: ignore
+        self._subscribers: defaultdict[
+            str, list[tuple[int, MemorySendChannel[MAVLinkMessage]]]
+        ] = defaultdict(list)
 
         self._id = id
         self._id_formatter = id_formatter
@@ -321,6 +332,25 @@ class MAVLinkNetwork:
             yield future
         finally:
             matchers.pop(matchers.index(item))
+
+    @contextmanager
+    def subscribe(
+        self, type: str, system_id: int, capacity: int = 2048
+    ) -> Iterator[MemoryReceiveChannel[MAVLinkMessage]]:
+        """Delivers every autopilot message of the given type from one system
+        until the context exits. Messages are dropped while the receiver is more
+        than `capacity` messages behind.
+        """
+        sender, receiver = open_memory_channel[MAVLinkMessage](capacity)
+        item = (system_id, sender)
+        subscribers = self._subscribers[type]
+        subscribers.append(item)
+        try:
+            with receiver:
+                yield receiver
+        finally:
+            subscribers.remove(item)
+            sender.close()
 
     @property
     def id(self) -> str:
@@ -876,6 +906,13 @@ class MAVLinkNetwork:
                     )
                 if matched:
                     future.set_result(message)
+
+            for system_id, subscriber in self._subscribers.get(type, ()):
+                if message.get_srcSystem() == system_id:
+                    try:
+                        subscriber.send_nowait(message)
+                    except WouldBlock:
+                        pass
 
             # Call the message handler if we have one
             handler = handlers.get(type)

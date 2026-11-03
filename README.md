@@ -62,6 +62,9 @@ for the rtls-link UWB indoor positioning system:
   audio output of the server host, sample-aligned with the show clock. It
   needs the system PortAudio library; see
   [`src/flockwave/server/ext/show_audio/README.md`](src/flockwave/server/ext/show_audio/README.md).
+- **`axio-fc-logs`** — verified, resumable flight-controller log collection
+  through the server's MAVLink link or a direct USB link. See
+  [`src/flockwave/server/ext/mavlink/log_collection/README.md`](src/flockwave/server/ext/mavlink/log_collection/README.md).
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
 reference configuration for indoor shows. The MAVLink ingest convention for

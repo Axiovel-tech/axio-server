@@ -54,6 +54,7 @@ dependencies = [
 ]
 
 [project.scripts]
+axio-fc-logs = "flockwave.server.ext.mavlink.log_collection.cli:main"
 skybrushd = "flockwave.server.launcher:start"
 skybrush-gateway = "flockwave.gateway.launcher:start"
 skybrush-proxy = "flockwave.proxy.launcher:start"
