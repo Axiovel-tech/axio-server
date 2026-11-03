@@ -51,6 +51,7 @@ from flockwave.server.show import (
     get_coordinate_system_from_show_specification,
     get_light_program_from_show_specification,
 )
+from flockwave.server.show.gdm_upload import decode_gdm_upload_request
 from flockwave.server.utils import color_to_rgb565
 
 from .battery import VirtualBattery
@@ -104,6 +105,9 @@ class VirtualUAV(UAVBase):
     _shutdown_reason: str | None
     _sleeping: bool
     _trajectory_transformation: FlatEarthToGPSCoordinateTransformation | None
+
+    _gdmb: bytes | None
+    """The `.gdmb` show uploaded last, if the last upload was a `.gdm`"""
     _trans: FlatEarthToGPSCoordinateTransformation
     _velocity_xyz: Vector3D
     _velocity_ned: VelocityNED
@@ -187,6 +191,7 @@ class VirtualUAV(UAVBase):
         self._trajectory = None
         self._trajectory_player = None
         self._trajectory_transformation = None
+        self._gdmb = None
         self._trans = FlatEarthToGPSCoordinateTransformation(
             origin=GPSCoordinate(lat=0, lon=0)
         )
@@ -580,12 +585,39 @@ class VirtualUAV(UAVBase):
             show
         )
         self._trajectory = show.get("trajectory", None)
+        self._gdmb = None
 
         self._light_controller.load_light_program(
             get_light_program_from_show_specification(show)
         )
 
         self.update_status(mode="mission" if self.has_trajectory else "stab")
+
+    def handle_gdm_upload(self, data: bytes, config: ShowSpecification) -> None:
+        """Handles the upload of a validated `.gdmb` show.
+
+        Virtual UAVs store the payload but cannot fly it: they have no
+        `.gdmb` evaluator. Like a real drone's show slot, the upload replaces
+        any `.skyc` show loaded before, so that one is never flown either.
+
+        Parameters:
+            data: the `.gdmb` bytes, already validated against the show hash
+            config: show-level settings with `coordinateSystem`, as in a
+                `__show_upload` specification
+
+        Raises:
+            RuntimeError: if the drone is not on the ground
+        """
+        if self.state is not VirtualUAVState.LANDED:
+            raise RuntimeError("Cannot upload a show while the drone is airborne")
+
+        self._trajectory_transformation = get_coordinate_system_from_show_specification(
+            config
+        )
+        self._trajectory = None
+        self._gdmb = bytes(data)
+
+        self.update_status(mode="stab")
 
     def handle_where_are_you(self, duration: float) -> None:
         """Handles a 'where are you' command.
@@ -1178,6 +1210,31 @@ class VirtualUAVDriver(UAVDriver[VirtualUAV]):
         """
         uav.handle_show_upload(show)
         await sleep(0.25 + random() * 0.5)
+
+    async def handle_command___gdm_upload(
+        self,
+        uav: VirtualUAV,
+        *,
+        gdmb: str,
+        showHash: str,  # noqa: N803 (Flockwave keyword argument)
+        config: ShowSpecification,
+    ) -> str:
+        """Handles a `.gdm` show upload request for the given UAV: validates
+        the `.gdmb` exactly as the MAVLink driver does, then stores it.
+
+        Parameters:
+            gdmb: the UAV's `.gdmb` payload, base64-encoded
+            showHash: the show hash of the `.gdm`, as 64 hexadecimal digits
+            config: the show-level settings of `__show_upload` that do not
+                come from the show file
+        """
+        data, summary = decode_gdm_upload_request(gdmb, showHash)
+        uav.handle_gdm_upload(data, config)
+        await sleep(0.25 + random() * 0.5)
+        return (
+            f"Stored .gdmb ({summary.size} bytes, show "
+            f"{summary.show_hash.hex()[:12]}); virtual UAVs do not fly .gdmb shows"
+        )
 
     async def handle_command_yo(self, uav: VirtualUAV) -> str:
         await sleep(0.5 + random())
