@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import partial
 from logging import Logger
 from math import inf, isfinite
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Sequence
 
 from colour import Color
@@ -35,6 +35,7 @@ from flockwave.server.command_handlers import (
 from flockwave.server.errors import NotSupportedError
 from flockwave.server.ext.rc import RCExtensionAPI
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.ext.show.takeoff import split_start_time
 from flockwave.server.model.battery import BatteryInfo
 from flockwave.server.model.commands import (
     Progress,
@@ -100,11 +101,13 @@ from .log_download import MAVLinkLogDownloader
 from .packets import (
     DroneShowExecutionStage,
     DroneShowStatus,
+    ShowScheduleStatus,
     authorization_scope_to_int,
     create_led_control_packet,
     create_rc_override_packet,
 )
 from .rssi import RSSIMode, rtcm_counter_to_rssi
+from .schedule import ShowSchedule
 from .show_slot import (
     SHOW_SLOT_VERSION,
     SHOW_SLOT_VERSION_PARAMETER,
@@ -146,6 +149,20 @@ def transport_options_to_channel(options: TransportOptions | None) -> str:
         return Channel.SECONDARY
     else:
         return Channel.PRIMARY
+
+
+SECONDS_IN_HALF_WEEK = 302_400
+
+
+def nearest_week(timestamp: float, now: float) -> float:
+    """Moves a timestamp resolved in the current GPS week by a week if that
+    puts it nearer to ``now``: a start across the week boundary is in the
+    previous or the next week."""
+    if timestamp - now > SECONDS_IN_HALF_WEEK:
+        return timestamp - 2 * SECONDS_IN_HALF_WEEK
+    if now - timestamp > SECONDS_IN_HALF_WEEK:
+        return timestamp + 2 * SECONDS_IN_HALF_WEEK
+    return timestamp
 
 
 class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
@@ -194,6 +211,9 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     destination address in that medium.
     """
 
+    show_schedule: ShowSchedule
+    """The show start in cluster time, shared by every MAVLink network."""
+
     use_bulk_parameter_uploads: bool = False
     """Whether to use bulk parameter uploads instead of individual uploads if
     the autopilot supports bulk uploads.
@@ -216,6 +236,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         self.mandatory_custom_mode = None
         self.run_in_background = None  # type: ignore
         self.send_packet = None  # type: ignore
+        self.show_schedule = ShowSchedule()
 
         self._default_timeout = 2
         self._default_retries = 10
@@ -1241,9 +1262,16 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     _scheduled_takeoff_time: int | None = None
     """Scheduled takeoff time of the drone, as a UNIX timestamp, in seconds"""
 
+    _show_schedule_status: ShowScheduleStatus | None = None
+    """The last show schedule echo of the drone, if its firmware counts the
+    show start in cluster time."""
+
     _scheduled_takeoff_time_gps_time_of_week: int | None = None
     """Scheduled takeoff time of the drone, as a GPS time-of-week timestamp,
     in seconds"""
+
+    _scheduled_takeoff_time_msec: int = 0
+    """Millisecond part of the scheduled takeoff time of the drone"""
 
     _velocity: VelocityNED
     """Current velocity of the drone in NED coordinate system, m/sec"""
@@ -1667,6 +1695,19 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         return self._scheduled_takeoff_time
 
     @property
+    def scheduled_takeoff_time_msec(self) -> int:
+        """Returns the millisecond part (0-999) of the scheduled takeoff time
+        of the UAV; zero if the UAV is not scheduled for an automatic takeoff.
+        """
+        return self._scheduled_takeoff_time_msec
+
+    @property
+    def show_schedule_status(self) -> ShowScheduleStatus | None:
+        """The last show schedule echo of the UAV; ``None`` if its firmware
+        does not count the show start in cluster time."""
+        return self._show_schedule_status
+
+    @property
     def scheduled_takeoff_time_gps_time_of_week(self) -> int | None:
         """Returns the scheduled takeoff time of the UAV as a GPS time of week
         value, or `None` if the UAV is not scheduled for an automatic takeoff.
@@ -1858,13 +1899,22 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._update_gps_fix_type_and_satellite_count(data.gps_fix, data.num_satellites)
 
         gps_start_time = data.start_time if data.start_time >= 0 else None
-        if gps_start_time != self._scheduled_takeoff_time_gps_time_of_week:
+        if self._show_schedule_status is None:
+            self._scheduled_takeoff_time_msec = (
+                data.start_time_msec if gps_start_time is not None else 0
+            )
+        if (
+            self._show_schedule_status is None
+            and gps_start_time != self._scheduled_takeoff_time_gps_time_of_week
+        ):
             self._scheduled_takeoff_time_gps_time_of_week = gps_start_time
             if gps_start_time is None:
                 self._scheduled_takeoff_time = None
             else:
                 self._scheduled_takeoff_time = int(
-                    gps_time_of_week_to_utc(gps_start_time).timestamp()
+                    nearest_week(
+                        gps_time_of_week_to_utc(gps_start_time).timestamp(), time()
+                    )
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope
@@ -1911,6 +1961,26 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.update_status(**updates)
 
         self.notify_updated()
+
+    def handle_message_show_schedule_status(self, message: MAVLinkMessage) -> None:
+        """Handles an incoming show schedule echo of this UAV. The start that
+        the UAV reports comes from the echo from then on."""
+        echo = ShowScheduleStatus.from_mavlink_message(message, time())
+        if echo is None:
+            return
+        self._show_schedule_status = echo
+        start = (
+            self.driver.show_schedule.wall_at(echo.start_cluster_us)
+            if echo.has_start
+            else None
+        )
+        if start is None:
+            self._scheduled_takeoff_time = None
+            self._scheduled_takeoff_time_msec = 0
+        else:
+            seconds, msec = split_start_time(start)
+            self._scheduled_takeoff_time = seconds
+            self._scheduled_takeoff_time_msec = msec
 
     def handle_message_heartbeat(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink HEARTBEAT message targeted at this UAV."""
@@ -2327,9 +2397,11 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         await self.set_parameter("SHOW_START_AUTH", authorization_scope_to_int(scope))
 
-    async def set_scheduled_takeoff_time(self, seconds: int | None) -> None:
+    async def set_scheduled_takeoff_time(
+        self, seconds: int | None, msec: int = 0
+    ) -> None:
         """Sets the scheduled takeoff time of the UAV to the given timestamp in
-        seconds. Only integer seconds are supported. Setting the takeoff time
+        whole seconds plus a millisecond part (0-999). Setting the takeoff time
         to `None` or a negative number will clear the takeoff time.
         """
         # The UAV needs GPS time of week so we convert it first. Note that we
@@ -2343,6 +2415,16 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             dt = datetime.fromtimestamp(int(seconds), tz=timezone.utc)
             _, gps_time_of_week = datetime_to_gps_time_of_week(dt)
 
+        # The firmware reads SHOW_START_MSEC with SHOW_START_TIME, so it is
+        # written with every start: a value left over from an earlier start
+        # would move this one. Firmware without it still gets whole seconds.
+        if gps_time_of_week >= 0:
+            try:
+                await self.set_parameter("SHOW_START_MSEC", msec)
+            except Exception as ex:
+                self.driver.log.warning(
+                    f"Could not set SHOW_START_MSEC: {ex}", extra={"id": self.id}
+                )
         await self.set_parameter("SHOW_START_TIME", gps_time_of_week)
 
     async def set_led_color(
