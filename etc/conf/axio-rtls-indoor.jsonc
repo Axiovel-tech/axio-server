@@ -56,13 +56,22 @@
       }
     },
 
-    // Indoor show: started with the RC start switch (RC option 248).
-    // Do NOT use "auto" here: with no scheduled start time, the server
-    // broadcasts a "clear start time" START_CONFIG packet at 1 Hz, which
-    // cancels an RC-scheduled countdown on drones in internal sync mode
-    // (SHOW_SYNC_MODE=0).
+    // Show music from this host's default audio output, in sync with the
+    // show clock (needs libportaudio2, see ext/show_audio/README.md)
+    "show_audio": {
+      "enabled": true,
+      "device": null,
+      "offset_ms": 0,
+      "arm_lead_s": 15
+    },
+
+    // The server schedules the start; "rc" selects the RC-switch start
+    // (RC option 248). With "auto" and no start time set, the server
+    // broadcasts a show schedule without a start (and a "clear start time"
+    // START_CONFIG) at 1 Hz, which cancels an RC-switch countdown on the
+    // drones.
     "show": {
-      "default_start_method": "rc"
+      "default_start_method": "auto"
     }
   }
 }
