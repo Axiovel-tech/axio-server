@@ -43,7 +43,16 @@ __all__ = (
     "SimpleScheduledTakeoffManager",
     "SimpleScheduledTakeoffManagerBase",
     "TakeoffConfiguration",
+    "split_start_time",
 )
+
+
+def split_start_time(start_time: float) -> tuple[int, int]:
+    """Splits a UNIX timestamp into whole seconds and the millisecond part
+    (0-999), rounded to the nearest millisecond.
+    """
+    seconds, msec = divmod(round(start_time * 1000), 1000)
+    return int(seconds), int(msec)
 
 
 @dataclass
@@ -61,9 +70,10 @@ class TakeoffConfiguration:
     `takeoff_time` property of this object.
     """
 
-    takeoff_time: int | None = None
-    """The desired takeoff time of the swarm; `None` if the takeoff time should
-    be cleared. Ignored if `should_update_takeoff_time` is set to `False`.
+    takeoff_time: float | None = None
+    """The desired takeoff time of the swarm as a UNIX timestamp; `None` if the
+    takeoff time should be cleared. Ignored if `should_update_takeoff_time` is
+    set to `False`.
     """
 
     @classmethod
@@ -101,7 +111,7 @@ class TakeoffConfiguration:
                 # User has a show clock and the show clock has a scheduled
                 # start time so we want to use that
                 return cls(
-                    takeoff_time=int(start_time), authorization_scope=desired_auth_scope
+                    takeoff_time=start_time, authorization_scope=desired_auth_scope
                 )
             else:
                 # User has no show clock or the show clock is stopped, so we
@@ -144,9 +154,36 @@ class TakeoffConfiguration:
 
         Returns:
             -1 if the takeoff time should not be updated, `None` if the takeoff
-            time should be cleared, or the real takeoff time otherwise
+            time should be cleared, or the takeoff time in whole seconds
+            otherwise
         """
-        return self.takeoff_time if self.should_update_takeoff_time else -1
+        return (
+            self.takeoff_time_in_whole_seconds
+            if self.should_update_takeoff_time
+            else -1
+        )
+
+    @property
+    def takeoff_time_in_whole_seconds(self) -> int | None:
+        """Returns the whole-second part of the desired takeoff time, which is
+        what the drones report back and what the ``SHOW_START_TIME`` parameter
+        can hold; `None` if the takeoff time should be cleared.
+        """
+        if self.takeoff_time is None:
+            return None
+        seconds, _ = split_start_time(self.takeoff_time)
+        return seconds
+
+    @property
+    def takeoff_time_msec(self) -> int:
+        """Returns the millisecond part (0-999) of the desired takeoff time,
+        which the ``SHOW_START_MSEC`` parameter holds; zero if the takeoff time
+        should be cleared.
+        """
+        if self.takeoff_time is None:
+            return 0
+        _, msec = split_start_time(self.takeoff_time)
+        return msec
 
 
 TUAV = TypeVar("TUAV", bound="UAV")
@@ -194,6 +231,19 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
     the UNIX epoch.
     """
 
+    _start_agreement_start: float | None = None
+    """The takeoff time that the start agreement checks are run for; a start
+    within a second of it is the same start, moved slightly."""
+
+    _start_agreement_due: list[float]
+    """Leads of `start_agreement_leads` not checked yet for that start."""
+
+    start_agreement_leads: tuple[float, ...] = (15, 5)
+    """Numbers of seconds before the takeoff when the UAVs are checked for a
+    start that differs from the desired one: once before the drones commit
+    to their start ten seconds before the takeoff, and once after.
+    """
+
     _uavs_to_update: set[TUAV]
     """Set of UAVs waiting to be updated individually when the start time or the
     start configuration of the show changes.
@@ -228,6 +278,7 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
         self._parking_lot = ParkingLot()
         self._uavs_to_update = set()
         self._uavs_last_updated_at = WeakKeyDictionary()
+        self._start_agreement_due = []
 
     @abstractmethod
     async def broadcast_takeoff_configuration(
@@ -279,6 +330,41 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
         a background task that processes multiple UAVs in parallel.
         """
         ...
+
+    def check_start_agreement(self, config: TakeoffConfiguration, lead: float) -> None:
+        """Called at each of `start_agreement_leads` seconds before a scheduled
+        takeoff to warn about UAVs that are not ready to start with the rest
+        of the fleet. The default implementation logs the UAVs that would
+        still need an individual update.
+
+        Parameters:
+            config: the desired takeoff configuration
+            lead: the element of `start_agreement_leads` that came due
+        """
+        uav_ids = [
+            uav.id
+            for uav in self.iter_uavs_to_schedule()
+            if self.uav_needs_update(uav, config)
+        ]
+        if uav_ids and self._log:
+            self._log.warning(
+                f"UAVs not in agreement with the scheduled start: {', '.join(uav_ids)}"
+            )
+
+    def _check_start_agreement_if_due(
+        self, config: TakeoffConfiguration, takeoff_time: float
+    ) -> None:
+        start = self._start_agreement_start
+        if start is None or abs(takeoff_time - start) >= 1:
+            self._start_agreement_start = takeoff_time
+            self._start_agreement_due = sorted(self.start_agreement_leads)
+        lead = takeoff_time - time()
+        passed = [due for due in self._start_agreement_due if lead <= due]
+        if passed:
+            self._start_agreement_due = [
+                due for due in self._start_agreement_due if lead > due
+            ]
+            self.check_start_agreement(config, min(passed))
 
     @property
     def config(self) -> DroneShowConfiguration | None:
@@ -357,6 +443,14 @@ class ScheduledTakeoffManager(ABC, Generic[TUAV]):
                         except Exception:
                             # Do not blow up if the broadcasting fails for any reason
                             pass
+
+                    takeoff_time = takeoff_config.takeoff_time
+                    if (
+                        takeoff_time is not None
+                        and takeoff_config.authorized
+                        and takeoff_config.is_takeoff_in_the_future
+                    ):
+                        self._check_start_agreement_if_due(takeoff_config, takeoff_time)
 
                     # First we scan the _uavs array and find all UAVs that need to
                     # be configured. The actual configuration will take place in a

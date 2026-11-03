@@ -1,5 +1,7 @@
 """Error classes specific to the MAVLink extension."""
 
+from flockwave.server.errors import FlockwaveError
+
 from .enums import MAVMissionResult
 
 __all__ = (
@@ -8,10 +10,11 @@ __all__ = (
     "InvalidSigningKeyError",
     "InvalidSystemIdError",
     "MissionAcknowledgmentError",
+    "ParameterNotFoundError",
 )
 
 
-class MAVLinkExtensionError(RuntimeError):
+class MAVLinkExtensionError(FlockwaveError):
     """Base class for all error classes related to the MAVLink extension."""
 
     pass
@@ -60,3 +63,13 @@ class MissionAcknowledgmentError(MAVLinkExtensionError):
         )
         message = f"{operation} returned {MAVMissionResult.describe(result)}"
         super().__init__(message)
+
+
+class ParameterNotFoundError(MAVLinkExtensionError):
+    """Error thrown when the UAV replied that it has no parameter with a given
+    name.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(f"The drone has no parameter named {name}")
+        self.name = name
