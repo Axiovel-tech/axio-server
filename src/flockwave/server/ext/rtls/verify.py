@@ -207,15 +207,10 @@ def _firmware_rule(ext: "RtlsExtension") -> dict[str, Any]:
     protocol = ext._require_protocol()
     versions: dict[str, dict[str, list[int]]] = {}
     for system_id, device in protocol.devices.items():
-        adv = ext._adv.get(system_id, {})
         params = _decoded_device_params(device)
-        role = adv.get("role") or (
-            "tag"
-            if not params.get("UWB_ROLE") or params.get("UWB_ROLE") == 1
-            else "anchor"
-        )
-        group = "tag" if str(role).startswith("tag") or role == "tag" else "anchor"
-        version = adv.get("firmwareVersion") or params.get("FW_VERSION")
+        uwb_role = params.get("UWB_ROLE")
+        group = "tag" if not uwb_role or uwb_role == 1 else "anchor"
+        version = params.get("FW_VERSION")
         versions.setdefault(group, {}).setdefault(
             str(version) if version else "unknown", []
         ).append(system_id)

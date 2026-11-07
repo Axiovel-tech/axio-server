@@ -36,7 +36,6 @@ from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_ACCEPTED,
     PARAM_ACK_IN_PROGRESS,
-    RTLS_COMPONENT_ID,
 )
 
 try:
@@ -141,23 +140,14 @@ INF_INTERVAL = 1.0
 #: refreshing between transitions
 INF_REFRESH_INTERVAL = 10.0
 
-#: default UDP port of the firmware's phone-home / state-advertisement
-#: datagrams (CONFIG_RTLS_LINK_NET_PHONE_HOME_PORT; mirrors
-#: rtlslink.advertisement.ADVERTISEMENT_PORT without requiring the module,
-#: which pre-advertisement SDK pins do not ship)
-DEFAULT_ADVERTISEMENT_PORT = 3343
+#: UDP port of the management socket: the boards stream their telemetry
+#: to MGMT_HOST:MGMT_PORT, and this is the firmware's MGMT_PORT default
+DEFAULT_LISTEN_PORT = 3343
 
-#: active-mode presence defaults: the classic 2 s heartbeat probe with a
-#: 6 s liveness timeout (three missed probes)
+#: presence defaults: a 2 s heartbeat probe with a 6 s liveness timeout
+#: (three missed probes)
 DEFAULT_HEARTBEAT_INTERVAL = 2.0
 DEFAULT_DEVICE_TIMEOUT = 6.0
-
-#: passive-mode presence defaults: a slow 60 s "hello" (boards still need
-#: to learn the server address for their unicast telemetry, and legacy
-#: boards without advertisement firmware still need an occasional probe)
-#: and a 30 s timeout = 3x the firmware's 10 s advertisement period
-DEFAULT_HELLO_INTERVAL = 60.0
-DEFAULT_PASSIVE_DEVICE_TIMEOUT = 30.0
 
 #: heartbeat system_status values the sleep latch derives from (STANDBY =
 #: sleeping, ACTIVE = awake); numeric MAVLink enum values mirrored here --
@@ -172,8 +162,7 @@ MAV_STATE_ACTIVE = 4
 #: refill would race its own trigger and duplicate the dump
 REFILL_INITIAL_DELAY = 15.0
 
-#: minimum spacing between identity-refill retry rounds, in seconds; in
-#: passive mode the (longer) hello interval paces the rounds instead
+#: minimum spacing between identity-refill retry rounds, in seconds
 REFILL_MIN_INTERVAL = 10.0
 
 #: targeted re-request rounds before the refill gives up on a device
@@ -298,34 +287,14 @@ class RtlsExtension(Extension):
         #: stats throttle
         self._last_pos_broadcast: dict[int, float] = {}
         self._last_pos_sent: dict[int, dict[str, Any]] = {}
-        #: ``rtlslink.advertisement.parse_advertisement`` once resolved (a
-        #: seam: tests may pre-set a fake); ``None`` while unresolved or when
-        #: the pinned SDK predates the advertisement module
-        self._parse_advertisement = None
-        #: passive-presence mode (config ``passive``): the active heartbeat
-        #: slows to the hello cadence and ANY attributable inbound datagram
-        #: refreshes device liveness, not just heartbeats
-        self._passive = False
-        #: management UDP port of the fleet (config ``port``); an
-        #: advertisement's source IP is combined with it to form the
-        #: device's real address (the datagram leaves a throwaway socket)
-        self._management_port = 3333
-        #: socket of the state-advertisement listener; ``None`` when the
-        #: listener is disabled (config, or a pre-advertisement SDK pin)
-        self._adv_sock = None
-        #: latest advertisement-borne enrichment per device (keys among
-        #: ``firmwareVersion``/``role``/``uptimeMs``); fresher than the
-        #: param cache, pruned on device loss
-        self._adv: dict[int, dict[str, Any]] = {}
+        #: latest uptime per device from its periodic SYSTEM_TIME, in ms;
+        #: pruned on device loss
+        self._uptime_ms: dict[int, int] = {}
         #: last-known sleep latch per device: system_id -> (sleeping, stamp)
         #: where the stamp is the monotonic time of the heartbeat (or
         #: authoritative sleep/wake transaction) that reported it; drives
-        #: the X-RTLS-INF push on an ACTIVE<->STANDBY flip and the
-        #: staleness cutoff in :meth:`_device_json`
+        #: the X-RTLS-INF push on an ACTIVE<->STANDBY flip
         self._sleeping: dict[int, tuple[bool, float]] = {}
-        #: device-liveness timeout from the presence config, mirrored here
-        #: as the sleep-latch staleness cutoff
-        self._device_timeout = DEFAULT_DEVICE_TIMEOUT
         #: authoritative sleep-state pins from accepted sleep/wake
         #: transactions: system_id -> (expected_sleeping, deadline); while
         #: pinned, contradicting heartbeats are overridden (see
@@ -342,7 +311,7 @@ class RtlsExtension(Extension):
         #: or the attempt cap is reached — until the next rediscovery
         self._refill: dict[int, dict[str, Any]] = {}
         #: spacing between refill retry rounds; recomputed in run() from
-        #: the presence config (the hello interval paces passive mode)
+        #: the heartbeat interval
         self._refill_interval = max(DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL)
         #: lazy proxy of the mavlink extension's API (``None`` when the
         #: extension module is unavailable); resolves the MAVLink system id
@@ -371,9 +340,7 @@ class RtlsExtension(Extension):
         targets, self._smp_ports = _configured_devices(
             configuration.get("devices", []), port
         )
-        broadcast = _configured_addresses(
-            configuration.get("broadcast", ["255.255.255.255"]), port
-        )
+        listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
         register_beacons = bool(configuration.get("register_beacons", True))
         self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
@@ -387,71 +354,43 @@ class RtlsExtension(Extension):
         except (KeyError, RuntimeError):
             self._mavlink_api = None
 
-        self._passive = bool(configuration.get("passive", False))
-        self._management_port = port
-        heartbeat_interval, device_timeout = _presence_config(configuration)
-        self._device_timeout = device_timeout
+        heartbeat_interval = float(
+            configuration.get("heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)
+        )
+        device_timeout = float(
+            configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)
+        )
         self._refill_interval = max(heartbeat_interval, REFILL_MIN_INTERVAL)
+
+        sock = trio.socket.socket(trio.socket.AF_INET, trio.socket.SOCK_DGRAM)
+        try:
+            # no SO_REUSEADDR: a second process on the port must fail here
+            # instead of silently taking a share of the boards' streams
+            await sock.bind(("0.0.0.0", listen_port))
+        except OSError as ex:
+            sock.close()
+            raise RuntimeError(
+                f"rtls: cannot bind the management socket to UDP :{listen_port} "
+                f"({ex}); the boards stream their telemetry to this port"
+            ) from ex
+        self._sock = sock
 
         dialect = load_dialect()
         self._protocol = protocol = RtlsProtocol(
             dialect,
             targets=targets,
-            broadcast_targets=broadcast,
             heartbeat_interval=heartbeat_interval,
             device_timeout=device_timeout,
         )
 
-        sock = trio.socket.socket(trio.socket.AF_INET, trio.socket.SOCK_DGRAM)
-        sock.setsockopt(trio.socket.SOL_SOCKET, trio.socket.SO_BROADCAST, 1)
-        await sock.bind(("0.0.0.0", 0))
-        self._sock = sock
-
-        # Passive presence: listen for the firmware's autonomous state
-        # advertisements (phone-home datagrams) next to the active
-        # management conversation. Both a config of 0/None and a pinned
-        # SDK without the advertisement parser disable the listener; the
-        # rest of the extension is unaffected either way.
-        advertisement_port = int(
-            configuration.get("advertisement_port", DEFAULT_ADVERTISEMENT_PORT) or 0
-        )
-        if advertisement_port:
-            if self._parse_advertisement is None:
-                self._parse_advertisement = _load_advertisement_parser(logger)
-            if self._parse_advertisement is not None:
-                adv_sock = trio.socket.socket(
-                    trio.socket.AF_INET, trio.socket.SOCK_DGRAM
-                )
-                try:
-                    # deliberately NO SO_REUSEADDR: on Linux it would let a
-                    # second reuse-enabled listener bind the same port and
-                    # silently steal unicast delivery — a collision must
-                    # fail loudly (EADDRINUSE) into the warning below
-                    await adv_sock.bind(("0.0.0.0", advertisement_port))
-                except OSError as ex:
-                    adv_sock.close()
-                    logger.warning(
-                        f"rtls: cannot listen for state advertisements on "
-                        f"UDP :{advertisement_port} ({ex}); passive "
-                        f"presence disabled"
-                    )
-                else:
-                    self._adv_sock = adv_sock
-
         logger.info(
-            f"rtls: managing devices on UDP :{port} "
-            f"({len(targets)} static, broadcast {len(broadcast)}, "
-            f"{'passive' if self._passive else 'active'} presence, "
-            f"advertisements "
-            + (f"on UDP :{advertisement_port}" if self._adv_sock is not None else "off")
-            + ")"
+            f"rtls: managing {len(targets)} devices on UDP :{port}, "
+            f"listening on UDP :{sock.getsockname()[1]}"
         )
 
         try:
             async with trio.open_nursery() as nursery:
                 self._nursery = nursery
-                if self._adv_sock is not None:
-                    nursery.start_soon(self._run_advertisement_loop, self._adv_sock)
                 with app.message_hub.use_message_handlers(
                     {
                         "X-RTLS-INF": self._handle_RTLS_INF,
@@ -469,11 +408,9 @@ class RtlsExtension(Extension):
                     await self._run_protocol_loop(protocol, sock, logger)
         finally:
             self._nursery = None
+            sock.close()
             self._sock = None
-            if self._adv_sock is not None:
-                self._adv_sock.close()
-                self._adv_sock = None
-            self._adv.clear()
+            self._uptime_ms.clear()
             self._sleeping.clear()
             self._sleep_pins.clear()
             self._mavlink_api = None
@@ -533,88 +470,12 @@ class RtlsExtension(Extension):
         except OSError:
             pass
 
-    async def _run_advertisement_loop(self, sock) -> None:
-        """Consumes the firmware's autonomous state advertisements
-        (one datagram per board every ADV_PERIOD_S, plus a burst on DHCP
-        bind) so presence tracking works without probing the boards."""
-        while True:
-            try:
-                data, address = await sock.recvfrom(2048)
-            except OSError:
-                await trio.sleep(1)
-                continue
-            await self._process_advertisement(data, address, time.monotonic())
-
-    async def _process_advertisement(
-        self, data: bytes, address: tuple[str, int], now: float
-    ) -> None:
-        """One datagram from the advertisement socket: parse it, cache the
-        enrichment (firmware version / role / uptime), then feed the
-        SANITIZED frames through the same protocol seam as a
-        management-channel datagram — the advertisement is HEARTBEAT +
-        SYSTEM_TIME + PARAM_EXT_VALUE frames by design, so discovery,
-        liveness refresh, the param cache and the X-RTLS-INF gained/lost
-        broadcasts behave exactly as for active discovery. The datagram's
-        source PORT is a throwaway sender the firmware never reads from;
-        the device is recorded at (source IP, management port) instead.
-
-        Only the advertiser's own validated frames reach the protocol
-        (see :func:`_sanitized_advertisement_frames`): the raw datagram
-        must never touch the protocol's shared parser."""
-        if self._parse_advertisement is None or self._protocol is None:
-            return
-        try:
-            advertisement = self._parse_advertisement(
-                data, address, management_port=self._management_port
-            )
-        except Exception:
-            # the port is open to the world; a garbage datagram must not
-            # take the listener down
-            return
-        if advertisement is None:
-            return
-        mgmt_address = advertisement.address
-        if mgmt_address is None:
-            return
-        entry: dict[str, Any] = {}
-        if advertisement.firmware_version is not None:
-            entry["firmwareVersion"] = advertisement.firmware_version
-        kind = getattr(advertisement, "kind", None)
-        if kind is not None:
-            entry["role"] = kind
-        if advertisement.uptime_ms is not None:
-            entry["uptimeMs"] = int(advertisement.uptime_ms)
-        self._adv[advertisement.system_id] = entry
-        frames = _sanitized_advertisement_frames(data, advertisement.system_id)
-        if frames:
-            await self._process_datagram(frames, tuple(mgmt_address), now)
-
     async def _process_datagram(
         self, data: bytes, address: tuple[str, int], now: float
     ) -> None:
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        if self._passive:
-            # In passive mode the boards are probed only every
-            # hello_interval, so ANY inbound datagram from a device counts
-            # as proof of life — content-independent, because real
-            # firmware datagrams exist that yield no protocol event at all
-            # (the pn/pe/pd position stats and SYSTEM_TIME are dropped by
-            # the pinned SDK, which itself refreshes liveness on
-            # heartbeats only), and without this a board whose heartbeats
-            # are lost to a contended AP would flap on the slow hello
-            # cadence. Attribution is by the MAVLink header system id,
-            # NOT by source address: bench DHCP reassigns IPs across
-            # power cycles, and an address-keyed refresh would keep a
-            # ghost device alive forever on its successor's traffic. The
-            # source IP is only a guard — on a mismatch (the device
-            # moved) nothing is refreshed here and the normal heartbeat
-            # seam migrates the recorded address instead.
-            for system_id in _datagram_system_ids(data):
-                device = self._protocol.devices.get(system_id)
-                if device is not None and device.address[0] == address[0]:
-                    device.last_seen = max(device.last_seen, now)
         for event in self._protocol.feed(data, address, now):
             if event.kind == "discovered":
                 if self.log:
@@ -653,12 +514,14 @@ class RtlsExtension(Extension):
                 # GUI queries X-RTLS-INF once) see the device appear
                 await self._on_inf_change(now)
             elif event.kind == "heartbeat":
-                # heartbeats (including the sanitized state advertisements)
-                # re-latch the device's sleep state; a flip must reach
+                # heartbeats re-latch the device's sleep state; a flip must reach
                 # clients now, not on the 10 s slow INF refresh
                 await self._track_sleeping(
                     event.system_id, event.data.get("sleeping"), now
                 )
+            elif event.kind == "uptime":
+                if event.system_id in self._protocol.devices:
+                    self._uptime_ms[event.system_id] = int(event.data["uptime_ms"])
             elif event.kind == "stats":
                 # health telemetry arrives unsolicited; cache the latest
                 # snapshot and broadcast it (throttled) so live GCS clients
@@ -1336,7 +1199,7 @@ class RtlsExtension(Extension):
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
-        self._adv.pop(event.system_id, None)
+        self._uptime_ms.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
         # the network (lost + rediscovered) inside its pin window
@@ -1438,8 +1301,7 @@ class RtlsExtension(Extension):
             {
                 device.system_id: (
                     _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
-                    bool(getattr(device, "sleeping", False))
-                    or not self._sleep_state_known(device),
+                    bool(getattr(device, "sleeping", False)),
                 )
                 for device in devices.values()
             }
@@ -1472,11 +1334,10 @@ class RtlsExtension(Extension):
         dump loses datagrams; without this a device keeps a generic name
         and missing anchor beacons until it reboots).
 
-        Rounds are paced by the refill interval (the hello cadence in
-        passive mode) and capped at ``REFILL_MAX_ATTEMPTS``; a device
-        whose snapshot is complete — including the complete-but-unmatched
-        anchor case — sheds its refill entry and is never polled again
-        until rediscovery."""
+        Rounds are paced by the refill interval and capped at
+        ``REFILL_MAX_ATTEMPTS``; a device whose snapshot is complete —
+        including the complete-but-unmatched anchor case — sheds its
+        refill entry and is never polled again until rediscovery."""
         if self._protocol is None or not self._refill:
             return
         for system_id, state in list(self._refill.items()):
@@ -1574,19 +1435,14 @@ class RtlsExtension(Extension):
 
     def _missing_identity_params(self, device) -> list[str]:
         """The role-relevant identity params missing from a device's
-        snapshot (see :func:`_missing_identity_param_names`); the role is
-        resolved like :meth:`_device_json` does, preferring the fresher
-        state advertisement over the param cache."""
+        snapshot (see :func:`_missing_identity_param_names`)."""
         if device.param_count is not None and len(device.params) >= device.param_count:
             # the snapshot is count-complete, so the dump lost nothing:
             # an identity param absent from it is genuinely absent on the
             # device and must not be re-polled
             return []
         params = _decoded_device_params(device)
-        role = self._adv.get(device.system_id, {}).get("role") or role_from_params(
-            params
-        )
-        return _missing_identity_param_names(params, role)
+        return _missing_identity_param_names(params, role_from_params(params))
 
     # ---- client message handlers ----
 
@@ -1955,14 +1811,6 @@ class RtlsExtension(Extension):
             for device in devices.values()
         }
 
-    def _sleep_state_known(self, device) -> bool:
-        """Whether a heartbeat has latched the device's sleep state within
-        the device timeout; past it (passive mode, where any traffic keeps a
-        device alive) the latch, and the FC_STATE that arrived with it, are
-        guesses. Both stamps come from the feed clock."""
-        latch = self._sleeping.get(device.system_id)
-        return latch is None or device.last_seen - latch[1] <= self._device_timeout
-
     def _device_json(
         self,
         device,
@@ -1972,33 +1820,21 @@ class RtlsExtension(Extension):
     ) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
         params = _decoded_device_params(device)
-        # the state advertisement re-announces version/role every
-        # ADV_PERIOD_S, so it is a fresher source than the param cache
-        # (filled on discovery / explicit reads); the param path stays the
-        # fallback for boards without advertisement firmware
-        adv = self._adv.get(device.system_id, {})
-        role = adv.get("role") or role_from_params(params)
+        role = role_from_params(params)
 
         body = {
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "firmwareVersion": adv.get("firmwareVersion") or firmware_version(device),
+            "firmwareVersion": firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
-        # The sleep flag is a passive latch of the last heartbeat's
-        # MAV_STATE; when the device has stayed alive past the device
-        # timeout without a heartbeat re-latching it (possible in passive
-        # mode, where ANY traffic refreshes liveness) the latched value is
-        # a guess -- omit the key so clients render "unknown" instead of a
-        # stale definite state. Both stamps come from the feed clock, so
-        # the comparison is immune to the query-time clock.
-        if self._sleep_state_known(device):
-            # getattr: tolerate an SDK that predates sleep mode
-            body["sleeping"] = bool(getattr(device, "sleeping", False))
-        if "uptimeMs" in adv:
-            body["uptimeMs"] = adv["uptimeMs"]
+        # getattr: tolerate an SDK that predates sleep mode
+        body["sleeping"] = bool(getattr(device, "sleeping", False))
+        uptime_ms = self._uptime_ms.get(device.system_id)
+        if uptime_ms is not None:
+            body["uptimeMs"] = uptime_ms
         if uav_id is not None:
             body["uav"] = uav_id
         if flight_controller is not None:
@@ -2285,102 +2121,6 @@ def _sleep_error(requested: bool, detail: str) -> dict[str, Any]:
     }
 
 
-def _presence_config(configuration) -> tuple[float, float]:
-    """Resolve the presence cadence from the extension configuration:
-    returns ``(heartbeat_interval, device_timeout)`` in seconds.
-
-    Active mode (default) keeps the classic 2 s probe / 6 s timeout.
-    Passive mode (``passive: true``) slows the probe to ``hello_interval``
-    (default 60 s) and defaults the timeout to 30 s — 3x the firmware's
-    10 s advertisement period — unless ``device_timeout`` is configured
-    explicitly."""
-    if configuration.get("passive", False):
-        heartbeat_interval = float(
-            configuration.get("hello_interval", DEFAULT_HELLO_INTERVAL)
-        )
-        device_timeout = float(
-            configuration.get("device_timeout", DEFAULT_PASSIVE_DEVICE_TIMEOUT)
-        )
-    else:
-        heartbeat_interval = float(
-            configuration.get("heartbeat_interval", DEFAULT_HEARTBEAT_INTERVAL)
-        )
-        device_timeout = float(
-            configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)
-        )
-    return heartbeat_interval, device_timeout
-
-
-def _datagram_system_ids(data: bytes) -> set[int]:
-    """The system ids carried in the MAVLink frame headers of one
-    datagram, extracted with a fresh throwaway parser (never the
-    protocol's shared stateful one). Undecodable bytes yield nothing."""
-    parser = load_dialect().MAVLink(None)
-    parser.robust_parsing = True
-    system_ids: set[int] = set()
-    for message in parser.parse_buffer(bytes(data)) or []:
-        if message.get_type() == "BAD_DATA":
-            continue
-        system_ids.add(message.get_srcSystem())
-    return system_ids
-
-
-def _sanitized_advertisement_frames(data: bytes, system_id: int) -> bytes:
-    """Re-serializes exactly the frames of one advertisement datagram that
-    belong to the advertising device: its HEARTBEAT(s) and its
-    PARAM_EXT_VALUE frames (component id 197, same system id as the
-    validated advertisement). Everything else is dropped.
-
-    The raw datagram must never be fed to the protocol core:
-
-    - its shared parser is STATEFUL across datagrams, so a truncated
-      trailing frame would leave it mid-frame and eat the first frame of
-      the next management datagram (cross-socket parser pollution);
-      the fresh per-datagram parser here provides isolation, and only
-      complete, re-serialized frames come out;
-    - frames piggybacked after a valid heartbeat could otherwise
-      fabricate other devices, refresh their liveness or overwrite their
-      cached parameters from a single spoofed datagram.
-    """
-    parser = load_dialect().MAVLink(None)
-    parser.robust_parsing = True
-    frames: list[bytes] = []
-    for message in parser.parse_buffer(bytes(data)) or []:
-        if (
-            message.get_srcSystem() != system_id
-            or message.get_srcComponent() != RTLS_COMPONENT_ID
-            or message.get_type() not in ("HEARTBEAT", "PARAM_EXT_VALUE")
-        ):
-            continue
-        frames.append(bytes(message.get_msgbuf()))
-    return b"".join(frames)
-
-
-def _load_advertisement_parser(log):
-    """Resolves ``rtlslink.advertisement.parse_advertisement``, or returns
-    ``None`` (after one warning) when the pinned rtls-link SDK predates
-    the advertisement module — the listener is then disabled and the rest
-    of the extension works as before."""
-    try:
-        from rtlslink.advertisement import parse_advertisement
-    except ImportError:
-        if log:
-            log.warning(
-                "rtls: the pinned rtls-link SDK has no advertisement "
-                "parser (rtlslink.advertisement); state advertisements "
-                "will not be consumed — bump the rtls-link pin to enable "
-                "passive presence"
-            )
-        return None
-    return parse_advertisement
-
-
-def _configured_addresses(values, default_port: int) -> list[tuple[str, int]]:
-    """Parse configured ``host`` / ``host:port`` strings into address tuples,
-    defaulting the port to the extension's management port."""
-    return [parse_address(value, default_port) for value in values]
-
-
 def _configured_devices(
     values, default_port: int
 ) -> tuple[list[tuple[str, int]], dict[tuple[str, int], int]]:
@@ -2517,12 +2257,12 @@ def _missing_identity_param_names(
         )
         return missing
     if role is None and "UWB_ROLE" not in params:
-        # the device cannot be classified (no advertisement, UWB_ROLE
-        # lost with the dump — or genuinely absent on a legacy tag, the
-        # _cell_source_role compatibility bridge, which is recognized
-        # only once the snapshot is count-complete). The marker makes the
-        # poll re-request the whole dump: holes whose names were never
-        # listed cannot be enumerated by targeted reads.
+        # the device cannot be classified (UWB_ROLE lost with the dump —
+        # or genuinely absent on a legacy tag, the _cell_source_role
+        # compatibility bridge, which is recognized only once the snapshot
+        # is count-complete). The marker makes the poll re-request the
+        # whole dump: holes whose names were never listed cannot be
+        # enumerated by targeted reads.
         return ["UWB_ROLE"]
     return []
 
@@ -2732,38 +2472,20 @@ schema = {
         },
         "devices": {
             "type": "array",
-            "title": "Static device addresses (in addition to broadcast)",
+            "title": "Device management addresses",
             "items": {"type": "string"},
             "default": [],
         },
-        "broadcast": {
-            "type": "array",
-            "title": "Broadcast addresses for discovery",
-            "items": {"type": "string"},
-            "default": ["255.255.255.255"],
+        "listen_port": {
+            "type": "integer",
+            "title": "Local UDP port the devices stream their telemetry to "
+            "(their MGMT_PORT)",
+            "default": DEFAULT_LISTEN_PORT,
         },
         "register_beacons": {
             "type": "boolean",
             "title": "Register configured RTLS anchors as map beacons",
             "default": True,
-        },
-        "advertisement_port": {
-            "type": "integer",
-            "title": "UDP port for the devices' state advertisements "
-            "(0 disables the listener)",
-            "default": 3343,
-        },
-        "passive": {
-            "type": "boolean",
-            "title": "Passive presence: track devices from their state "
-            "advertisements and slow active probing to the hello interval "
-            "(requires advertisement-capable firmware on the fleet)",
-            "default": False,
-        },
-        "hello_interval": {
-            "type": "number",
-            "title": "Interval of the active hello probe in passive mode, in seconds",
-            "default": 60,
         },
     }
 }
