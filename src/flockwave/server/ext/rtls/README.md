@@ -4,16 +4,17 @@ Manages rtls-link UWB positioning devices over their management UDP
 channel (MAVLink 2, default port 3333) and exposes them to Axio
 clients through the server's message hub:
 
-- **Discovery / presence**: the extension announces itself with GCS
-  heartbeats (unicast to configured `devices` plus `broadcast`
-  addresses); each device's management link learns the server from
-  inbound datagrams and heartbeats back (component id 197). Devices are
-  tracked with a liveness timeout, and their full parameter list is
-  fetched automatically on discovery. In addition, the extension
-  listens for the firmware's autonomous **state advertisements**
-  (UDP :3343, see below) so devices are found and kept fresh without
-  being probed; `passive: true` makes advertisements the primary
-  presence source.
+- **Discovery / presence**: the extension knows the boards only from
+  its configured `devices` (a board's address is its `NET_PREFIX` plus
+  its `MAV_SYS_ID`). Every board streams its management telemetry
+  (heartbeats on component id 197, stats, and every few seconds its
+  uptime and, on tags, `FC_SYS_ID` / `FC_STATE`) to its
+  `MGMT_HOST:MGMT_PORT` from boot, and answers each request at the
+  request's source. The extension binds its one management socket to
+  `listen_port` (default 3343, the firmware's `MGMT_PORT` default), so
+  streams and replies arrive together; it still sends GCS heartbeats to
+  the configured `devices`. Devices are tracked with a liveness timeout,
+  and their full parameter list is fetched automatically on discovery.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
 - **Telemetry**: the firmware's unsolicited health stats are cached and
@@ -85,86 +86,17 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 ```jsonc
 "EXTENSIONS": {
   "rtls": {
-    "port": 3333,
-    "devices": ["192.168.4.1"],        // static addresses (optional)
-    "broadcast": ["255.255.255.255"],  // discovery broadcast
-    "advertisement_port": 3343,        // state-advertisement listener (0 disables)
-    "passive": false,                  // advertisement-driven presence (see below)
-    "hello_interval": 60,              // active probe cadence in passive mode, s
+    "port": 3333,                      // the devices' management port
+    "devices": ["192.168.4.1"],        // management addresses
+    "listen_port": 3343,               // the devices' MGMT_PORT
     "register_beacons": true           // anchors as map beacons (see X-RTLS-INF)
   }
 }
 ```
 
 `heartbeat_interval` and `device_timeout` (seconds) may also be set to
-override the presence cadence; the defaults are 2 s / 6 s in active mode
-and `hello_interval` / 30 s in passive mode.
-
-## Passive presence (state advertisements)
-
-Firmware with the state-advertisement feature (fw PR
-`feature/state-advertisement`) announces itself autonomously: one UDP
-datagram to `:3343` after every DHCP bind and then every `ADV_PERIOD_S`
-(device parameter, default 10 s), carrying HEARTBEAT (identity + sleep
-state), SYSTEM_TIME (uptime) and PARAM_EXT_VALUE frames for
-`FW_VERSION` and `UWB_ROLE`. The extension always listens on
-`advertisement_port` (default 3343; `0`/`null` disables) and treats
-every advertisement as a device heartbeat: the device is discovered /
-kept alive at *(source IP, management `port`)* — the datagram itself
-leaves a throwaway socket the firmware never reads from — its
-version/role/sleep/uptime are refreshed, and the same
-gained/lost `X-RTLS-INF` notifications fire as for active discovery.
-
-With `passive: false` (default) nothing else changes: the extension
-still probes with GCS heartbeats every `heartbeat_interval` (2 s) and
-expires devices after `device_timeout` (6 s); advertisements just
-discover boards earlier and enrich `X-RTLS-INF`.
-
-With `passive: true` the mgmt channel stops being hammered — during
-shows the 2.4 GHz AP is contended, and management flapping is
-operator-visible noise. Active probing slows to one "hello" every
-`hello_interval` (default 60 s; still needed so boards learn the server
-address for their unicast telemetry, and so legacy boards get probed at
-all), and `device_timeout` defaults to 30 s (3× the 10 s advertisement
-period) unless configured explicitly.
-
-**Fleet requirements and legacy boards.** `passive: true` assumes the
-fleet runs advertisement-capable firmware. Legacy boards (no
-advertisement image) are still tracked, with caveats:
-
-- Once a legacy board hears one hello, its management link locks onto
-  the server and its firmware streams **1 Hz heartbeats** (plus ~2 Hz
-  stats) to it unconditionally — the board keeps *itself* alive; the
-  30 s timeout does not flap it in steady state. (Contrary to the
-  intuition that a board "answering each 60 s hello" would expire on a
-  30 s timeout: boards are not reply-only, they free-run once peered.)
-- As extra insurance, in passive mode the extension refreshes liveness
-  from **any** inbound datagram on either socket, content-independent:
-  real firmware datagrams exist that the SDK protocol core emits no
-  event for at all (the `pn`/`pe`/`pd` position stats, SYSTEM_TIME; the
-  core itself only counts heartbeats). A board whose heartbeats are
-  lost to a contended AP stays alive as long as anything from it gets
-  through. Attribution is by the MAVLink header **system id** carried
-  in the datagram's frames, guarded by the source IP matching the
-  device's known address — never by source address alone: DHCP reuses
-  IPs across power cycles, and an address-keyed refresh would keep a
-  ghost device alive forever on its successor's traffic. On an IP
-  mismatch (the device moved) nothing is refreshed; the normal
-  heartbeat path migrates the recorded address. A device must still be
-  *discovered* by a heartbeat or advertisement first.
-- Residual gaps: after a legacy board reboots (or the server restarts
-  on a new source port), the board sends nothing until the next hello,
-  so its (re)discovery can take up to `hello_interval` — advertising
-  boards re-announce within `ADV_PERIOD_S` instead. A legacy board that
-  goes fully silent is only re-probed on the hello cadence, so a true
-  outage is detected within `device_timeout` but recovery detection can
-  lag by up to `hello_interval`.
-
-If the pinned `rtls-link` SDK predates the advertisement parser
-(`rtlslink.advertisement`), the extension logs one warning, disables
-the listener and otherwise works exactly as before — `passive: true`
-then degrades to just the slow hello + 30 s timeout, which is only
-safe with self-heartbeating boards (see above).
+override the presence cadence; the defaults are 2 s / 6 s. The
+extension does not start when `listen_port` is taken.
 
 ## Cluster clock (UWB-timebase show start)
 
@@ -256,13 +188,11 @@ plus a site-level `anchors` list:
 }
 ```
 
-- `age` — seconds since the last heartbeat from the device (in passive
-  mode: since any datagram from it).
-- `firmwareVersion` — from the device's latest state advertisement when
-  one has been received, else the `FW_VERSION` parameter if the device
-  exposes one, otherwise `null`.
-- `uptimeMs` — device uptime in milliseconds, as reported by its latest
-  state advertisement; absent for devices that never advertised (the
+- `age` — seconds since the last heartbeat from the device.
+- `firmwareVersion` — the `FW_VERSION` parameter if the device exposes
+  one, otherwise `null`.
+- `uptimeMs` — device uptime in milliseconds, from the latest
+  SYSTEM_TIME in the device's stream; absent until one arrives (the
   underlying counter wraps after ~49.7 days, like the firmware's).
 - `paramCount` — size of the device's parameter registry once known
   (the list is auto-fetched on discovery), otherwise `null`.
@@ -272,11 +202,7 @@ plus a site-level `anchors` list:
   the motors/flight controller, ELRS receiver and UWB module cut; WiFi
   and this management link still up). Derived from the device's
   heartbeat (`MAV_STATE_STANDBY`), so it is live even though sleep is
-  commanded through the `SLEEP` parameter. **Omitted** when the device
-  has stayed alive past the device timeout without a heartbeat
-  re-latching the state (possible in passive mode, where any traffic
-  refreshes liveness) — the latched value is then a guess, and a UI
-  should render the absence as "unknown". An `X-RTLS-INF` notification
+  commanded through the `SLEEP` parameter. An `X-RTLS-INF` notification
   is pushed (throttled) whenever a device's `sleeping` flips, and an
   accepted sleep/wake transaction updates the flag optimistically —
   a woken device reads `sleeping: false` immediately, even though it
@@ -294,8 +220,8 @@ plus a site-level `anchors` list:
   notification is pushed (throttled) whenever a device's `uav` or
   `flightController` changes.
 - `flightController` — the autopilot this device itself reports through
-  its `FC_SYS_ID` / `FC_STATE` parameters, which its state advertisement
-  carries also while it sleeps: `systemId` is that autopilot's MAVLink
+  its `FC_SYS_ID` / `FC_STATE` parameters, which its stream carries
+  also while it sleeps: `systemId` is that autopilot's MAVLink
   system id and `state` is `"live"` (heard on the device's UART now),
   `"remembered"` (the persisted id of the last confirmed autopilot, not
   heard now; always so while the device sleeps) or `"ambiguous"` (with a
@@ -305,8 +231,8 @@ plus a site-level `anchors` list:
   ambiguous. Absent on devices without an identity (anchors,
   never-associated tags, firmware without the parameters).
 - `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
-  `"disabled"`, from the latest state advertisement or the device's
-  `UWB_ROLE` parameter; absent when the device exposes neither.
+  `"disabled"`, from the device's `UWB_ROLE` parameter; absent when the
+  device does not expose it.
 - `name` — a human-readable role-aware label (e.g. `"RTLS anchor A0"`);
   absent for devices with no recognised role.
 - `twr` — inter-anchor TWR telemetry: a list (freshest first) of
@@ -711,8 +637,7 @@ sends `0` for a plane it did not fit) — before it is graded. Every entry
 names its `cell` (`CELL_ID`); tags are
 compared within their cell only, `references` holds one reference per
 cell and `reference` is that of the only cell (`null` with none or
-several). Anchors — by advertised role, or `UWB_ROLE` when the
-advertisement is absent — are never graded. `consistent` is true when at
+several). Anchors (by `UWB_ROLE`) are never graded. `consistent` is true when at
 least one cell has a reference and no tag deviates, drifted, differs in
 frame, is still
 calibrating, failed, went silent or is unknown; manual tags are reported

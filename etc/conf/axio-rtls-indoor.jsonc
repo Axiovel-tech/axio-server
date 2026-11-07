@@ -11,15 +11,11 @@
     },
 
 
-    // RTLS-Link devices (anchors + tag) for the RTLS panel. Broadcast
-    // discovery does not work on this multi-homed host (see
-    // docs/bench-reliability-findings.md in the fw repo) -- static list.
-    // DHCP reservations: the last octet is the board sysid.
+    // RTLS-Link devices (anchors + tags) for the RTLS panel. A board's
+    // address is its NET_PREFIX plus its sysid (the last octet); the boards
+    // stream to this host's MGMT_HOST:MGMT_PORT, the default listen_port.
     "rtls": {
       "enabled": true,
-      // Passive presence trial 2026-07-16: track boards from their
-      // autonomous :3343 state advertisements; active hello slows to 60 s.
-      "passive": true,
       "devices": [
         "192.168.0.101",
         "192.168.0.102",

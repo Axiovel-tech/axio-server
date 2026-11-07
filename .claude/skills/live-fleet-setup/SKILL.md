@@ -18,12 +18,12 @@ The host (`singu-server`) is multi-homed:
 
 | Interface | Address | Role |
 |---|---|---|
-| `enp2s0` | `192.168.0.100/24` | Board network (private AP). All RTLS-Link devices live here. |
+| `enp2s0` | fixed, equal to the boards' `MGMT_HOST` | Board network (private AP). All RTLS-Link devices live here. |
 | `wlp1s0` | `10.10.10.x/24` | Internet uplink, default route. |
 
 `ufw` is default-deny incoming: any **board-initiated** flow needs an
 explicit allow on `enp2s0`. Existing allows: 3333/udp (mgmt), 3334/udp
-(logs), 3335/udp (anchor telemetry), 3343/udp (phone-home), 14550/udp
+(logs), 3335/udp (anchor telemetry), 3343/udp (rtls management stream), 14550/udp
 (mavlink). Conntrack masks the deny for host-initiated flows, which
 makes firewall problems look intermittent — check `sudo ufw status`
 first when a board-initiated feature seems dead.
@@ -75,18 +75,14 @@ params are applied **at tag boot** — after changing them, reboot the tag
 (`kernel reboot cold` over SMP; the FC keeps power through a tag
 reboot). Set + verify readback + reboot, in that order.
 
-Mind mgmt-link contention: the running server polls every device on
-its single learned UDP peer, so CLI `param set/get` against a live
-server flakes intermittently — retry a couple of times before
-concluding anything.
-
 ## RTLS device management
 
 The rtls ext (see `etc/conf/axio-rtls-indoor.jsonc`) lists device mgmt
-addresses (`192.168.0.101`–`.112`, port 3333) with `"passive": true`.
-DHCP reshuffles IPs between sessions — identify devices by MAC/sysid,
-never by remembered IP. Device roster (stable): anchors sysid 101–108,
-tags/drones 19x–200.
+addresses (port 3333). A board's address is fixed: its `NET_PREFIX` /24
+plus its `MAV_SYS_ID`. Every board streams its management telemetry to
+`MGMT_HOST:MGMT_PORT` (3343) from boot, which is where the ext binds its
+management socket (`listen_port`). Device roster (stable): anchors sysid
+101–108, tags/drones 19x–200.
 
 ## Launch recipe
 
@@ -112,13 +108,13 @@ per-instance or per-vehicle port layouts into the live config, and
 never "fix" a live problem by assigning fresh ports — align the device
 side to 14550 instead.
 
-## Spare boards default to sysid 200
+## Spare boards and duplicate sysids
 
-A factory-fresh / spare AxioLight tag boots with `MAV_SYS_ID = 200` — the
-same sysid as a fleet tag. The server keys devices by sysid, so powering a
-spare next to a live fleet hijacks that identity: commands for the real
-drone silently go to the spare (observed live 2026-07-21: "drone 11 is
-stuck" was a bench test rig answering as 200 with no FC attached, whose
-arming gate refused every sleep). Before powering any spare on the board
-network, renumber it (`rtls-link param set <ip> MAV_SYS_ID 250` + reboot)
-or keep it off the fleet AP. Identify the culprit by MAC, not IP.
+A factory-fresh board boots with `MAV_SYS_ID = 199`, which the firmware
+refuses to address: it keeps Wi-Fi down until it is set up. A board given
+a fleet board's sysid also takes that board's address, and the server keys
+devices by sysid, so powering it next to the live fleet hijacks that
+identity: commands for the real drone silently go to the spare (observed
+live 2026-07-21: "drone 11 is stuck" was a bench test rig answering as 200
+with no FC attached). Give every board its own sysid and identify a
+culprit by MAC.

@@ -72,12 +72,11 @@ STATE_CALIBRATED = 3
 STATE_FAILED = 4
 
 
-def _is_tag(ext: "RtlsExtension", system_id: int, params: dict[str, Any]) -> bool:
-    """Whether a device is (or may still turn out to be) a tag. The state
-    advertisement names the role before the parameter cache does, so it
-    is consulted first, as X-RTLS-INF does; a device of unknown role is
-    graded (and reported as ``unknown``) rather than silently skipped."""
-    role = ext._adv.get(system_id, {}).get("role") or role_from_params(params)
+def _is_tag(params: dict[str, Any]) -> bool:
+    """Whether a device is (or may still turn out to be) a tag; a device of
+    unknown role is graded (and reported as ``unknown``) rather than
+    silently skipped."""
+    role = role_from_params(params)
     return role is None or role == "tag"
 
 
@@ -368,7 +367,7 @@ def _tag_entries(
         if ids is not None and system_id not in ids:
             continue
         params = _decoded_device_params(device)
-        if not _is_tag(ext, system_id, params):
+        if not _is_tag(params):
             continue
         stats_age = now - ext._stats_at.get(system_id, float("-inf"))
         entry = _entry_for(

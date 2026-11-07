@@ -9,7 +9,8 @@ processes and talks to them over a real UDP socket. Run manually:
     .venv/bin/python test/e2e/rtls_two_apps_live.py
 
 Sequence (each image booted un-orchestrated on the default mgmt port
-3333, so run it on a host where :3333 is free):
+3333, streaming to the extension's default listen port 3343, so run it
+on a host where :3333 and :3343 are free):
 
 1. anchor image: discovery -> UWB_ROLE == 3 (responder default);
    UWB_ROLE=2 accepted (initiator, in-bounds); UWB_ROLE=1 (species
@@ -103,7 +104,6 @@ async def _drive(binary: str, name: str, checks) -> None:
                         app,
                         {
                             "devices": ["127.0.0.1"],
-                            "broadcast": [],
                             "port": MGMT_PORT,
                             "heartbeat_interval": 0.5,
                             "device_timeout": 5,
