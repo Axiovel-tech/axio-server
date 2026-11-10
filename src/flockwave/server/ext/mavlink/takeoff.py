@@ -284,7 +284,8 @@ ECHO_MAX_AGE = 3.0
 
 START_TOLERANCE_BEFORE_COMMIT_US = 1000
 """Microseconds by which a drone's echoed start may differ from the sent one
-before the drones commit: one re-sent start may be on its way."""
+before the drones commit. An echo of the start that a re-send has just
+replaced is accepted on its own (`ShowSchedule.was_just_resent_from`)."""
 
 START_TOLERANCE_AFTER_COMMIT_US = 5000
 """Microseconds by which a committed drone's start, which moves with the drift
@@ -302,6 +303,8 @@ def _problem_before_commit(
         return f"it holds schedule {echo.schedule_id}, not {schedule.id}"
     if not echo.has_start:
         return "it holds no start"
+    if schedule.was_just_resent_from(echo.start_cluster_us):
+        return None
     return _start_off(echo, schedule, START_TOLERANCE_BEFORE_COMMIT_US)
 
 
