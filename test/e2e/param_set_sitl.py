@@ -50,21 +50,25 @@ class Relay:
         self.vehicle: tuple[str, int] | None = None
         self.mode = "pass"
         self.dropped = 0
+        self.replayed = 0
         self.last_param_value: dict[str, bytes] = {}
-        self.parser = mavutil.mavlink.MAVLink(None)
-        self.parser.robust_parsing = True
+        self.parsers = {
+            side: mavutil.mavlink.MAVLink(None) for side in ("vehicle", "server")
+        }
+        for parser in self.parsers.values():
+            parser.robust_parsing = True
 
     def start(self) -> None:
         for target in (self._from_vehicle, self._from_server):
             threading.Thread(target=target, daemon=True).start()
 
-    def _messages(self, data: bytes):
-        return self.parser.parse_buffer(data) or []
+    def _messages(self, side: str, data: bytes):
+        return self.parsers[side].parse_buffer(data) or []
 
     def _from_vehicle(self) -> None:
         while True:
             data, self.vehicle = self.vehicle_side.recvfrom(65536)
-            for message in self._messages(data):
+            for message in self._messages("vehicle", data):
                 if message.get_msgId() == PARAM_VALUE_ID:
                     self.last_param_value[message.param_id] = message.get_msgbuf()
             self.server_side.sendto(data, ("127.0.0.1", MAVLINK_PORT))
@@ -72,11 +76,16 @@ class Relay:
     def _from_server(self) -> None:
         while True:
             data, _ = self.server_side.recvfrom(65536)
-            sets = [m for m in self._messages(data) if m.get_msgId() == PARAM_SET_ID]
+            sets = [
+                m
+                for m in self._messages("server", data)
+                if m.get_msgId() == PARAM_SET_ID
+            ]
             if sets and self.mode != "pass":
                 self.dropped += 1
                 stale = self.last_param_value.get(sets[0].param_id)
                 if self.mode == "drop-set-replay-stale" and stale:
+                    self.replayed += 1
                     self.server_side.sendto(bytes(stale), ("127.0.0.1", MAVLINK_PORT))
                 continue
             if self.vehicle is not None:
@@ -210,12 +219,18 @@ def scenarios(client: Client, relay: Relay, side: Side) -> dict:
     original = side.read(PARAM)
 
     def run(name: str, mode: str, value: float, expect_value: float | None) -> None:
-        relay.mode, relay.dropped = mode, 0
+        relay.mode, relay.dropped, relay.replayed = mode, 0, 0
         reply, seconds = set_through_server(client, value)
         relay.mode = "pass"
         held = side.read(PARAM)
         if expect_value is None:
-            ok = "error" in reply and held != value
+            # The fault must have happened, and the error must be the write's.
+            ok = (
+                "tried to set" in str(reply.get("error"))
+                and held != value
+                and relay.dropped > 0
+                and (mode != "drop-set-replay-stale" or relay.replayed > 0)
+            )
         else:
             ok = reply.get("result") == expect_value and held == expect_value
         results[name] = {
@@ -223,6 +238,7 @@ def scenarios(client: Client, relay: Relay, side: Side) -> dict:
             "reply": {k: reply[k] for k in ("result", "error") if k in reply},
             "vehicle_holds": held,
             "param_sets_dropped": relay.dropped,
+            "stale_replies_replayed": relay.replayed,
             "seconds": round(seconds, 1),
         }
         print(name, "OK" if ok else "FAILED", json.dumps(results[name]), flush=True)

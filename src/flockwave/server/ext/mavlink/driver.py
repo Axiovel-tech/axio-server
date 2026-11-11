@@ -1136,6 +1136,17 @@ def _require_finite(name: str, value: float) -> None:
         raise RuntimeError(f"Value of parameter {name!r} must be finite")
 
 
+def _require_float32(name: str, value: float) -> None:
+    """A MAVLink parameter travels as a 32-bit float; a value outside that
+    range cannot be sent, nor compared with what the vehicle reports."""
+    try:
+        pack("<f", value)
+    except OverflowError:
+        raise RuntimeError(
+            f"Value of parameter {name!r} does not fit a MAVLink parameter"
+        ) from None
+
+
 def _same_wire_value(received: float, sent: float) -> bool:
     """Whether two PARAM_VALUE floats are the same 32-bit wire value."""
     return pack("<f", received) == pack("<f", sent)
@@ -1768,6 +1779,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         encoded_value = self._autopilot.encode_param_to_wire_representation(
             value, param_type
         )
+        _require_float32(name, encoded_value)
 
         try:
             # Only a PARAM_VALUE carrying the written value confirms the write:

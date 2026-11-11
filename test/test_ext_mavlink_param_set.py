@@ -116,6 +116,14 @@ async def test_a_float_parameter_is_compared_as_its_32_bit_wire_value():
     assert await set_parameter(link, 0.1) == pytest.approx(0.1)
 
 
+async def test_a_value_outside_float32_is_refused_before_anything_is_sent():
+    # Packed inside the shared receive loop it would raise there instead.
+    link = FakeLink(replies=[], reads=[param_value(0.0)])
+    with pytest.raises(RuntimeError, match="does not fit"):
+        await set_parameter(link, 1e39)
+    assert link.attempts == 0
+
+
 async def test_the_driver_passes_the_confirmed_value_to_the_prm_set_reply():
     async def confirmed_set(name, value):
         return value
