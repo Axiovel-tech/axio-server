@@ -193,6 +193,20 @@ async def test_without_a_heartbeat_parameters_are_refused_and_never_touched(
     assert vehicle.params["DISARM_DELAY"] == 10.0
 
 
+@pytest.mark.parametrize("bulk", [True, False])
+async def test_prm_set_many_reports_why_it_refused_before_a_heartbeat(
+    bulk, autojump_clock
+):
+    # Both the bulk and the per-parameter path catch errors; the reason must survive.
+    vehicle = FakeVehicle(DISARM_DELAY=10.0)
+    uav = new_uav(vehicle)
+    uav.driver.use_bulk_parameter_uploads = bulk
+    with pytest.raises(MAVLinkExtensionError, match="not identified yet"):
+        async for _ in uav.driver._set_parameters_single(uav, {"DISARM_DELAY": 13}):
+            pass
+    assert vehicle.sent == []
+
+
 async def test_a_read_waits_for_the_heartbeat_and_decodes_as_the_autopilot_does(
     autojump_clock,
 ):

@@ -1114,6 +1114,10 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     async def _set_parameters_single(
         self, uav: "MAVLinkUAV", parameters: dict[str, Any]
     ) -> ProgressEvents[BulkParameterUploadResponse]:
+        # Outside both paths' per-batch and per-parameter error handling, so
+        # the client gets the reason ("not identified yet, retry").
+        if parameters:
+            await uav._wait_for_autopilot_identification()
         if self.use_bulk_parameter_uploads:
             parameters_as_float = {}
             for name, value in parameters.items():
