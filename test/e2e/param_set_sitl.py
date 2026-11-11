@@ -8,7 +8,9 @@ with ``ARDUPILOT_SITL`` and ``SITL_DEFAULTS`` exported:
 The vehicle reaches the server over UDP (SERIAL0) through a relay that can
 lose the server's PARAM_SET, alone or answered by a replay of the last
 PARAM_VALUE (the late reply to the read before the write, as on the bench).
-SERIAL1 is a side channel that reads the value the vehicle really holds.
+The relay starts by holding back the vehicle's HEARTBEATs, so the server sees
+the UAV without knowing its autopilot. SERIAL1 is a side channel that reads
+the value the vehicle really holds.
 Results go to ``<work>/results.json``.
 """
 
@@ -35,6 +37,8 @@ RELAY_PORT = 24660
 INSTANCE = 6
 UAV = "03"
 PARAM = "DISARM_DELAY"
+HEARTBEAT_ID = 0
+PARAM_REQUEST_READ_ID = 20
 PARAM_SET_ID = 23
 PARAM_VALUE_ID = 22
 
@@ -49,6 +53,8 @@ class Relay:
         self.server_side.bind(("127.0.0.1", 0))
         self.vehicle: tuple[str, int] | None = None
         self.mode = "pass"
+        self.holding_heartbeats = True
+        self.param_requests_forwarded = 0
         self.dropped = 0
         self.replayed = 0
         self.last_param_value: dict[str, bytes] = {}
@@ -68,19 +74,20 @@ class Relay:
     def _from_vehicle(self) -> None:
         while True:
             data, self.vehicle = self.vehicle_side.recvfrom(65536)
+            ids = set()
             for message in self._messages("vehicle", data):
+                ids.add(message.get_msgId())
                 if message.get_msgId() == PARAM_VALUE_ID:
                     self.last_param_value[message.param_id] = message.get_msgbuf()
+            if self.holding_heartbeats and HEARTBEAT_ID in ids:
+                continue
             self.server_side.sendto(data, ("127.0.0.1", MAVLINK_PORT))
 
     def _from_server(self) -> None:
         while True:
             data, _ = self.server_side.recvfrom(65536)
-            sets = [
-                m
-                for m in self._messages("server", data)
-                if m.get_msgId() == PARAM_SET_ID
-            ]
+            messages = self._messages("server", data)
+            sets = [m for m in messages if m.get_msgId() == PARAM_SET_ID]
             if sets and self.mode != "pass":
                 self.dropped += 1
                 stale = self.last_param_value.get(sets[0].param_id)
@@ -89,6 +96,10 @@ class Relay:
                     self.server_side.sendto(bytes(stale), ("127.0.0.1", MAVLINK_PORT))
                 continue
             if self.vehicle is not None:
+                self.param_requests_forwarded += sum(
+                    m.get_msgId() in (PARAM_REQUEST_READ_ID, PARAM_SET_ID)
+                    for m in messages
+                )
                 self.vehicle_side.sendto(data, self.vehicle)
 
 
@@ -192,18 +203,8 @@ def wait_for_uav(client: Client, timeout: float = 60) -> None:
         time.sleep(1)
 
 
-def wait_for_server_to_read(client: Client, side: Side, timeout: float = 30) -> None:
-    """Until the server knows the autopilot it encodes parameters bytewise,
-    so a write in that window lands mangled; wait until it reads right."""
-    deadline = time.monotonic() + timeout
-    expected = side.read(PARAM)
-    while (
-        client.request({"type": "PRM-GET", "ids": [UAV], "name": PARAM}).get("result")
-        != expected
-    ):
-        if time.monotonic() > deadline:
-            raise TimeoutError("the server never read the vehicle's value")
-        time.sleep(1)
+def get_through_server(client: Client) -> dict:
+    return client.request({"type": "PRM-GET", "ids": [UAV], "name": PARAM})
 
 
 def set_through_server(client: Client, value: float) -> tuple[dict, float]:
@@ -212,6 +213,55 @@ def set_through_server(client: Client, value: float) -> tuple[dict, float]:
         {"type": "PRM-SET", "ids": [UAV], "name": PARAM, "value": value}
     )
     return reply, time.monotonic() - started
+
+
+def unidentified_scenarios(client: Client, relay: Relay, side: Side) -> dict:
+    """The UAV is listed but its autopilot is unknown until a heartbeat
+    passes: nothing may reach the vehicle, and a read that the heartbeat
+    catches up with returns the vehicle's value."""
+    results: dict[str, dict] = {}
+    original = side.read(PARAM)
+
+    def record(name: str, reply: dict, ok: bool, seconds: float) -> None:
+        results[name] = {
+            "ok": ok,
+            "reply": {k: reply[k] for k in ("result", "error") if k in reply},
+            "vehicle_holds": side.read(PARAM),
+            "param_requests_forwarded": relay.param_requests_forwarded,
+            "seconds": round(seconds, 1),
+        }
+        print(name, "OK" if ok else "FAILED", json.dumps(results[name]), flush=True)
+
+    started = time.monotonic()
+    reply = get_through_server(client)
+    refused = "not identified yet" in str(reply.get("error"))
+    record(
+        "PRM-GET before the autopilot is known",
+        reply,
+        refused and relay.param_requests_forwarded == 0,
+        time.monotonic() - started,
+    )
+
+    reply, seconds = set_through_server(client, original + 3)
+    refused = "not identified yet" in str(reply.get("error"))
+    untouched = side.read(PARAM) == original
+    record(
+        "PRM-SET before the autopilot is known",
+        reply,
+        refused and untouched and relay.param_requests_forwarded == 0,
+        seconds,
+    )
+
+    threading.Timer(1, setattr, (relay, "holding_heartbeats", False)).start()
+    started = time.monotonic()
+    reply = get_through_server(client)
+    record(
+        "PRM-GET answered once a heartbeat names the autopilot",
+        reply,
+        reply.get("result") == original,
+        time.monotonic() - started,
+    )
+    return results
 
 
 def scenarios(client: Client, relay: Relay, side: Side) -> dict:
@@ -270,8 +320,8 @@ def main() -> int:
         start_server(stack, work)
         client = Client()
         wait_for_uav(client)
-        wait_for_server_to_read(client, side)
-        results = scenarios(client, relay, side)
+        results = unidentified_scenarios(client, relay, side)
+        results |= scenarios(client, relay, side)
     (work / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     passed = all(result["ok"] for result in results.values())
     print("ALL PASSED" if passed else "FAILURES", flush=True)

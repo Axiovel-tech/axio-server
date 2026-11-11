@@ -96,7 +96,11 @@ from .enums import (
     RebootShutdownConditions,
     SkybrushUserCommand,
 )
-from .errors import MAVLinkExtensionError, ParameterNotFoundError
+from .errors import (
+    AutopilotNotIdentifiedError,
+    MAVLinkExtensionError,
+    ParameterNotFoundError,
+)
 from .ftp import MAVFTP
 from .log_download import MAVLinkLogDownloader
 from .packets import (
@@ -132,6 +136,10 @@ SEC_TO_USEC = 1000000
 FORCE_MAGIC = 21196
 """Magic number to force an arming or disarming operation even if it is unsafe
 to do so."""
+
+AUTOPILOT_IDENTIFICATION_TIMEOUT = 3.0
+"""Seconds a parameter access waits for the first heartbeat (sent at 1 Hz)
+that names the autopilot of a UAV the server has just seen."""
 
 nan = float("nan")
 """"Not a number" constant, used in some MAVLink messages to indicate a default
@@ -1542,11 +1550,28 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 the parameter does not exist. Firmware that predates PARAM_ERROR
                 does not reply at all, which looks like a lost packet.
             TooSlowError: if the drone did not reply in time
+            AutopilotNotIdentifiedError: if no heartbeat arrived in time
         """
+        await self._wait_for_autopilot_identification()
         response = await self._get_parameter(name)
         return self._autopilot.decode_param_from_wire_representation(
             response.param_value, response.param_type
         )
+
+    async def _wait_for_autopilot_identification(self) -> None:
+        """Waits a few heartbeat periods for the first heartbeat if we do not
+        know the autopilot yet, because parameter values are encoded the way
+        the autopilot expects them.
+
+        Raises:
+            AutopilotNotIdentifiedError: if no heartbeat arrived in time
+        """
+        if not isinstance(self._autopilot, UnknownAutopilot):
+            return
+        with move_on_after(AUTOPILOT_IDENTIFICATION_TIMEOUT):
+            await self.wait_until_connected()
+        if self._connection_state is not ConnectionState.CONNECTED:
+            raise AutopilotNotIdentifiedError(self.id)
 
     async def _get_parameter(self, name: str) -> MAVLinkMessage:
         """Retrieves the value of a parameter from the UAV and returns a
@@ -1819,6 +1844,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         value the UAV confirmed.
         """
         _require_finite(name, value)
+        await self._wait_for_autopilot_identification()
         return await self._set_parameter_single(name, value)
 
     async def set_parameters(self, parameters: dict[str, float]) -> None:
@@ -1832,6 +1858,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         for name, value in parameters.items():
             _require_finite(name, value)
 
+        await self._wait_for_autopilot_identification()
         if len(parameters) > 1 and self._autopilot.supports_mavftp_parameter_upload:
             # Do a bulk upload
             async with aclosing(MAVFTP.for_uav(self)) as ftp:
