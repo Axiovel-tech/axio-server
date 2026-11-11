@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, overload
 import trio
 
 from flockwave.server.ext.base import UAVExtension
+from flockwave.server.ext.show.takeoff import TakeoffConfiguration
 from flockwave.server.ext.show.time import BinaryTimeAxisConfiguration
 from flockwave.server.ext.show.types import ShowExtensionAPI
 from flockwave.server.ext.signals import SignalsExtensionAPI
@@ -166,28 +167,24 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     def exports(self) -> dict[str, Any]:
         return {
             "find_network_by_id": self._find_network_by_id,
-            "get_uav_source_addresses": self._get_uav_source_addresses,
+            "get_uav_ids_by_system_id": self._get_uav_ids_by_system_id,
             "use_mavlink_message_channel_factory": use_mavlink_message_channel_factory,
         }
 
-    def _get_uav_source_addresses(self) -> dict[str, tuple[str, int]]:
-        """Returns a mapping from the IDs of the connected UAVs to the
-        ``(host, port)`` source address each UAV was last heard from, across
-        all the networks managed by this extension.
-
-        UAVs that are not currently connected, or whose last source address
-        is not a host-port pair (e.g. UAVs on a serial link), are omitted.
+    def _get_uav_ids_by_system_id(self) -> dict[int, str]:
+        """Returns the IDs of every UAV the networks of this extension have
+        heard from, connected or not, keyed by MAVLink system ID. A system ID
+        that appears in more than one network maps to none of its UAVs.
         """
-        result: dict[str, tuple[str, int]] = {}
+        result: dict[int, str] = {}
+        shared: set[int] = set()
         for network in (self._networks or {}).values():
-            for uav, address in network.uav_addresses().items():
-                if (
-                    uav.is_connected
-                    and isinstance(address, tuple)
-                    and len(address) == 2
-                    and isinstance(address[0], str)
-                ):
-                    result[uav.id] = address
+            for uav in network.uavs():
+                if uav.system_id in result:
+                    shared.add(uav.system_id)
+                result[uav.system_id] = uav.id
+        for system_id in shared:
+            del result[system_id]
         return result
 
     def _find_network_by_id(self, network_id: str) -> MAVLinkNetwork | None:
@@ -213,6 +210,19 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         # Get a handle to the signals extension that we will need
         signals = app.import_api("signals", SignalsExtensionAPI)
         status_summary_signal = signals.get("mavlink:status_summary")
+
+        # The drones count the show start in the UWB cluster time that the
+        # rtls extension relates to wall time
+        try:
+            rtls = app.import_api("rtls")
+        except (KeyError, RuntimeError):
+            rtls = None
+        schedule = self._driver.show_schedule
+        schedule.cluster_clock = lambda: (
+            rtls.cluster_clock if rtls is not None and rtls.loaded else None
+        )
+        show = app.import_api("show", ShowExtensionAPI)
+        schedule.is_locked = lambda: show.is_start_locked()
 
         # Create self._uavs only here and not in the constructor; this is to
         # ensure that we cannot accidentally register a UAV when the extension
@@ -654,6 +664,8 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 "configuration)"
             )
 
+        self._update_show_schedule()
+
     def _update_show_start_time_in_networks(self) -> None:
         """Updates the scheduled start times of the drones managed by this
         extension, based on the start time extracted from the show clock.
@@ -680,6 +692,23 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
                 "Failed to dispatch scheduled takeoff configuration change signal "
                 "to other extensions (reason of dispatch attempt: updated start time)"
             )
+
+        self._update_show_schedule()
+
+    def _update_show_schedule(self) -> None:
+        """Updates the show schedule of the drones from the start configuration
+        and the show clock of the `show` extension.
+        """
+        assert self.app is not None
+        assert self._driver is not None
+
+        show = self.app.import_api("show", ShowExtensionAPI)
+        clock = show.get_clock()
+        self._driver.show_schedule.update(
+            TakeoffConfiguration.from_show_config(
+                show.get_configuration(), clock.start_time if clock else None
+            )
+        )
 
     def _update_show_light_configuration_in_networks(
         self, config: LightConfiguration | None = None

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, ClassVar
 from flockwave.gps.time import gps_time_of_week_to_utc, unix_to_gps_time_of_week
 
 from flockwave.server.ext.show.config import AuthorizationScope
+from flockwave.server.ext.show.takeoff import split_start_time
 from flockwave.server.ext.show.time import BinaryTimeAxisConfiguration
 from flockwave.server.model.gps import GPSFixType as OurGPSFixType
 
@@ -23,8 +24,10 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DroneShowStatus",
+    "ShowScheduleStatus",
     "create_led_control_packet",
     "create_rc_override_packet",
+    "create_show_schedule_packet",
     "create_start_time_configuration_packet",
     "create_time_axis_configuration_packet",
 )
@@ -110,25 +113,30 @@ def create_start_time_configuration_packet(
             updated on the swarm; set this to `False` if you do not want to
             change the start time, only the authorization flag
     """
+    start_time_msec = 0
     if not should_update_takeoff_time:
         # do not touch; this is expressed by a value larger than 604800 seconds
         # on the drone's side.
-        start_time = 0x7FFFFFFF
+        start_time_tow = 0x7FFFFFFF
         msec_until_start = 0x7FFFFFFF
     elif start_time is None or start_time < 0:
         # clear start time; this is expressed by a value smaller than -604800
         # seconds on the drone's side
-        start_time = -0x80000000
+        start_time_tow = -0x80000000
         msec_until_start = -0x80000000
     else:
-        # convert from UNIX timestamp to GPS time-of-week
-        msec_until_start = int(1000 * (start_time - time()))
+        msec_until_start = round(1000 * (start_time - time()))
         msec_until_start = min(max(msec_until_start, -MSEC_IN_WEEK), MSEC_IN_WEEK)
-        _, start_time = unix_to_gps_time_of_week(int(start_time))
+        start_time_sec, start_time_msec = split_start_time(start_time)
+        _, start_time_tow = unix_to_gps_time_of_week(start_time_sec)
 
+    # Firmware that predates the trailing millisecond field ignores it
     scope_value = authorization_scope_to_int(authorization_scope)
     return create_custom_data_packet(
-        type=1, payload=pack("<iBi", start_time, scope_value, msec_until_start)
+        type=1,
+        payload=pack(
+            "<iBiH", start_time_tow, scope_value, msec_until_start, start_time_msec
+        ),
     )
 
 
@@ -137,6 +145,22 @@ def create_time_axis_configuration_packet(
 ) -> MAVLinkMessageSpecification:
     """Creates a time axis configuration packet used by our firmware."""
     return create_custom_data_packet(type=5, payload=config)
+
+
+SHOW_SCHEDULE_TYPE = 0x42
+"""First data byte of the Axio show schedule packet and of its echo."""
+
+
+def create_show_schedule_packet(
+    schedule_id: int, start_cluster_us: int
+) -> MAVLinkMessageSpecification:
+    """Creates an Axio show schedule packet: the show start in microseconds of
+    the UWB cluster clock (zero for no start, an abort after the drones have
+    committed to the start) and the ID of the schedule that it belongs to.
+    """
+    return create_custom_data_packet(
+        type=SHOW_SCHEDULE_TYPE, payload=pack("<HQB", schedule_id, start_cluster_us, 0)
+    )
 
 
 def create_led_control_packet(
@@ -330,6 +354,9 @@ class DroneShowStatus:
     if not set.
     """
 
+    start_time_msec: int = 0
+    """Millisecond part of the scheduled start time (0-999)."""
+
     elapsed_time: int = 0
     """Number of seconds elapsed in the drone show."""
 
@@ -394,6 +421,13 @@ class DroneShowStatus:
             secondary_rtcm_count_plus_one,
         ) = cls._struct.unpack(data[:14])
 
+        # The firmware packs the millisecond part of the start time above the
+        # 20 bits of the seconds of week
+        start_time_msec = 0
+        if start_time >= 0:
+            start_time_msec = (start_time >> 20) & 0x3FF
+            start_time &= 0xFFFFF
+
         # Merge flags, flags2 and flags3 into one byte. Lower 4 bits of flags2
         # is the execution stage. Lower 2 bits of flags3 is the boot count
         # modulo 4.
@@ -434,6 +468,7 @@ class DroneShowStatus:
 
         return cls(
             start_time=start_time,
+            start_time_msec=start_time_msec,
             elapsed_time=elapsed_time,
             light=light,
             flags=flags,
@@ -687,3 +722,65 @@ class DroneShowStatusExtension:
 
         # TODO(ntamas): show ID, trajectory index
         return cls(lat, lng, alt, relative_alt, vx, vy, vz, heading, h_acc, v_acc)
+
+
+class ShowScheduleStatusFlag(IntFlag):
+    """Flags of the Axio show schedule echo."""
+
+    HAS_START = 1
+    COMMITTED = 2
+    CLOCK_VALID = 4
+    SET_BY_RC = 8
+
+
+@dataclass(frozen=True)
+class ShowScheduleStatus:
+    """The show schedule that a drone holds, echoed back after each drone show
+    status packet by firmware that counts the show start in cluster time.
+    """
+
+    schedule_id: int
+    """ID of the schedule of the start that the drone holds or last cleared;
+    zero for none or a start set by the RC."""
+
+    flags: ShowScheduleStatusFlag
+
+    start_cluster_us: int
+    """The start in microseconds of the cluster clock: exactly the received
+    value before the drone commits to it; after that, or when set by the RC,
+    the drone's own start mapped back to the cluster clock, which moves with
+    the drift of its crystal. Zero for no start."""
+
+    received_at: float
+    """When the echo arrived, as a UNIX timestamp."""
+
+    TYPE: ClassVar[int] = 0x5E
+    """Identifier of Axio drone-to-GCS DATA* packets."""
+
+    _struct: ClassVar[Struct] = Struct("<HBQ")
+
+    @classmethod
+    def from_mavlink_message(
+        cls, message: MAVLinkMessage, received_at: float
+    ) -> ShowScheduleStatus | None:
+        """Decodes an Axio DATA* packet; ``None`` if it is not a show schedule
+        echo."""
+        data = bytes(message.data[: message.len])
+        if len(data) < 1 + cls._struct.size or data[0] != SHOW_SCHEDULE_TYPE:
+            return None
+        schedule_id, flags, start_cluster_us = cls._struct.unpack_from(data, 1)
+        return cls(
+            schedule_id, ShowScheduleStatusFlag(flags), start_cluster_us, received_at
+        )
+
+    @property
+    def committed(self) -> bool:
+        return ShowScheduleStatusFlag.COMMITTED in self.flags
+
+    @property
+    def clock_valid(self) -> bool:
+        return ShowScheduleStatusFlag.CLOCK_VALID in self.flags
+
+    @property
+    def has_start(self) -> bool:
+        return ShowScheduleStatusFlag.HAS_START in self.flags

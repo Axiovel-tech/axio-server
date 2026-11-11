@@ -356,6 +356,19 @@ class MAVProtocolCapability(IntFlag):
     DRONE_SHOW_MODE = 0x4000000
 
 
+class MAVParamError(IntEnum):
+    """Replica of the `MAV_PARAM_ERROR` enum of the MAVLink protocol, using
+    proper Python enums.
+    """
+
+    NO_ERROR = 0
+    DOES_NOT_EXIST = 1
+    VALUE_OUT_OF_RANGE = 2
+    PERMISSION_DENIED = 3
+    COMPONENT_NOT_FOUND = 4
+    READ_ONLY = 5
+
+
 class MAVResult(IntEnum):
     """Replica of the `MAV_RESULT` enum of the MAVLink protocol, using proper
     Python enums.

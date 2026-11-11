@@ -446,7 +446,9 @@ async def test_inf_site_anchor_list_without_beacon_registration(
     }
 
 
-async def test_site_anchor_active_when_anchor_device_online(extension, device, builder, hub):
+async def test_site_anchor_active_when_anchor_device_online(
+    extension, device, builder, hub
+):
     add_rtls_cell_params(device)
     extension._beacon_api = StubBeaconAPI()
     await discover(extension, device)
@@ -480,7 +482,9 @@ async def test_param_cache_registers_configured_anchors_as_beacons(extension, de
     assert anchor1.position.amsl == pytest.approx(14.8)
 
 
-async def test_anchor_beacon_active_reflects_associated_anchor_device(extension, device):
+async def test_anchor_beacon_active_reflects_associated_anchor_device(
+    extension, device
+):
     add_rtls_cell_params(device)
     extension._beacon_api = StubBeaconAPI()
     await discover(extension, device)
@@ -504,7 +508,9 @@ async def test_invalid_role_does_not_register_anchor_beacons(extension, device):
     assert extension._beacon_api.beacons == {}
 
 
-async def test_complete_cell_without_role_registers_legacy_tag_beacons(extension, device):
+async def test_complete_cell_without_role_registers_legacy_tag_beacons(
+    extension, device
+):
     add_rtls_cell_params(device)
     device.params.pop("UWB_ROLE")
     device.param_count = len(device.params)
@@ -604,9 +610,7 @@ async def test_refill_requests_only_missing_anchor_params(extension, device):
     assert "UWB_MAC" not in cached.params
 
     device.read_requests.clear()
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
     # exactly the missing names were re-requested, and the replies
     # completed the snapshot (dropping the refill bookkeeping)
@@ -631,18 +635,14 @@ async def test_refill_restores_anchor_name(extension, device, builder, hub):
     entry = response.body["status"][str(DEVICE_SYSID)]
     assert entry["name"] == f"RTLS anchor {DEVICE_SYSID}"
 
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
     response = await extension._handle_RTLS_INF(message, None, hub)
     entry = response.body["status"][str(DEVICE_SYSID)]
     assert entry["name"] == "RTLS anchor A1"
 
 
-async def test_refill_backs_off_and_gives_up_at_the_retry_cap(
-    extension, device
-):
+async def test_refill_backs_off_and_gives_up_at_the_retry_cap(extension, device):
     add_anchor_identity_params(device)
     device.drop_from_list = {"UWB_MAC"}
     await discover(extension, device)
@@ -684,9 +684,7 @@ async def test_refill_skips_complete_but_unmatched_anchor(extension, device):
     await discover(extension, device)
     device.read_requests.clear()
 
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     assert device.read_requests == []
     assert DEVICE_SYSID not in extension._refill
 
@@ -699,9 +697,7 @@ async def test_refill_ignores_lost_non_identity_params(extension, device):
     await discover(extension, device)
     device.read_requests.clear()
 
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     assert device.read_requests == []
     assert DEVICE_SYSID not in extension._refill
 
@@ -715,9 +711,7 @@ async def test_refill_skips_count_complete_snapshot(extension, device):
     assert cached.param_count == len(cached.params)
     device.read_requests.clear()
 
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     assert device.read_requests == []
     assert DEVICE_SYSID not in extension._refill
 
@@ -734,9 +728,7 @@ async def test_refill_restores_tag_cell_and_beacons(extension, device):
     assert extension._beacon_api.beacons == {}
 
     device.read_requests.clear()
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
     # CELL_ID and POS_YAW_DEG are geometry-consistency identity params
     # now; this fake registry has neither, so the first round requests
@@ -765,9 +757,7 @@ async def test_refill_redumps_when_role_is_unknown(extension, device):
     assert not cached.params
 
     device.respond_to_list = True  # this time the dump gets through
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     # no targeted reads were needed: the re-dump filled the snapshot
     assert device.read_requests == []
     assert "UWB_ROLE" in cached.params
@@ -775,9 +765,7 @@ async def test_refill_redumps_when_role_is_unknown(extension, device):
     assert DEVICE_SYSID not in extension._refill
 
 
-async def test_refill_repairs_legacy_tag_without_role_param(
-    extension, device
-):
+async def test_refill_repairs_legacy_tag_without_role_param(extension, device):
     # a legacy tag (no UWB_ROLE param at all; the _cell_source_role
     # compatibility bridge) is recognized only once its snapshot is
     # count-complete — even a lost NON-identity param (POS_X) keeps it
@@ -791,9 +779,7 @@ async def test_refill_repairs_legacy_tag_without_role_param(
     assert extension._beacon_api.beacons == {}
 
     device.drop_from_list = set()  # the retransmitted dump gets through
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     # snapshot count-complete -> the legacy tag inference activates and
     # the cell renders
     assert device.read_requests == []
@@ -815,9 +801,7 @@ async def test_refill_paces_targeted_reads(extension, device, autojump_clock):
         await transport(payload, address)
 
     extension._send = recording_send
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
     assert device.read_requests == ["UWB_MAC", "UWB_AN0_MAC", "UWB_AN1_MAC"]
     # the reads of one round are spaced out, not blasted as one burst
     # the firmware's management TX queue would drop replies from
@@ -1450,7 +1434,9 @@ async def test_ota_role_guardrail_accepts_matching_species(
 
     image = tmp_path / "anchor.bin"
     image.write_bytes(b"\x00" * 16)
-    extension._ota_upgrade = lambda address, image_path, *, timeout=10.0, on_progress=None: "9.9.9"
+    extension._ota_upgrade = (
+        lambda address, image_path, *, timeout=10.0, on_progress=None: "9.9.9"
+    )
 
     async with trio.open_nursery() as nursery:
         extension._nursery = nursery
@@ -1735,94 +1721,105 @@ async def test_inf_no_rebroadcast_without_devices(extension, device):
     assert len(_inf_broadcasts(extension)) == 2
 
 
-# ---- tag<->drone association (source-IP join) ---------------------------
+# ---- tag<->drone association (the tag's flight-controller claim) --------
 
 
-def _set_uav_addresses(extension, addresses):
-    """Install a fake UAV source-address feed (the seam through which the
+def _set_uav_ids(extension, uav_ids):
+    """Install a fake UAV-id-by-system-id feed (the seam through which the
     extension reads the mavlink extension's API)."""
-    extension._uav_source_addresses = lambda: addresses
+    extension._uav_ids_by_system_id = lambda: uav_ids
 
 
-async def test_uav_mapping_appears_in_inf(extension, device, builder, hub):
-    await discover(extension, device)
+def _claim_flight_controller(device, system_id, state):
+    set_fake_param(device, "FC_SYS_ID", system_id, "uint8")
+    set_fake_param(device, "FC_STATE", state, "uint8")
 
-    # before any UAV shares the tag's IP the device is unassociated
+
+async def _inf_entry(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
-
-    # a connected UAV heard from the tag's bridge IP associates with it
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
-    assert extension._refresh_uav_map() is True
-
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body["status"][str(DEVICE_SYSID)]["uav"] == "05"
+    return response.body["status"][str(DEVICE_SYSID)]
 
 
-async def test_uav_mapping_clears_on_ip_change(extension, device, builder, hub):
+async def test_uav_is_the_drone_the_tag_names(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 1)
     await discover(extension, device)
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+
+    # the server has not heard from that drone yet
+    assert "uav" not in await _inf_entry(extension, builder, hub)
+
+    _set_uav_ids(extension, {5: "05", 6: "06"})
     assert extension._refresh_uav_map() is True
 
-    # a DHCP renewal moves the UAV's source IP off the tag: the mapping
-    # must clear on the next recompute, never persist
-    _set_uav_addresses(extension, {"05": ("192.168.4.99", 14550)})
-    assert extension._refresh_uav_map() is True
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+    entry = await _inf_entry(extension, builder, hub)
+    assert entry["uav"] == "05"
+    assert entry["flightController"] == {"systemId": 5, "state": "live"}
 
 
-async def test_uav_mapping_ambiguous_ip_maps_nothing(
-    extension, device, builder, hub
-):
+async def test_uav_stays_while_the_drone_sleeps(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 1)
+    _set_uav_ids(extension, {5: "05"})
     await discover(extension, device)
-    # two UAVs claiming one source IP cannot be told apart; mapping either
-    # would risk exactly the mis-attribution this feature exists to prevent
-    _set_uav_addresses(
-        extension,
-        {"05": (DEVICE_ADDRESS[0], 14550), "06": (DEVICE_ADDRESS[0], 14551)},
+
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    await extension._process_datagram(
+        device.heartbeat(), device.address, time.monotonic()
     )
-    assert extension._refresh_uav_map() is False
 
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    assert "uav" not in response.body["status"][str(DEVICE_SYSID)]
+    entry = await _inf_entry(extension, builder, hub)
+    assert entry["sleeping"] is True
+    assert entry["uav"] == "05"
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
 
 
-async def test_uav_mapping_change_pushes_inf(extension, device):
+async def test_ambiguous_claim_names_no_uav(extension, device, builder, hub):
+    _claim_flight_controller(device, 5, 3)
+    _set_uav_ids(extension, {5: "05"})
+    await discover(extension, device)
+
+    entry = await _inf_entry(extension, builder, hub)
+    assert "uav" not in entry
+    assert entry["flightController"]["state"] == "ambiguous"
+
+
+async def test_association_change_pushes_inf(extension, device):
+    _claim_flight_controller(device, 5, 1)
     await _feed_heartbeat(extension, device, now=0.0)
     assert len(_inf_broadcasts(extension)) == 1
 
-    # the association appearing is a mapping change: the poll in the
+    # the drone becoming known is a mapping change: the poll in the
     # protocol loop pushes the device list (throttled, like gained/lost)
-    _set_uav_addresses(extension, {"05": (DEVICE_ADDRESS[0], 14550)})
+    _set_uav_ids(extension, {5: "05"})
     await extension._poll_uav_map(now=2.0)
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 2
     assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["uav"] == "05"
 
-    # an unchanged mapping stays quiet
+    # an unchanged association stays quiet
     await extension._poll_uav_map(now=4.0)
     assert len(_inf_broadcasts(extension)) == 2
 
-    # the UAV disappearing clears the mapping and pushes again
-    _set_uav_addresses(extension, {})
+    # a claim change alone pushes too
+    _claim_flight_controller(device, 5, 2)
+    await extension._process_datagram(
+        device._param_value("FC_STATE", list(device.params).index("FC_STATE")),
+        device.address,
+        5.0,
+    )
     await extension._poll_uav_map(now=6.0)
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 3
-    assert "uav" not in broadcasts[-1]["status"][str(DEVICE_SYSID)]
+    entry = broadcasts[-1]["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
 
 
-def test_uav_addresses_empty_without_mavlink_api(extension):
+def test_uav_ids_empty_without_mavlink_api(extension):
     # no mavlink extension (or one that is not loaded) leaves every device
     # unassociated instead of failing
     assert extension._mavlink_api is None
-    assert extension._uav_source_addresses() == {}
+    assert extension._uav_ids_by_system_id() == {}
     extension._mavlink_api = SimpleNamespace(loaded=False)
-    assert extension._uav_source_addresses() == {}
+    assert extension._uav_ids_by_system_id() == {}
 
 
 @requires_sleep_sdk
@@ -1879,6 +1876,20 @@ async def test_inf_sleeping_omitted_when_latch_stale(extension, device):
     await _feed_heartbeat(extension, device, now=100.0)
     status = extension._inf_status(now=100.5)
     assert status[str(DEVICE_SYSID)]["sleeping"] is False
+
+
+@requires_sleep_sdk
+async def test_live_claim_reads_remembered_when_heartbeats_go_stale(extension, device):
+    _claim_flight_controller(device, 5, 1)
+    await _feed_heartbeat(extension, device, now=0.0)
+    entry = extension._inf_status(now=1.0)[str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "live"}
+
+    # heartbeats (and the advertisements carrying FC_STATE) go silent while
+    # other traffic keeps the device alive
+    extension._protocol.devices[DEVICE_SYSID].last_seen = 100.0
+    entry = extension._inf_status(now=100.0)[str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 5, "state": "remembered"}
 
 
 # ---- X-RTLS-STATS health telemetry --------------------------------------
@@ -2025,9 +2036,7 @@ async def test_stats_broadcast_throttled(extension, device):
     ]
     assert len(stats_broadcasts) == 2
     # and it carries the latest value
-    assert (
-        stats_broadcasts[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 10.0
-    )
+    assert stats_broadcasts[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 10.0
 
 
 async def test_stats_trailing_flush_delivers_latest_within_interval(extension, device):
@@ -2089,19 +2098,7 @@ async def test_lost_device_stats_pruned_from_query(extension, device, builder, h
     assert DEVICE_SYSID not in extension._last_stats_sent
 
 
-# ---- show-clock pin (cluster -> GPS) ----
-
-
-def _add_pin_params(device):
-    """Give the fake device the GPS_PIN_* param slots the firmware defines."""
-    device.params.update(
-        {
-            "GPS_PIN_WEEK": (struct.pack("<H", 0), 4),  # MAV_PARAM_EXT_TYPE_UINT16
-            "GPS_PIN_TOW_MS": (struct.pack("<I", 0), 5),  # UINT32
-            "GPS_PIN_C0_HI": (struct.pack("<I", 0), 5),
-            "GPS_PIN_C0_LO": (struct.pack("<I", 0), 5),
-        }
-    )
+# ---- cluster clock estimate ----
 
 
 CLUSTER_STATS = {
@@ -2116,167 +2113,213 @@ CLUSTER_STATS = {
 }
 
 
-def test_show_clock_pin_pure():
-    """mint_pin pairs cluster seconds with wall UTC; pin_writes follows the
-    week-zero-first contract; the restart prediction tracks wall time."""
-    from rtlslink import TICK_SECONDS
+def _cluster_clock_driver(monkeypatch):
+    """A cluster clock estimate and a function feeding it one cluster-clock
+    report received at a given wall time."""
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
 
-    from flockwave.server.ext.rtls.show_clock import mint_pin, pin_writes
+    now = [0.0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
+    )
+    clock = ClusterClock()
 
-    pin = mint_pin(120.5, now_unix=1_752_000_000.0)
-    assert pin.c0_ticks == round(120.5 / TICK_SECONDS)
-    assert 0 < pin.week < 4096
-    assert 0 <= pin.tow_ms < 604_800_000
+    def report(system_id, cluster_seconds, received_at, clkok=1.0):
+        now[0] = received_at
+        hi = float(int(cluster_seconds // 4096) * 4096)
+        clock.on_stats(
+            system_id, {"clkok": clkok, "clkh": hi, "clks": cluster_seconds - hi}
+        )
 
-    writes = pin_writes(pin)
-    # week zeroed first, written last; C0 split into the two u32 halves
-    assert writes[0] == ("GPS_PIN_WEEK", 0, "uint16")
-    assert writes[-1] == ("GPS_PIN_WEEK", pin.week, "uint16")
-    assert ("GPS_PIN_C0_HI", (pin.c0_ticks >> 32) & 0xFFFFFFFF, "uint32") in writes
-    assert ("GPS_PIN_C0_LO", pin.c0_ticks & 0xFFFFFFFF, "uint32") in writes
-
-    # ten wall seconds later a live cluster should read ~10 s further
-    assert pin.predicted_cluster_seconds(1_752_000_010.0) == pytest.approx(130.5)
+    return clock, report
 
 
-async def test_show_clock_pin_distributed_on_fresh_stats(extension, device):
-    """A clkok stats snapshot mints the pin and pushes it to the device in
-    the contract order; the device ends up carrying the minted pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-        # nursery exit waits for the spawned push to complete
-    extension._nursery = None
-
-    pin = extension._show_clock.pin
-    assert pin is not None
-    assert DEVICE_SYSID in extension._show_clock._pinned
-
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
-    c0_hi = struct.unpack("<I", device.params["GPS_PIN_C0_HI"][0])[0]
-    c0_lo = struct.unpack("<I", device.params["GPS_PIN_C0_LO"][0])[0]
-    assert week == pin.week
-    assert tow == pin.tow_ms
-    assert (c0_hi << 32) | c0_lo == pin.c0_ticks
-
-
-async def test_show_clock_pin_not_minted_without_clkok(extension, device):
-    """Stale or missing cluster stats must never mint a pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    stale = dict(CLUSTER_STATS, clkok=0.0)
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, stale, now=0.0)
-    extension._nursery = None
-
-    assert extension._show_clock.pin is None
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    assert week == 0
-
-
-async def test_show_clock_repin_on_cluster_restart(extension, device):
-    """A cluster time far off the pin's prediction re-mints the pin and
-    redistributes it (the restart makes every distributed pin invalid)."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    extension._nursery = None
-    first_pin = extension._show_clock.pin
-    assert DEVICE_SYSID in extension._show_clock._pinned
-
-    # the cluster restarts: reported time drops far below the prediction
-    restarted = dict(CLUSTER_STATS, clks=2.0)
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, restarted, now=1.0)
-    extension._nursery = None
-
-    second_pin = extension._show_clock.pin
-    assert second_pin is not first_pin
-    assert DEVICE_SYSID in extension._show_clock._pinned
-    week = struct.unpack("<H", device.params["GPS_PIN_WEEK"][0])[0]
-    tow = struct.unpack("<I", device.params["GPS_PIN_TOW_MS"][0])[0]
-    assert (week, tow) == (second_pin.week, second_pin.tow_ms)
-
-
-async def test_show_clock_ignores_repeated_accumulated_snapshot(
+async def test_cluster_clock_fed_by_fresh_stats_without_device_writes(
     extension, device, monkeypatch
 ):
-    """Other NAMED_VALUE_FLOAT fields repeat the cached clkh/clks pair.
-    A parameter transaction can delay the next clock field beyond the restart
-    tolerance; that stale snapshot must not trigger a false re-pin."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
+    """A clkok stats snapshot feeds the exported estimate; stale cluster time
+    does not, and nothing is written to the device."""
+    writes = []
 
-    now = [1_752_000_000.0]
+    async def set_param(*args, **kwds):
+        writes.append(args)
+
+    monkeypatch.setattr(extension, "set_param", set_param)
+    await discover(extension, device)
+    clock = extension.exports()["cluster_clock"]
+
+    await _feed_stats(extension, device, dict(CLUSTER_STATS, clkok=0.0), now=0.0)
+    assert clock.estimate() is None
+
+    before = time.time()
+    await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    after = time.time()
+    assert before - 120.5 <= clock.estimate() <= after - 120.5
+    assert writes == []
+
+
+def test_cluster_clock_follows_least_delayed_report(monkeypatch):
+    """Reports from three tags arrive with a varying latency: the estimate is
+    the least delayed report of the last 20 s, and maps wall time to cluster
+    microseconds and back."""
+    import random
+
+    clock, report = _cluster_clock_driver(monkeypatch)
+    rng = random.Random(3)
+    wall_minus_cluster = 1_752_000_000.0
+
+    for step in range(3 * 75):
+        sampled_at = wall_minus_cluster + 100.0 + step / 3
+        latency = 0.08 if step == 0 else 0.004 + rng.expovariate(1 / 0.04)
+        report(step % 3 + 1, sampled_at - wall_minus_cluster, sampled_at + latency)
+
+    assert 0.004 <= clock.estimate() - wall_minus_cluster < 0.006
+    assert clock.epoch == 0
+
+    wall = wall_minus_cluster + 200.0
+    cluster_us = clock.cluster_us_at(wall)
+    assert cluster_us == pytest.approx(200e6 - 5e3, abs=1e3)
+    assert clock.wall_at(cluster_us) == pytest.approx(wall, abs=1e-6)
+
+
+def test_cluster_clock_restart_starts_a_new_timebase(monkeypatch):
+    """A cluster time far off the estimate's prediction, confirmed by the
+    next distinct sample of the same device, re-seeds the estimate and bumps
+    the epoch."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 100.0, t0)
+    report(1, 101.0, t0 + 1)
+    assert clock.estimate() == pytest.approx(t0 - 100.0)
+
+    report(1, 2.0, t0 + 2)
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 100.0)
+
+    report(1, 2.5, t0 + 2.5)
+    assert clock.epoch == 1
+    assert clock.estimate() == pytest.approx(t0)
+
+
+def test_cluster_clock_restart_clears_every_pending_deviation(monkeypatch):
+    """A deviation recorded against the old timebase must not count as the
+    first of two against the new one."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 100.0, t0)
+    report(2, 3000.0, t0)  # device 2 deviates once against the first timebase
+    report(1, 2000.0, t0 + 0.5)
+    report(1, 2000.5, t0 + 1)  # device 1 confirms a restart
+    assert clock.epoch == 1
+
+    report(2, 3500.0, t0 + 1.5)  # device 2's first deviation against the new one
+    assert clock.epoch == 1
+
+
+def test_cluster_clock_ignores_repeated_accumulated_snapshot(monkeypatch):
+    """Other NAMED_VALUE_FLOAT fields repeat the cached clkh/clks pair; a
+    stale pair arriving long after its sample is not a deviation."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 120.5, t0)
+    report(1, 120.5, t0 + 6.0)
+    report(1, 120.5, t0 + 7.0)
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 120.5)
+
+
+def test_cluster_clock_keeps_its_timebase_across_a_torn_clock_pair(monkeypatch):
+    """clkh and clks are separate frames and the snapshot pairs the latest of
+    each. A lost clkh frame at a 4096 s boundary pairs the old clkh with the
+    new clks until the next report; crossing a boundary, the new clkh pairs
+    with the old clks until the clks frame arrives. Neither is a restart."""
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
+
+    t0 = 1_752_000_000.0
+    now = [t0]
     monkeypatch.setattr(
-        "flockwave.server.ext.rtls.show_clock.time.time", lambda: now[0]
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
     )
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
+    clock = ClusterClock()
+
+    def report(at, clkh, clks):
+        now[0] = t0 + at
+        clock.on_stats(1, {"clkok": 1.0, "clkh": clkh, "clks": clks})
+
+    report(0.0, 0.0, 4095.0)
+    report(1.0, 0.0, 0.0)  # clkh frame lost at the boundary
+    report(1.5, 4096.0, 0.5)
+    report(4096.5, 4096.0, 4095.5)
+    report(4097.0, 8192.0, 4095.5)  # clkh lands before its clks
+    report(4097.2, 8192.0, 0.2)
+    assert clock.epoch == 0
+
+
+@pytest.mark.parametrize("old_clks", [1753.1, 0.4])
+def test_cluster_clock_keeps_its_timebase_when_a_tag_resets_its_clock(
+    monkeypatch, old_clks
+):
+    """A tag whose estimator resets (geometry recalibration) sends clkh=0,
+    clks=0 and only then clkok=0, so two snapshots pair the zeroed halves
+    with the previous clkok=1. Seen on the bench as a -5849 s restart of the
+    whole estimate followed by a +5849 s one."""
+    from flockwave.server.ext.rtls.cluster_clock import ClusterClock
+
+    t0 = 1_752_000_000.0
+    now = [t0]
+    monkeypatch.setattr(
+        "flockwave.server.ext.rtls.cluster_clock.time.time", lambda: now[0]
+    )
+    clock = ClusterClock()
+
+    def report(at, system_id, clkh, clks, clkok=1.0):
+        now[0] = t0 + at
+        clock.on_stats(system_id, {"clkok": clkok, "clkh": clkh, "clks": clks})
+
+    report(0.0, 2, 4096.0, old_clks + 1.0)
+    report(0.5, 1, 4096.0, old_clks + 1.5)
+    report(1.5, 1, 0.0, old_clks + 1.5)
+    report(1.52, 1, 0.0, 0.0)
+    report(1.54, 1, 0.0, 0.0, clkok=0.0)
+    report(2.0, 2, 4096.0, old_clks + 3.0)
+    report(3.0, 1, 4096.0, old_clks + 4.0)
+
+    assert clock.epoch == 0
+    assert clock.estimate() == pytest.approx(t0 - 4096.0 - old_clks - 1.0)
+
+
+def test_cluster_clock_restart_needs_a_sample_that_kept_running(monkeypatch):
+    """Two deviating samples restart the timebase only if the second one
+    advanced from the first by the elapsed wall time."""
+    clock, report = _cluster_clock_driver(monkeypatch)
+    t0 = 1_752_000_000.0
+
+    report(1, 5000.0, t0)
+    report(1, 3.0, t0 + 1)
+    report(1, 1.0, t0 + 2)  # deviates again, but ran backwards
+    report(1, 900.0, t0 + 3)  # deviates again, but jumped ahead
+    assert clock.epoch == 0
+
+    report(1, 901.1, t0 + 4)
+    assert clock.epoch == 1
+    assert clock.estimate() == pytest.approx(t0 + 4 - 901.1)
+
+
+async def test_cluster_clock_forgets_a_lost_device(extension, device):
+    """A lost device's last sample is dropped, so its first report after
+    rediscovery is evaluated even if it repeats the old pair."""
     await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    first_pin = extension._show_clock.pin
-    assert first_pin is not None
-
-    # The pin writes can occupy the management channel for longer than the
-    # five-second restart tolerance. The SDK still emits accumulated snapshots
-    # for non-clock stats, carrying the old clkh/clks pair.
-    now[0] += 6.0
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=6.0)
-    assert extension._show_clock.pin is first_pin
-
-    # A genuinely new sample is still evaluated and agrees with the pin.
-    advanced = dict(CLUSTER_STATS, clks=126.5)
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, advanced, now=6.0)
-    extension._nursery = None
-    assert extension._show_clock.pin is first_pin
-
-
-async def test_show_clock_lost_device_repinned_on_return(extension, device):
-    """A lost device is dropped from the pinned set, so its next fresh
-    stats snapshot after rediscovery pushes the pin again (it may have
-    rebooted with default params)."""
-    from flockwave.server.ext.rtls.show_clock import ShowClockPinManager
-
-    _add_pin_params(device)
-    extension._show_clock = ShowClockPinManager(extension)
-    await discover(extension, device)
-
-    async with trio.open_nursery() as nursery:
-        extension._nursery = nursery
-        await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
-    extension._nursery = None
-    assert DEVICE_SYSID in extension._show_clock._pinned
+    await _feed_stats(extension, device, CLUSTER_STATS, now=0.0)
+    clock = extension._cluster_clock
+    assert DEVICE_SYSID in clock._last_cluster_seconds
 
     events = extension._protocol.expire(time.monotonic() + 1000)
     for event in events:
         extension._handle_lost(event)
-    assert DEVICE_SYSID not in extension._show_clock._pinned
+    assert DEVICE_SYSID not in clock._last_cluster_seconds
 
 
 # ---- passive presence: state advertisements ------------------------------
@@ -2297,17 +2340,17 @@ ADV_SOURCE = (DEVICE_ADDRESS[0], 49321)
 
 
 def make_advertisement(device, *, uptime_ms=120_000):
-    """One state-advertisement datagram as lib/net/phone_home_advert.cpp
+    """One state-advertisement datagram as lib/management/src/phone_home_advert.cpp
     packs it: HEARTBEAT first, then SYSTEM_TIME (uptime) and the
-    PARAM_EXT_VALUE frames for FW_VERSION and UWB_ROLE (when present),
-    back to back in one datagram."""
+    PARAM_EXT_VALUE frames for FW_VERSION, UWB_ROLE, FC_SYS_ID and FC_STATE
+    (when present), back to back in one datagram."""
     d = device.dialect
     frames = [device.heartbeat()]
     system_time = d.MAVLink_system_time_message(
         time_unix_usec=0, time_boot_ms=uptime_ms
     )
     frames.append(bytes(system_time.pack(device._mav)))
-    for name in ("FW_VERSION", "UWB_ROLE"):
+    for name in ("FW_VERSION", "UWB_ROLE", "FC_SYS_ID", "FC_STATE"):
         if name in device.params:
             frames.append(device._param_value(name, list(device.params).index(name)))
     return b"".join(frames)
@@ -2419,6 +2462,62 @@ async def test_advertisement_discovers_device_and_broadcasts_inf(
     assert entry["sleeping"] is False
 
 
+async def test_sleeping_tag_advertisement_reports_its_flight_controller(
+    extension, device, builder, hub
+):
+    """A drone asleep since before the server started is known only from its
+    advertisements; they alone must name the flight controller it carries."""
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    set_fake_param(device, "FC_SYS_ID", 8, "uint8")
+    set_fake_param(device, "FC_STATE", 2, "uint8")
+    device.respond_to_list = False
+    extension._parse_advertisement = stub_advertisement_parser(sleeping=True)
+
+    await extension._process_advertisement(make_advertisement(device), ADV_SOURCE, 0.0)
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["sleeping"] is True
+    assert "uav" not in entry
+    assert entry["flightController"] == {"systemId": 8, "state": "remembered"}
+
+
+async def test_flight_controller_reads_remembered_once_the_tag_sleeps(
+    extension, device, builder, hub
+):
+    set_fake_param(device, "FC_SYS_ID", 8, "uint8")
+    set_fake_param(device, "FC_STATE", 1, "uint8")
+    await discover(extension, device)
+    message = make_message(builder, {"type": "X-RTLS-INF"})
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 8, "state": "live"}
+
+    # the cached FC_STATE still says live until the next advertisement
+    set_fake_param(device, "SLEEP", 1, "uint8")
+    await extension._process_datagram(
+        device.heartbeat(), device.address, time.monotonic()
+    )
+
+    response = await extension._handle_RTLS_INF(message, None, hub)
+    entry = response.body["status"][str(DEVICE_SYSID)]
+    assert entry["flightController"] == {"systemId": 8, "state": "remembered"}
+
+
+async def test_tag_without_flight_controller_identity_omits_it(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+
+    response = await extension._handle_RTLS_INF(
+        make_message(builder, {"type": "X-RTLS-INF"}), None, hub
+    )
+    assert "flightController" not in response.body["status"][str(DEVICE_SYSID)]
+
+
 async def test_advertisement_refreshes_known_device(extension, device):
     """For an already known device an advertisement is a liveness refresh
     (a heartbeat), not a rediscovery: last_seen moves, no INF push."""
@@ -2454,9 +2553,7 @@ async def test_advertisement_without_enrichment_keeps_param_path(
     assert "role" not in entry
 
 
-async def test_advertisement_piggybacked_frames_are_dropped(
-    extension, device, dialect
-):
+async def test_advertisement_piggybacked_frames_are_dropped(extension, device, dialect):
     """A single valid heartbeat must not smuggle extra frames into the
     protocol: piggybacked HEARTBEAT/PARAM_EXT_VALUE frames for OTHER
     system ids (and non-advertisement message types) are stripped before
@@ -2548,7 +2645,9 @@ def test_load_advertisement_parser_degrades_without_sdk(monkeypatch):
     warning and disables the listener instead of breaking the extension."""
     monkeypatch.setitem(sys.modules, "rtlslink.advertisement", None)
     warnings = []
-    log = SimpleNamespace(warning=lambda message, *args, **kwargs: warnings.append(message))
+    log = SimpleNamespace(
+        warning=lambda message, *args, **kwargs: warnings.append(message)
+    )
 
     assert _load_advertisement_parser(log) is None
 
@@ -2843,8 +2942,14 @@ def _pos_broadcasts(extension):
 async def test_pos_broadcast_on_complete_cycle(extension, device):
     await discover(extension, device)
     await _feed_pos(
-        extension, device, 1.2044, -0.3506, -0.82, sigma=0.1204,
-        time_boot_ms=1234, now=0.0,
+        extension,
+        device,
+        1.2044,
+        -0.3506,
+        -0.82,
+        sigma=0.1204,
+        time_boot_ms=1234,
+        now=0.0,
     )
 
     broadcasts = _pos_broadcasts(extension)
@@ -2991,9 +3096,7 @@ async def test_pos_pruned_on_device_loss(extension, device, builder, hub):
 
 async def test_pos_nonfinite_ned_invalidates_only_that_cycle(extension, device):
     await discover(extension, device)
-    await _feed_pos(
-        extension, device, float("nan"), 2.0, -0.5, time_boot_ms=1, now=0.0
-    )
+    await _feed_pos(extension, device, float("nan"), 2.0, -0.5, time_boot_ms=1, now=0.0)
     assert not _pos_broadcasts(extension)
 
     # the next (finite) cycle regroups on its fresh stamp and broadcasts
@@ -3003,16 +3106,20 @@ async def test_pos_nonfinite_ned_invalidates_only_that_cycle(extension, device):
     assert broadcasts[-1]["positions"][str(DEVICE_SYSID)]["north"] == 1.0
 
 
-async def test_pos_nonfinite_sigma_does_not_blackhole_the_stream(
-    extension, device
-):
+async def test_pos_nonfinite_sigma_does_not_blackhole_the_stream(extension, device):
     # a persistently non-finite psig (covariance blow-up) must degrade to
     # "no sigma", not silence the whole stream: the poisoned field still
     # counts for the cycle grouping
     await discover(extension, device)
     await _feed_pos(
-        extension, device, 1.0, 2.0, -0.5, sigma=float("inf"),
-        time_boot_ms=1, now=0.0,
+        extension,
+        device,
+        1.0,
+        2.0,
+        -0.5,
+        sigma=float("inf"),
+        time_boot_ms=1,
+        now=0.0,
     )
 
     broadcasts = _pos_broadcasts(extension)
@@ -3073,9 +3180,7 @@ async def test_pos_reboot_backstep_resets_the_assembly(extension, device):
     # a device reboot rewinds time_boot_ms; the recurring low stamps must
     # start a fresh cycle instead of being dropped as "older" forever
     await discover(extension, device)
-    await _feed_pos(
-        extension, device, 1.0, 2.0, -0.5, time_boot_ms=600_000, now=0.0
-    )
+    await _feed_pos(extension, device, 1.0, 2.0, -0.5, time_boot_ms=600_000, now=0.0)
     assert len(_pos_broadcasts(extension)) == 1
 
     # rebooted: stamps restart near zero (backstep far above the threshold)
@@ -3087,9 +3192,7 @@ async def test_pos_reboot_backstep_resets_the_assembly(extension, device):
     assert entry["timeBootMs"] == 1500
 
 
-async def test_pos_broadcast_does_not_block_on_a_full_hub_queue(
-    extension, device
-):
+async def test_pos_broadcast_does_not_block_on_a_full_hub_queue(extension, device):
     # X-RTLS-POS is emitted from the extension's single receive/expiry
     # loop, so it must never await the hub's bounded TX queue: on overflow
     # the notification is dropped and the stream continues
@@ -3141,7 +3244,7 @@ async def test_inf_site_anchor_list_carries_ned(extension, device, builder, hub)
     }
 
 
-# ---- X-RTLS-GEO ---------------------------------------------------------
+# ---- multi-device helpers ----------------------------------------------
 
 
 def wire_devices(extension, *devices):
@@ -3154,9 +3257,7 @@ def wire_devices(extension, *devices):
         if target is None:
             return
         for reply in target.handle(payload):
-            await extension._process_datagram(
-                reply, target.address, time.monotonic()
-            )
+            await extension._process_datagram(reply, target.address, time.monotonic())
 
     extension._send = fake_send
 
@@ -3166,189 +3267,6 @@ def make_second_tag(dialect, *, system_id=DEVICE_SYSID + 1):
     second.address = ("192.168.4.%d" % (system_id % 250), 3333)
     add_rtls_cell_params(second)
     return second
-
-
-async def geo_message(extension, builder, hub, body):
-    message = make_message(builder, {"type": "X-RTLS-GEO", **body})
-    return await extension._handle_RTLS_GEO(message, None, hub)
-
-
-async def adopt_from(extension, builder, hub, sysid=DEVICE_SYSID):
-    """Adopts a tag's geometry as the canonical one (the bootstrap step
-    of the server-owned-truth model)."""
-    response = await geo_message(
-        extension, builder, hub, {"op": "adopt", "reference": sysid}
-    )
-    assert response.body["type"] == "X-RTLS-GEO", response.body
-    return response
-
-
-async def test_geo_check_consistent(extension, device, dialect, builder, hub):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-
-    body = response.body
-    assert body["type"] == "X-RTLS-GEO"
-    assert body["op"] == "check"
-    assert body["cell"] == "default"
-    assert body["consistent"] is True
-    # EVERY tag is a target now, the adopted one included
-    assert body["devices"][str(DEVICE_SYSID)] == {"status": "consistent"}
-    assert body["devices"][str(DEVICE_SYSID + 1)] == {"status": "consistent"}
-
-
-async def test_geo_check_reports_deltas_and_missing(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")  # a moved anchor
-    # no POS_YAW_DEG on the second tag at all
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-
-    body = response.body
-    assert body["consistent"] is False
-    entry = body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "mismatch"
-    assert entry["deltas"]["UWB_AN1_X"] == {"expected": 10.0, "actual": 10.5}
-    assert entry["missing"] == ["POS_YAW_DEG"]
-
-
-async def test_geo_check_float_tolerance(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
-    second = make_second_tag(dialect)
-    # representation noise well under the default 1e-4 tolerance
-    set_fake_param(second, "POS_YAW_DEG", 90.00003, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-
-    assert response.body["consistent"] is True
-
-
-async def test_geo_check_incomplete_target(extension, device, builder, hub):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    # a cache-only tag whose snapshot never gained the origin params or
-    # the anchor table (the count itself matches, so nothing mismatches)
-    stub = add_anchor_device(extension, 77, role=1, uwb_mac=254)
-    set_cached_param(stub, "UWB_AN_COUNT", 2, "uint8")
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-
-    entry = response.body["devices"]["77"]
-    assert entry["status"] == "incomplete"
-    assert "ORIGIN_LAT_E7" in entry["missing"]
-    assert response.body["consistent"] is False
-
-
-async def test_geo_check_without_canonical_geometry_is_rejected(
-    extension, builder, hub
-):
-    response = await geo_message(extension, builder, hub, {"op": "check"})
-    assert response.body["type"] == "ACK-NAK"
-    assert "canonical" in response.body["reason"]
-
-
-async def test_geo_invalid_op_is_rejected(extension, builder, hub):
-    response = await geo_message(extension, builder, hub, {"op": "explode"})
-    assert response.body["type"] == "ACK-NAK"
-    assert "op" in response.body["reason"]
-
-
-async def test_geo_non_tag_target_is_an_error_entry(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    add_anchor_device(extension, 90, role=2, uwb_mac=1)
-
-    response = await geo_message(
-        extension,
-        builder,
-        hub,
-        {"op": "check", "ids": [90]},
-    )
-
-    entry = response.body["devices"]["90"]
-    assert entry["status"] == "error"
-    assert "Not a tag" in entry["detail"]
-
-
-async def test_geo_sync_writes_reboots_and_converges(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "POS_YAW_DEG", 0.0, "real32")
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    set_fake_param(second, "ORIGIN_ALT_MM", 20000, "int32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append((address, port))
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced"
-    assert entry["failures"] == {}
-    assert set(entry["written"]) == {"POS_YAW_DEG", "UWB_AN1_X", "ORIGIN_ALT_MM"}
-    assert "ORIGIN_LAT_E7" in entry["skipped"]
-    assert entry["rebooted"] is True
-    # No smp_port configured for this device: the fixed hardware port.
-    assert resets == [(second.address[0], 1337)]
-
-    # the device-side wire store converged to the reference geometry
-    assert struct.unpack("<f", second.params["UWB_AN1_X"][0][:4])[0] == 10.0
-    assert struct.unpack("<i", second.params["ORIGIN_ALT_MM"][0][:4])[0] == 10000
-
-    check = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-    assert check.body["consistent"] is True
 
 
 def test_configured_devices_accepts_smp_port_entries():
@@ -3364,254 +3282,6 @@ def test_configured_devices_accepts_smp_port_entries():
     assert smp_ports == {("127.0.0.1", 3433): 1437}
 
 
-async def test_geo_sync_reset_targets_the_configured_smp_port(
-    extension, device, dialect, builder, hub
-):
-    """A device whose config entry declared an smp_port is reset there,
-    not at the fixed hardware :1337 -- the whole point of forwarding the
-    sim manifest's per-device ports through the generated config."""
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-    extension._smp_ports = {tuple(second.address): 1437}
-
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append((address, port))
-
-    response = await geo_message(extension, builder, hub, {"op": "sync"})
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["rebooted"] is True
-    assert resets == [(second.address[0], 1437)]
-
-
-async def test_geo_sync_count_is_written_last(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN_COUNT", 1, "uint8")
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    writes = []
-    original_handle = second.handle
-
-    def recording_handle(data):
-        for message in dialect.MAVLink(None).parse_buffer(bytes(data)) or []:
-            if message.get_type() == "PARAM_EXT_SET":
-                writes.append(message.param_id)
-        return original_handle(data)
-
-    second.handle = recording_handle
-    extension._geo_reset = lambda address, *, port: None
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced"
-    # a partially synced registry must never declare a window onto a
-    # half-written anchor table: the count trails every other write
-    assert writes[-1] == "UWB_AN_COUNT"
-    assert "UWB_AN1_X" in writes[:-1]
-
-
-async def test_geo_sync_rejected_write_means_partial_and_no_reboot(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    second.set_result = PARAM_ACK_FAILED
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append(address)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "partial"
-    assert "UWB_AN1_X" in entry["failures"]
-    assert "rejected by device" in entry["failures"]["UWB_AN1_X"]
-    assert entry["rebooted"] is False
-    assert "writes failed" in entry["rebootDetail"]
-    assert resets == []
-
-
-async def test_geo_sync_no_changes_needed_skips_reboot(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append(address)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced"
-    assert entry["written"] == []
-    assert entry["rebooted"] is False
-    assert "no changes" in entry["rebootDetail"]
-    assert resets == []
-
-
-async def test_geo_sync_reboot_false_skips_reset(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append(address)
-
-    response = await geo_message(
-        extension,
-        builder,
-        hub,
-        {"op": "sync", "reboot": False},
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced"
-    assert "rebooted" not in entry
-    assert resets == []
-
-
-async def test_geo_sync_timeout_aborts_that_device_only(
-    extension, device, dialect, builder, hub, autojump_clock
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
-    set_fake_param(third, "UWB_AN1_X", 11.5, "real32")
-    third.respond_to_set = False
-    wire_devices(extension, device, second, third)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-    await extension._process_datagram(
-        third.heartbeat(), third.address, time.monotonic()
-    )
-
-    extension._geo_reset = lambda address, *, port: None
-
-    response = await geo_message(
-        extension,
-        builder,
-        hub,
-        {"op": "sync", "timeout": 1},
-    )
-
-    healthy = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert healthy["status"] == "synced"
-    silent = response.body["devices"][str(DEVICE_SYSID + 2)]
-    assert silent["status"] == "error"
-    assert "timeout" in silent["detail"]
-
-
-async def test_geo_concurrent_sync_is_refused(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    extension._geo_sync_running = True
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-    assert response.body["type"] == "ACK-NAK"
-    assert "in progress" in response.body["reason"]
-
-    # and the latch is released once a real sync finishes
-    extension._geo_sync_running = False
-    extension._geo_reset = lambda address, *, port: None
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-    assert response.body["type"] == "X-RTLS-GEO"
-    assert extension._geo_sync_running is False
-
-
-async def test_geo_adopt_refuses_an_incomplete_snapshot(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    # simulate a lossy dump: the registry claims more params than cached
-    extension._get_devices()[DEVICE_SYSID].param_count = 99
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "adopt", "reference": DEVICE_SYSID}
-    )
-    assert response.body["type"] == "ACK-NAK"
-    assert "snapshot incomplete" in response.body["reason"]
-
-
-async def test_geo_incomplete_target_snapshot_is_flagged(
-    extension, device, builder, hub
-):
-    # a lossy-dump hole in an OPTIONAL param must not read as "consistent"
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    stub = add_anchor_device(extension, 78, role=1, uwb_mac=254)
-    stub.param_count = 99
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-    entry = response.body["devices"]["78"]
-    assert entry["status"] == "incomplete"
-    assert "snapshot incomplete" in entry["detail"]
-
-
 async def test_cell_id_change_rehomes_the_source(extension, device):
     add_rtls_cell_params(device)
     set_fake_param(device, "CELL_ID", "a", "custom")
@@ -3625,75 +3295,6 @@ async def test_cell_id_change_rehomes_the_source(extension, device):
     assert extension._anchor_cell_sources == {"b": DEVICE_SYSID}
 
 
-async def test_geo_sync_withholds_count_after_failed_writes(
-    extension, device, dialect, builder, hub
-):
-    # ref count 2, target count 1: the count write is due — but earlier
-    # rejected table writes must withhold it, or the next reboot would
-    # activate a window onto a mixed anchor table
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN_COUNT", 1, "uint8")
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    second.set_result = PARAM_ACK_FAILED
-    writes = []
-    original_handle = second.handle
-
-    def recording_handle(data):
-        for message in dialect.MAVLink(None).parse_buffer(bytes(data)) or []:
-            if message.get_type() == "PARAM_EXT_SET":
-                writes.append(message.param_id)
-        return original_handle(data)
-
-    second.handle = recording_handle
-    extension._geo_reset = lambda address, *, port: None
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "partial"
-    assert entry["failures"]["UWB_AN_COUNT"].startswith("withheld"), entry
-    assert "UWB_AN_COUNT" not in writes  # never even sent to the device
-
-
-async def test_geo_incomplete_snapshot_with_full_geometry_is_accepted(
-    extension, device, dialect, builder, hub
-):
-    # a lossy dump that only lost NON-geometry params must not block the
-    # check: with every geometry param (optional ones included) cached,
-    # the comparison is fully determined
-    add_rtls_cell_params(device)
-    set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
-    set_fake_param(device, "CELL_ID", "default", "custom")
-    second = make_second_tag(dialect)
-    set_fake_param(second, "POS_YAW_DEG", 90.0, "real32")
-    set_fake_param(second, "CELL_ID", "default", "custom")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
-        extension._get_devices()[sysid].param_count = 99
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "check"}
-    )
-
-    assert response.body["type"] == "X-RTLS-GEO", response.body
-    assert response.body["consistent"] is True, response.body
-
-
 async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
     await discover(extension, device)
 
@@ -3704,112 +3305,6 @@ async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
     with pytest.raises(trio.TooSlowError):
         await extension.set_param(DEVICE_SYSID, "UWB_CH", 8, timeout=1)
     assert extension._param_write_locks == {}
-
-
-async def test_geo_sync_detects_concurrent_drift(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    # a concurrent writer changes an ALREADY-SYNCED param mid-sync: the
-    # device pushes a param_value for UWB_AN0_X (written earlier in the
-    # sync order) while the server writes UWB_AN1_X
-    original_handle = second.handle
-
-    def drifting_handle(data):
-        out = original_handle(data)
-        parser = dialect.MAVLink(None)
-        for message in parser.parse_buffer(bytes(data)) or []:
-            if (
-                message.get_type() == "PARAM_EXT_SET"
-                and message.param_id == "UWB_AN1_X"
-            ):
-                set_fake_param(second, "UWB_AN0_X", 99.0, "real32")
-                index = list(second.params).index("UWB_AN0_X")
-                out.append(second._param_value("UWB_AN0_X", index))
-        return out
-
-    second.handle = drifting_handle
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append(address)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "partial", entry
-    assert "post-write verification" in entry["failures"]["UWB_AN0_X"], entry
-    assert entry["rebooted"] is False  # a drifted geometry must not activate
-    assert resets == []
-
-
-async def test_geo_adopt_refuses_an_anchor(extension, device, builder, hub):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    add_anchor_device(extension, 91, role=2, uwb_mac=1)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "adopt", "reference": 91}
-    )
-    assert response.body["type"] == "ACK-NAK"
-    assert "not a tag" in response.body["reason"]
-
-
-async def test_geo_sync_survives_mid_sync_rediscovery(
-    extension, device, dialect, builder, hub
-):
-    # the target is lost + rediscovered mid-sync: acks mirror into the
-    # NEW device object, and the post-write verification must read that
-    # one — the detached old object would flag phantom drift forever
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-
-    swapped = []
-    original_handle = second.handle
-
-    def swapping_handle(data):
-        if not swapped:
-            old = extension._protocol.devices[DEVICE_SYSID + 1]
-            clone = SimpleNamespace(
-                system_id=old.system_id,
-                address=old.address,
-                last_seen=old.last_seen,
-                params=dict(old.params),
-                param_types=dict(old.param_types),
-                param_count=old.param_count,
-            )
-            extension._protocol.devices[DEVICE_SYSID + 1] = clone
-            swapped.append(True)
-        return original_handle(data)
-
-    second.handle = swapping_handle
-    resets = []
-    extension._geo_reset = lambda address, *, port: resets.append(address)
-
-    response = await geo_message(
-        extension, builder, hub, {"op": "sync"}
-    )
-
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "synced", entry
-    assert entry["rebooted"] is True
-    assert resets == [second.address[0]]
 
 
 async def test_refill_repairs_geometry_consistency_params(extension, device):
@@ -3826,9 +3321,7 @@ async def test_refill_repairs_geometry_consistency_params(extension, device):
     assert "POS_YAW_DEG" not in cached.params
 
     device.read_requests.clear()
-    await extension._poll_param_refill(
-        time.monotonic() + REFILL_INITIAL_DELAY + 1
-    )
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
     assert sorted(device.read_requests) == ["POS_YAW_DEG", "UWB_AN1_BIAS_M"]
     assert "POS_YAW_DEG" in cached.params
@@ -3877,6 +3370,10 @@ class StubUAV:
         return self._params[name]
 
 
+#: one bench cell as the tags fit it (AN0-AN1 .. AN0-AN7), metres
+FLEET_DISTANCES = (8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233)
+
+
 def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
     """Two consistent wire tags paired to two stub drones with healthy
     solver stats; returns the second tag for perturbation."""
@@ -3903,6 +3400,10 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "clockPpm": 1.2,
             "anchorMask": 0b1111,
             "clockSyncOk": True,
+            "geometryState": 3,
+            "geometryResidualM": -0.02,
+            "geometryDriftM": 0.001,
+            "geometryDistancesM": list(FLEET_DISTANCES),
         }
         extension._stats_at[sysid] = time.monotonic()
     return second
@@ -3919,9 +3420,7 @@ async def test_verify_rejects_an_empty_fleet(extension, builder, hub):
     response = await verify_message(extension, builder, hub)
 
     assert response.body["passed"] is False
-    pairing = next(
-        rule for rule in response.body["rules"] if rule["id"] == "pairing"
-    )
+    pairing = next(rule for rule in response.body["rules"] if rule["id"] == "pairing")
     assert pairing["severity"] == "error"
     assert pairing["status"] == "fail"
     assert "no online tags" in pairing["detail"]
@@ -3936,7 +3435,7 @@ async def test_verify_passes_on_a_healthy_fleet(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
 
     response = await verify_message(extension, builder, hub)
 
@@ -3954,34 +3453,7 @@ async def test_verify_passes_on_a_healthy_fleet(
     }
 
 
-async def test_verify_honors_explicit_cell_with_multiple_stored_cells(
-    extension, device, dialect, builder, hub
-):
-    second = wire_verify_fleet(extension, device, dialect)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    await adopt_from(extension, builder, hub)
-    extension._geo_canonical["other"] = {
-        **extension._geo_canonical["default"],
-        "CELL_ID": "other",
-    }
-
-    response = await verify_message(
-        extension, builder, hub, {"cell": "default"}
-    )
-
-    body = response.body
-    assert body["type"] == "X-RTLS-VERIFY"
-    assert body["cell"] == "default"
-    geometry = next(rule for rule in body["rules"] if rule["id"] == "geometry")
-    assert geometry["status"] == "pass"
-
-
-async def test_verify_flags_wrong_yaw_source(
-    extension, device, dialect, builder, hub
-):
+async def test_verify_flags_wrong_yaw_source(extension, device, dialect, builder, hub):
     second = wire_verify_fleet(
         extension,
         device,
@@ -3992,7 +3464,7 @@ async def test_verify_flags_wrong_yaw_source(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
 
     response = await verify_message(extension, builder, hub)
 
@@ -4004,17 +3476,14 @@ async def test_verify_flags_wrong_yaw_source(
     assert rule["devices"]["05"]["yawSource"] == 1.0
 
 
-async def test_verify_flags_geometry_drift_and_missing_stats(
-    extension, device, dialect, builder, hub
-):
+async def test_verify_flags_missing_stats(extension, device, dialect, builder, hub):
     second = wire_verify_fleet(extension, device, dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
     await discover(extension, device)
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
-    del extension._stats[DEVICE_SYSID + 1]  # and one tag went silent
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    del extension._stats[DEVICE_SYSID + 1]  # one tag went silent
 
     response = await verify_message(extension, builder, hub)
 
@@ -4022,6 +3491,7 @@ async def test_verify_flags_geometry_drift_and_missing_stats(
     assert body["passed"] is False
     by_id = {rule["id"]: rule for rule in body["rules"]}
     assert by_id["geometry"]["status"] == "fail"
+    assert "no geometry telemetry" in by_id["geometry"]["detail"]
     assert by_id["uwb"]["status"] == "fail"
     assert "no telemetry" in by_id["uwb"]["detail"]
 
@@ -4034,7 +3504,7 @@ async def test_verify_in_depth_reports_param_diffs_as_warnings(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     # give both drones the full in-depth set; one WPNAV_SPEED differs
     from flockwave.server.ext.rtls.verify import IN_DEPTH_PARAMS
 
@@ -4067,7 +3537,6 @@ async def test_verify_concurrent_run_is_refused(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
     extension._verify_running = True
     response = await verify_message(extension, builder, hub)
     assert response.body["type"] == "ACK-NAK"
@@ -4082,7 +3551,6 @@ async def test_verify_flags_silent_telemetry_as_stale(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now - 60  # stream went silent
@@ -4102,7 +3570,6 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     await extension._process_datagram(
         second.heartbeat(), second.address, time.monotonic()
     )
-    await adopt_from(extension, builder, hub)
     now = time.monotonic()
     extension._stats_at[DEVICE_SYSID] = now
     extension._stats_at[DEVICE_SYSID + 1] = now
@@ -4118,543 +3585,553 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     assert rule["status"] == "pass", rule
 
 
-# ---- X-RTLS-GEO rolling-summary fit -------------------------------------
-
-
-def _setup_anchor_calibration_fleet(extension, device):
-    """Install one tag cell and the eight four-tripod anchor identities."""
-    add_rtls_cell_params(device)
-    set_fake_param(device, "UWB_AN_COUNT", 8, "uint8")
-    positions = (
-        (0.0, 0.0, 0.0),
-        (20.0, 0.0, 0.0),
-        (0.0, 16.0, 0.0),
-        (20.0, 16.0, 0.0),
-        (0.0, 0.0, -2.5),
-        (20.0, 0.0, -2.5),
-        (0.0, 16.0, -2.5),
-        (20.0, 16.0, -2.5),
-    )
-    for index, position in enumerate(positions):
-        for axis, value in zip("XYZ", position, strict=True):
-            set_fake_param(device, f"UWB_AN{index}_{axis}", value, "real32")
-        set_fake_param(device, f"UWB_AN{index}_MAC", index + 1, "uint16")
-        set_fake_param(device, f"UWB_AN{index}_BIAS_M", 0.0, "real32")
-        add_anchor_device(
-            extension,
-            70 + index,
-            role=2 if index == 0 else 3,
-            uwb_mac=index + 1,
-        )
-    return positions
-
-
-def _rolling_summary(positions, *, sequence=1, count=80):
-    """Test description of the seven responder-owned A0 spokes."""
-    return {
-        "version": 1,
-        "sequence": sequence,
-        "timeBootMs": 1000 * sequence,
-        "ranges": [
-            {
-                "anchorIndex": index,
-                "distanceM": sum(value * value for value in positions[index])
-                ** 0.5,
-                "madM": 0.005,
-                "count": count,
-            }
-            for index in range(1, 8)
-        ],
-    }
-
-
-def _emit_responder_summaries(extension, summary):
-    """Emit one local A0-peer generation for every described responder."""
-    from flockwave.server.ext.rtls.fit import on_twr_summary
-
-    for item in summary["ranges"]:
-        index = item["anchorIndex"]
-        on_twr_summary(
-            extension,
-            70 + index,
-            {
-                "version": summary["version"],
-                "sequence": summary["sequence"] + index,
-                "validMask": item.get("validMask", 0x01),
-                "timeBootMs": summary["timeBootMs"] + index,
-                "ranges": [
-                    {
-                        "peerMac": item.get("measuredPeerMac", 1),
-                        "distanceM": item["distanceM"],
-                        "madM": item["madM"],
-                        "count": item["count"],
-                    }
-                ],
-            },
-            time.monotonic(),
-        )
-
-
-async def _fit_after_summary(extension, builder, hub, body, summary):
-    """Start the request, then emit one generation from each responder."""
-    response = {}
-
-    async def request():
-        message = make_message(builder, {"type": "X-RTLS-GEO", **body})
-        response["value"] = await extension._handle_RTLS_GEO(message, None, hub)
-
-    async with trio.open_nursery() as nursery:
-        nursery.start_soon(request)
-        await trio.testing.wait_all_tasks_blocked()
-        _emit_responder_summaries(extension, summary)
-    return response["value"]
-
-
-async def test_geo_strict_fit_waits_for_and_pins_a_complete_summary(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
+async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder, hub):
+    second = wire_verify_fleet(extension, device, dialect)
     await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    response = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions),
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
     )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    drifted = list(FLEET_DISTANCES)
+    drifted[0] += 0.05  # AN1's tripod moved 5 cm for this tag only
+    extension._stats[DEVICE_SYSID + 1]["geometryDistancesM"] = drifted
+
+    response = await verify_message(extension, builder, hub)
 
     body = response.body
-    assert body["selectedModel"] == "strict"
-    assert body["summary"]["captureId"] == 1
-    assert body["summary"]["validMask"] == 0xFE
-    assert len(body["summary"]["sources"]) == 7
-    assert body["strict"]["accepted"]
-    # numeric recovery is proven to tolerance by the unit fit tests; here we
-    # only confirm the integration wires a sane, apply-ready payload (exact
-    # equality on an LM-solver output would be needlessly brittle)
-    assert abs(body["strict"]["parameters"]["lengthM"] - 20.0) < 1e-3
-    assert body["applyGeometry"]["POS_YAW_DEG"] == 0.0
-    assert body["applyGeometry"]["UWB_AN0_X"] == 0.0
-    assert abs(body["applyGeometry"]["UWB_AN7_Z"] + 2.5) < 1e-3
-
-
-async def test_geo_strict_fit_honors_explicit_cell_with_multiple_stored_cells(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    extension._geo_canonical["other"] = {
-        **extension._geo_canonical["default"],
-        "CELL_ID": "other",
-    }
-
-    response = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict", "cell": "default"},
-        _rolling_summary(positions),
-    )
-
-    assert response.body["type"] == "X-RTLS-GEO"
-    assert response.body["cell"] == "default"
-    assert response.body["selectedModel"] == "strict"
-
-
-async def test_geo_refined_fit_reuses_the_requested_pinned_summary(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    strict = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions, sequence=7),
-    )
-    capture_id = strict.body["summary"]["captureId"]
-
-    # New telemetry may arrive, but the opt-in refined fit compares the exact
-    # snapshot the operator reviewed.
-    _emit_responder_summaries(
-        extension, _rolling_summary(positions, sequence=80)
-    )
-    message = make_message(
-        builder,
-        {
-            "type": "X-RTLS-GEO",
-            "op": "fit",
-            "mode": "refined",
-            "captureId": capture_id,
-        },
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["summary"]["captureId"] == capture_id
-    assert response.body["refined"]["model"] == "refined"
-    assert response.body["selectedModel"] is None
-    assert response.body["comparison"]["meaningfulImprovement"] is False
-    assert response.body["applyGeometry"] is None
-
-
-async def test_geo_fit_rejects_a_low_quality_summary_actionably(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    response = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions, count=5),
-    )
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "A1 summary has 5 samples" in response.body["reason"]
-
-
-async def test_geo_fit_times_out_actionably_without_any_summary(
-    extension, device, builder, hub
-):
-    _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    message = make_message(
-        builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict", "timeout": 0.2},
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "no fresh rolling TWR summary from A1" in response.body["reason"]
-
-
-async def test_geo_fit_rejects_a_stale_summary(extension, device, builder, hub):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    # All responder summaries predate the request and must not satisfy it.
-    _emit_responder_summaries(extension, _rolling_summary(positions))
-
-    message = make_message(
-        builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict", "timeout": 0.2},
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "no fresh rolling TWR summary" in response.body["reason"]
-
-
-async def test_geo_fit_rejects_an_unsupported_summary_version(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    summary = _rolling_summary(positions)
-    summary["version"] = 2
-    response = await _fit_after_summary(
-        extension, builder, hub, {"op": "fit", "mode": "strict"}, summary
-    )
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "version 2 is unsupported" in response.body["reason"]
-
-
-async def test_geo_fit_names_the_missing_spokes(extension, device, builder, hub):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    # A7 fails to publish after the request.
-    summary = _rolling_summary(positions)
-    summary["ranges"] = summary["ranges"][:-1]
-    response = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict", "timeout": 0.2},
-        summary,
-    )
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "no fresh rolling TWR summary from A7" in response.body["reason"]
-
-
-async def test_geo_fit_rejects_summary_peers_outside_the_cell(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    # A5 reports a peer other than A0.
-    summary = _rolling_summary(positions)
-    summary["ranges"][4]["measuredPeerMac"] = 0x0063
-    response = await _fit_after_summary(
-        extension, builder, hub, {"op": "fit", "mode": "strict"}, summary
-    )
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "A5 summary does not contain exactly its A0 range" in response.body["reason"]
-
-
-async def test_geo_fit_requires_the_four_tripod_anchor_count(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)  # the stock two-anchor test cell
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    message = make_message(
-        builder, {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict"}
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "exactly 8 anchors" in response.body["reason"]
-
-
-async def test_geo_fit_requires_one_unambiguous_initiator(
-    extension, device, builder, hub
-):
-    _setup_anchor_calibration_fleet(extension, device)
-    # a second online device also claims the A0 MAC as initiator
-    add_anchor_device(extension, 90, role=2, uwb_mac=1)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    message = make_message(
-        builder, {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict"}
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "multiple online devices claim the configured A0 MAC" in response.body["reason"]
-
-
-async def test_geo_fit_rejects_a_responder_with_the_wrong_role(
-    extension, device, builder, hub
-):
-    _setup_anchor_calibration_fleet(extension, device)
-    # A5 has the configured MAC but claims to be another initiator. Accepting
-    # it would wait for telemetry that this role is deliberately unable to send.
-    set_cached_param(extension._protocol.devices[75], "UWB_ROLE", 2, "uint8")
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    message = make_message(
-        builder, {"type": "X-RTLS-GEO", "op": "fit", "mode": "strict"}
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-
-    assert response.body["type"] == "ACK-NAK"
-    assert "A5 has UWB role 2; expected responder" in response.body["reason"]
-
-
-async def test_geo_refined_fit_requires_the_pinned_capture(
-    extension, device, builder, hub
-):
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    # refined before any strict fit
-    message = make_message(
-        builder,
-        {"type": "X-RTLS-GEO", "op": "fit", "mode": "refined", "captureId": 1},
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-    assert response.body["type"] == "ACK-NAK"
-    assert "strict fit first" in response.body["reason"]
-
-    strict = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions, sequence=3),
-    )
-    capture_id = strict.body["summary"]["captureId"]
-    # a stale GUI asking for a generation that is no longer pinned
-    message = make_message(
-        builder,
-        {
-            "type": "X-RTLS-GEO",
-            "op": "fit",
-            "mode": "refined",
-            "captureId": capture_id + 1,
-        },
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-    assert response.body["type"] == "ACK-NAK"
-    assert "no longer the pinned" in response.body["reason"]
-
-
-async def test_geo_fit_session_dies_with_its_a0(extension, device, builder, hub):
-    from rtlslink.protocol import ProtocolEvent
-
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    strict = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions),
-    )
-    assert extension._geo_fit_session is not None
-    capture_id = strict.body["summary"]["captureId"]
-
-    extension._handle_lost(ProtocolEvent("lost", 70))
-
-    assert extension._geo_fit_session is None
-    assert 70 not in extension._twr_summaries
-    message = make_message(
-        builder,
-        {
-            "type": "X-RTLS-GEO",
-            "op": "fit",
-            "mode": "refined",
-            "captureId": capture_id,
-        },
-    )
-    response = await extension._handle_RTLS_GEO(message, None, hub)
-    assert response.body["type"] == "ACK-NAK"
-
-
-async def test_geo_fit_exposes_only_the_constrained_models(
-    extension, device, builder, hub
-):
-    """Identifiability guard: A0-star radii cannot support per-anchor moves
-    or per-plane skew, so the protocol must not offer them."""
-    positions = _setup_anchor_calibration_fleet(extension, device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-
-    strict = await _fit_after_summary(
-        extension,
-        builder,
-        hub,
-        {"op": "fit", "mode": "strict"},
-        _rolling_summary(positions),
-    )
-    assert "moves" not in strict.body
-    assert set(strict.body["strict"]["parameters"]) == {
-        "lengthM",
-        "widthM",
-        "heightM",
-    }
-
-    message = make_message(
-        builder,
-        {
-            "type": "X-RTLS-GEO",
-            "op": "fit",
-            "mode": "refined",
-            "captureId": strict.body["summary"]["captureId"],
-        },
-    )
-    refined = await extension._handle_RTLS_GEO(message, None, hub)
-    assert set(refined.body["refined"]["parameters"]) == {
-        "bottomLengthM",
-        "bottomWidthM",
-        "topLengthM",
-        "topWidthM",
-        "heightM",
-        "angleDeg",
-    }
-
-
-async def test_geo_adopt_unanimous_fleet_needs_no_reference(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    response = await geo_message(extension, builder, hub, {"op": "adopt"})
-    assert response.body["type"] == "X-RTLS-GEO", response.body
-    assert response.body["op"] == "adopt"
-
-    check = await geo_message(extension, builder, hub, {"op": "check"})
-    assert check.body["consistent"] is True
-
-
-async def test_geo_adopt_refuses_a_disagreeing_fleet(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "UWB_AN1_X", 10.5, "real32")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-
-    response = await geo_message(extension, builder, hub, {"op": "adopt"})
-    assert response.body["type"] == "ACK-NAK"
-    assert "disagrees" in response.body["reason"]
-    # explicit adoption still works — the operator names the truth
-    response = await geo_message(
-        extension, builder, hub, {"op": "adopt", "reference": DEVICE_SYSID}
-    )
-    assert response.body["type"] == "X-RTLS-GEO"
-
-
-async def test_geo_canonical_geometry_persists(
-    extension, device, builder, hub, dialect, tmp_path
-):
-    extension._geo_store_path = tmp_path / "geometry.json"
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await adopt_from(extension, builder, hub)
-    assert (tmp_path / "geometry.json").exists()
-
-    # a fresh extension instance (server restart) reads the same store
-    second_ext = RtlsExtension()
-    second_ext._protocol = RtlsProtocol(dialect, targets=[device.address])
-    second_ext.app = StubApp()
-
-    async def fake_send(payload, address):
-        for reply in device.handle(payload):
-            await second_ext._process_datagram(
-                reply, device.address, time.monotonic()
+    assert body["passed"] is False
+    rule = next(r for r in body["rules"] if r["id"] == "geometry")
+    assert rule["status"] == "fail"
+    assert "AN0-AN1" in rule["detail"]
+    assert body["geometry"]["consistent"] is False
+
+
+# ---- X-RTLS-GEOM fleet geometry agreement --------------------------------
+
+
+GEOM_STATS = {
+    **FULL_STATS,
+    "geom": 3.0,
+    "gfail": 0.0,
+    "gres": -0.075,
+    "gdrift": 0.002,
+    **{f"gd{i + 1}": d for i, d in enumerate(FLEET_DISTANCES)},
+}
+
+
+def cache_frame(extension, *sysids, lat=413900000, yaw=90.0, macs=None):
+    """Caches the coordinate-frame params (origin, show yaw, slot MACs) on
+    live protocol devices, as the identity refill would after discovery."""
+    for sysid in sysids:
+        cached = extension._protocol.devices[sysid]
+        set_cached_param(cached, "ORIGIN_LAT_E7", lat, "int32")
+        set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
+        set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
+        set_cached_param(cached, "POS_YAW_DEG", yaw, "real32")
+        set_cached_param(cached, "UWB_AN_COUNT", 8, "uint8")
+        for slot in range(8):
+            set_cached_param(
+                cached, f"UWB_AN{slot}_MAC", (macs or {}).get(slot, slot + 1), "uint16"
             )
+            set_cached_param(cached, f"UWB_AN{slot}_BIAS_M", 0.0, "real32")
 
-    second_ext._send = fake_send
-    second_ext._geo_store_path = tmp_path / "geometry.json"
-    await second_ext._process_datagram(
-        device.heartbeat(), device.address, time.monotonic()
+
+async def geom_message(extension, builder, hub, body=None):
+    message = make_message(builder, {"type": "X-RTLS-GEOM", **(body or {})})
+    return await extension._handle_RTLS_GEOM(message, None, hub)
+
+
+async def test_stats_carry_the_fitted_geometry(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_stats(extension, device, GEOM_STATS, now=0.0)
+
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+
+    entry = response.body["stats"][str(DEVICE_SYSID)]
+    assert entry["geometryState"] == 3
+    assert entry["geometryReason"] == 0
+    assert entry["geometryResidualM"] == -0.075
+    assert entry["geometryDriftM"] == 0.002
+    assert entry["geometryDistancesM"] == list(FLEET_DISTANCES)
+
+
+def test_stats_json_without_geometry_omits_the_fields():
+    body = _stats_json(7, dict(FULL_STATS))
+    assert "geometryState" not in body
+    assert "geometryDistancesM" not in body
+    # non-finite values are dropped rather than forwarded
+    body = _stats_json(
+        7,
+        {
+            **FULL_STATS,
+            "geom": float("nan"),
+            "gres": float("nan"),
+            "gdrift": float("inf"),
+            "gd1": float("nan"),
+            "gd2": 9.0,
+        },
     )
-    message = make_message(builder, {"type": "X-RTLS-GEO", "op": "check"})
-    response = await second_ext._handle_RTLS_GEO(message, None, hub)
-    assert response.body["type"] == "X-RTLS-GEO", response.body
+    assert "geometryState" not in body
+    assert "geometryResidualM" not in body
+    assert "geometryDriftM" not in body
+    assert body["geometryDistancesM"][:2] == [None, 9.0]
+    # a four-anchor cell reports only the bottom plane
+    body = _stats_json(
+        7, {**FULL_STATS, "geom": 3.0, "gd1": 8.0, "gd2": 9.0, "gd3": 12.0}
+    )
+    assert body["geometryDistancesM"] == [8.0, 9.0, 12.0, None, None, None, None]
+
+
+async def test_geom_agreeing_fleet(extension, device, dialect, builder, hub):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    # the second tag fitted the same cell 3 mm off on one distance
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd4": FLEET_DISTANCES[3] + 0.003},
+        now=time.monotonic(),
+    )
+
+    response = await geom_message(extension, builder, hub)
+
+    body = response.body
+    assert body["type"] == "X-RTLS-GEOM"
+    assert body["consistent"] is True
+    # the reference is the lower median: a value some tag really reported
+    assert body["reference"][3] == pytest.approx(FLEET_DISTANCES[3], abs=1e-4)
+    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
+        entry = body["devices"][str(sysid)]
+        assert entry["status"] == "agree"
+        assert entry["stateName"] == "calibrated"
+        assert entry["maxDeviationM"] <= 0.0031
+        assert entry["residualM"] == -0.075
+
+
+async def test_geom_flags_a_deviating_tag_and_names_the_distance(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.05},
+        now=time.monotonic(),
+    )
+
+    response = await geom_message(extension, builder, hub)
+
+    body = response.body
+    assert body["consistent"] is False
+    deviating = body["devices"][str(DEVICE_SYSID + 1)]
+    assert deviating["status"] == "deviates"
+    assert set(deviating["deviations"]) == {"AN0-AN1"}
+    assert "AN0-AN1" in deviating["detail"]
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # a wider tolerance accepts it
+    response = await geom_message(extension, builder, hub, {"tolerance": 0.1})
     assert response.body["consistent"] is True
 
 
-async def test_geo_sync_without_canonical_is_rejected(
+async def test_geom_reports_uncalibrated_manual_stale_and_unknown_tags(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
+    wire_devices(extension, device, second, third)
+    await discover(extension, device)
+    for tag in (second, third):
+        await extension._process_datagram(
+            tag.heartbeat(), tag.address, time.monotonic()
+        )
+    now = time.monotonic()
+    await _feed_stats(extension, device, {**GEOM_STATS, "geom": 2.0}, now=now)
+    await _feed_stats(extension, second, {**FULL_STATS, "geom": 0.0}, now=now)
+    await _feed_stats(extension, third, FULL_STATS, now=now)
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is False
+    assert body["reference"] is None
+    devices = body["devices"]
+    assert devices[str(DEVICE_SYSID)]["status"] == "calibrating"
+    assert devices[str(DEVICE_SYSID + 1)]["status"] == "manual"
+    assert devices[str(DEVICE_SYSID + 2)]["status"] == "unknown"
+
+    # silence makes a fit stale
+    extension._stats[DEVICE_SYSID]["geometryState"] = 3
+    extension._stats_at[DEVICE_SYSID] = now - 60
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "stale"
+
+
+async def test_geom_names_why_a_tag_rejected_the_rig(extension, device, builder, hub):
+    """A placement outside the convention (two anchors swapped) is rejected
+    on the tag with a reason code; the verdict names it and blocks."""
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    await _feed_stats(
+        extension,
+        device,
+        {**FULL_STATS, "geom": 4.0, "gfail": 4.0, "gres": -5.83, "gdrift": 0.0},
+        now=time.monotonic(),
+    )
+
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "failed"
+    assert entry["reason"] == 4
+    assert entry["residualM"] == -5.83
+    assert "not a rectangle" in entry["detail"]
+    assert response.body["consistent"] is False
+
+
+async def test_geom_ids_filter_and_validation(extension, device, dialect, builder, hub):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID]})
+    assert set(response.body["devices"]) == {str(DEVICE_SYSID)}
+    assert response.body["consistent"] is True
+
+    response = await geom_message(extension, builder, hub, {"tolerance": 0})
+    assert response.body["type"] == "ACK-NAK"
+    response = await geom_message(extension, builder, hub, {"ids": [0]})
+    assert response.body["type"] == "ACK-NAK"
+
+
+async def test_geom_anchors_are_not_graded(extension, device, builder, hub):
+    # an anchor image (role 3) carries no fit: it must not appear
+    set_fake_param(device, "UWB_ROLE", 3, "uint8")
+    await discover(extension, device)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"] == {}
+    assert response.body["consistent"] is False
+
+
+async def test_geom_flags_live_drift_as_blocking(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    # same fit, but this tag's live distances moved 5 cm since (a tripod)
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+    )
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is False
+    drifted = body["devices"][str(DEVICE_SYSID + 1)]
+    assert drifted["status"] == "drifted"
+    assert "5.0 cm" in drifted["detail"]
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # the verify rule blocks on it too
+    wire_verify_fleet(extension, device, dialect)
+    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.05
+    response = await verify_message(extension, builder, hub)
+    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
+    assert rule["status"] == "fail"
+    assert "moved" in rule["detail"]
+
+
+async def test_geom_needs_the_live_drift(extension, device, builder, hub):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    without_drift = {k: v for k, v in GEOM_STATS.items() if k != "gdrift"}
+    await _feed_stats(extension, device, without_drift, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "calibrating"
+    assert "drift" in entry["detail"]
+    assert response.body["consistent"] is False
+
+
+async def test_geom_waits_for_the_cell_id_of_a_partial_listing(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    await _feed_stats(extension, second, GEOM_STATS, now=time.monotonic())
+    cached = extension._protocol.devices[DEVICE_SYSID + 1]
+    assert "CELL_ID" not in cached.params
+    # the listing is still being refilled: the tag's cell is unknown
+    cached.param_count = len(cached.params) + 1
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert entry["status"] == "incomplete"
+    assert entry["missingParams"] == ["CELL_ID"]
+    assert response.body["consistent"] is False
+    # a complete listing that lacks CELL_ID is the legacy default cell
+    cached.param_count = len(cached.params)
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "default"
+
+
+async def test_geom_references_are_per_cell(extension, device, dialect, builder, hub):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "CELL_ID", "other", "custom")
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    # a legitimately different cell: every distance 50 cm longer
+    other = {
+        **GEOM_STATS,
+        **{f"gd{i + 1}": d + 0.5 for i, d in enumerate(FLEET_DISTANCES)},
+    }
+    await _feed_stats(extension, second, other, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is True
+    assert body["reference"] is None  # two cells: no single reference
+    assert set(body["references"]) == {"default", "other"}
+    assert body["references"]["other"][0] == pytest.approx(
+        FLEET_DISTANCES[0] + 0.5, abs=1e-4
+    )
+    assert (
+        body["devices"][str(DEVICE_SYSID)] | {"cell": "default"}
+        == body["devices"][str(DEVICE_SYSID)]
+    )
+    assert body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "other"
+    assert all(entry["status"] == "agree" for entry in body["devices"].values())
+
+
+async def test_geom_honors_the_advertised_role(extension, device, builder, hub):
+    # an anchor known from its state advertisement whose UWB_ROLE has not
+    # reached the parameter cache yet must not be graded as a tag
+    await discover(extension, device)
+    device_params = extension._protocol.devices[DEVICE_SYSID].params
+    device_params.pop("UWB_ROLE", None)
+    extension._adv[DEVICE_SYSID] = {"role": "anchor-responder"}
+    await _feed_stats(extension, device, FULL_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"] == {}
+
+
+async def test_geom_waits_for_a_complete_distance_vector(
     extension, device, builder, hub
 ):
     add_rtls_cell_params(device)
     await discover(extension, device)
-    response = await geo_message(extension, builder, hub, {"op": "sync"})
-    assert response.body["type"] == "ACK-NAK"
-    assert "canonical" in response.body["reason"]
+    # only the first distance has arrived so far
+    partial = {
+        k: val
+        for k, val in GEOM_STATS.items()
+        if k not in ("gd2", "gd3", "gd4", "gd5", "gd6", "gd7")
+    }
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(extension, device, partial, now=time.monotonic())
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "calibrating"
+    assert response.body["consistent"] is False
+    # a half top plane is equally incomplete
+    await _feed_stats(
+        extension, device, {"gd2": 9.2, "gd3": 12.5, "gd4": 4.0}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "calibrating"
+    # a four-anchor cell reports zeros for the top plane: complete
+    await _feed_stats(
+        extension,
+        device,
+        {"gd4": 0.0, "gd5": 0.0, "gd6": 0.0, "gd7": 0.0},
+        now=time.monotonic(),
+    )
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["status"] == "agree"
+    assert entry["distancesM"][3:] == [None, None, None, None]
+
+
+async def test_geom_flags_a_differing_coordinate_frame(
+    extension, device, dialect, builder, hub
+):
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    set_fake_param(second, "ORIGIN_LAT_E7", 413900100, "int32")  # 1.1 m north
+    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
+    wire_devices(extension, device, second, third)
+    await discover(extension, device)
+    for tag in (second, third):
+        await extension._process_datagram(
+            tag.heartbeat(), tag.address, time.monotonic()
+        )
+    for tag in (device, second, third):
+        await _feed_stats(extension, tag, GEOM_STATS, now=time.monotonic())
+
+    # before the identity refill cached the frame, a fit is not certified
+    response = await geom_message(extension, builder, hub)
+    assert response.body["consistent"] is False
+    incomplete = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert incomplete["status"] == "incomplete"
+    assert "POS_YAW_DEG" in incomplete["missingParams"]
+
+    # the frame params as the identity refill would have cached them
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 2)
+    cache_frame(extension, DEVICE_SYSID + 1, lat=413900100)
+
+    response = await geom_message(extension, builder, hub)
+    body = response.body
+    assert body["consistent"] is False
+    odd = body["devices"][str(DEVICE_SYSID + 1)]
+    assert odd["status"] == "frame"
+    assert odd["frame"] == ["ORIGIN_LAT_E7"]
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+    assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
+
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    # the same rotation written as 360 is not a differing frame...
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 450.0, "real32"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert "frame" not in response.body["devices"][str(DEVICE_SYSID + 1)]
+    # ...while a non-finite yaw is no frame at all
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "POS_YAW_DEG",
+        float("inf"),
+        "real32",
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "incomplete"
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["missingParams"] == [
+        "POS_YAW_DEG"
+    ]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 90.0, "real32"
+    )
+
+    # a different anchor count consumes a different table
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 4, "uint8"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == ["UWB_AN_COUNT"]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 8, "uint8"
+    )
+
+    # a different range bias on one anchor solves differently too
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.25, "real32"
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == [
+        "UWB_AN3_BIAS_M"
+    ]
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.0, "real32"
+    )
+
+    # two slots swapped on one tag: same distances, different anchors
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1],
+        "ORIGIN_LAT_E7",
+        413900000,
+        "int32",
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN1_MAC", 3, "uint16"
+    )
+    set_cached_param(
+        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN2_MAC", 2, "uint16"
+    )
+    response = await geom_message(extension, builder, hub)
+    odd = response.body["devices"][str(DEVICE_SYSID + 1)]
+    assert odd["status"] == "frame"
+    assert odd["frame"] == ["UWB_AN1_MAC", "UWB_AN2_MAC"]
+
+
+async def test_verify_passes_an_all_manual_fleet(
+    extension, device, dialect, builder, hub
+):
+    second = wire_verify_fleet(extension, device, dialect)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
+        extension._stats[sysid]["geometryState"] = 0  # provisioned tables
+
+    response = await verify_message(extension, builder, hub)
+    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
+    assert rule["status"] == "pass", rule
+    assert "provisioned table" in rule["detail"]
+
+
+async def test_geom_reports_requested_ids_that_are_not_online(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    cache_frame(extension, DEVICE_SYSID)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+
+    response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID, 77]})
+    body = response.body
+    assert body["consistent"] is False
+    assert body["devices"]["77"]["status"] == "missing"

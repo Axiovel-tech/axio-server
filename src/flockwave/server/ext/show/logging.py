@@ -91,10 +91,15 @@ class ShowUploadLoggingMiddleware:
         type = message.get_type()
         if type == "OBJ-CMD":
             cmd = message.body.get("command", "")
-            if cmd == "__show_upload":
-                kwds = message.body.get("kwds", {})
-                if isinstance(kwds, dict) and "show" in kwds:
-                    return kwds["show"]
+            kwds = message.body.get("kwds", {})
+            if not isinstance(kwds, dict):
+                return None
+            if cmd == "__show_upload" and "show" in kwds:
+                return kwds["show"]
+            if cmd == "__gdm_upload" and isinstance(kwds.get("config"), dict):
+                # `.gdm` uploads carry the same show-level settings (mission,
+                # coordinate system, AMSL reference, geofence) in `config`
+                return kwds["config"]
 
     @property
     def last_show_metadata(self) -> ShowMetadata | None:

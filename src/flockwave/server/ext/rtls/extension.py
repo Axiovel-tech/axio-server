@@ -51,7 +51,8 @@ from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .show_clock import ShowClockPinManager
+from .cluster_clock import ClusterClock
+from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -192,11 +193,11 @@ REFILL_READ_SPACING = 0.01
 REFILL_MAX_ANCHOR_TABLE = 16
 
 #: identity params a tag must carry for its cell geometry to render
-#: (see :func:`_has_cell_geometry`) — plus the geometry-consistency
-#: params: X-RTLS-GEO refuses to trust a snapshot whose optional
-#: geometry params may be dump-loss holes, so the refill must repair
-#: those holes too. A name genuinely absent from an older registry
-#: costs the capped retry rounds and is then left alone.
+#: (see :func:`_has_cell_geometry`) — plus ``POS_YAW_DEG`` (reported by
+#: the fleet-verification yaw rule) and ``CELL_ID`` (cell naming), which
+#: are optional on older registries: the refill repairs dump-loss holes
+#: in them too. A name genuinely absent from an older registry costs the
+#: capped retry rounds and is then left alone.
 TAG_IDENTITY_PARAMS = (
     "ORIGIN_LAT_E7",
     "ORIGIN_LON_E7",
@@ -249,39 +250,15 @@ class RtlsExtension(Extension):
         self._last_inf_broadcast: Optional[float] = None
         #: test hook; ``None`` means "use ota.upgrade"
         self._ota_upgrade = None
-        #: test hook for the geometry-sync device reset; ``None`` means
-        #: "use the SMP os-reset" (see geometry._default_reset)
-        self._geo_reset = None
         #: SMP (MCUmgr) port per configured management address. Hardware is
         #: always :1337; simulated devices share one loopback host and each
         #: publish their own port in the sim manifest, which the generated
         #: config forwards (rtlslink.sim.gcs_config_from_manifest).
         self._smp_ports: dict[tuple[str, int], int] = {}
-        #: True while an X-RTLS-GEO sync runs; a second concurrent sync
-        #: is refused, and the cell-source bookkeeping refuses to move
-        #: the source off the pinned reference while targets are being
-        #: rewritten (see :meth:`_sync_anchor_beacons`)
-        self._geo_sync_running = False
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
         self._verify_running = False
-        #: complete rolling TWR summaries keyed by reporting system ID.
-        #: Scalar ``twr`` events remain in ``_twr`` for X-RTLS-INF only;
-        #: calibration consumes these capability-gated coherent generations.
-        self._twr_summaries: dict[int, Any] = {}
-        #: edge-triggered wakeup for fit requests waiting for a generation
-        self._twr_summary_changed = trio.Event()
-        #: strict fit + exact summary pinned for an optional refined fit
-        self._geo_fit_session = None
-        #: Process-local identifier for a distributed calibration capture.
-        #: A restart clears the pinned session, so persistence is unnecessary.
-        self._next_geo_capture_id = 1
-        #: lazily loaded canonical-geometry store (see geometry.py);
-        #: ``None`` = not loaded yet
-        self._geo_canonical: Optional[dict[str, Any]] = None
-        #: test seam: overrides the canonical store's file path
-        self._geo_store_path = None
         #: per-(system id, name) write serialization: PARAM_EXT acks
         #: carry no transaction id — they are matched by device + name
         #: only — so two overlapping writes of the same parameter could
@@ -299,9 +276,9 @@ class RtlsExtension(Extension):
         #: given cell id; lets us re-home a cell onto another live tag when the
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
-        #: cluster->GPS pin lifecycle for the UWB-timebase show clock
-        #: (``None`` when disabled via config ``show_clock_pin: false``)
-        self._show_clock: Optional[ShowClockPinManager] = None
+        #: wall-clock estimate of the UWB cluster clock that the drones count
+        #: the show start in
+        self._cluster_clock = ClusterClock()
         #: latest inter-anchor TWR telemetry per device:
         #: system_id -> {peer_mac: (measured_distance_m, harvest_monotonic_s)}.
         #: Surfaced in X-RTLS-INF (with a derived age); pruned on device loss.
@@ -366,16 +343,15 @@ class RtlsExtension(Extension):
         self._refill: dict[int, dict[str, Any]] = {}
         #: spacing between refill retry rounds; recomputed in run() from
         #: the presence config (the hello interval paces passive mode)
-        self._refill_interval = max(
-            DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL
-        )
+        self._refill_interval = max(DEFAULT_HEARTBEAT_INTERVAL, REFILL_MIN_INTERVAL)
         #: lazy proxy of the mavlink extension's API (``None`` when the
-        #: extension module is unavailable); source of the UAV source
-        #: addresses the tag<->drone association joins against
+        #: extension module is unavailable); resolves the MAVLink system id
+        #: each tag reports for its flight controller to a server UAV id
         self._mavlink_api = None
-        #: current device->UAV association: system_id -> flockwave UAV id.
-        #: Derived state, recomputed continuously by :meth:`_poll_uav_map`
-        #: from the live device and UAV source addresses -- never persisted
+        #: each device's flight-controller claim and the server UAV it names
+        #: (system_id -> flockwave UAV id), recomputed continuously by
+        #: :meth:`_poll_uav_map` -- never persisted
+        self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
 
     async def run(self, app, configuration, logger):
@@ -399,8 +375,7 @@ class RtlsExtension(Extension):
             configuration.get("broadcast", ["255.255.255.255"]), port
         )
         register_beacons = bool(configuration.get("register_beacons", True))
-        if bool(configuration.get("show_clock_pin", True)):
-            self._show_clock = ShowClockPinManager(self)
+        self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
         # Lazy import: the proxy resolves once the mavlink extension loads
@@ -437,9 +412,9 @@ class RtlsExtension(Extension):
         # management conversation. Both a config of 0/None and a pinned
         # SDK without the advertisement parser disable the listener; the
         # rest of the extension is unaffected either way.
-        advertisement_port = int(configuration.get(
-            "advertisement_port", DEFAULT_ADVERTISEMENT_PORT
-        ) or 0)
+        advertisement_port = int(
+            configuration.get("advertisement_port", DEFAULT_ADVERTISEMENT_PORT) or 0
+        )
         if advertisement_port:
             if self._parse_advertisement is None:
                 self._parse_advertisement = _load_advertisement_parser(logger)
@@ -468,11 +443,7 @@ class RtlsExtension(Extension):
             f"({len(targets)} static, broadcast {len(broadcast)}, "
             f"{'passive' if self._passive else 'active'} presence, "
             f"advertisements "
-            + (
-                f"on UDP :{advertisement_port}"
-                if self._adv_sock is not None
-                else "off"
-            )
+            + (f"on UDP :{advertisement_port}" if self._adv_sock is not None else "off")
             + ")"
         )
 
@@ -480,9 +451,7 @@ class RtlsExtension(Extension):
             async with trio.open_nursery() as nursery:
                 self._nursery = nursery
                 if self._adv_sock is not None:
-                    nursery.start_soon(
-                        self._run_advertisement_loop, self._adv_sock
-                    )
+                    nursery.start_soon(self._run_advertisement_loop, self._adv_sock)
                 with app.message_hub.use_message_handlers(
                     {
                         "X-RTLS-INF": self._handle_RTLS_INF,
@@ -493,7 +462,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
-                        "X-RTLS-GEO": self._handle_RTLS_GEO,
+                        "X-RTLS-GEOM": self._handle_RTLS_GEOM,
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                     }
                 ):
@@ -508,6 +477,7 @@ class RtlsExtension(Extension):
             self._sleeping.clear()
             self._sleep_pins.clear()
             self._mavlink_api = None
+            self._fc_claims.clear()
             self._uav_map.clear()
             self._beacon_api = None
             self._clear_anchor_beacons()
@@ -522,9 +492,8 @@ class RtlsExtension(Extension):
                 logger.warning(f"rtls: device sysid {event.system_id} lost")
                 self._handle_lost(event)
 
-            # re-join the tag<->drone association against the UAVs' current
-            # source addresses (DHCP churn, UAVs appearing/disappearing);
-            # a change pushes the (throttled) device list
+            # re-resolve each tag's flight-controller claim against the known
+            # UAVs; a change pushes the (throttled) device list
             await self._poll_uav_map(now)
 
             # re-request identity params a lossy discovery dump left out
@@ -701,14 +670,6 @@ class RtlsExtension(Extension):
                 # from the wire name); cache it per peer with a harvest stamp so
                 # X-RTLS-INF can report its age.
                 self._on_twr(event.system_id, event.data, now)
-            elif event.kind == "twr_summary":
-                # The SDK emits this only after it has assembled a coherent
-                # capability/header plus complete range/quality/count triples
-                # from one device generation. Calibration later combines one
-                # A0 spoke from each responder.
-                from .fit import on_twr_summary
-
-                on_twr_summary(self, event.system_id, event.data, now)
             elif event.kind == "param_value":
                 # a freshly learned parameter may complete a tag's cell or
                 # change an anchor's MAC/role; resync the anchor beacons
@@ -943,9 +904,7 @@ class RtlsExtension(Extension):
                 if device is None:
                     raise KeyError(system_id)
                 with self._subscribed_events() as events:
-                    request = protocol.set_param(
-                        system_id, name, encoded, param_type
-                    )
+                    request = protocol.set_param(system_id, name, encoded, param_type)
                     if request is None:
                         raise KeyError(system_id)
                     await self._send(*request)
@@ -983,9 +942,7 @@ class RtlsExtension(Extension):
                             )
                             self._refresh_anchor_cells()
                     return {
-                        "value": decode_param_value(
-                            event.data["value"], param_type
-                        ),
+                        "value": decode_param_value(event.data["value"], param_type),
                         "type": param_type_to_name(param_type),
                         "result": result,
                         "accepted": result == PARAM_ACK_ACCEPTED,
@@ -1058,9 +1015,7 @@ class RtlsExtension(Extension):
 
             await trio.sleep(settle)
             try:
-                state = await self.get_param(
-                    system_id, SLEEP_PARAM, timeout=timeout
-                )
+                state = await self.get_param(system_id, SLEEP_PARAM, timeout=timeout)
             except (KeyError, trio.TooSlowError):
                 # The write was acknowledged, so the device is most likely
                 # asleep -- report the verification gap instead of a plain
@@ -1199,9 +1154,7 @@ class RtlsExtension(Extension):
         body = {"type": "X-RTLS-OTA", "id": job["id"], "job": dict(job)}
         await hub.broadcast_message(hub.create_notification(body))
 
-    async def _on_stats(
-        self, system_id: int, data: dict[str, Any], now: float
-    ) -> None:
+    async def _on_stats(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache the latest health-telemetry snapshot for a device and
         broadcast it to clients, throttled to at most one per
         ``STATS_INTERVAL`` per device.
@@ -1219,10 +1172,7 @@ class RtlsExtension(Extension):
         snapshot once the window elapses, so newer values are never dropped."""
         self._stats[system_id] = _stats_json(system_id, data)
         self._stats_at[system_id] = now
-        # the show-clock pin rides the same stats feed: fresh cluster time
-        # (clkok) mints/verifies the pin and unpinned devices get a push
-        if self._show_clock is not None and self._nursery is not None:
-            self._show_clock.on_stats(system_id, data, self._nursery)
+        self._cluster_clock.on_stats(system_id, data)
         # STATS_FIELDS is the SDK's required legacy set; newer stats (``slp``
         # sleep state, ``vbat`` battery voltage, the cluster clock) are optional
         # and must not gate the broadcast, or firmware without them would never
@@ -1278,10 +1228,7 @@ class RtlsExtension(Extension):
             if name not in POS_DEBUG_FIELDS:
                 continue
             system_id = message.get_srcSystem()
-            if (
-                self._protocol is None
-                or system_id not in self._protocol.devices
-            ):
+            if self._protocol is None or system_id not in self._protocol.devices:
                 # Only known (heartbeating) devices may populate the caches:
                 # an unknown sysid has no ``lost`` path, so accepting it here
                 # would grow the pos dicts unboundedly (spoofed traffic) or
@@ -1300,10 +1247,7 @@ class RtlsExtension(Extension):
                 # under a recurring stamp).
                 current = next(iter(wire.values()))[1]
                 if stamp != current:
-                    if (
-                        stamp > current
-                        or current - stamp > POS_REBOOT_BACKSTEP_MS
-                    ):
+                    if stamp > current or current - stamp > POS_REBOOT_BACKSTEP_MS:
                         wire.clear()
                     else:
                         continue
@@ -1392,19 +1336,11 @@ class RtlsExtension(Extension):
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
-        self._twr_summaries.pop(event.system_id, None)
-        if (
-            self._geo_fit_session is not None
-            and event.system_id
-            in self._geo_fit_session.capture.participant_system_ids
-        ):
-            self._geo_fit_session = None
         self._adv.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
         # the network (lost + rediscovered) inside its pin window
-        if self._show_clock is not None:
-            self._show_clock.forget_device(event.system_id)
+        self._cluster_clock.forget_device(event.system_id)
         self._drop_anchor_cells_for_source(event.system_id)
         self._refresh_anchor_cells()
         self._inf_pending = True
@@ -1481,51 +1417,49 @@ class RtlsExtension(Extension):
 
     # ---- tag<->drone association ----
 
-    def _uav_source_addresses(self) -> dict[str, tuple[str, int]]:
-        """The connected MAVLink UAVs' last-heard-from source addresses,
-        keyed by flockwave UAV id, from the mavlink extension's API (empty
-        while the extension is not loaded). Tests override this seam."""
+    def _uav_ids_by_system_id(self) -> dict[int, str]:
+        """The flockwave id of every UAV the mavlink extension has heard
+        from, connected or not, keyed by MAVLink system id, from the mavlink
+        extension's API (empty while the extension is not loaded). Tests
+        override this seam."""
         api = self._mavlink_api
         if api is None or not getattr(api, "loaded", False):
             return {}
         try:
-            return api.get_uav_source_addresses()
+            return api.get_uav_ids_by_system_id()
         except Exception:
             return {}
 
-    def _refresh_uav_map(self) -> bool:
-        """Recompute the device->UAV association and return whether it
-        changed.
-
-        A drone's flight controller reaches the server through its tag's
-        WiFi-UART bridge, so the UAV's UDP source IP equals the tag's
-        management IP -- the join is on that IP. Purely derived state:
-        a device or UAV that disappears (or moves to another IP on a DHCP
-        renewal) drops out of the mapping on the next recompute. An IP
-        claimed by more than one UAV yields no mapping for its devices
-        (better unmapped than mis-attributed -- mis-attribution is the
-        operator incident this exists to prevent)."""
-        mapping: dict[int, str] = {}
+    def _associations(self) -> tuple[dict[int, FlightController], dict[int, str]]:
+        """Each device's flight-controller claim (see :mod:`.fc_identity`)
+        and the server UAV that claim names."""
         devices = self._protocol.devices if self._protocol else {}
-        if devices:
-            uav_by_ip: dict[str, Optional[str]] = {}
-            for uav_id, address in self._uav_source_addresses().items():
-                ip = address[0]
-                # None marks an ambiguous IP (multiple UAVs behind it)
-                uav_by_ip[ip] = uav_id if ip not in uav_by_ip else None
-            for system_id, device in devices.items():
-                uav_id = uav_by_ip.get(device.address[0])
-                if uav_id is not None:
-                    mapping[system_id] = uav_id
-        if mapping == self._uav_map:
+        claims = flight_controller_claims(
+            {
+                device.system_id: (
+                    _decoded_device_params(device, ("FC_SYS_ID", "FC_STATE")),
+                    bool(getattr(device, "sleeping", False))
+                    or not self._sleep_state_known(device),
+                )
+                for device in devices.values()
+            }
+        )
+        return claims, uav_ids_for_claims(claims, self._uav_ids_by_system_id())
+
+    def _refresh_uav_map(self) -> bool:
+        """Recompute the claims and the device->UAV association and return
+        whether either changed."""
+        claims, mapping = self._associations()
+        if claims == self._fc_claims and mapping == self._uav_map:
             return False
-        self._uav_map = mapping
+        self._fc_claims, self._uav_map = claims, mapping
         return True
 
     async def _poll_uav_map(self, now: float) -> None:
-        """One pass of the association loop: recompute the mapping and, when
-        it changed, push the (throttled) X-RTLS-INF device list so clients
-        re-render the tag<->drone pairing without polling."""
+        """One pass of the association loop: recompute the claims and the
+        mapping and, when either changed, push the (throttled) X-RTLS-INF
+        device list so clients re-render the tag<->drone pairing without
+        polling."""
         if self._refresh_uav_map():
             await self._on_inf_change(now)
 
@@ -1588,15 +1522,11 @@ class RtlsExtension(Extension):
                 # the paced reads sleep between datagrams; run them off
                 # the receive loop so a large round cannot stall
                 # heartbeat consumption into false device expiry
-                self._nursery.start_soon(
-                    self._send_refill_reads, system_id, missing
-                )
+                self._nursery.start_soon(self._send_refill_reads, system_id, missing)
             else:
                 await self._send_refill_reads(system_id, missing)
 
-    async def _send_refill_reads(
-        self, system_id: int, names: list[str]
-    ) -> None:
+    async def _send_refill_reads(self, system_id: int, names: list[str]) -> None:
         """Send one targeted PARAM_EXT_REQUEST_READ per name, paced: each
         read is answered immediately by the firmware, whose management TX
         queue cannot absorb a burst of replies (the reason its own dump
@@ -1647,18 +1577,14 @@ class RtlsExtension(Extension):
         snapshot (see :func:`_missing_identity_param_names`); the role is
         resolved like :meth:`_device_json` does, preferring the fresher
         state advertisement over the param cache."""
-        if (
-            device.param_count is not None
-            and len(device.params) >= device.param_count
-        ):
+        if device.param_count is not None and len(device.params) >= device.param_count:
             # the snapshot is count-complete, so the dump lost nothing:
             # an identity param absent from it is genuinely absent on the
             # device and must not be re-polled
             return []
         params = _decoded_device_params(device)
-        role = (
-            self._adv.get(device.system_id, {}).get("role")
-            or role_from_params(params)
+        role = self._adv.get(device.system_id, {}).get("role") or role_from_params(
+            params
         )
         return _missing_identity_param_names(params, role)
 
@@ -1927,9 +1853,7 @@ class RtlsExtension(Extension):
             stats = self._stats.get(system_id)
             snapshot = {str(system_id): dict(stats)} if stats is not None else {}
         else:
-            snapshot = {
-                str(sysid): dict(stats) for sysid, stats in self._stats.items()
-            }
+            snapshot = {str(sysid): dict(stats) for sysid, stats in self._stats.items()}
 
         return hub.create_response_or_notification(
             body={"type": "X-RTLS-STATS", "stats": snapshot},
@@ -1964,110 +1888,26 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
-    async def _handle_RTLS_GEO(
+    async def _handle_RTLS_GEOM(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
-        # Lazy import: geometry.py imports helpers from this module, so
-        # importing it at module load would be a cycle.
-        from .geometry import (
-            DEFAULT_FLOAT_TOLERANCE,
-            run_adopt,
-            run_check,
-            run_sync,
-        )
+        # Lazy import: geometry_agreement.py imports helpers from this module.
+        from .geometry_agreement import DEFAULT_TOLERANCE_M, run_agreement
 
         body = message.body
-        op = body.get("op")
-        if op == "fit":
-            from .fit import SUMMARY_WAIT_TIMEOUT_S, run_fit
-
-            try:
-                mode = body.get("mode", "strict")
-                if not isinstance(mode, str):
-                    raise ValueError(f"Invalid fit mode: {mode!r}")
-                capture_id = body.get("captureId")
-                if capture_id is not None:
-                    try:
-                        capture_id = int(capture_id)
-                    except (TypeError, ValueError):
-                        raise ValueError(
-                            f"Invalid captureId: {capture_id!r}"
-                        ) from None
-                timeout = body.get("timeout", SUMMARY_WAIT_TIMEOUT_S)
-                try:
-                    timeout = float(timeout)
-                except (TypeError, ValueError):
-                    raise ValueError(f"Invalid timeout: {timeout!r}") from None
-                cell = body.get("cell")
-                if cell is not None and not isinstance(cell, str):
-                    raise ValueError(f"Invalid cell: {cell!r}")
-                result = await run_fit(
-                    self,
-                    mode=mode,
-                    cell=cell,
-                    capture_id=capture_id,
-                    timeout=timeout,
-                )
-            except ValueError as ex:
-                return hub.reject(message, reason=str(ex))
-            return hub.create_response_or_notification(
-                body=result, in_response_to=message
-            )
-        if op not in ("adopt", "check", "sync"):
-            return hub.reject(
-                message,
-                reason=f"Invalid op: {op!r} (expected 'adopt', 'check', "
-                "'sync' or 'fit')",
-            )
         try:
-            reference = _get_optional_device_id(body, "reference")
             ids = _get_optional_device_ids(body)
-            cell = body.get("cell")
-            if cell is not None and not isinstance(cell, str):
-                raise ValueError(f"Invalid cell: {cell!r}")
-            tolerance = body.get("tolerance", DEFAULT_FLOAT_TOLERANCE)
-            try:
-                tolerance = float(tolerance)
-            except (TypeError, ValueError):
-                raise ValueError(f"Invalid tolerance: {tolerance!r}") from None
-            if not 0 <= tolerance <= 1:
-                raise ValueError("Tolerance must be between 0 and 1")
-            timeout = _get_timeout(message, DEFAULT_PARAM_TIMEOUT)
+            tolerance = body.get("tolerance", DEFAULT_TOLERANCE_M)
+            if (
+                isinstance(tolerance, bool)
+                or not isinstance(tolerance, (int, float))
+                or not 0.0 < float(tolerance) <= 1.0
+            ):
+                raise ValueError("Invalid tolerance (metres, 0 < tolerance <= 1)")
+            result = run_agreement(self, ids=ids, tolerance=float(tolerance))
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-
-        try:
-            if op == "adopt":
-                result = await run_adopt(
-                    self, reference=reference, tolerance=tolerance
-                )
-            elif op == "check":
-                result = await run_check(
-                    self, cell=cell, ids=ids, tolerance=tolerance
-                )
-            else:
-                geometry = body.get("geometry")
-                if geometry is not None and not isinstance(geometry, dict):
-                    return hub.reject(
-                        message,
-                        reason="'geometry' must be an object of "
-                        "parameter name -> value",
-                    )
-                result = await run_sync(
-                    self,
-                    cell=cell,
-                    ids=ids,
-                    geometry=geometry,
-                    tolerance=tolerance,
-                    reboot=bool(body.get("reboot", True)),
-                    timeout=timeout,
-                )
-        except ValueError as ex:
-            return hub.reject(message, reason=str(ex))
-
-        return hub.create_response_or_notification(
-            body=result, in_response_to=message
-        )
+        return hub.create_response_or_notification(body=result, in_response_to=message)
 
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2077,15 +1917,10 @@ class RtlsExtension(Extension):
 
         in_depth = bool(message.body.get("inDepth", False))
         try:
-            cell = message.body.get("cell")
-            if cell is not None and not isinstance(cell, str):
-                raise ValueError(f"Invalid cell: {cell!r}")
-            result = await run_verify(self, cell=cell, in_depth=in_depth)
+            result = await run_verify(self, in_depth=in_depth)
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-        return hub.create_response_or_notification(
-            body=result, in_response_to=message
-        )
+        return hub.create_response_or_notification(body=result, in_response_to=message)
 
     # ---- helpers / exports ----
 
@@ -2112,12 +1947,29 @@ class RtlsExtension(Extension):
         by system id (as string). Shared by the query response and the
         gained/lost broadcast so both carry the same body shape."""
         devices = self._protocol.devices if self._protocol else {}
+        claims, uav_ids = self._associations()
         return {
-            str(device.system_id): self._device_json(device, now)
+            str(device.system_id): self._device_json(
+                device, now, claims.get(device.system_id), uav_ids.get(device.system_id)
+            )
             for device in devices.values()
         }
 
-    def _device_json(self, device, now: float) -> dict[str, Any]:
+    def _sleep_state_known(self, device) -> bool:
+        """Whether a heartbeat has latched the device's sleep state within
+        the device timeout; past it (passive mode, where any traffic keeps a
+        device alive) the latch, and the FC_STATE that arrived with it, are
+        guesses. Both stamps come from the feed clock."""
+        latch = self._sleeping.get(device.system_id)
+        return latch is None or device.last_seen - latch[1] <= self._device_timeout
+
+    def _device_json(
+        self,
+        device,
+        now: float,
+        flight_controller: FlightController | None,
+        uav_id: str | None,
+    ) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
         params = _decoded_device_params(device)
         # the state advertisement re-announces version/role every
@@ -2131,8 +1983,7 @@ class RtlsExtension(Extension):
             "id": device.system_id,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "firmwareVersion": adv.get("firmwareVersion")
-            or firmware_version(device),
+            "firmwareVersion": adv.get("firmwareVersion") or firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
@@ -2143,18 +1994,15 @@ class RtlsExtension(Extension):
         # a guess -- omit the key so clients render "unknown" instead of a
         # stale definite state. Both stamps come from the feed clock, so
         # the comparison is immune to the query-time clock.
-        latch = self._sleeping.get(device.system_id)
-        if latch is None or device.last_seen - latch[1] <= self._device_timeout:
+        if self._sleep_state_known(device):
             # getattr: tolerate an SDK that predates sleep mode
             body["sleeping"] = bool(getattr(device, "sleeping", False))
         if "uptimeMs" in adv:
             body["uptimeMs"] = adv["uptimeMs"]
-        # the drone whose flight controller talks through this device's
-        # WiFi-UART bridge (source-IP join, see _refresh_uav_map); absent
-        # for unassociated devices (anchors, spares, bridge-less tags)
-        uav_id = self._uav_map.get(device.system_id)
         if uav_id is not None:
             body["uav"] = uav_id
+        if flight_controller is not None:
+            body["flightController"] = flight_controller
         if role is not None:
             body["role"] = role
         name = _device_name(device.system_id, params, role)
@@ -2191,9 +2039,7 @@ class RtlsExtension(Extension):
             if device is None:
                 continue
             try:
-                cell = cell_from_params(
-                    _decoded_device_params(device), cell_id=cell_id
-                )
+                cell = cell_from_params(_decoded_device_params(device), cell_id=cell_id)
             except (KeyError, TypeError, ValueError):
                 continue
             for anchor in cell.anchors:
@@ -2412,6 +2258,7 @@ class RtlsExtension(Extension):
 
     def exports(self):
         return {
+            "cluster_clock": self._cluster_clock,
             "devices": self._get_devices,
             "protocol": lambda: self._protocol,
             "get_param": self.get_param,
@@ -2559,15 +2406,18 @@ def _configured_devices(
     return targets, smp_ports
 
 
-def _decoded_device_params(device) -> dict[str, Any]:
-    """Decode a device's cached raw params into plain Python values, keyed by
-    name. Parameters whose type is not yet known are skipped."""
+def _decoded_device_params(
+    device, names: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    """Decode a device's cached raw params (all of them, or only ``names``)
+    into plain Python values, keyed by name. Parameters whose type is not
+    yet known are skipped."""
     params: dict[str, Any] = {}
-    for name, value in device.params.items():
+    for name in device.params if names is None else names:
         param_type = device.param_types.get(name)
-        if param_type is None:
+        if param_type is None or name not in device.params:
             continue
-        params[name] = decode_param_value(value, param_type)
+        params[name] = decode_param_value(device.params[name], param_type)
     return params
 
 
@@ -2654,9 +2504,7 @@ def _missing_identity_param_names(
     if role in ("anchor-initiator", "anchor-responder"):
         if _anchor_index_for_device(params) is not None:
             return []  # A-index already resolves
-        missing = [
-            name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params
-        ]
+        missing = [name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params]
         missing.extend(_missing_anchor_table_names(params, ("MAC",)))
         return missing
     if role == "tag":
@@ -2665,9 +2513,7 @@ def _missing_identity_param_names(
         # (and the MAC drives the beacon's live/active matching); a hole
         # there keeps the whole cell — hence the map beacons — unrendered
         missing.extend(
-            _missing_anchor_table_names(
-                params, ("X", "Y", "Z", "MAC", "BIAS_M")
-            )
+            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC", "BIAS_M"))
         )
         return missing
     if role is None and "UWB_ROLE" not in params:
@@ -2729,6 +2575,33 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # UI both need it; previously only the show-clock pin manager
         # consumed it internally
         body["clockSyncOk"] = bool(data["clkok"])
+    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state
+    # (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed), why the
+    # last fit was rejected (0 none, 1 anchor count not 4 or 8, 2 anchor
+    # missing, 3 side too short, 4 not a rectangle, 5 top plane not above
+    # the bottom one), the rectangle-diagonal residual, the largest live
+    # drift since calibration and the seven fitted AN0-ANi distances (0
+    # without a fit; a four-anchor cell reports the first three). The fleet
+    # agreement check (X-RTLS-GEOM) compares the distances.
+    # non-finite floats cannot be JSON and cannot be graded: drop them
+    if "geom" in data and math.isfinite(float(data["geom"])):
+        body["geometryState"] = int(data["geom"])
+    if "gfail" in data and math.isfinite(float(data["gfail"])):
+        body["geometryReason"] = int(data["gfail"])
+    if "gres" in data and math.isfinite(float(data["gres"])):
+        body["geometryResidualM"] = round(float(data["gres"]), 4)
+    if "gdrift" in data and math.isfinite(float(data["gdrift"])):
+        body["geometryDriftM"] = round(float(data["gdrift"]), 4)
+    distances = [data.get(f"gd{i}") for i in range(1, 8)]
+    if any(d is not None for d in distances):
+        # the firmware sends 0 for a distance it has no fit for (a
+        # four-anchor cell's top plane, or no fit at all): not a distance
+        body["geometryDistancesM"] = [
+            round(float(d), 4)
+            if d is not None and math.isfinite(float(d)) and float(d) > 0.0
+            else None
+            for d in distances
+        ]
     return body
 
 
@@ -2889,8 +2762,7 @@ schema = {
         },
         "hello_interval": {
             "type": "number",
-            "title": "Interval of the active hello probe in passive mode, "
-            "in seconds",
+            "title": "Interval of the active hello probe in passive mode, in seconds",
             "default": 60,
         },
     }

@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
+from functools import cache
 from logging import Logger
 from time import time_ns
 from typing import TYPE_CHECKING, Any
@@ -27,7 +28,16 @@ from flockwave.connections import (
     create_connection,
 )
 from flockwave.networking import find_interfaces_with_address
-from trio import move_on_after, open_nursery, to_thread
+from flockwave.protocols.mavlink.introspection import get_mavlink_message_class
+from trio import (
+    MemoryReceiveChannel,
+    MemorySendChannel,
+    WouldBlock,
+    move_on_after,
+    open_memory_channel,
+    open_nursery,
+    to_thread,
+)
 from trio.abc import ReceiveChannel
 from trio_util import periodic
 
@@ -42,7 +52,7 @@ from .driver import MAVLinkDriver, MAVLinkUAV
 from .enums import MAVAutopilot, MAVComponent, MAVMessageType, MAVState, MAVType
 from .errors import InvalidSystemIdError
 from .led_lights import MAVLinkLEDLightConfigurationManager
-from .packets import DroneShowStatus
+from .packets import DroneShowStatus, ShowScheduleStatus
 from .rssi import RSSIMode
 from .rtk import RTKCorrectionPacketEncoder
 from .signing import MAVLinkSigningConfiguration
@@ -240,6 +250,9 @@ class MAVLinkNetwork:
 
         self.log = None  # type: ignore
         self._matchers = None  # type: ignore
+        self._subscribers: defaultdict[
+            str, list[tuple[int, MemorySendChannel[MAVLinkMessage]]]
+        ] = defaultdict(list)
 
         self._id = id
         self._id_formatter = id_formatter
@@ -319,6 +332,25 @@ class MAVLinkNetwork:
             yield future
         finally:
             matchers.pop(matchers.index(item))
+
+    @contextmanager
+    def subscribe(
+        self, type: str, system_id: int, capacity: int = 2048
+    ) -> Iterator[MemoryReceiveChannel[MAVLinkMessage]]:
+        """Delivers every autopilot message of the given type from one system
+        until the context exits. Messages are dropped while the receiver is more
+        than `capacity` messages behind.
+        """
+        sender, receiver = open_memory_channel[MAVLinkMessage](capacity)
+        item = (system_id, sender)
+        subscribers = self._subscribers[type]
+        subscribers.append(item)
+        try:
+            with receiver:
+                yield receiver
+        finally:
+            subscribers.remove(item)
+            sender.close()
 
     @property
     def id(self) -> str:
@@ -642,11 +674,12 @@ class MAVLinkNetwork:
         # From this point onwards, spec is not None, i.e. we are definitely
         # sending something
 
-        spec[1].update(
-            target_system=target.system_id,
-            target_component=MAVComponent.AUTOPILOT1,
-            _mavlink_version=target.mavlink_version,
-        )
+        if _has_target_fields(spec[0]):
+            spec[1].update(
+                target_system=target.system_id,
+                target_component=MAVComponent.AUTOPILOT1,
+            )
+        spec[1].update(_mavlink_version=target.mavlink_version)
 
         if wait_for_response:
             response_type, response_fields = wait_for_response
@@ -687,13 +720,6 @@ class MAVLinkNetwork:
         iteration takes place.
         """
         return self._uavs.values() if self._uavs else []
-
-    def uav_addresses(self) -> dict[MAVLinkUAV, Any]:
-        """Returns a snapshot of the source addresses the UAVs of this
-        network were last heard from, keyed by UAV. UAVs that have not been
-        heard from yet are not included.
-        """
-        return dict(self._uav_addresses)
 
     def _create_uav(self, system_id: int) -> MAVLinkUAV:
         """Creates a new UAV with the given system ID in this network and
@@ -882,6 +908,13 @@ class MAVLinkNetwork:
                 if matched:
                     future.set_result(message)
 
+            for system_id, subscriber in self._subscribers.get(type, ()):
+                if message.get_srcSystem() == system_id:
+                    try:
+                        subscriber.send_nowait(message)
+                    except WouldBlock:
+                        pass
+
             # Call the message handler if we have one
             handler = handlers.get(type)
             if handler:
@@ -928,6 +961,10 @@ class MAVLinkNetwork:
             uav = self._find_uav_from_message(message, address)
             if uav:
                 uav.handle_message_drone_show_status(message)
+        elif message.type == ShowScheduleStatus.TYPE:
+            uav = self._find_uav_from_message(message, address)
+            if uav:
+                uav.handle_message_show_schedule_status(message)
 
     def _handle_message_global_position_int(
         self, message: MAVLinkMessage, *, connection_id: str, address: Any
@@ -1251,3 +1288,12 @@ def format_channel_ids(ids: Sequence[str]) -> str:
         if index < len(ids) - 1:
             parts.append(", " if index < len(ids) - 2 else " and ")
     return "".join(parts)
+
+
+@cache
+def _has_target_fields(message_type: str) -> bool:
+    """Returns whether a MAVLink message addresses a target system; the DATA*
+    messages carrying custom packets do not, and reach one drone only through
+    its own address."""
+    message_class = get_mavlink_message_class("ardupilotmega", message_type)
+    return "target_system" in message_class.fieldnames

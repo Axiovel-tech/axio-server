@@ -3,9 +3,9 @@
 One message runs the whole "are my drones consistent?" rule set that
 used to be checked by hand before every flight:
 
-- **geometry** — every tag carries the majority cell geometry
-  (delegates to the X-RTLS-GEO check, so origin, ``POS_YAW_DEG``,
-  ``CELL_ID`` and the anchor table are all covered);
+- **geometry** — every tag has fitted the cell itself and the fleet
+  agrees on it (delegates to the X-RTLS-GEOM agreement check over the
+  live geometry stats; see geometry_agreement.py);
 - **firmware** — uniform firmware version within each role group;
 - **pairing** — every online tag is associated with a drone (and every
   drone reached through a tag);
@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import trio
 
 from .extension import _decoded_device_params
-from .geometry import run_check
+from .geometry_agreement import run_agreement
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -113,9 +113,7 @@ def _rule(
     }
 
 
-async def _read_uav_param(
-    uav: Any, name: str
-) -> tuple[Optional[float], Optional[str]]:
+async def _read_uav_param(uav: Any, name: str) -> tuple[Optional[float], Optional[str]]:
     """Reads one ArduPilot parameter from a UAV with error isolation:
     returns ``(value, None)`` or ``(None, reason)``."""
     try:
@@ -145,36 +143,64 @@ def _angles_agree(values: list[float]) -> bool:
     return True
 
 
-def _geometry_rule(geometry: Optional[dict[str, Any]], error: str) -> dict:
-    if geometry is None:
+def _geometry_rule(agreement: dict[str, Any]) -> dict:
+    """Grades the fleet agreement body: fails when a tag deviates from
+    the fleet reference or cannot be certified (still calibrating,
+    failed, silent, or without geometry telemetry); manual tags are
+    named but do not fail the rule."""
+    devices = agreement["devices"]
+    if not devices:
         return _rule(
             "geometry",
-            "Cell geometry consistency",
+            "Cell geometry agreement",
             "error",
             "fail",
-            error,
+            "no online tags",
         )
-    drifted = [
-        device_id
-        for device_id, entry in geometry["devices"].items()
-        if entry.get("status") != "consistent"
+    problems = [
+        f"tag {device_id}: {entry.get('detail', entry['status'])}"
+        for device_id, entry in devices.items()
+        if entry["status"] not in ("agree", "manual")
     ]
-    if drifted:
+    manual = [
+        device_id for device_id, entry in devices.items() if entry["status"] == "manual"
+    ]
+    if problems:
         return _rule(
             "geometry",
-            "Cell geometry consistency",
+            "Cell geometry agreement",
             "error",
             "fail",
-            f"{len(drifted)} tag(s) disagree with the canonical geometry: "
-            f"{', '.join(sorted(drifted))} — run a geometry sync",
+            "; ".join(problems),
         )
-    return _rule(
-        "geometry",
-        "Cell geometry consistency",
-        "error",
-        "pass",
-        "every tag matches the canonical geometry",
+    if len(manual) == len(devices):
+        # a layout outside the convention, provisioned on every tag: the
+        # operator's deliberate choice, nothing to compare
+        return _rule(
+            "geometry",
+            "Cell geometry agreement",
+            "error",
+            "pass",
+            "every tag uses its provisioned table (UWB_GEOM_MODE=0)",
+        )
+    if not agreement["consistent"]:
+        return _rule(
+            "geometry",
+            "Cell geometry agreement",
+            "error",
+            "fail",
+            "no tag has fitted the cell yet",
+        )
+    max_deviation = max(
+        (entry.get("maxDeviationM", 0.0) for entry in devices.values()), default=0.0
     )
+    detail = (
+        f"every fitted tag agrees within {agreement['tolerance'] * 100:.0f} cm "
+        f"(largest deviation {max_deviation * 100:.1f} cm)"
+    )
+    if manual:
+        detail += "; provisioned table on tag " + ", ".join(sorted(manual))
+    return _rule("geometry", "Cell geometry agreement", "error", "pass", detail)
 
 
 def _firmware_rule(ext: "RtlsExtension") -> dict[str, Any]:
@@ -250,13 +276,11 @@ def _pairing_rule(ext: "RtlsExtension") -> dict[str, Any]:
         problems.append("no drones are known")
     if unpaired:
         problems.append(
-            f"tag(s) {', '.join(map(str, unpaired))} are not associated "
-            "with any drone"
+            f"tag(s) {', '.join(map(str, unpaired))} are not associated with any drone"
         )
     if total_uavs is not None and total_uavs > len(ext._uav_map):
         problems.append(
-            f"{total_uavs - len(ext._uav_map)} drone(s) have no "
-            "associated tag"
+            f"{total_uavs - len(ext._uav_map)} drone(s) have no associated tag"
         )
     if problems:
         return _rule(
@@ -310,9 +334,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
                 else:
                     entry[key] = value
         device = (
-            ext._require_protocol().devices.get(tag_sysid)
-            if ext._protocol
-            else None
+            ext._require_protocol().devices.get(tag_sysid) if ext._protocol else None
         )
         if device is not None:
             yaw = _decoded_device_params(device).get("POS_YAW_DEG")
@@ -337,9 +359,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
             f"virtual compass ({YAW_SOURCE_PARAM} != "
             f"{YAW_SOURCE_VIRTUAL_COMPASS})"
         )
-    vc_values = [
-        entry["vcYaw"] for entry in per_drone.values() if "vcYaw" in entry
-    ]
+    vc_values = [entry["vcYaw"] for entry in per_drone.values() if "vcYaw" in entry]
     if len(vc_values) > 1 and not _angles_agree(vc_values):
         problems.append(
             f"{VC_YAW_PARAM} differs across the fleet "
@@ -352,8 +372,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
     ]
     if unreadable:
         problems.append(
-            f"could not read parameters of drone(s) "
-            f"{', '.join(sorted(unreadable))}"
+            f"could not read parameters of drone(s) {', '.join(sorted(unreadable))}"
         )
 
     return _rule(
@@ -363,10 +382,7 @@ async def _yaw_rule(ext: "RtlsExtension") -> dict[str, Any]:
         "fail" if problems else "pass",
         "; ".join(problems)
         if problems
-        else (
-            f"every paired drone uses the virtual compass; "
-            f"{VC_YAW_PARAM} agrees"
-        ),
+        else (f"every paired drone uses the virtual compass; {VC_YAW_PARAM} agrees"),
         devices=per_drone,
     )
 
@@ -388,17 +404,14 @@ def _uwb_rule(ext: "RtlsExtension") -> dict[str, Any]:
         stats_age = now - ext._stats_at.get(system_id, float("-inf"))
         if stats_age > STATS_FRESH_S:
             errors.append(
-                f"tag {system_id}: telemetry went silent "
-                f"({stats_age:.0f} s ago)"
+                f"tag {system_id}: telemetry went silent ({stats_age:.0f} s ago)"
             )
             continue
         if float(stats.get("solveRateHz", 0.0)) <= 0.0:
             errors.append(f"tag {system_id}: not solving")
             continue
         if int(stats.get("fixAgeMs", 0)) > MAX_FIX_AGE_MS:
-            warnings.append(
-                f"tag {system_id}: stale fix ({stats['fixAgeMs']} ms)"
-            )
+            warnings.append(f"tag {system_id}: stale fix ({stats['fixAgeMs']} ms)")
         if float(stats.get("solvePct", 100.0)) < MIN_SOLVE_PCT:
             warnings.append(
                 f"tag {system_id}: solve quality "
@@ -492,8 +505,7 @@ async def _in_depth_rule(ext: "RtlsExtension") -> dict[str, Any]:
         "fail" if problems else "pass",
         "; ".join(problems)
         if problems
-        else f"{len(IN_DEPTH_PARAMS)} parameters agree across "
-        f"{len(pairs)} drone(s)",
+        else f"{len(IN_DEPTH_PARAMS)} parameters agree across {len(pairs)} drone(s)",
         diffs=diffs,
     )
 
@@ -501,7 +513,6 @@ async def _in_depth_rule(ext: "RtlsExtension") -> dict[str, Any]:
 async def run_verify(
     ext: "RtlsExtension",
     *,
-    cell: Optional[str] = None,
     in_depth: bool = False,
 ) -> dict[str, Any]:
     """Runs the fleet verification rule set; returns the X-RTLS-VERIFY
@@ -511,15 +522,10 @@ async def run_verify(
         raise ValueError("A fleet verification is already in progress")
     ext._verify_running = True
     try:
-        geometry: Optional[dict[str, Any]] = None
-        geometry_error = ""
-        try:
-            geometry = await run_check(ext, cell=cell)
-        except ValueError as ex:
-            geometry_error = str(ex)
+        geometry = run_agreement(ext)
 
         rules = [
-            _geometry_rule(geometry, geometry_error),
+            _geometry_rule(geometry),
             _firmware_rule(ext),
             _pairing_rule(ext),
             await _yaw_rule(ext),
@@ -547,9 +553,8 @@ async def run_verify(
                 for rule in rules
             ),
         }
-        if geometry is not None:
-            body["geometry"] = geometry
-            body["cell"] = geometry["cell"]
+        # the agreement body rides along for UI reuse
+        body["geometry"] = geometry
         return body
     finally:
         ext._verify_running = False
