@@ -1,12 +1,16 @@
-"""PRM-SET on a MAVLink UAV: only a PARAM_VALUE carrying the written value
-confirms the write, and the caller gets that value back or an error."""
+"""PRM-GET and PRM-SET on a MAVLink UAV: only a PARAM_VALUE carrying the
+written value confirms a write, the caller gets that value back or an error,
+and no parameter is touched before a heartbeat names the autopilot."""
 
 from types import SimpleNamespace
 
 import pytest
+import trio
 from trio import TooSlowError
 
 from flockwave.server.ext.mavlink.driver import MAVLinkDriver, MAVLinkUAV
+from flockwave.server.ext.mavlink.enums import MAVParamType
+from flockwave.server.ext.mavlink.errors import MAVLinkExtensionError
 
 NAME = "MAV3_OPTIONS"
 INT8 = 2
@@ -52,7 +56,8 @@ def make_uav(link: FakeLink):
             decode_param_from_wire_representation=lambda value, type: float(value),
         ),
     )
-    uav._set_parameter_single = MAVLinkUAV._set_parameter_single.__get__(uav)
+    for method in ("_set_parameter_single", "_wait_for_autopilot_identification"):
+        setattr(uav, method, getattr(MAVLinkUAV, method).__get__(uav))
     return uav
 
 
@@ -131,3 +136,111 @@ async def test_the_driver_passes_the_confirmed_value_to_the_prm_set_reply():
     uav = SimpleNamespace(set_parameter=confirmed_set)
     result = await MAVLinkDriver._set_parameter_single(None, uav, NAME, "2")  # type: ignore[arg-type]
     assert result == 2.0
+
+
+# Before the first heartbeat the server does not know the autopilot, and
+# ArduPilot sends every value as a plain float where the MAVLink spec packs
+# integers bytewise: DISARM_DELAY = 10 decodes as 0 and a write of 13 lands as 0.
+
+ARDUPILOT = 3
+GENERIC = 0
+
+
+class FakeVehicle:
+    """Holds parameters the way ArduPilot does: every value a plain float."""
+
+    def __init__(self, **params):
+        self.params = dict(params)
+        self.sent = []
+
+    async def send_packet_with_retries(self, spec, target, **kwds):
+        name, fields = spec
+        self.sent.append(name)
+        param_id = fields["param_id"].decode()
+        if name == "PARAM_SET":
+            self.params[param_id] = fields["param_value"]
+        reply = param_value(self.params[param_id], name=param_id)
+        return ("value", reply) if "wait_for_one_of" in kwds else reply
+
+
+def heartbeat(autopilot: int) -> SimpleNamespace:
+    return SimpleNamespace(autopilot=autopilot, system_status=4)
+
+
+def new_uav(vehicle: FakeVehicle) -> MAVLinkUAV:
+    driver = MAVLinkDriver()
+    driver.send_packet_with_retries = vehicle.send_packet_with_retries  # type: ignore
+    driver.run_in_background = lambda *args, **kwds: None
+    return MAVLinkUAV("03", driver=driver)
+
+
+PARAMETER_OPERATIONS = {
+    "PRM-GET": lambda uav: uav.get_parameter("DISARM_DELAY"),
+    "PRM-SET": lambda uav: uav.set_parameter("DISARM_DELAY", 13),
+    "bulk PRM-SET": lambda uav: uav.set_parameters({"DISARM_DELAY": 13}),
+}
+
+
+@pytest.mark.parametrize("operation", PARAMETER_OPERATIONS)
+async def test_without_a_heartbeat_parameters_are_refused_and_never_touched(
+    operation, autojump_clock
+):
+    vehicle = FakeVehicle(DISARM_DELAY=10.0)
+    uav = new_uav(vehicle)
+    with pytest.raises(MAVLinkExtensionError, match="not identified yet"):
+        await PARAMETER_OPERATIONS[operation](uav)
+    assert vehicle.sent == []
+    assert vehicle.params["DISARM_DELAY"] == 10.0
+
+
+@pytest.mark.parametrize("bulk", [True, False])
+async def test_prm_set_many_reports_why_it_refused_before_a_heartbeat(
+    bulk, autojump_clock
+):
+    # Both the bulk and the per-parameter path catch errors; the reason must survive.
+    vehicle = FakeVehicle(DISARM_DELAY=10.0)
+    uav = new_uav(vehicle)
+    uav.driver.use_bulk_parameter_uploads = bulk
+    with pytest.raises(MAVLinkExtensionError, match="not identified yet"):
+        async for _ in uav.driver._set_parameters_single(uav, {"DISARM_DELAY": 13}):
+            pass
+    assert vehicle.sent == []
+
+
+async def test_a_read_waits_for_the_heartbeat_and_decodes_as_the_autopilot_does(
+    autojump_clock,
+):
+    vehicle = FakeVehicle(DISARM_DELAY=10.0)
+    uav = new_uav(vehicle)
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(heartbeat_after, uav, 0.8, ARDUPILOT)
+        assert await uav.get_parameter("DISARM_DELAY") == 10.0
+
+
+async def test_a_write_waits_for_the_heartbeat_and_lands_as_written(autojump_clock):
+    vehicle = FakeVehicle(DISARM_DELAY=10.0)
+    uav = new_uav(vehicle)
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(heartbeat_after, uav, 0.8, ARDUPILOT)
+        assert await uav.set_parameter("DISARM_DELAY", 13) == 13.0
+    assert vehicle.params["DISARM_DELAY"] == 13.0
+
+
+async def test_an_autopilot_type_the_server_does_not_know_keeps_the_mavlink_encoding(
+    autojump_clock,
+):
+    vehicle = FakeVehicle(DISARM_DELAY=MAVParamType.INT8.as_float(10))
+    uav = new_uav(vehicle)
+    uav.notify_reconnection(heartbeat(GENERIC))
+    with trio.fail_after(0.1):
+        assert await uav.get_parameter("DISARM_DELAY") == 10
+
+
+async def heartbeat_after(uav: MAVLinkUAV, delay: float, autopilot: int) -> None:
+    await trio.sleep(delay)
+    uav.notify_reconnection(heartbeat(autopilot))
+
+
+@pytest.fixture
+def autojump_clock():
+    return trio.testing.MockClock(autojump_threshold=0)
