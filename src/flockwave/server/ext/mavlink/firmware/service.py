@@ -11,6 +11,7 @@ from .backend import (
     ArduPilotUpdateBackend,
     FirmwareUpdateConfiguration,
     _reason_detail,
+    _warning_detail,
 )
 from .model import OTAJob
 from .transaction import (
@@ -112,6 +113,9 @@ class ArduPilotOTAService:
         image = message.body.get("image")
         if not isinstance(name, str) or not isinstance(sha256, str):
             return hub.reject(message, reason="Missing firmware name or SHA-256")
+        allow_low_battery = message.body.get("allowLowBattery", False)
+        if not isinstance(allow_low_battery, bool):
+            return hub.reject(message, reason="allowLowBattery must be a boolean")
         if uav_id not in self._configuration.provisioned_uav_ids:
             return hub.reject(
                 message, reason="UAV is not provisioned with the OTA bootloader"
@@ -124,6 +128,7 @@ class ArduPilotOTAService:
                 name=name,
                 payload=payload,
                 sha256=sha256,
+                allow_low_battery=allow_low_battery,
             )
         except (ValueError, KeyError) as ex:
             return hub.reject(message, reason=str(ex))
@@ -190,5 +195,12 @@ def _target_json(state) -> dict:
             "disarmed": state.disarmed,
             "onGround": state.on_ground,
             "powerSufficient": state.power_sufficient,
+            "batteryVoltage": state.battery_voltage,
+            "minimumBatteryVoltage": state.minimum_battery_voltage,
         },
+        "warning": (
+            {"code": state.warning_code, "detail": _warning_detail(state)}
+            if state.warning_code
+            else None
+        ),
     }

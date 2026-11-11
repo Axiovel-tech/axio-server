@@ -106,7 +106,11 @@ class FakeBackend:
 
 
 async def start_job(
-    nursery, backend: FakeBackend, notifications: list[dict], notify_hook=None
+    nursery,
+    backend: FakeBackend,
+    notifications: list[dict],
+    notify_hook=None,
+    **start_options,
 ):
     payload = make_apj()
 
@@ -125,6 +129,7 @@ async def start_job(
         name="arducopter.apj",
         payload=payload,
         sha256=hashlib.sha256(payload).hexdigest(),
+        **start_options,
     )
     return coordinator, job
 
@@ -133,6 +138,40 @@ async def wait_finished(job) -> None:
     with trio.fail_after(2):
         while job.status == "running":
             await trio.sleep(0)
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_low_battery_is_accepted_only_when_the_operator_allows_it(
+    allowed: bool,
+) -> None:
+    @dataclass
+    class LowBatteryBackend(FakeBackend):
+        accepted: bool = False
+
+        def accept_low_battery(self) -> None:
+            self.accepted = True
+
+        def check_safety(self, board_id: int) -> None:
+            super().check_safety(board_id)
+            if not self.accepted:
+                raise UpdateOperationError("batteryLow", "UAV battery is low")
+
+    backend = LowBatteryBackend()
+    notifications: list[dict] = []
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(
+            nursery, backend, notifications, allow_low_battery=allowed
+        )
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+
+    assert backend.accepted is allowed
+    if allowed:
+        assert job.status == "success"
+    else:
+        assert job.status == "failed"
+        assert job.error == {"code": "batteryLow", "detail": "UAV battery is low"}
+        assert "stage" not in backend.calls
 
 
 async def test_full_update_survives_lost_reboot_ack() -> None:

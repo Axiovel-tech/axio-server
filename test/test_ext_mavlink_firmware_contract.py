@@ -104,7 +104,43 @@ def test_target_wire_shape_matches_control_contract() -> None:
             "disarmed": True,
             "onGround": True,
             "powerSufficient": True,
+            "batteryVoltage": None,
+            "minimumBatteryVoltage": None,
         },
+        "warning": None,
+    }
+
+
+def test_low_battery_is_a_warning_with_the_measured_voltage() -> None:
+    target = TargetState(
+        id="7",
+        compatible=True,
+        connected=True,
+        disarmed=True,
+        on_ground=True,
+        power_sufficient=False,
+        board_id=1177,
+        current_hash="0123abcd",
+        current_version="4.6.1",
+        reason_code=None,
+        battery_voltage=7.23,
+        minimum_battery_voltage=7.3,
+        warning_code="batteryLow",
+    )
+
+    body = _target_json(target)
+    assert body["error"] is None
+    assert body["warning"] == {
+        "code": "batteryLow",
+        "detail": "UAV battery voltage 7.23 V is below the configured minimum 7.30 V",
+    }
+    assert body["safety"] == {
+        "connected": True,
+        "disarmed": True,
+        "onGround": True,
+        "powerSufficient": False,
+        "batteryVoltage": 7.23,
+        "minimumBatteryVoltage": 7.3,
     }
 
 
@@ -253,11 +289,49 @@ async def test_start_decodes_payload_and_preserves_request_operation() -> None:
         "name": "firmware.apj",
         "payload": b"apj",
         "sha256": "0" * 64,
+        "allow_low_battery": False,
     }
     assert response.body["op"] == "start"
     assert response.body["id"] == "7"
     assert response.body["job"]["operationId"] == "op-1"
     assert response.refs == request.id
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(True, True), (False, False), ("yes", None), (1, None)]
+)
+async def test_start_passes_low_battery_acceptance_only_as_a_boolean(
+    value: object, expected: bool | None
+) -> None:
+    job = OTAJob(operation_id="op-1", uav_id="7", name="firmware.apj")
+    coordinator = CoordinatorStub(job)
+    service, hub, manager, nursery, _, _ = await make_service(
+        uavs=[SimpleNamespace(id="7")]
+    )
+    service._coordinator = coordinator
+    try:
+        response = await service.handle_message(
+            make_message(
+                op="start",
+                id="7",
+                name="firmware.apj",
+                image="YXBq",
+                sha256="0" * 64,
+                allowLowBattery=value,
+            ),
+            cast(Client, None),
+            hub,
+        )
+    finally:
+        nursery.cancel_scope.cancel()
+        await manager.__aexit__(None, None, None)
+
+    if expected is None:
+        assert response.body["reason"] == "allowLowBattery must be a boolean"
+        assert coordinator.start_args is None
+    else:
+        assert coordinator.start_args is not None
+        assert coordinator.start_args["allow_low_battery"] is expected
 
 
 async def test_start_rejects_uav_without_provisioned_bootloader() -> None:

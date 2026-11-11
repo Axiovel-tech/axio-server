@@ -49,6 +49,7 @@ class OTAJob:
         default_factory=lambda: {"gitHash": None, "version": None}
     )
     error: OTAError | None = None
+    allow_low_battery: bool = False
     cancel_requested: trio.Event = field(default_factory=trio.Event, repr=False)
 
     def json(self) -> dict[str, Any]:

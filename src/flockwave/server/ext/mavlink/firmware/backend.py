@@ -53,6 +53,12 @@ class TargetState:
     current_hash: str | None
     current_version: str | None
     reason_code: str | None
+    """Reason that blocks an update, or ``None``."""
+
+    battery_voltage: float | None = None
+    minimum_battery_voltage: float | None = None
+    warning_code: str | None = None
+    """Condition that the operator must accept before an update may start."""
 
 
 @dataclass(frozen=True)
@@ -122,6 +128,14 @@ class ArduPilotUpdateBackend:
     ):
         self._uav = uav
         self._configuration = configuration or FirmwareUpdateConfiguration()
+        self._low_battery_accepted = False
+
+    def accept_low_battery(self) -> None:
+        """Records that the operator chose to update despite a low battery.
+
+        An unknown battery voltage still blocks the update.
+        """
+        self._low_battery_accepted = True
 
     def target_state(self) -> TargetState:
         heartbeat = self._fresh_message(MAVMessageType.HEARTBEAT)
@@ -158,7 +172,6 @@ class ArduPilotUpdateBackend:
             armed,
             on_ground,
             power_observed,
-            power_sufficient,
             board_id,
             self._uav.id in self._configuration.provisioned_uav_ids,
             show_state_fresh=(
@@ -188,6 +201,15 @@ class ArduPilotUpdateBackend:
                 else None
             ),
             reason_code=reason,
+            battery_voltage=(
+                float(voltage)
+                if sys_status is not None and voltage is not None and voltage > 0
+                else None
+            ),
+            minimum_battery_voltage=threshold,
+            warning_code=(
+                "batteryLow" if power_observed and not power_sufficient else None
+            ),
         )
 
     def _fresh_message(self, message_type: MAVMessageType):
@@ -199,6 +221,8 @@ class ArduPilotUpdateBackend:
         state = self.target_state()
         if state.reason_code:
             raise UpdateOperationError(state.reason_code, _reason_detail(state))
+        if state.warning_code and not self._low_battery_accepted:
+            raise UpdateOperationError(state.warning_code, _warning_detail(state))
         if state.board_id != board_id:
             raise UpdateOperationError(
                 "boardMismatch",
@@ -353,7 +377,6 @@ def _target_reason(
     armed: bool,
     on_ground: bool,
     power_observed: bool,
-    power_sufficient: bool,
     board_id: int | None,
     bootloader_provisioned: bool,
     *,
@@ -375,8 +398,6 @@ def _target_reason(
         return "bootloaderNotProvisioned"
     if not power_observed:
         return "batteryUnknown"
-    if not power_sufficient:
-        return "batteryLow"
     if not show_state_fresh:
         return "showStateUnknown"
     if show_scheduled:
@@ -394,7 +415,6 @@ def _reason_detail(state: TargetState) -> str:
         "batteryUnknown": (
             "UAV battery voltage is unavailable or its minimum is not configured"
         ),
-        "batteryLow": "UAV battery voltage is below the configured minimum",
         "boardUnknown": "UAV board ID is not available",
         "unsupportedBoard": f"UAV board ID {state.board_id} is not supported",
         "bootloaderNotProvisioned": "UAV is not provisioned with the OTA bootloader",
@@ -403,6 +423,17 @@ def _reason_detail(state: TargetState) -> str:
         "showAuthorized": "UAV is authorized for a show",
     }
     return details.get(state.reason_code, "UAV is not ready for an update")
+
+
+def _warning_detail(state: TargetState) -> str:
+    if state.warning_code != "batteryLow":
+        return "UAV reports a condition that needs operator confirmation"
+    if state.battery_voltage is None or state.minimum_battery_voltage is None:
+        return "UAV battery voltage is below the configured minimum"
+    return (
+        f"UAV battery voltage {state.battery_voltage:.2f} V is below the "
+        f"configured minimum {state.minimum_battery_voltage:.2f} V"
+    )
 
 
 def _flash_failure(entries: set[str]) -> tuple[str, str] | None:

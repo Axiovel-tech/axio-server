@@ -25,6 +25,7 @@ from flockwave.server.ext.mavlink.firmware.backend import (
     _interrupted_flash_failure,
     _reason_detail,
     _target_reason,
+    _warning_detail,
 )
 from flockwave.server.ext.show.config import AuthorizationScope
 
@@ -147,6 +148,9 @@ def test_production_configuration_accepts_only_axiolight() -> None:
         current_hash="0123abcd",
         current_version="4.6.1",
         reason_code=None,
+        battery_voltage=16.0,
+        minimum_battery_voltage=14,
+        warning_code=None,
     )
 
 
@@ -294,7 +298,6 @@ def test_configuration_parses_all_bounds_and_simulation_mapping() -> None:
         (FakeUAV(1177, connected=False), "disconnected"),
         (FakeUAV(1177, armed=True), "armed"),
         (FakeUAV(1177, landed_state=None), "notOnGround"),
-        (FakeUAV(1177, battery_voltage=13.9), "batteryLow"),
         (FakeUAV(42), "unsupportedBoard"),
     ],
 )
@@ -331,7 +334,8 @@ def test_unknown_hardware_battery_fails_closed() -> None:
         )
 
     low = make_backend(FakeUAV(1177, battery_voltage=0.5)).target_state()
-    assert low.reason_code == "batteryLow"
+    assert low.reason_code is None
+    assert low.warning_code == "batteryLow"
 
     unconfigured = FirmwareUpdateConfiguration(provisioned_uav_ids=frozenset({"1"}))
     state = ArduPilotUpdateBackend(
@@ -341,10 +345,51 @@ def test_unknown_hardware_battery_fails_closed() -> None:
     assert state.reason_code == "batteryUnknown"
 
 
+def test_low_battery_is_a_warning_the_operator_can_accept() -> None:
+    backend = make_backend(FakeUAV(1177, battery_voltage=13.9))
+    state = backend.target_state()
+    assert state.power_sufficient is False
+    assert state.reason_code is None
+    assert state.warning_code == "batteryLow"
+    assert state.battery_voltage == 13.9
+    assert state.minimum_battery_voltage == 14
+    assert _warning_detail(state) == (
+        "UAV battery voltage 13.90 V is below the configured minimum 14.00 V"
+    )
+
+    with pytest.raises(UpdateOperationError) as raised:
+        backend.check_safety(1177)
+    assert raised.value.code == "batteryLow"
+    assert str(raised.value) == _warning_detail(state)
+
+    backend.accept_low_battery()
+    backend.check_safety(1177)
+
+
+def test_accepting_low_battery_does_not_lift_other_safety_checks() -> None:
+    uav = FakeUAV(1177, battery_voltage=13.9)
+    backend = make_backend(uav)
+    backend.accept_low_battery()
+
+    uav.scheduled_takeoff_time = 123
+    assert backend.target_state().reason_code == "showScheduled"
+    with pytest.raises(UpdateOperationError) as scheduled:
+        backend.check_safety(1177)
+    assert scheduled.value.code == "showScheduled"
+
+    unknown = make_backend(FakeUAV(1177, battery_voltage=None))
+    unknown.accept_low_battery()
+    assert unknown.target_state().warning_code is None
+    with pytest.raises(UpdateOperationError) as raised:
+        unknown.check_safety(1177)
+    assert raised.value.code == "batteryUnknown"
+
+
 def test_battery_voltage_threshold_is_inclusive() -> None:
     state = make_backend(FakeUAV(1177, battery_voltage=14)).target_state()
     assert state.power_sufficient is True
     assert state.reason_code is None
+    assert state.warning_code is None
 
 
 @pytest.mark.parametrize(
@@ -394,11 +439,6 @@ def test_safety_telemetry_at_freshness_boundary_is_accepted() -> None:
             "batteryUnknown",
             1177,
             "UAV battery voltage is unavailable or its minimum is not configured",
-        ),
-        (
-            "batteryLow",
-            1177,
-            "UAV battery voltage is below the configured minimum",
         ),
         ("boardUnknown", None, "UAV board ID is not available"),
         ("unsupportedBoard", 42, "UAV board ID 42 is not supported"),
@@ -512,12 +552,10 @@ def test_version_helpers_preserve_reported_identity() -> None:
 
 
 def test_target_reason_function_allows_only_ready_supported_target() -> None:
-    assert _target_reason(True, False, True, True, True, 1177, True) is None
+    assert _target_reason(True, False, True, True, 1177, True) is None
+    assert _target_reason(False, True, False, False, None, False) == "disconnected"
     assert (
-        _target_reason(False, True, False, False, False, None, False) == "disconnected"
-    )
-    assert (
-        _target_reason(True, False, True, True, True, 1177, False)
+        _target_reason(True, False, True, True, 1177, False)
         == "bootloaderNotProvisioned"
     )
 

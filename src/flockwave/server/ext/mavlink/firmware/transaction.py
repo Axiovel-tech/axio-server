@@ -68,10 +68,16 @@ class FirmwareUpdateCoordinator:
         name: str,
         payload: bytes,
         sha256: str,
+        allow_low_battery: bool = False,
     ) -> OTAJob:
         if self._active_operation_id is not None:
             raise UpdateBusyError("Another flight-controller update is already running")
-        job = OTAJob(operation_id=uuid4().hex, uav_id=uav_id, name=name)
+        job = OTAJob(
+            operation_id=uuid4().hex,
+            uav_id=uav_id,
+            name=name,
+            allow_low_battery=allow_low_battery,
+        )
         self._jobs[uav_id] = job
         self._active_operation_id = job.operation_id
         self._nursery.start_soon(self._run, job, payload, sha256)
@@ -105,6 +111,8 @@ class FirmwareUpdateCoordinator:
             )
             job.total_bytes = image.total_size
             backend = self._backend_factory(job.uav_id)
+            if job.allow_low_battery:
+                backend.accept_low_battery()
             with trio.CancelScope() as scope:
                 self._precommit_cancel_scopes[job.operation_id] = scope
                 try:
