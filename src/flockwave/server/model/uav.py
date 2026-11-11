@@ -1572,11 +1572,13 @@ class UAVDriver(Generic[TUAV], ABC):
 
     def _set_parameter_single(
         self, uav: TUAV, name: str, value: Any
-    ) -> None | Awaitable[None]:
+    ) -> Any | Awaitable[Any]:
         """Asks the driver to set the value of a parameter with the given
         name for a single UAV managed by this driver.
 
         May return an awaitable if preparing the result takes a longer time.
+        A driver that reads the value back returns it, and the client gets it
+        in the response.
 
         The function follows the "samurai principle", i.e. "return victorious,
         or not at all". It means that if it returns, the operation succeeded.
