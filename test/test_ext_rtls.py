@@ -9,6 +9,7 @@ pushed back through ``_process_datagram``. No sockets are involved.
 """
 
 import logging
+import math
 import socket
 import struct
 import sys
@@ -4135,3 +4136,93 @@ async def test_geom_reports_requested_ids_that_are_not_online(
     body = response.body
     assert body["consistent"] is False
     assert body["devices"]["77"]["status"] == "missing"
+
+
+# ---- anchors rendered from the tag's own fit ----------------------------
+
+
+def test_fitted_anchor_positions_follow_the_convention():
+    from flockwave.server.ext.rtls.fitted_cell import fitted_anchor_positions
+
+    d1, d2, d3, h, d5, d6, d7 = FLEET_DISTANCES
+    stats = {"geometryState": 3, "geometryDistancesM": list(FLEET_DISTANCES)}
+    positions = fitted_anchor_positions(stats)
+    assert positions is not None and len(positions) == 8
+    assert positions[:4] == [
+        (0.0, 0.0, 0.0),
+        (d1, 0.0, 0.0),
+        (0.0, d2, 0.0),
+        (d1, d2, 0.0),
+    ]
+    y6 = math.sqrt(d6**2 - h**2)
+    assert positions[4] == (0.0, 0.0, -h)
+    assert positions[5] == pytest.approx((math.sqrt(d5**2 - h**2), 0.0, -h))
+    assert positions[6] == pytest.approx((0.0, y6, -h))
+    assert positions[7] == pytest.approx((math.sqrt(d7**2 - h**2 - y6**2), y6, -h))
+
+    # a four-anchor cell reports the bottom plane only
+    four = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3] + [None] * 4}
+    assert fitted_anchor_positions(four) == positions[:4]
+    # no applied fit, or an incomplete one: nothing to render
+    assert fitted_anchor_positions({**stats, "geometryState": 2}) is None
+    assert fitted_anchor_positions(None) is None
+    partial = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3, h, None, d6, d7]}
+    assert fitted_anchor_positions(partial) is None
+
+
+def add_four_anchor_cell_params(device):
+    """A tag whose provisioned UWB_AN* table is stale (not the rig it
+    fits): four anchors on a 1 m square."""
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, (x, y) in enumerate(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0))):
+        for suffix, value, param_type in (
+            ("X", x, "real32"),
+            ("Y", y, "real32"),
+            ("Z", 0.0, "real32"),
+            ("MAC", index + 1, "uint16"),
+            ("BIAS_M", 0.0, "real32"),
+        ):
+            set_fake_param(device, f"UWB_AN{index}_{suffix}", value, param_type)
+
+
+async def test_anchors_render_from_the_tag_fit(extension, device, builder, hub):
+    add_four_anchor_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    async def site_anchors():
+        message = make_message(builder, {"type": "X-RTLS-INF"})
+        response = await extension._handle_RTLS_INF(message, None, hub)
+        return {a["index"]: a for a in response.body["anchors"]}
+
+    # no fit yet: the provisioned table
+    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
+
+    d1, d2, d3 = FLEET_DISTANCES[:3]
+    fit = {**FULL_STATS, "geom": 3.0, "gd1": d1, "gd2": d2, "gd3": d3}
+    fit.update({f"gd{i}": 0.0 for i in range(4, 8)})
+    await _feed_stats(extension, device, fit, now=time.monotonic())
+
+    anchors = await site_anchors()
+    assert anchors[1]["ned"] == {"north": d1, "east": 0.0, "down": 0.0}
+    assert anchors[3]["ned"] == {"north": d1, "east": d2, "down": 0.0}
+    assert anchors[3]["mac"] == 4  # slot identity still from the params
+    beacon = extension._beacon_api.beacons["rtls::default::anchor_3"]
+    lat, lon, _ = ned_to_global_e7_for_test(d1, d2)
+    assert beacon.position.lat == pytest.approx(lat)
+    assert beacon.position.lon == pytest.approx(lon)
+
+    # the fit goes away (recalibrating): back to the provisioned table
+    await _feed_stats(extension, device, {"geom": 2.0}, now=time.monotonic())
+    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
+
+
+def ned_to_global_e7_for_test(north, east):
+    from flockwave.server.ext.rtls.cell_compat import ned_to_global_e7
+
+    origin = SimpleNamespace(
+        lat_e7=413900000, lon_e7=21500000, alt_mm=10000, lat_deg=41.39
+    )
+    lat_e7, lon_e7, alt_mm = ned_to_global_e7(origin, north, east, 0.0)
+    return lat_e7 * 1e-7, lon_e7 * 1e-7, alt_mm * 1e-3

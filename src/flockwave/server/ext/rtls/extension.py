@@ -12,6 +12,7 @@ experimental (``X-`` prefixed) message types on the message hub; see
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 from contextlib import contextmanager
@@ -53,6 +54,7 @@ from flockwave.server.registries.errors import RegistryFull
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
+from .fitted_cell import fitted_anchor_positions
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -276,6 +278,9 @@ class RtlsExtension(Extension):
         #: given cell id; lets us re-home a cell onto another live tag when the
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
+        #: the anchor positions each tag fitted itself (automatic geometry),
+        #: as last applied to the cell it sources; None without a fit
+        self._fitted_cells: dict[int, Optional[list[tuple[float, float, float]]]] = {}
         #: wall-clock estimate of the UWB cluster clock that the drones count
         #: the show start in
         self._cluster_clock = ClusterClock()
@@ -1173,6 +1178,7 @@ class RtlsExtension(Extension):
         self._stats[system_id] = _stats_json(system_id, data)
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
+        await self._follow_fitted_cell(system_id, now)
         # STATS_FIELDS is the SDK's required legacy set; newer stats (``slp``
         # sleep state, ``vbat`` battery voltage, the cluster clock) are optional
         # and must not gate the broadcast, or firmware without them would never
@@ -1183,6 +1189,18 @@ class RtlsExtension(Extension):
         if last is not None and now - last < STATS_INTERVAL:
             return
         await self._broadcast_stats(system_id, now)
+
+    async def _follow_fitted_cell(self, system_id: int, now: float) -> None:
+        """Re-renders the cell a tag sources when its own fit appears,
+        changes (a recalibration) or goes away: the anchors then sit where
+        the tag positions them, not where its provisioned table says."""
+        fitted = fitted_anchor_positions(self._stats.get(system_id))
+        if fitted == self._fitted_cells.get(system_id):
+            return
+        self._fitted_cells[system_id] = fitted
+        if system_id in self._anchor_cell_sources.values():
+            self._sync_anchor_beacons_for_system(system_id)
+            await self._on_inf_change(now)
 
     async def _flush_pending_stats(self, now: float) -> None:
         """Broadcast any cached stats snapshot that is newer than the last
@@ -1350,6 +1368,7 @@ class RtlsExtension(Extension):
         """Drop all cached stats state for a device (e.g. on ``lost``)."""
         self._stats.pop(system_id, None)
         self._stats_at.pop(system_id, None)
+        self._fitted_cells.pop(system_id, None)
         self._last_stats_broadcast.pop(system_id, None)
         self._last_stats_sent.pop(system_id, None)
 
@@ -2039,7 +2058,9 @@ class RtlsExtension(Extension):
             if device is None:
                 continue
             try:
-                cell = cell_from_params(_decoded_device_params(device), cell_id=cell_id)
+                cell = self._source_cell(
+                    source, _decoded_device_params(device), cell_id
+                )
             except (KeyError, TypeError, ValueError):
                 continue
             for anchor in cell.anchors:
@@ -2071,6 +2092,22 @@ class RtlsExtension(Extension):
                 )
         return out
 
+    def _source_cell(self, system_id: int, params: dict[str, Any], cell_id: str):
+        """The cell a tag sources: origin, slot MACs and biases from its
+        parameters; anchor positions from its own fit when it has one (the
+        positions it actually solves on), its UWB_AN* table otherwise."""
+        cell = cell_from_params(params, cell_id=cell_id)
+        fitted = fitted_anchor_positions(self._stats.get(system_id))
+        if fitted is None or len(fitted) != len(cell.anchors):
+            return cell
+        return dataclasses.replace(
+            cell,
+            anchors=tuple(
+                dataclasses.replace(anchor, north_m=n, east_m=e, down_m=d)
+                for anchor, (n, e, d) in zip(cell.anchors, fitted)
+            ),
+        )
+
     def _sync_anchor_beacons_for_system(self, system_id: int) -> None:
         if self._protocol is None:
             return
@@ -2098,7 +2135,9 @@ class RtlsExtension(Extension):
             return
 
         try:
-            cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
+            cell = self._source_cell(
+                device.system_id, params, _cell_id_from_params(params)
+            )
         except (KeyError, TypeError, ValueError):
             return
 
