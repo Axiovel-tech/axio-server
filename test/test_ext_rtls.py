@@ -3890,9 +3890,22 @@ async def test_geom_accepts_centimetres_of_drift(
         extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
     )
 
-    response = await geom_message(extension, builder, hub)
-    assert response.body["consistent"] is True
+    for tolerance in (0.001, 0.02, 0.5):
+        response = await geom_message(extension, builder, hub, {"tolerance": tolerance})
+        assert response.body["consistent"] is True
+        assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+
+    # the bound itself is accepted; a request tolerance does not move it
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.08}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
     assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.081}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "drifted"
 
 
 async def test_geom_needs_the_live_drift(extension, device, builder, hub):
