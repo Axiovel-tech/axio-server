@@ -39,9 +39,12 @@ __all__ = (
 )
 
 #: a fitted distance farther than this from the fleet's median reference
-#: marks the drone as deviating, metres. Bench: independent fits of the
-#: same cell agree within ~4 mm.
-DEFAULT_TOLERANCE_M = 0.02
+#: marks the drone as deviating, metres. Fits taken together agree within
+#: ~4 mm, but the live distances shift by centimetres over a session, so a
+#: tag that fitted later (rebooted, woke, recalibrated) differs from the rest
+#: by that shift (~1.5 cm between tags of one 2026-11-09 bench session). A
+#: fleet recalibration puts every fit back on the same moment.
+DEFAULT_TOLERANCE_M = 0.05
 
 #: a live initiator distance farther than this from its calibrated value
 #: marks the drone as drifted (a tripod moved after the fit), metres. The
@@ -227,6 +230,7 @@ def _compare(
                 + ", ".join(
                     f"{name} {dev * 100:.1f} cm" for name, dev in deviations.items()
                 )
+                + " — recalibrate the fleet so every tag fits at the same time"
             )
         if missing:
             parts.append("anchor set differs (" + ", ".join(missing) + ")")

@@ -661,18 +661,20 @@ The check is a pure function over the cached `X-RTLS-STATS` snapshots:
 no device I/O, instant, swarm-sized.
 
 ```json
-{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.02}
+{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.05}
 ```
 
 `ids` (optional) restricts the grading to those system ids; `tolerance`
-(metres, default 0.02) is the largest accepted deviation of one distance
-from the reference. `driftTolerance` in the response (0.08 m, fixed) is the
+(metres, default 0.05) is the largest accepted deviation of one distance
+from the reference. Fits taken at different times differ by the slow shift of
+the live distances, so a deviating tag usually means "recalibrate the fleet"
+(`UWB_GEOM_RECAL=1` on every tag; Control's Recalibrate button). `driftTolerance` in the response (0.08 m, fixed) is the
 largest accepted live drift. Response:
 
 ```json
 {
   "type": "X-RTLS-GEOM",
-  "tolerance": 0.02,
+  "tolerance": 0.05,
   "driftTolerance": 0.08,
   "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
   "references": {"default": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]},
@@ -684,9 +686,9 @@ largest accepted live drift. Response:
            "maxDeviationM": 0.001},
     "43": {"id": 43, "status": "deviates", "state": 3, "stateName": "calibrated",
            "residualM": -0.074, "driftM": 0.001,
-           "distancesM": [8.637, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-           "maxDeviationM": 0.05, "deviations": {"AN0-AN1": 0.05},
-           "detail": "off the fleet reference by AN0-AN1 5.0 cm"},
+           "distancesM": [8.657, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+           "maxDeviationM": 0.07, "deviations": {"AN0-AN1": 0.07},
+           "detail": "off the fleet reference by AN0-AN1 7.0 cm — recalibrate the fleet so every tag fits at the same time"},
     "44": {"id": 44, "status": "calibrating", "state": 2, "stateName": "calibrating",
            "detail": "still fitting the cell"}
   }

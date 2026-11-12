@@ -3593,7 +3593,7 @@ async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder,
     )
     cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     drifted = list(FLEET_DISTANCES)
-    drifted[0] += 0.05  # AN1's tripod moved 5 cm for this tag only
+    drifted[0] += 0.08  # AN1's tripod moved 8 cm for this tag only
     extension._stats[DEVICE_SYSID + 1]["geometryDistancesM"] = drifted
 
     response = await verify_message(extension, builder, hub)
@@ -3731,7 +3731,7 @@ async def test_geom_flags_a_deviating_tag_and_names_the_distance(
     await _feed_stats(
         extension,
         second,
-        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.05},
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
         now=time.monotonic(),
     )
 
@@ -3743,7 +3743,26 @@ async def test_geom_flags_a_deviating_tag_and_names_the_distance(
     assert deviating["status"] == "deviates"
     assert set(deviating["deviations"]) == {"AN0-AN1"}
     assert "AN0-AN1" in deviating["detail"]
+    assert "recalibrate" in deviating["detail"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # a tag that fitted later than the fleet differs by the session's
+    # shift (centimetres); the default tolerance accepts it
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.03},
+        now=time.monotonic(),
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["consistent"] is True
+    assert response.body["tolerance"] == 0.05
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
+        now=time.monotonic(),
+    )
 
     # a wider tolerance accepts it
     response = await geom_message(extension, builder, hub, {"tolerance": 0.1})
