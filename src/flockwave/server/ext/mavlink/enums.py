@@ -174,8 +174,19 @@ class MAVMessageType(IntEnum):
     SCALED_IMU3 = 129
     BATTERY_STATUS = 147
     AUTOPILOT_VERSION = 148
+    EXTENDED_SYS_STATE = 245
     MAG_CAL_PROGRESS = 191  # ArduPilot-specific
     MAG_CAL_REPORT = 192
+
+
+class MAVLandedState(IntEnum):
+    """Values of the MAVLink ``MAV_LANDED_STATE`` enum used by OTA gates."""
+
+    UNDEFINED = 0
+    ON_GROUND = 1
+    IN_AIR = 2
+    TAKEOFF = 3
+    LANDING = 4
 
 
 class MAVMissionResult(IntEnum):

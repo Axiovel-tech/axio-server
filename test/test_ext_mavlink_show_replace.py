@@ -163,7 +163,7 @@ def uav(calls, ftp, drone, monkeypatch) -> MAVLinkUAV:
     monkeypatch.setattr(uav, "remove_show", remove_show)
     monkeypatch.setattr(uav, "_configure_show_frame_and_reload", configure_and_reload)
     monkeypatch.setattr(
-        driver_module.MAVFTP, "for_uav", classmethod(lambda cls, _: ftp)
+        driver_module.MAVFTP, "for_uav", classmethod(lambda cls, _, **_kwargs: ftp)
     )
     return uav
 

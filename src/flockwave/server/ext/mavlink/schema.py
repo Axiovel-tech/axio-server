@@ -292,6 +292,67 @@ schema = {
             "format": "checkbox",
             "propertyOrder": 14000,
         },
+        "firmware_update": {
+            "type": "object",
+            "title": "ArduPilot application firmware updates",
+            "propertyOrder": 15000,
+            "properties": {
+                "provisioned_uav_ids": {
+                    "type": "array",
+                    "description": (
+                        "UAV object IDs physically provisioned with the OTA bootloader."
+                    ),
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "uniqueItems": True,
+                    "default": [],
+                },
+                "minimum_battery_voltage": {
+                    "type": ["number", "null"],
+                    "description": (
+                        "Pack-specific minimum voltage required for hardware OTA. "
+                        "Leave unset to reject hardware updates when safe battery "
+                        "voltage cannot be established."
+                    ),
+                    "minimum": 0.1,
+                    "maximum": 100,
+                    "default": None,
+                },
+                "simulation_reported_board_id_overrides": {
+                    "type": "object",
+                    "description": (
+                        "Simulation-only board mapping; mapped SITL targets bypass "
+                        "hardware landed-state and battery-voltage observability."
+                    ),
+                    "additionalProperties": {"type": "integer", "enum": [1177]},
+                    "default": {},
+                },
+                "disconnect_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+                "reconnect_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 180,
+                },
+                "result_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+                "version_timeout": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "maximum": 600,
+                    "default": 15,
+                },
+            },
+            "default": {},
+        },
         # packet_loss is an advanced setting and is not included here
     }
 }
