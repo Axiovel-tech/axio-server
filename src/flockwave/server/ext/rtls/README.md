@@ -666,12 +666,14 @@ no device I/O, instant, swarm-sized.
 
 `ids` (optional) restricts the grading to those system ids; `tolerance`
 (metres, default 0.02) is the largest accepted deviation of one distance
-from the reference. Response:
+from the reference. `driftTolerance` in the response (0.08 m, fixed) is the
+largest accepted live drift. Response:
 
 ```json
 {
   "type": "X-RTLS-GEOM",
   "tolerance": 0.02,
+  "driftTolerance": 0.08,
   "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
   "references": {"default": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]},
   "consistent": false,
@@ -693,7 +695,7 @@ from the reference. Response:
 
 Per-tag `status`: `agree` / `deviates` (graded against the reference of
 the tag's cell, with `maxDeviationM` and the offending `deviations`),
-`drifted` (the live initiator distances moved more than `tolerance` away
+`drifted` (the live initiator distances moved more than `driftTolerance` away
 from the fit — a tripod moved after calibration; recalibrate), `frame`
 (the tag's `ORIGIN_*` / `POS_YAW_DEG` / `UWB_AN_COUNT` / `UWB_AN{i}_MAC` /
 `UWB_AN{i}_BIAS_M` differ from the rest of its cell — same distances, different world placement or

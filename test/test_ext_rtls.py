@@ -3848,26 +3848,51 @@ async def test_geom_flags_live_drift_as_blocking(
     )
     cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    # same fit, but this tag's live distances moved 5 cm since (a tripod)
+    # same fit, but this tag's live distances moved 12 cm since (a tripod)
     await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+        extension, second, {**GEOM_STATS, "gdrift": 0.12}, now=time.monotonic()
     )
 
     response = await geom_message(extension, builder, hub)
     body = response.body
     assert body["consistent"] is False
+    assert body["driftTolerance"] == 0.08
     drifted = body["devices"][str(DEVICE_SYSID + 1)]
     assert drifted["status"] == "drifted"
-    assert "5.0 cm" in drifted["detail"]
+    assert "12.0 cm" in drifted["detail"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
 
     # the verify rule blocks on it too
     wire_verify_fleet(extension, device, dialect)
-    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.05
+    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.12
     response = await verify_message(extension, builder, hub)
     rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
     assert rule["status"] == "fail"
     assert "moved" in rule["detail"]
+
+
+async def test_geom_accepts_centimetres_of_drift(
+    extension, device, dialect, builder, hub
+):
+    """Warm-up and people around the rig move the live distances by a few
+    centimetres; only a moved tripod (decimetres) blocks, whatever the
+    agreement tolerance."""
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+    )
+
+    response = await geom_message(extension, builder, hub)
+    assert response.body["consistent"] is True
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
 
 
 async def test_geom_needs_the_live_drift(extension, device, builder, hub):

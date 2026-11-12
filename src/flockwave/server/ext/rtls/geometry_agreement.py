@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DEFAULT_TOLERANCE_M",
+    "DRIFT_TOLERANCE_M",
     "GEOMETRY_REASON_NAMES",
     "GEOMETRY_STATE_NAMES",
     "STATS_FRESH_S",
@@ -38,11 +39,17 @@ __all__ = (
 )
 
 #: a fitted distance farther than this from the fleet's median reference
-#: marks the drone as deviating, metres; a live initiator distance that
-#: drifted farther than this from its calibrated value marks the drone as
-#: drifted (a tripod moved after the fit). Bench: independent fits of the
-#: same cell agree within ~4 mm; a moved tripod shows as centimetres.
+#: marks the drone as deviating, metres. Bench: independent fits of the
+#: same cell agree within ~4 mm.
 DEFAULT_TOLERANCE_M = 0.02
+
+#: a live initiator distance farther than this from its calibrated value
+#: marks the drone as drifted (a tripod moved after the fit), metres. The
+#: live value wanders with warm-up and people around the rig (1.6 cm after
+#: 39 min awake on the 2026-11-09 bench); an anchor table off by a few
+#: centimetres moves positions less than the show's tracking error, and a
+#: knocked tripod moves decimetres.
+DRIFT_TOLERANCE_M = 0.08
 
 #: a stats snapshot older than this many seconds is STALE: the stream
 #: went silent and the tag's geometry cannot be certified on it
@@ -122,11 +129,11 @@ def _fit_state(
     return entry
 
 
-def _fitted_distances(entry: dict[str, Any], stats: dict[str, Any], tolerance: float) -> None:
+def _fitted_distances(entry: dict[str, Any], stats: dict[str, Any]) -> None:
     """Attaches a candidate's fit or downgrades the entry. The stats arrive
     one field at a time, so only a complete, finite fit — the three
     bottom-plane distances plus all or none of the top plane — with its
-    live drift is graded; a drift over ``tolerance`` means a tripod moved
+    live drift is graded; a drift over ``DRIFT_TOLERANCE_M`` means a tripod moved
     since the fit, and the table is stale even if every tag agrees on it."""
     distances = list(stats.get("geometryDistancesM") or [])
     distances += [None] * (7 - len(distances))
@@ -148,7 +155,7 @@ def _fitted_distances(entry: dict[str, Any], stats: dict[str, Any], tolerance: f
         entry["status"] = "calibrating"
         entry["detail"] = "fitted distances are not finite yet"
         return
-    if drift > tolerance:
+    if drift > DRIFT_TOLERANCE_M:
         entry["status"] = "drifted"
         entry["detail"] = (
             f"an initiator distance moved {drift * 100:.1f} cm since the fit "
@@ -161,12 +168,11 @@ def _entry_for(
     cell: str,
     stats: Optional[dict[str, Any]],
     stats_age: float,
-    tolerance: float,
 ) -> dict[str, Any]:
     """The per-device entry before the fleet comparison."""
     entry = _fit_state(system_id, cell, stats, stats_age)
     if entry["status"] == "candidate":
-        _fitted_distances(entry, stats or {}, tolerance)
+        _fitted_distances(entry, stats or {})
     return entry
 
 
@@ -347,7 +353,6 @@ def _tag_entries(
     ext: "RtlsExtension",
     protocol: Any,
     ids: Optional[list[int]],
-    tolerance: float,
     now: float,
 ) -> dict[str, dict[str, Any]]:
     """One entry per graded device: a requested id that is not online is a
@@ -376,7 +381,6 @@ def _tag_entries(
             _cell_id_from_params(params),
             ext._stats.get(system_id),
             stats_age,
-            tolerance,
         )
         if entry["status"] == "candidate" and not _cell_known(device, params):
             entry["status"] = "incomplete"
@@ -433,7 +437,7 @@ def run_agreement(
     protocol = ext._require_protocol()
     if now is None:
         now = time.monotonic()
-    entries = _tag_entries(ext, protocol, ids, tolerance, now)
+    entries = _tag_entries(ext, protocol, ids, now)
     references = _grade_cells(protocol, entries, tolerance)
     consistent = bool(references) and not any(
         entry["status"] in BLOCKING for entry in entries.values()
@@ -441,6 +445,7 @@ def run_agreement(
     return {
         "type": "X-RTLS-GEOM",
         "tolerance": tolerance,
+        "driftTolerance": DRIFT_TOLERANCE_M,
         "reference": next(iter(references.values())) if len(references) == 1 else None,
         "references": references,
         "consistent": consistent,
