@@ -1175,7 +1175,13 @@ class RtlsExtension(Extension):
         a complete update that lands inside the window is only cached here --
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
-        self._stats[system_id] = _stats_json(system_id, data)
+        body = _stats_json(system_id, data)
+        temperatures = self._imu_temperatures(system_id)
+        if temperatures:
+            # The drone's own telemetry rides its tag's snapshot so that one
+            # row shows the whole pre-show health of a drone
+            body["imuTemperaturesC"] = temperatures
+        self._stats[system_id] = body
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
         await self._follow_fitted_cell(system_id, now)
@@ -1448,6 +1454,19 @@ class RtlsExtension(Extension):
             return api.get_uav_ids_by_system_id()
         except Exception:
             return {}
+
+    def _imu_temperatures(self, system_id: int) -> list[float | None]:
+        """The IMU temperatures of the drone a device belongs to, from the
+        mavlink extension's API (empty without a paired drone, a reading or
+        the extension). Tests override this seam."""
+        uav_id = self._uav_map.get(system_id)
+        api = self._mavlink_api
+        if uav_id is None or api is None or not getattr(api, "loaded", False):
+            return []
+        try:
+            return api.get_imu_temperatures(uav_id)
+        except Exception:
+            return []
 
     def _associations(self) -> tuple[dict[int, FlightController], dict[int, str]]:
         """Each device's flight-controller claim (see :mod:`.fc_identity`)
@@ -2024,6 +2043,9 @@ class RtlsExtension(Extension):
             body["flightController"] = flight_controller
         if role is not None:
             body["role"] = role
+        if role == "tag":
+            # the cell whose anchor slots the tag's anchor masks index
+            body["cell"] = _cell_id_from_params(params)
         name = _device_name(device.system_id, params, role)
         if name is not None:
             body["name"] = name
@@ -2048,7 +2070,8 @@ class RtlsExtension(Extension):
     def _site_anchors(self) -> list[dict[str, Any]]:
         """The site-level anchor list for X-RTLS-INF: one entry per anchor in
         every known cell, with its stable beacon id, GPS position (origin+NED)
-        and ``active`` flag (true iff a matching live anchor device is online).
+        and ``active`` flag (true iff a matching live anchor device is online,
+        whose ``systemId`` it then carries).
         Derived from the same cell the anchor beacons render."""
         out: list[dict[str, Any]] = []
         if self._protocol is None:
@@ -2067,6 +2090,7 @@ class RtlsExtension(Extension):
                 lat_e7, lon_e7, alt_mm = ned_to_global_e7(
                     cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
                 )
+                anchor_system_id = self._anchor_device_system_id(anchor.mac)
                 out.append(
                     {
                         "id": _anchor_beacon_id(cell_id, anchor.index),
@@ -2087,7 +2111,10 @@ class RtlsExtension(Extension):
                             "east": round(anchor.east_m, 3),
                             "down": round(anchor.down_m, 3),
                         },
-                        "active": self._anchor_device_online(anchor.mac),
+                        "active": anchor_system_id is not None,
+                        # names the anchor in a tag's anchor masks, whose
+                        # bits are these slots
+                        "systemId": anchor_system_id,
                     }
                 )
         return out
@@ -2170,7 +2197,7 @@ class RtlsExtension(Extension):
                     lon=lon_e7 * 1e-7,
                     amsl=alt_mm * 1e-3,
                 ),
-                active=self._anchor_device_online(anchor.mac),
+                active=self._anchor_device_system_id(anchor.mac) is not None,
             )
 
         for beacon_id in list(self._anchor_beacons):
@@ -2241,10 +2268,12 @@ class RtlsExtension(Extension):
                 return device, params
         return None
 
-    def _anchor_device_online(self, mac: int | None) -> bool:
+    def _anchor_device_system_id(self, mac: int | None) -> int | None:
+        """System id of the online anchor device whose ``UWB_MAC`` is
+        ``mac``, None while none is."""
         if mac is None or self._protocol is None:
-            return False
-        for device in self._protocol.devices.values():
+            return None
+        for system_id, device in self._protocol.devices.items():
             params = _decoded_device_params(device)
             if role_from_params(params) not in (
                 "anchor-initiator",
@@ -2253,10 +2282,10 @@ class RtlsExtension(Extension):
                 continue
             try:
                 if int(params.get("UWB_MAC")) == int(mac):
-                    return True
+                    return int(system_id)
             except (TypeError, ValueError):
                 continue
-        return False
+        return None
 
     def _drop_anchor_cell(self, cell_id: str) -> None:
         self._anchor_cell_sources.pop(cell_id, None)
@@ -2592,7 +2621,7 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
 
     ``anc``/``agems``/``ancmask`` are integer-semantic floats over the wire
     (anchor count, milliseconds, bitmask); cast them to int for the UI."""
-    body = {
+    body: dict[str, Any] = {
         "id": int(system_id),
         "solveRateHz": float(data.get("rate", 0.0)),
         "solvePct": float(data.get("solvepct", 0.0)),
@@ -2631,6 +2660,26 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         body["geometryResidualM"] = round(float(data["gres"]), 4)
     if "gdrift" in data and math.isfinite(float(data["gdrift"])):
         body["geometryDriftM"] = round(float(data["gdrift"]), 4)
+    # UWB link quality over the tag's last report interval: the weakest
+    # anchor's mean RSSI (0: no row carried a reading), the anchors the chip
+    # flagged NLOS on most rows, the anchors the solver is outvoting and its
+    # mean residual RMS (-1: no solve). A sentinel becomes null.
+    if "urssi" in data and math.isfinite(float(data["urssi"])):
+        rssi = float(data["urssi"])
+        body["uwbRssiDbm"] = round(rssi, 1) if rssi < 0.0 else None
+    if "nlosmask" in data and math.isfinite(float(data["nlosmask"])):
+        body["nlosMask"] = int(data["nlosmask"])
+    if "outmask" in data and math.isfinite(float(data["outmask"])):
+        body["outvotedMask"] = int(data["outmask"])
+    if "rmse" in data and math.isfinite(float(data["rmse"])):
+        rmse = float(data["rmse"])
+        body["residualRmsM"] = round(rmse, 4) if rmse >= 0.0 else None
+    # The WiFi station's link: rssi is sent only while associated, wdisc
+    # counts the associations lost since boot
+    if "rssi" in data and math.isfinite(float(data["rssi"])):
+        body["wifiRssiDbm"] = int(data["rssi"])
+    if "wdisc" in data and math.isfinite(float(data["wdisc"])):
+        body["wifiDisconnects"] = int(data["wdisc"])
     distances = [data.get(f"gd{i}") for i in range(1, 8)]
     if any(d is not None for d in distances):
         # the firmware sends 0 for a distance it has no fit for (a

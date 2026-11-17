@@ -421,6 +421,9 @@ async def test_inf_site_anchor_list(extension, device, builder, hub):
     assert a1["mac"] == 2
     # no live anchor device online yet
     assert a1["active"] is False
+    assert a1["systemId"] is None
+    # the tag names the cell its anchor masks index
+    assert response.body["status"][str(DEVICE_SYSID)]["cell"] == "default"
     # origin + NED projected to global
     assert a1["position"]["lat"] == pytest.approx(41.3900898)
     assert a1["position"]["lon"] == pytest.approx(2.1501197)
@@ -462,7 +465,11 @@ async def test_site_anchor_active_when_anchor_device_online(
     response = await extension._handle_RTLS_INF(message, None, hub)
     anchors = {a["id"]: a for a in response.body["anchors"]}
     assert anchors["rtls::default::anchor_1"]["active"] is True
+    assert anchors["rtls::default::anchor_1"]["systemId"] == 102
     assert anchors["rtls::default::anchor_0"]["active"] is False
+    assert anchors["rtls::default::anchor_0"]["systemId"] is None
+    # only a tag carries a cell
+    assert "cell" not in response.body["status"]["102"]
 
 
 async def test_param_cache_registers_configured_anchors_as_beacons(extension, device):
@@ -3682,6 +3689,88 @@ def test_stats_json_without_geometry_omits_the_fields():
         7, {**FULL_STATS, "geom": 3.0, "gd1": 8.0, "gd2": 9.0, "gd3": 12.0}
     )
     assert body["geometryDistancesM"] == [8.0, 9.0, 12.0, None, None, None, None]
+
+
+def test_stats_json_carries_link_quality_and_wifi():
+    body = _stats_json(
+        7,
+        {
+            **FULL_STATS,
+            "urssi": -81.53,
+            "nlosmask": 4.0,
+            "outmask": 32.0,
+            "rmse": 0.04213,
+            "rssi": -61.0,
+            "wdisc": 2.0,
+        },
+    )
+    assert body["uwbRssiDbm"] == -81.5
+    assert body["nlosMask"] == 4
+    assert body["outvotedMask"] == 32
+    assert body["residualRmsM"] == 0.0421
+    assert body["wifiRssiDbm"] == -61
+    assert body["wifiDisconnects"] == 2
+
+
+def test_stats_json_link_quality_sentinels_are_null():
+    # urssi 0: no row carried a reading; rmse -1: no solve in the interval
+    body = _stats_json(7, {**FULL_STATS, "urssi": 0.0, "rmse": -1.0})
+    assert body["uwbRssiDbm"] is None
+    assert body["residualRmsM"] is None
+
+
+def test_stats_json_without_link_quality_omits_the_fields():
+    body = _stats_json(7, dict(FULL_STATS))
+    for key in (
+        "uwbRssiDbm",
+        "nlosMask",
+        "outvotedMask",
+        "residualRmsM",
+        "wifiRssiDbm",
+        "wifiDisconnects",
+    ):
+        assert key not in body
+
+
+async def test_stats_carry_the_paired_drones_imu_temperatures(
+    extension, device, builder, hub
+):
+    _claim_flight_controller(device, 5, 1)
+    await discover(extension, device)
+    _set_uav_ids(extension, {5: "05"})
+    extension._refresh_uav_map()
+    temperatures = {"05": [41.5, None]}
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: temperatures.get(uav_id, [])
+    )
+
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert response.body["stats"][str(DEVICE_SYSID)]["imuTemperaturesC"] == [
+        41.5,
+        None,
+    ]
+
+    # no reading from the drone: the field is left out, not an empty list
+    temperatures.clear()
+    await _feed_stats(extension, device, FULL_STATS, now=1.0)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "imuTemperaturesC" not in response.body["stats"][str(DEVICE_SYSID)]
+
+
+async def test_stats_without_a_paired_drone_omit_imu_temperatures(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: [40.0]
+    )
+
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "imuTemperaturesC" not in response.body["stats"][str(DEVICE_SYSID)]
 
 
 async def test_geom_agreeing_fleet(extension, device, dialect, builder, hub):
