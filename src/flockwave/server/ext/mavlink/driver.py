@@ -1554,25 +1554,23 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         Celsius, IMU 0 first, from the SCALED_IMU messages it streams.
 
         An IMU without a reading in the last `max_age` seconds, or one that
-        reports no temperature, is `None`; unknown IMUs after the last known
-        one are left out, so a UAV with no reading at all yields an empty list.
+        reports no temperature, is `None`. Trailing IMUs that never reported a
+        temperature are left out, so a UAV with no reading at all yields an
+        empty list, while one whose IMU 1 went silent yields `[t0, None]`.
         """
         now = monotonic()
         temperatures: list[float | None] = []
-        for type in SCALED_IMU_TYPES:
+        reported = 0
+        for index, type in enumerate(SCALED_IMU_TYPES):
             message = self.get_last_message(type)
             # MAVLink: 0 means "no temperature"; an IMU at 0 °C sends 1 (0.01 °C)
-            if (
-                message is None
-                or message.temperature == 0
-                or self.get_age_of_message(type, now) > max_age
-            ):
+            if message is None or message.temperature == 0:
                 temperatures.append(None)
-            else:
-                temperatures.append(message.temperature / 100)
-        while temperatures and temperatures[-1] is None:
-            temperatures.pop()
-        return temperatures
+                continue
+            reported = index + 1
+            fresh = self.get_age_of_message(type, now) <= max_age
+            temperatures.append(message.temperature / 100 if fresh else None)
+        return temperatures[:reported]
 
     async def get_geofence_status(self) -> GeofenceStatus:
         """Returns the status of the geofence of the UAV."""

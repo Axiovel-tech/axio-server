@@ -67,3 +67,11 @@ def test_a_stale_imu_is_unknown():
     receive(uav, MAVMessageType.SCALED_IMU2, 4100)
 
     assert uav.get_imu_temperatures() == [None, pytest.approx(41.0)]
+
+
+def test_a_silent_imu_keeps_its_slot():
+    uav = make_uav()
+    receive(uav, MAVMessageType.SCALED_IMU, 4000)
+    receive(uav, MAVMessageType.SCALED_IMU2, 4100, age=IMU_TEMPERATURE_MAX_AGE + 1)
+
+    assert uav.get_imu_temperatures() == [pytest.approx(40.0), None]
