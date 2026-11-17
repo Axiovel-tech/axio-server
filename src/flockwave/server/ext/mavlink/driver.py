@@ -150,7 +150,8 @@ SCALED_IMU_TYPES = (
 included."""
 
 IMU_TEMPERATURE_MAX_AGE = 5.0
-"""Seconds after which an IMU temperature, streamed at 1 Hz, is stale."""
+"""Seconds after which an IMU temperature is stale. AVCopter's show telemetry
+streams SCALED_IMU and SCALED_IMU2 at 1 Hz from boot; the server never asks."""
 
 nan = float("nan")
 """"Not a number" constant, used in some MAVLink messages to indicate a default
@@ -3195,9 +3196,6 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             (MAVMessageType.SYS_STATUS, 1),
             (MAVMessageType.GPS_RAW_INT, 1),
             (MAVMessageType.GLOBAL_POSITION_INT, 2),
-            # IMU die temperatures for the pre-show fleet health view; they
-            # change over minutes, and an IMU the autopilot lacks sends nothing
-            *((type, 1) for type in SCALED_IMU_TYPES),
         ]
 
         for message_id, interval_hz in stream_rates:

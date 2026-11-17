@@ -616,9 +616,11 @@ Response / notification body — entries keyed by system id (as string):
   boot (`wdisc`).
 - `imuTemperaturesC` — not a tag stat: the die temperature of each IMU of
   the drone the tag belongs to (the `uav` of X-RTLS-INF), IMU 0 first, from
-  the SCALED_IMU/SCALED_IMU2/SCALED_IMU3 messages the mavlink extension
-  requests at 1 Hz. An IMU silent for over 5 s is `null`; omitted while the
-  tag has no drone or the drone no reading. It is refreshed with the tag's
+  the SCALED_IMU/SCALED_IMU2/SCALED_IMU3 messages the drone streams on its
+  own (AVCopter's standard show telemetry sends the first two at 1 Hz from
+  boot; the server never requests them). An IMU silent for over 5 s is
+  `null`; omitted while the tag has no drone or the drone no reading, which
+  includes autopilots without that telemetry. It is refreshed with the tag's
   own stats.
 - The ground's green/yellow/red zones for these fields, and their evidence,
   are in AxioStack `contracts/rtls-fleet-health.md`.
