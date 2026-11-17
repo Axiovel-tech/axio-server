@@ -4372,3 +4372,84 @@ def ned_to_global_e7_for_test(north, east):
     )
     lat_e7, lon_e7, alt_mm = ned_to_global_e7(origin, north, east, 0.0)
     return lat_e7 * 1e-7, lon_e7 * 1e-7, alt_mm * 1e-3
+
+
+# ---- one health report per datagram ---------------------------------------
+
+
+def _bundle(device, values):
+    """A whole health report in one datagram, as the firmware sends it."""
+    return b"".join(device.named_value_float(n, v) for n, v in values.items())
+
+
+BUNDLED_REPORT = {**FULL_STATS, "urssi": -81.5, "rmse": 0.025}
+
+
+async def test_a_bundled_report_is_handled_once(extension, device):
+    _claim_flight_controller(device, 5, 1)
+    await discover(extension, device)
+    _set_uav_ids(extension, {5: "05"})
+    extension._refresh_uav_map()
+    joins = []
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: joins.append(uav_id) or [40.0]
+    )
+
+    await extension._process_datagram(
+        _bundle(device, BUNDLED_REPORT), device.address, 0.0
+    )
+
+    assert joins == ["05"]
+    stats = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert len(stats) == 1
+    entry = stats[0]["stats"][str(DEVICE_SYSID)]
+    # the fields after the required set ride the same, first broadcast
+    assert entry["uwbRssiDbm"] == -81.5
+    assert entry["residualRmsM"] == 0.025
+    assert entry["imuTemperaturesC"] == [40.0]
+
+
+async def test_a_report_inside_the_window_is_cached_then_flushed_once(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    await extension._process_datagram(
+        _bundle(device, BUNDLED_REPORT), device.address, 0.0
+    )
+    newer = {**BUNDLED_REPORT, "rate": 9.0}
+    await extension._process_datagram(_bundle(device, newer), device.address, 0.5)
+
+    def stats_broadcasts():
+        return [
+            b
+            for b in extension.app.message_hub.broadcasts
+            if b["type"] == "X-RTLS-STATS"
+        ]
+
+    assert len(stats_broadcasts()) == 1
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert response.body["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 9.0
+
+    await extension._flush_pending_stats(now=1.0)
+    await extension._flush_pending_stats(now=2.5)
+    assert len(stats_broadcasts()) == 2
+    assert stats_broadcasts()[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 9.0
+
+
+async def test_watchers_get_one_stats_event_per_report(extension, device):
+    await discover(extension, device)
+    with extension._subscribed_events() as events:
+        await extension._process_datagram(
+            _bundle(device, BUNDLED_REPORT), device.address, 0.0
+        )
+        kinds = []
+        while True:
+            try:
+                kinds.append(events.receive_nowait().kind)
+            except trio.WouldBlock:
+                break
+
+    assert kinds.count("stats") == 1

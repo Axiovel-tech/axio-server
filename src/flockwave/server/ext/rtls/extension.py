@@ -620,7 +620,15 @@ class RtlsExtension(Extension):
                 device = self._protocol.devices.get(system_id)
                 if device is not None and device.address[0] == address[0]:
                     device.last_seen = max(device.last_seen, now)
-        for event in self._protocol.feed(data, address, now):
+        events = self._protocol.feed(data, address, now)
+        # A device's whole health report arrives as one datagram, one
+        # NAMED_VALUE_FLOAT per stat, and every stats event carries the SDK's
+        # accumulated snapshot: the device's last one is the full report, so
+        # the earlier ones are neither handled nor dispatched.
+        last_stats = {e.system_id: e for e in events if e.kind == "stats"}
+        for event in events:
+            if event.kind == "stats" and last_stats[event.system_id] is not event:
+                continue
             if event.kind == "discovered":
                 if self.log:
                     self.log.info(
@@ -1164,7 +1172,9 @@ class RtlsExtension(Extension):
         broadcast it to clients, throttled to at most one per
         ``STATS_INTERVAL`` per device.
 
-        The firmware emits one NAMED_VALUE_FLOAT per stat, so the SDK's
+        The firmware emits one NAMED_VALUE_FLOAT per stat, all of a report in
+        one datagram, and :meth:`_process_datagram` hands over only the last
+        stats event of a datagram, so this runs once per report. The SDK's
         accumulated ``data`` is only complete once a full cycle has arrived.
         We cache every update (so the X-RTLS-STATS query always has the
         latest), but only broadcast once the full stat set is present --
