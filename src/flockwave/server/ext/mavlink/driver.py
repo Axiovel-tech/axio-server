@@ -141,6 +141,17 @@ AUTOPILOT_IDENTIFICATION_TIMEOUT = 3.0
 """Seconds a parameter access waits for the first heartbeat (sent at 1 Hz)
 that names the autopilot of a UAV the server has just seen."""
 
+SCALED_IMU_TYPES = (
+    MAVMessageType.SCALED_IMU,
+    MAVMessageType.SCALED_IMU2,
+    MAVMessageType.SCALED_IMU3,
+)
+"""The messages that carry the readings of IMU 0, 1 and 2, temperature
+included."""
+
+IMU_TEMPERATURE_MAX_AGE = 5.0
+"""Seconds after which an IMU temperature, streamed at 1 Hz, is stale."""
+
 nan = float("nan")
 """"Not a number" constant, used in some MAVLink messages to indicate a default
 value."""
@@ -1535,6 +1546,33 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             now = monotonic()
         return now - record.timestamp if record else inf
 
+    def get_imu_temperatures(
+        self, max_age: float = IMU_TEMPERATURE_MAX_AGE
+    ) -> list[float | None]:
+        """Returns the die temperature of each IMU of the UAV in degrees
+        Celsius, IMU 0 first, from the SCALED_IMU messages it streams.
+
+        An IMU without a reading in the last `max_age` seconds, or one that
+        reports no temperature, is `None`; unknown IMUs after the last known
+        one are left out, so a UAV with no reading at all yields an empty list.
+        """
+        now = monotonic()
+        temperatures: list[float | None] = []
+        for type in SCALED_IMU_TYPES:
+            message = self.get_last_message(type)
+            # MAVLink: 0 means "no temperature"; an IMU at 0 °C sends 1 (0.01 °C)
+            if (
+                message is None
+                or message.temperature == 0
+                or self.get_age_of_message(type, now) > max_age
+            ):
+                temperatures.append(None)
+            else:
+                temperatures.append(message.temperature / 100)
+        while temperatures and temperatures[-1] is None:
+            temperatures.pop()
+        return temperatures
+
     async def get_geofence_status(self) -> GeofenceStatus:
         """Returns the status of the geofence of the UAV."""
         return await self._autopilot.get_geofence_status(self)
@@ -2230,7 +2268,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.update_rssi(index=0, value=rssi)
 
     def handle_message_scaled_imu(self, message: MAVLinkMessage):
-        """Handles an incoming MAVLink SCALED_IMU message targeted at this UAV."""
+        """Handles an incoming MAVLink SCALED_IMU, SCALED_IMU2 or SCALED_IMU3
+        message targeted at this UAV."""
+        self._store_message(message)
         calib = self._compass_motor_interference_calibration
         if calib is not None:
             calib.handle_message_scaled_imu(message)
@@ -3155,6 +3195,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             (MAVMessageType.SYS_STATUS, 1),
             (MAVMessageType.GPS_RAW_INT, 1),
             (MAVMessageType.GLOBAL_POSITION_INT, 2),
+            # IMU die temperatures for the pre-show fleet health view; they
+            # change over minutes, and an IMU the autopilot lacks sends nothing
+            *((type, 1) for type in SCALED_IMU_TYPES),
         ]
 
         for message_id, interval_hz in stream_rates:
