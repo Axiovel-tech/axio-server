@@ -5,6 +5,7 @@ from flockwave.server.errors import FlockwaveError
 from .enums import MAVMissionResult
 
 __all__ = (
+    "AutopilotNotIdentifiedError",
     "MAVLinkExtensionError",
     "UnknownFlightModeError",
     "InvalidSigningKeyError",
@@ -73,3 +74,14 @@ class ParameterNotFoundError(MAVLinkExtensionError):
     def __init__(self, name: str):
         super().__init__(f"The drone has no parameter named {name}")
         self.name = name
+
+
+class AutopilotNotIdentifiedError(MAVLinkExtensionError):
+    """Error thrown when a parameter is accessed before a heartbeat told us
+    which autopilot the UAV runs, i.e. how it encodes parameter values.
+    """
+
+    def __init__(self, uav_id: str):
+        super().__init__(
+            f"Autopilot of UAV {uav_id} not identified yet (no heartbeat), retry"
+        )

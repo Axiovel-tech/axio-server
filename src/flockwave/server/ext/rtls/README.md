@@ -238,6 +238,7 @@ plus a site-level `anchors` list:
       "uav": "05",
       "flightController": {"systemId": 5, "state": "live"},
       "role": "tag",
+      "cell": "default",
       "name": "RTLS tag 42",
       "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
     }
@@ -250,7 +251,8 @@ plus a site-level `anchors` list:
       "mac": 1,
       "position": {"lat": 41.39, "lon": 2.15, "amsl": 10.0},
       "ned": {"north": -10.0, "east": -10.0, "down": 0.0},
-      "active": true
+      "active": true,
+      "systemId": 101
     }
   ]
 }
@@ -320,9 +322,12 @@ The site-level `anchors` list mirrors the configured cell geometry: each
 anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
 (cell origin + NED), its native cell-frame NED coordinates in meters
 (`ned` — the frame the X-RTLS-POS estimates are expressed in, so a
-debug view can plot both without a lossy GPS round-trip), and `active`
+debug view can plot both without a lossy GPS round-trip), `active`
 — true only when a live anchor device with the matching `UWB_MAC` is
-online. These anchors are also published
+online — and that device's `systemId` (null while none is). A tag's
+`cell` names the cell whose anchor slots its `nlosMask` and
+`outvotedMask` bits index, so a client can name a flagged anchor by its
+system id. These anchors are also published
 to clients through the existing Axio Server **beacon** layer (same stable
 ids), so the map renders them without a bespoke anchor layer. Set
 `register_beacons: false` to disable the beacon registration.
@@ -571,7 +576,14 @@ Response / notification body — entries keyed by system id (as string):
       "geometryReason": 0,
       "geometryResidualM": -0.075,
       "geometryDriftM": 0.002,
-      "geometryDistancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]
+      "geometryDistancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+      "uwbRssiDbm": -81.5,
+      "nlosMask": 4,
+      "outvotedMask": 0,
+      "residualRmsM": 0.0312,
+      "wifiRssiDbm": -58,
+      "wifiDisconnects": 0,
+      "imuTemperaturesC": [41.25, 39.8]
     }
   }
 }
@@ -592,6 +604,26 @@ Response / notification body — entries keyed by system id (as string):
   since calibration (m), and the seven fitted AN0-ANi distances (m; the
   last four are `null` for a four-anchor cell). Present only on firmware
   with automatic geometry; the distances arrive once calibrated.
+- `uwbRssiDbm` / `nlosMask` / `outvotedMask` / `residualRmsM` — the tag's
+  UWB link quality over its last report interval (firmware
+  `urssi`/`nlosmask`/`outmask`/`rmse`): the weakest anchor's mean RSSI
+  (dBm), the anchors the chip flagged NLOS on most rows, the anchors the
+  solver is outvoting, and the solver's mean residual RMS (m).
+  `uwbRssiDbm` is `null` when no row carried a reading and `residualRmsM`
+  when the tag did not solve in the interval.
+- `wifiRssiDbm` / `wifiDisconnects` — the tag's WiFi association (firmware
+  `rssi`, sent only while associated) and the associations it lost since
+  boot (`wdisc`).
+- `imuTemperaturesC` — not a tag stat: the die temperature of each IMU of
+  the drone the tag belongs to (the `uav` of X-RTLS-INF), IMU 0 first, from
+  the SCALED_IMU/SCALED_IMU2/SCALED_IMU3 messages the drone streams on its
+  own (AVCopter's standard show telemetry sends the first two at 1 Hz from
+  boot; the server never requests them). An IMU silent for over 5 s is
+  `null`; omitted while the tag has no drone or the drone no reading, which
+  includes autopilots without that telemetry. It is refreshed with the tag's
+  own stats.
+- The ground's green/yellow/red zones for these fields, and their evidence,
+  are in AxioStack `contracts/rtls-fleet-health.md`.
 - The first broadcast for a device waits until the full legacy stat set
   (`solveRateHz` … `anchorMask`) has arrived once, so it never carries a
   half-populated snapshot; optional stats never gate the broadcast.
@@ -661,17 +693,21 @@ The check is a pure function over the cached `X-RTLS-STATS` snapshots:
 no device I/O, instant, swarm-sized.
 
 ```json
-{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.02}
+{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.05}
 ```
 
 `ids` (optional) restricts the grading to those system ids; `tolerance`
-(metres, default 0.02) is the largest accepted deviation of one distance
-from the reference. Response:
+(metres, default 0.05) is the largest accepted deviation of one distance
+from the reference. Fits taken at different times differ by the slow shift of
+the live distances, so a deviating tag usually means "recalibrate the fleet"
+(`UWB_GEOM_RECAL=1` on every tag; Control's Recalibrate button). `driftTolerance` in the response (0.08 m, fixed) is the
+largest accepted live drift. Response:
 
 ```json
 {
   "type": "X-RTLS-GEOM",
-  "tolerance": 0.02,
+  "tolerance": 0.05,
+  "driftTolerance": 0.08,
   "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
   "references": {"default": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]},
   "consistent": false,
@@ -682,9 +718,9 @@ from the reference. Response:
            "maxDeviationM": 0.001},
     "43": {"id": 43, "status": "deviates", "state": 3, "stateName": "calibrated",
            "residualM": -0.074, "driftM": 0.001,
-           "distancesM": [8.637, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-           "maxDeviationM": 0.05, "deviations": {"AN0-AN1": 0.05},
-           "detail": "off the fleet reference by AN0-AN1 5.0 cm"},
+           "distancesM": [8.657, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
+           "maxDeviationM": 0.07, "deviations": {"AN0-AN1": 0.07},
+           "detail": "off the fleet reference by AN0-AN1 7.0 cm — recalibrate the fleet so every tag fits at the same time"},
     "44": {"id": 44, "status": "calibrating", "state": 2, "stateName": "calibrating",
            "detail": "still fitting the cell"}
   }
@@ -693,7 +729,7 @@ from the reference. Response:
 
 Per-tag `status`: `agree` / `deviates` (graded against the reference of
 the tag's cell, with `maxDeviationM` and the offending `deviations`),
-`drifted` (the live initiator distances moved more than `tolerance` away
+`drifted` (the live initiator distances moved more than `driftTolerance` away
 from the fit — a tripod moved after calibration; recalibrate), `frame`
 (the tag's `ORIGIN_*` / `POS_YAW_DEG` / `UWB_AN_COUNT` / `UWB_AN{i}_MAC` /
 `UWB_AN{i}_BIAS_M` differ from the rest of its cell — same distances, different world placement or

@@ -12,6 +12,7 @@ experimental (``X-`` prefixed) message types on the message hub; see
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 from contextlib import contextmanager
@@ -53,6 +54,7 @@ from flockwave.server.registries.errors import RegistryFull
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
+from .fitted_cell import fitted_anchor_positions
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -276,6 +278,9 @@ class RtlsExtension(Extension):
         #: given cell id; lets us re-home a cell onto another live tag when the
         #: source tag is lost
         self._anchor_cell_sources: dict[str, int] = {}
+        #: the anchor positions each tag fitted itself (automatic geometry),
+        #: as last applied to the cell it sources; None without a fit
+        self._fitted_cells: dict[int, Optional[list[tuple[float, float, float]]]] = {}
         #: wall-clock estimate of the UWB cluster clock that the drones count
         #: the show start in
         self._cluster_clock = ClusterClock()
@@ -615,7 +620,15 @@ class RtlsExtension(Extension):
                 device = self._protocol.devices.get(system_id)
                 if device is not None and device.address[0] == address[0]:
                     device.last_seen = max(device.last_seen, now)
-        for event in self._protocol.feed(data, address, now):
+        events = self._protocol.feed(data, address, now)
+        # A device's whole health report arrives as one datagram, one
+        # NAMED_VALUE_FLOAT per stat, and every stats event carries the SDK's
+        # accumulated snapshot: the device's last one is the full report, so
+        # the earlier ones are neither handled nor dispatched.
+        last_stats = {e.system_id: e for e in events if e.kind == "stats"}
+        for event in events:
+            if event.kind == "stats" and last_stats[event.system_id] is not event:
+                continue
             if event.kind == "discovered":
                 if self.log:
                     self.log.info(
@@ -1159,7 +1172,9 @@ class RtlsExtension(Extension):
         broadcast it to clients, throttled to at most one per
         ``STATS_INTERVAL`` per device.
 
-        The firmware emits one NAMED_VALUE_FLOAT per stat, so the SDK's
+        The firmware emits one NAMED_VALUE_FLOAT per stat, all of a report in
+        one datagram, and :meth:`_process_datagram` hands over only the last
+        stats event of a datagram, so this runs once per report. The SDK's
         accumulated ``data`` is only complete once a full cycle has arrived.
         We cache every update (so the X-RTLS-STATS query always has the
         latest), but only broadcast once the full stat set is present --
@@ -1170,9 +1185,16 @@ class RtlsExtension(Extension):
         a complete update that lands inside the window is only cached here --
         the periodic flush in :meth:`_run_protocol_loop` pushes the latest
         snapshot once the window elapses, so newer values are never dropped."""
-        self._stats[system_id] = _stats_json(system_id, data)
+        body = _stats_json(system_id, data)
+        temperatures = self._imu_temperatures(system_id)
+        if temperatures:
+            # The drone's own telemetry rides its tag's snapshot so that one
+            # row shows the whole pre-show health of a drone
+            body["imuTemperaturesC"] = temperatures
+        self._stats[system_id] = body
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
+        await self._follow_fitted_cell(system_id, now)
         # STATS_FIELDS is the SDK's required legacy set; newer stats (``slp``
         # sleep state, ``vbat`` battery voltage, the cluster clock) are optional
         # and must not gate the broadcast, or firmware without them would never
@@ -1183,6 +1205,18 @@ class RtlsExtension(Extension):
         if last is not None and now - last < STATS_INTERVAL:
             return
         await self._broadcast_stats(system_id, now)
+
+    async def _follow_fitted_cell(self, system_id: int, now: float) -> None:
+        """Re-renders the cell a tag sources when its own fit appears,
+        changes (a recalibration) or goes away: the anchors then sit where
+        the tag positions them, not where its provisioned table says."""
+        fitted = fitted_anchor_positions(self._stats.get(system_id))
+        if fitted == self._fitted_cells.get(system_id):
+            return
+        self._fitted_cells[system_id] = fitted
+        if system_id in self._anchor_cell_sources.values():
+            self._sync_anchor_beacons_for_system(system_id)
+            await self._on_inf_change(now)
 
     async def _flush_pending_stats(self, now: float) -> None:
         """Broadcast any cached stats snapshot that is newer than the last
@@ -1350,6 +1384,7 @@ class RtlsExtension(Extension):
         """Drop all cached stats state for a device (e.g. on ``lost``)."""
         self._stats.pop(system_id, None)
         self._stats_at.pop(system_id, None)
+        self._fitted_cells.pop(system_id, None)
         self._last_stats_broadcast.pop(system_id, None)
         self._last_stats_sent.pop(system_id, None)
 
@@ -1429,6 +1464,19 @@ class RtlsExtension(Extension):
             return api.get_uav_ids_by_system_id()
         except Exception:
             return {}
+
+    def _imu_temperatures(self, system_id: int) -> list[float | None]:
+        """The IMU temperatures of the drone a device belongs to, from the
+        mavlink extension's API (empty without a paired drone, a reading or
+        the extension). Tests override this seam."""
+        uav_id = self._uav_map.get(system_id)
+        api = self._mavlink_api
+        if uav_id is None or api is None or not getattr(api, "loaded", False):
+            return []
+        try:
+            return api.get_imu_temperatures(uav_id)
+        except Exception:
+            return []
 
     def _associations(self) -> tuple[dict[int, FlightController], dict[int, str]]:
         """Each device's flight-controller claim (see :mod:`.fc_identity`)
@@ -2005,6 +2053,9 @@ class RtlsExtension(Extension):
             body["flightController"] = flight_controller
         if role is not None:
             body["role"] = role
+        if role == "tag":
+            # the cell whose anchor slots the tag's anchor masks index
+            body["cell"] = _cell_id_from_params(params)
         name = _device_name(device.system_id, params, role)
         if name is not None:
             body["name"] = name
@@ -2029,7 +2080,8 @@ class RtlsExtension(Extension):
     def _site_anchors(self) -> list[dict[str, Any]]:
         """The site-level anchor list for X-RTLS-INF: one entry per anchor in
         every known cell, with its stable beacon id, GPS position (origin+NED)
-        and ``active`` flag (true iff a matching live anchor device is online).
+        and ``active`` flag (true iff a matching live anchor device is online,
+        whose ``systemId`` it then carries).
         Derived from the same cell the anchor beacons render."""
         out: list[dict[str, Any]] = []
         if self._protocol is None:
@@ -2039,13 +2091,16 @@ class RtlsExtension(Extension):
             if device is None:
                 continue
             try:
-                cell = cell_from_params(_decoded_device_params(device), cell_id=cell_id)
+                cell = self._source_cell(
+                    source, _decoded_device_params(device), cell_id
+                )
             except (KeyError, TypeError, ValueError):
                 continue
             for anchor in cell.anchors:
                 lat_e7, lon_e7, alt_mm = ned_to_global_e7(
                     cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
                 )
+                anchor_system_id = self._anchor_device_system_id(anchor.mac)
                 out.append(
                     {
                         "id": _anchor_beacon_id(cell_id, anchor.index),
@@ -2066,10 +2121,29 @@ class RtlsExtension(Extension):
                             "east": round(anchor.east_m, 3),
                             "down": round(anchor.down_m, 3),
                         },
-                        "active": self._anchor_device_online(anchor.mac),
+                        "active": anchor_system_id is not None,
+                        # names the anchor in a tag's anchor masks, whose
+                        # bits are these slots
+                        "systemId": anchor_system_id,
                     }
                 )
         return out
+
+    def _source_cell(self, system_id: int, params: dict[str, Any], cell_id: str):
+        """The cell a tag sources: origin, slot MACs and biases from its
+        parameters; anchor positions from its own fit when it has one (the
+        positions it actually solves on), its UWB_AN* table otherwise."""
+        cell = cell_from_params(params, cell_id=cell_id)
+        fitted = fitted_anchor_positions(self._stats.get(system_id))
+        if fitted is None or len(fitted) != len(cell.anchors):
+            return cell
+        return dataclasses.replace(
+            cell,
+            anchors=tuple(
+                dataclasses.replace(anchor, north_m=n, east_m=e, down_m=d)
+                for anchor, (n, e, d) in zip(cell.anchors, fitted)
+            ),
+        )
 
     def _sync_anchor_beacons_for_system(self, system_id: int) -> None:
         if self._protocol is None:
@@ -2098,7 +2172,9 @@ class RtlsExtension(Extension):
             return
 
         try:
-            cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
+            cell = self._source_cell(
+                device.system_id, params, _cell_id_from_params(params)
+            )
         except (KeyError, TypeError, ValueError):
             return
 
@@ -2131,7 +2207,7 @@ class RtlsExtension(Extension):
                     lon=lon_e7 * 1e-7,
                     amsl=alt_mm * 1e-3,
                 ),
-                active=self._anchor_device_online(anchor.mac),
+                active=self._anchor_device_system_id(anchor.mac) is not None,
             )
 
         for beacon_id in list(self._anchor_beacons):
@@ -2202,10 +2278,12 @@ class RtlsExtension(Extension):
                 return device, params
         return None
 
-    def _anchor_device_online(self, mac: int | None) -> bool:
+    def _anchor_device_system_id(self, mac: int | None) -> int | None:
+        """System id of the online anchor device whose ``UWB_MAC`` is
+        ``mac``, None while none is."""
         if mac is None or self._protocol is None:
-            return False
-        for device in self._protocol.devices.values():
+            return None
+        for system_id, device in self._protocol.devices.items():
             params = _decoded_device_params(device)
             if role_from_params(params) not in (
                 "anchor-initiator",
@@ -2214,10 +2292,10 @@ class RtlsExtension(Extension):
                 continue
             try:
                 if int(params.get("UWB_MAC")) == int(mac):
-                    return True
+                    return int(system_id)
             except (TypeError, ValueError):
                 continue
-        return False
+        return None
 
     def _drop_anchor_cell(self, cell_id: str) -> None:
         self._anchor_cell_sources.pop(cell_id, None)
@@ -2553,7 +2631,7 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
 
     ``anc``/``agems``/``ancmask`` are integer-semantic floats over the wire
     (anchor count, milliseconds, bitmask); cast them to int for the UI."""
-    body = {
+    body: dict[str, Any] = {
         "id": int(system_id),
         "solveRateHz": float(data.get("rate", 0.0)),
         "solvePct": float(data.get("solvepct", 0.0)),
@@ -2592,6 +2670,26 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         body["geometryResidualM"] = round(float(data["gres"]), 4)
     if "gdrift" in data and math.isfinite(float(data["gdrift"])):
         body["geometryDriftM"] = round(float(data["gdrift"]), 4)
+    # UWB link quality over the tag's last report interval: the weakest
+    # anchor's mean RSSI (0: no row carried a reading), the anchors the chip
+    # flagged NLOS on most rows, the anchors the solver is outvoting and its
+    # mean residual RMS (-1: no solve). A sentinel becomes null.
+    if "urssi" in data and math.isfinite(float(data["urssi"])):
+        rssi = float(data["urssi"])
+        body["uwbRssiDbm"] = round(rssi, 1) if rssi < 0.0 else None
+    if "nlosmask" in data and math.isfinite(float(data["nlosmask"])):
+        body["nlosMask"] = int(data["nlosmask"])
+    if "outmask" in data and math.isfinite(float(data["outmask"])):
+        body["outvotedMask"] = int(data["outmask"])
+    if "rmse" in data and math.isfinite(float(data["rmse"])):
+        rmse = float(data["rmse"])
+        body["residualRmsM"] = round(rmse, 4) if rmse >= 0.0 else None
+    # The WiFi station's link: rssi is sent only while associated, wdisc
+    # counts the associations lost since boot
+    if "rssi" in data and math.isfinite(float(data["rssi"])):
+        body["wifiRssiDbm"] = int(data["rssi"])
+    if "wdisc" in data and math.isfinite(float(data["wdisc"])):
+        body["wifiDisconnects"] = int(data["wdisc"])
     distances = [data.get(f"gd{i}") for i in range(1, 8)]
     if any(d is not None for d in distances):
         # the firmware sends 0 for a distance it has no fit for (a
