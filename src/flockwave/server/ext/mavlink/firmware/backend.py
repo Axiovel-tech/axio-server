@@ -37,6 +37,11 @@ RESULT_PATHS = (
 PENDING_PATHS = (READY_PATH, "/ardupilot-verify.abin", "/ardupilot-flash.abin")
 """Files the bootloader still acts on at any later power-on."""
 MAX_SAFETY_MESSAGE_AGE = 3.0
+REBOOT_COMMAND_TIMEOUT = 1.0
+REBOOT_COMMAND_RETRIES = 1
+"""The reboot command is only repeated while the flight controller cannot have
+restarted yet. A repeat that reached the restarted application would send it
+back into the bootloader, which then finds no update and waits indefinitely."""
 OTA_MAVFTP_MAX_RETRIES = 20
 OTA_MAVFTP_INITIAL_TIMEOUT = 1.0
 
@@ -278,7 +283,9 @@ class ArduPilotUpdateBackend:
         return True
 
     async def reboot(self) -> None:
-        await self._uav.reboot_after_update()
+        await self._uav.reboot_after_update(
+            timeout=REBOOT_COMMAND_TIMEOUT, retries=REBOOT_COMMAND_RETRIES
+        )
 
     async def wait_for_disconnect(self) -> None:
         with trio.fail_after(self._configuration.disconnect_timeout):

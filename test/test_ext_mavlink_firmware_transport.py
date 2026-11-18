@@ -9,8 +9,9 @@ import pytest
 import trio
 from test_ext_mavlink_firmware_backend import FakeUAV, make_backend
 
+from flockwave.server.ext.mavlink.channel import Channel
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
-from flockwave.server.ext.mavlink.enums import MAVMessageType, MAVState
+from flockwave.server.ext.mavlink.enums import MAVCommand, MAVMessageType, MAVState
 from flockwave.server.ext.mavlink.firmware.apj import FirmwareImage
 from flockwave.server.ext.mavlink.firmware.backend import (
     PART_PATH,
@@ -212,7 +213,57 @@ async def test_reboot_uses_the_uav_update_command_without_early_invalidation() -
 
     await make_backend(uav).reboot()
 
-    uav.reboot_after_update.assert_awaited_once_with()  # type: ignore[attr-defined]
+    uav.reboot_after_update.assert_awaited_once_with(  # type: ignore[attr-defined]
+        timeout=1.0, retries=1
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "forwarded"),
+    [
+        ({}, {"timeout": None, "retries": None}),
+        ({"timeout": 1.0, "retries": 1}, {"timeout": 1.0, "retries": 1}),
+    ],
+)
+async def test_update_reboot_holds_in_the_bootloader_with_bounded_repeats(
+    options: dict, forwarded: dict
+) -> None:
+    calls = []
+    notified = []
+
+    class Driver:
+        async def send_command_long(self, uav, command, param1, **kwargs) -> bool:
+            calls.append((uav, command, param1, kwargs))
+            return True
+
+    uav = SimpleNamespace(
+        driver=Driver(), _notify_rebooted_by_us=lambda: notified.append(True)
+    )
+    await MAVLinkUAV.reboot_after_update(cast(MAVLinkUAV, uav), **options)
+
+    assert calls == [
+        (
+            uav,
+            MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
+            3,
+            {"channel": Channel.PRIMARY, **forwarded},
+        )
+    ]
+    assert notified == [True]
+
+
+async def test_refused_update_reboot_is_an_error() -> None:
+    class Driver:
+        async def send_command_long(self, *_args, **_kwargs) -> bool:
+            return False
+
+    notified = []
+    uav = SimpleNamespace(
+        driver=Driver(), _notify_rebooted_by_us=lambda: notified.append(True)
+    )
+    with pytest.raises(RuntimeError, match="Reset and update command failed"):
+        await MAVLinkUAV.reboot_after_update(cast(MAVLinkUAV, uav))
+    assert notified == []
 
 
 async def test_wait_for_disconnect_observes_connection_loss(monkeypatch) -> None:

@@ -2328,18 +2328,33 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         else:
             self._notify_rebooted_by_us()
 
-    async def reboot_after_update(self, channel: str = Channel.PRIMARY) -> None:
+    async def reboot_after_update(
+        self,
+        channel: str = Channel.PRIMARY,
+        *,
+        timeout: float | None = None,
+        retries: int | None = None,
+    ) -> None:
         """Reboots the autopilot of the UAV and keeps it in the bootloader
         until upgraded.
 
         This function should be called after an over-the-air update if the UAV
         supports over-the-air updates.
+
+        Parameters:
+            channel: the channel to send the command on
+            timeout: time to wait for each acknowledgment; `None` means to use
+                the default timeout of the driver
+            retries: maximum number of retries; `None` means to use the default
+                retry count of the driver
         """
         success = await self.driver.send_command_long(
             self,
             MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
             3,  # reboot autopilot and stay in bootloader until updated
             channel=channel,
+            timeout=timeout,
+            retries=retries,
         )
         if not success:
             raise RuntimeError("Reset and update command failed")
