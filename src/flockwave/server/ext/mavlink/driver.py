@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -23,7 +23,7 @@ from flockwave.gps.vectors import (
     VelocityNED,
 )
 from flockwave.spec.errors import FlockwaveErrorCode
-from trio import Event, TooSlowError, fail_after, move_on_after, sleep
+from trio import Event, Lock, TooSlowError, fail_after, move_on_after, sleep
 from trio_util import periodic
 
 from flockwave.server.command_handlers import (
@@ -1264,6 +1264,12 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     drone any more.
     """
 
+    _last_drone_show_status_at: float | None = None
+    """Monotonic timestamp of the latest drone-show status packet."""
+
+    _mavftp_lock: Lock
+    """Serializes MAVFTP connections whose cleanup resets all remote sessions."""
+
     _last_skybrush_status_info: DroneShowStatus | None = None
 
     _log_downloader: MAVLinkLogDownloader | None = None
@@ -1356,7 +1362,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self._battery = BatteryInfo()
         self._connected_event = Event()
         self._gps_fix = GPSFix()
+        self._last_drone_show_status_at = None
         self._last_messages = defaultdict(MAVLinkMessageRecord)
+        self._mavftp_lock = Lock()
         self._preflight_status = PreflightCheckInfo()
         self._position = GPSCoordinate()
         self._rssi_mode = RSSIMode.NONE
@@ -1366,6 +1374,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         self.send_log_message_to_gcs = nop
 
         self._reset_mavlink_version()
+
+    @property
+    def mavftp_lock(self) -> Lock:
+        return self._mavftp_lock
 
     def assign_to_network_and_system_id(self, network_id: str, system_id: int) -> None:
         """Assigns the UAV to the MAVLink network with the given network ID.
@@ -1546,6 +1558,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         if now is None:
             now = monotonic()
         return now - record.timestamp if record else inf
+
+    def get_age_of_drone_show_status(self, now: float | None = None) -> float:
+        """Return the age of the latest drone-show status packet."""
+        if now is None:
+            now = monotonic()
+        timestamp = self._last_drone_show_status_at
+        return now - timestamp if timestamp is not None else inf
 
     def get_imu_temperatures(
         self, max_age: float = IMU_TEMPERATURE_MAX_AGE
@@ -1902,7 +1921,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         await self._wait_for_autopilot_identification()
         if len(parameters) > 1 and self._autopilot.supports_mavftp_parameter_upload:
             # Do a bulk upload
-            async with aclosing(MAVFTP.for_uav(self)) as ftp:
+            async with MAVFTP.use_for_uav(self) as ftp:
                 filename, contents = self._autopilot.prepare_mavftp_parameter_upload(
                     parameters
                 )
@@ -1971,7 +1990,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         ):
             yield event
 
-        self._clear_autopilot_capabilities()
+        self.invalidate_version_info()
 
     def handle_message_autopilot_version(self, message: MAVLinkMessage):
         """Handles an incoming MAVLink AUTOPILOT_VERSION message targeted at
@@ -2045,6 +2064,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
                 )
 
         self._scheduled_takeoff_authorization_scope = data.authorization_scope
+        self._last_drone_show_status_at = monotonic()
 
         debug = data.message.encode("utf-8")
 
@@ -2213,6 +2233,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             position=self._position, velocity=self._velocity, heading=heading
         )
         self.notify_updated()
+
+    def handle_message_extended_sys_state(self, message: MAVLinkMessage):
+        """Stores the autopilot's landed state for safety-sensitive operations."""
+        self._store_message(message)
 
     def handle_message_gps_raw_int(self, message: MAVLinkMessage):
         num_sats = message.satellites_visible
@@ -2399,6 +2423,8 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         if can_communicate_infer_from_heartbeat(heartbeat):
             new_state = ConnectionState.CONNECTED
+            if not self.driver.assume_data_streams_configured:
+                self._configure_data_streams_soon(force=True)
         else:
             new_state = ConnectionState.SLEEPING
         self._set_connection_state(new_state, heartbeat)
@@ -2420,18 +2446,33 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         else:
             self._notify_rebooted_by_us()
 
-    async def reboot_after_update(self, channel: str = Channel.PRIMARY) -> None:
+    async def reboot_after_update(
+        self,
+        channel: str = Channel.PRIMARY,
+        *,
+        timeout: float | None = None,
+        retries: int | None = None,
+    ) -> None:
         """Reboots the autopilot of the UAV and keeps it in the bootloader
         until upgraded.
 
         This function should be called after an over-the-air update if the UAV
         supports over-the-air updates.
+
+        Parameters:
+            channel: the channel to send the command on
+            timeout: time to wait for each acknowledgment; `None` means to use
+                the default timeout of the driver
+            retries: maximum number of retries; `None` means to use the default
+                retry count of the driver
         """
         success = await self.driver.send_command_long(
             self,
             MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
             3,  # reboot autopilot and stay in bootloader until updated
             channel=channel,
+            timeout=timeout,
+            retries=retries,
         )
         if not success:
             raise RuntimeError("Reset and update command failed")
@@ -2954,7 +2995,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # The version read can take several retries: check again before writing
         self._ensure_disarmed_for_show_upload()
 
-        async with aclosing(MAVFTP.for_uav(self)) as ftp:
+        async with MAVFTP.use_for_uav(self) as ftp:
             await write_show_slot(ftp, data)
 
     def _ensure_disarmed_for_show_upload(self) -> None:
@@ -3192,6 +3233,7 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         """
         stream_rates = [
             (MAVMessageType.SYS_STATUS, 1),
+            (MAVMessageType.EXTENDED_SYS_STATE, 1),
             (MAVMessageType.GPS_RAW_INT, 1),
             (MAVMessageType.GLOBAL_POSITION_INT, 2),
         ]
@@ -3284,12 +3326,13 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
         # Reset our internal state object of the compass calibration procedure
         self.compass_calibration.reset()
 
-    def _clear_autopilot_capabilities(self) -> None:
-        """Clears the cached autopilot capabilities and firmware version number
-        of the UAV.
+    def invalidate_version_info(self) -> None:
+        """Clears the cached autopilot firmware version information.
 
-        This function should be called after a firmware update to ensure that
-        we query the new firmware version after the update.
+        Called when the connection is lost and after a firmware update, so a
+        reflashed or replaced flight controller is never reported with the
+        identity cached before. Unless `autopilot_type` is configured, the next
+        heartbeat requests it again.
         """
         self._last_messages.pop(MAVMessageType.AUTOPILOT_VERSION, None)
 
@@ -3370,6 +3413,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     def _set_connection_state(
         self, value: ConnectionState, heartbeat: MAVLinkMessage | None
     ) -> None:
+        if value is ConnectionState.DISCONNECTED:
+            self._last_drone_show_status_at = None
+
         if self._connection_state is value:
             return
 
@@ -3393,6 +3439,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # was somehow reset and it does not "understand" MAVLink v2 in its new
             # configuration
             self._reset_mavlink_version()
+
+            # The flight controller may come back reflashed or replaced
+            self.invalidate_version_info()
 
         elif value is ConnectionState.CONNECTED:
             # We assume that the autopilot type stays the same even if we lost
