@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import json
 import re
+import struct
 import zlib
 from dataclasses import dataclass
 from hmac import compare_digest
@@ -16,6 +17,12 @@ MAX_APJ_SIZE = 3 * 1024 * 1024
 MAX_IMAGE_SIZE_BY_BOARD = {1177: 1_703_936}
 
 _GIT_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{8}")
+
+APP_DESCRIPTOR_SIGNATURE = bytes.fromhex("40a2e4f164689106")
+"""Marks ``app_descriptor_unsigned`` of AP_CheckFirmware in the image."""
+
+_APP_DESCRIPTOR = struct.Struct("<8sIIIIBBH8x")
+_APP_DESCRIPTOR_CRC2_OFFSET = 24
 
 
 class APJValidationError(ValueError):
@@ -64,6 +71,7 @@ def parse_apj(
             f"APJ declares {declared_size} image bytes but contains {len(image)}",
         )
     _reject_external_flash(document)
+    _validate_app_descriptor(image, board_id)
 
     git_hash = _require_git_hash(document)
     version = document.get("version")
@@ -148,6 +156,49 @@ def _decode_image(document: dict[str, Any], *, max_size: int) -> bytes:
     if not image:
         raise APJValidationError("invalidImage", "APJ firmware image is empty")
     return image
+
+
+def _validate_app_descriptor(image: bytes, board_id: int) -> None:
+    """Apply the bootloader's own acceptance tests to the application image.
+
+    The bootloader only boots an image whose embedded descriptor names its
+    board, its length and the checksums of both parts around the descriptor.
+    The ABIN MD5 is derived from this very image, so it cannot detect an image
+    that would fail those tests.
+    """
+    start = image.find(APP_DESCRIPTOR_SIGNATURE)
+    if start < 0 or start + _APP_DESCRIPTOR.size > len(image):
+        raise APJValidationError(
+            "invalidDescriptor",
+            "Firmware image has no ArduPilot application descriptor",
+        )
+    _, crc1, crc2, image_size, _, _, _, descriptor_board_id = (
+        _APP_DESCRIPTOR.unpack_from(image, start)
+    )
+    if descriptor_board_id != board_id:
+        raise APJValidationError(
+            "invalidDescriptor",
+            f"Firmware image is built for board ID {descriptor_board_id}, "
+            f"not {board_id}",
+        )
+    if image_size != len(image):
+        raise APJValidationError(
+            "invalidDescriptor",
+            f"Firmware image describes {image_size} bytes but contains {len(image)}",
+        )
+    signature_end = start + len(APP_DESCRIPTOR_SIGNATURE)
+    if crc1 != _bootloader_crc32(image[:signature_end]) or crc2 != _bootloader_crc32(
+        image[start + _APP_DESCRIPTOR_CRC2_OFFSET :]
+    ):
+        raise APJValidationError(
+            "invalidDescriptor",
+            "Firmware image is corrupt: its checksum does not match its descriptor",
+        )
+
+
+def _bootloader_crc32(data: bytes) -> int:
+    """CRC-32 as ``crc32_small`` computes it: no initial or final inversion."""
+    return zlib.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF
 
 
 def _require_int(document: dict[str, Any], key: str) -> int:

@@ -3,11 +3,13 @@
 import base64
 import hashlib
 import json
+import struct
 import zlib
 
 import pytest
 
 from flockwave.server.ext.mavlink.firmware.apj import (
+    APP_DESCRIPTOR_SIGNATURE,
     MAX_APJ_SIZE,
     MAX_IMAGE_SIZE_BY_BOARD,
     APJValidationError,
@@ -16,18 +18,56 @@ from flockwave.server.ext.mavlink.firmware.apj import (
     _reject_external_flash,
     _require_git_hash,
     _require_int,
+    _validate_app_descriptor,
     _validate_envelope,
     parse_apj,
 )
 
+IMAGE_HEAD = b"vectors!"
+DESCRIPTOR_START = len(IMAGE_HEAD)
+NO_DESCRIPTOR = "Firmware image has no ArduPilot application descriptor"
+CORRUPT = "Firmware image is corrupt: its checksum does not match its descriptor"
+
+
+def crc32_small(data: bytes) -> int:
+    """Bit-by-bit port of ArduPilot's ``crc32_small`` with a zero seed."""
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xEDB88320 if crc & 1 else 0)
+    return crc
+
+
+def make_image(
+    body: bytes = b"firmware",
+    *,
+    board_id: int = 1177,
+    described_size: int | None = None,
+) -> bytes:
+    """Builds an application image as ArduPilot's ``set_app_descriptor`` does."""
+    head = IMAGE_HEAD + APP_DESCRIPTOR_SIGNATURE
+    tail = struct.pack("<BBH8x", 4, 7, board_id) + body
+    size = len(head) + 16 + len(tail)
+    descriptor = struct.pack(
+        "<IIII",
+        crc32_small(head),
+        crc32_small(tail),
+        size if described_size is None else described_size,
+        0x0123ABCD,
+    )
+    return head + descriptor + tail
+
 
 def make_apj(
-    image: bytes = b"firmware",
+    image: bytes | None = None,
     *,
     board_id: int = 1177,
     git_hash: str = "0123abcd",
     declared_size: int | None = None,
 ) -> bytes:
+    if image is None:
+        image = make_image()
     document = {
         "magic": "APJFWv1",
         "board_id": board_id,
@@ -63,15 +103,15 @@ def assert_validation_error(call, code: str, detail: str) -> None:
 
 
 def test_apj_is_converted_to_md5_checked_abin() -> None:
-    payload = make_apj(b"abc")
-    image = parse(payload)
+    firmware = make_image()
+    image = parse(make_apj(firmware))
 
     assert image.board_id == 1177
     assert image.git_hash == "0123abcd"
     assert image.version == "4.6.1"
     assert image.total_size == len(image.abin)
     assert image.abin == (
-        b"git version: 0123abcd\nMD5: 900150983cd24fb0d6963f7d28e17f72\n--\nabc"
+        b"git version: 0123abcd\nMD5: 99dfa3a69aff84bf9f58ec40e09aef3e\n--\n" + firmware
     )
 
 
@@ -87,9 +127,10 @@ def test_abin_md5_is_explicitly_marked_non_security(monkeypatch) -> None:
         return Digest()
 
     monkeypatch.setattr(hashlib, "md5", md5)
-    image = parse(make_apj(b"abc"))
-    assert calls == [(b"abc", False)]
-    assert image.abin == b"git version: 0123abcd\nMD5: digest\n--\nabc"
+    firmware = make_image()
+    image = parse(make_apj(firmware))
+    assert calls == [(firmware, False)]
+    assert image.abin == b"git version: 0123abcd\nMD5: digest\n--\n" + firmware
 
 
 @pytest.mark.parametrize(
@@ -111,7 +152,7 @@ def test_abin_md5_is_explicitly_marked_non_security(monkeypatch) -> None:
             make_apj(declared_size=999),
             None,
             "sizeMismatch",
-            "APJ declares 999 image bytes but contains 8",
+            "APJ declares 999 image bytes but contains 52",
         ),
         (
             b"not-json",
@@ -307,3 +348,127 @@ def test_external_flash_images_are_rejected(value) -> None:
     )
     _reject_external_flash({})
     _reject_external_flash({"extf_image_size": 0})
+
+
+def test_generated_image_matches_the_descriptor_layout() -> None:
+    image = make_image()
+    assert len(image) == 52
+    assert image[DESCRIPTOR_START : DESCRIPTOR_START + 8] == bytes.fromhex(
+        "40a2e4f164689106"
+    )
+    assert struct.unpack_from("<IIII", image, DESCRIPTOR_START + 8) == (
+        0x7152E934,
+        0xBFDEED04,
+        52,
+        0x0123ABCD,
+    )
+    assert struct.unpack_from("<BBH", image, DESCRIPTOR_START + 24) == (4, 7, 1177)
+    _validate_app_descriptor(image, 1177)
+
+
+@pytest.mark.parametrize(
+    ("offset", "detail"),
+    [
+        (0, CORRUPT),
+        (DESCRIPTOR_START - 1, CORRUPT),
+        (DESCRIPTOR_START, NO_DESCRIPTOR),
+        (DESCRIPTOR_START + 7, NO_DESCRIPTOR),
+        (DESCRIPTOR_START + 8, CORRUPT),
+        (DESCRIPTOR_START + 11, CORRUPT),
+        (DESCRIPTOR_START + 12, CORRUPT),
+        (DESCRIPTOR_START + 15, CORRUPT),
+        (DESCRIPTOR_START + 16, "Firmware image describes 53 bytes but contains 52"),
+        (DESCRIPTOR_START + 24, CORRUPT),
+        (DESCRIPTOR_START + 25, CORRUPT),
+        (
+            DESCRIPTOR_START + 26,
+            "Firmware image is built for board ID 1176, not 1177",
+        ),
+        (DESCRIPTOR_START + 28, CORRUPT),
+        (DESCRIPTOR_START + 35, CORRUPT),
+        (DESCRIPTOR_START + 36, CORRUPT),
+        (51, CORRUPT),
+    ],
+)
+def test_apj_rejects_an_image_with_one_byte_flipped(offset: int, detail: str) -> None:
+    image = bytearray(make_image())
+    image[offset] ^= 0x01
+    assert_validation_error(
+        lambda: parse(make_apj(bytes(image))), "invalidDescriptor", detail
+    )
+
+
+def test_git_hash_in_the_descriptor_is_not_covered_by_its_checksums() -> None:
+    image = bytearray(make_image())
+    for offset in range(DESCRIPTOR_START + 20, DESCRIPTOR_START + 24):
+        image[offset] ^= 0xFF
+    _validate_app_descriptor(bytes(image), 1177)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        b"firmware",
+        b"x" * 4096,
+        APP_DESCRIPTOR_SIGNATURE,
+        make_image()[: DESCRIPTOR_START + 35],
+        make_image().replace(APP_DESCRIPTOR_SIGNATURE, bytes(8)),
+    ],
+)
+def test_apj_rejects_an_image_without_a_complete_descriptor(image: bytes) -> None:
+    assert_validation_error(
+        lambda: parse(make_apj(image)), "invalidDescriptor", NO_DESCRIPTOR
+    )
+
+
+def test_apj_accepts_a_descriptor_that_ends_the_image() -> None:
+    image = make_image(b"")
+    assert len(image) == DESCRIPTOR_START + 36
+    assert parse(make_apj(image)).abin.endswith(image)
+
+
+def test_apj_rejects_a_descriptor_for_another_board() -> None:
+    assert_validation_error(
+        lambda: parse(make_apj(make_image(board_id=1176))),
+        "invalidDescriptor",
+        "Firmware image is built for board ID 1176, not 1177",
+    )
+
+
+@pytest.mark.parametrize("described_size", [0, 51, 53])
+def test_apj_rejects_a_descriptor_with_another_image_length(
+    described_size: int,
+) -> None:
+    assert_validation_error(
+        lambda: parse(make_apj(make_image(described_size=described_size))),
+        "invalidDescriptor",
+        f"Firmware image describes {described_size} bytes but contains 52",
+    )
+
+
+def test_apj_rejects_bytes_appended_after_the_described_image() -> None:
+    assert_validation_error(
+        lambda: parse(make_apj(make_image() + b"\x00")),
+        "invalidDescriptor",
+        "Firmware image describes 52 bytes but contains 53",
+    )
+
+
+def test_only_the_first_descriptor_in_the_image_counts() -> None:
+    valid = make_image()
+    broken = bytearray(valid)
+    broken[-1] ^= 0x01
+    assert_validation_error(
+        lambda: _validate_app_descriptor(bytes(broken) + valid, 1177),
+        "invalidDescriptor",
+        "Firmware image describes 52 bytes but contains 104",
+    )
+
+
+def test_descriptor_is_checked_before_the_image_is_packaged(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hashlib, "md5", lambda *_args, **_kwargs: pytest.fail("image was packaged")
+    )
+    assert_validation_error(
+        lambda: parse(make_apj(b"firmware")), "invalidDescriptor", NO_DESCRIPTOR
+    )
