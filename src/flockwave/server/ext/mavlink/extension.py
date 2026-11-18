@@ -160,9 +160,21 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
     def exports(self) -> dict[str, Any]:
         return {
             "find_network_by_id": self._find_network_by_id,
+            "get_imu_temperatures": self._get_imu_temperatures,
             "get_uav_ids_by_system_id": self._get_uav_ids_by_system_id,
             "use_mavlink_message_channel_factory": use_mavlink_message_channel_factory,
         }
+
+    def _get_imu_temperatures(self, uav_id: str) -> list[float | None]:
+        """Returns the die temperature of each IMU of the UAV with the given
+        ID in degrees Celsius, IMU 0 first, `None` for an IMU without a recent
+        reading; an empty list for an unknown UAV or one with no reading.
+        """
+        for network in (self._networks or {}).values():
+            for uav in network.uavs():
+                if uav.id == uav_id:
+                    return uav.get_imu_temperatures()
+        return []
 
     def _get_uav_ids_by_system_id(self) -> dict[int, str]:
         """Returns the IDs of every UAV the networks of this extension have
