@@ -34,6 +34,8 @@ RESULT_PATHS = (
     "/ardupilot-flashed.abin",
     "/ardupilot-failed.abin",
 )
+PENDING_PATHS = (READY_PATH, "/ardupilot-verify.abin", "/ardupilot-flash.abin")
+"""Files the bootloader still acts on at any later power-on."""
 MAX_SAFETY_MESSAGE_AGE = 3.0
 OTA_MAVFTP_MAX_RETRIES = 20
 OTA_MAVFTP_INITIAL_TIMEOUT = 1.0
@@ -255,6 +257,26 @@ class ArduPilotUpdateBackend:
                     f"Flight controller rejected the staged image: {ex}",
                 ) from ex
 
+    async def withdraw(self) -> bool:
+        """Remove a committed image that the flight controller never rebooted into.
+
+        The bootloader installs a staged image at any later power-on, so one
+        whose reboot did not happen must not stay on the SD card. Returns
+        whether the flight controller confirmed that it deleted the image.
+        """
+        try:
+            with trio.fail_after(self._configuration.result_timeout):
+                async with _use_update_ftp(self._uav) as ftp:
+                    await ftp.rm(READY_PATH)
+        except Exception:
+            log.warning(
+                "Failed to withdraw the staged ArduPilot OTA image",
+                exc_info=True,
+                extra={"id": self._uav.id},
+            )
+            return False
+        return True
+
     async def reboot(self) -> None:
         await self._uav.reboot_after_update()
 
@@ -324,7 +346,28 @@ class ArduPilotUpdateBackend:
                         extra={"id": self._uav.id},
                     )
                 return
-        raise UpdateResultIndeterminateError(*_interrupted_flash_failure(entries))
+            pending = (
+                "no image is left pending on the SD card"
+                if await self._remove_pending(ftp)
+                else "an image may still be pending and install at the next power-on"
+            )
+        code, detail = _interrupted_flash_failure(entries)
+        raise UpdateResultIndeterminateError(code, f"{detail}; {pending}")
+
+    async def _remove_pending(self, ftp: MAVFTP) -> bool:
+        """Remove every image the bootloader would act on at a later power-on."""
+        try:
+            with trio.fail_after(self._configuration.result_timeout):
+                for path in PENDING_PATHS:
+                    await _remove_if_present(ftp, path)
+        except Exception:
+            log.warning(
+                "Failed to remove a pending ArduPilot OTA image",
+                exc_info=True,
+                extra={"id": self._uav.id},
+            )
+            return False
+        return True
 
 
 class UpdateOperationError(RuntimeError):

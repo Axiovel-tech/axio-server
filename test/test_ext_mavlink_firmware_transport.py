@@ -14,6 +14,7 @@ from flockwave.server.ext.mavlink.enums import MAVMessageType, MAVState
 from flockwave.server.ext.mavlink.firmware.apj import FirmwareImage
 from flockwave.server.ext.mavlink.firmware.backend import (
     PART_PATH,
+    PENDING_PATHS,
     READY_PATH,
     RESULT_PATHS,
     ArduPilotUpdateBackend,
@@ -481,4 +482,149 @@ async def test_flash_result_times_out_as_indeterminate(monkeypatch) -> None:
     with pytest.raises(UpdateResultIndeterminateError) as raised:
         await backend.verify_flash_result()
     assert raised.value.code == "verificationInterrupted"
+    assert str(raised.value) == (
+        "Bootloader verification did not finish; "
+        "no image is left pending on the SD card"
+    )
     assert delays == [0.25]
+    assert ftp.removed == [
+        "/ardupilot.abin",
+        "/ardupilot-verify.abin",
+        "/ardupilot-flash.abin",
+    ]
+    assert ftp.removed == list(PENDING_PATHS)
+    assert ftp.closed is True
+
+
+@pytest.mark.parametrize(
+    "remove_error",
+    [
+        OSError("read-only SD card"),
+        OperationNotAcknowledgedError(MAVFTPErrorCode.FAIL),
+        trio.TooSlowError(),
+    ],
+)
+async def test_unfinished_flash_result_reports_an_image_it_cannot_remove(
+    monkeypatch, remove_error: Exception
+) -> None:
+    uav = FakeUAV(1177)
+    ftp = MarkerFTP({"ardupilot.abin"}, remove_error)
+    warnings = []
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+    monkeypatch.setattr(
+        log,
+        "warning",
+        lambda message, **kwargs: warnings.append((message, kwargs)),
+    )
+
+    async def stop_polling(_delay: float) -> None:
+        await trio.sleep_forever()
+
+    monkeypatch.setattr(trio, "sleep", stop_polling)
+    configuration = FirmwareUpdateConfiguration(result_timeout=0.1)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    with pytest.raises(UpdateResultIndeterminateError) as raised:
+        await backend.verify_flash_result()
+    assert raised.value.code == "updateUnsupported"
+    assert str(raised.value) == (
+        "Bootloader did not process the staged update; "
+        "an image may still be pending and install at the next power-on"
+    )
+    assert ftp.removed == ["/ardupilot.abin"]
+    assert warnings == [
+        (
+            "Failed to remove a pending ArduPilot OTA image",
+            {"exc_info": True, "extra": {"id": "1"}},
+        )
+    ]
+
+
+async def test_pending_image_removal_is_bounded_by_the_result_timeout(
+    monkeypatch, autojump_clock
+) -> None:
+    uav = FakeUAV(1177)
+
+    class StalledFTP(MarkerFTP):
+        async def rm(self, path: str) -> None:
+            self.removed.append(path)
+            await trio.sleep_forever()
+
+    ftp = StalledFTP({"ardupilot-flash.abin"})
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+    configuration = FirmwareUpdateConfiguration(result_timeout=7)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    started = trio.current_time()
+    with pytest.raises(UpdateResultIndeterminateError) as raised:
+        await backend.verify_flash_result()
+    assert trio.current_time() - started == 14
+    assert raised.value.code == "flashingInterrupted"
+    assert str(raised.value).endswith(
+        "an image may still be pending and install at the next power-on"
+    )
+    assert ftp.removed == ["/ardupilot.abin"]
+
+
+async def test_withdraw_removes_only_the_committed_image(monkeypatch) -> None:
+    uav = FakeUAV(1177)
+    ftp = MarkerFTP(set())
+
+    def make_ftp(candidate, *, retry_policy):
+        assert candidate is uav
+        assert retry_policy.max_retries == 20
+        return ftp
+
+    monkeypatch.setattr(MAVFTP, "for_uav", make_ftp)
+    assert await make_backend(uav).withdraw() is True
+    assert ftp.removed == [READY_PATH]
+    assert ftp.closed is True
+
+
+@pytest.mark.parametrize(
+    "remove_error",
+    [
+        OperationNotAcknowledgedError(MAVFTPErrorCode.FILE_NOT_FOUND),
+        OperationNotAcknowledgedError(MAVFTPErrorCode.FAIL),
+        OSError("link lost"),
+    ],
+)
+async def test_withdraw_is_unconfirmed_unless_the_image_was_deleted(
+    monkeypatch, remove_error: Exception
+) -> None:
+    uav = FakeUAV(1177)
+    ftp = MarkerFTP(set(), remove_error)
+    warnings = []
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+    monkeypatch.setattr(
+        log,
+        "warning",
+        lambda message, **kwargs: warnings.append((message, kwargs)),
+    )
+    assert await make_backend(uav).withdraw() is False
+    assert ftp.removed == [READY_PATH]
+    assert ftp.closed is True
+    assert warnings == [
+        (
+            "Failed to withdraw the staged ArduPilot OTA image",
+            {"exc_info": True, "extra": {"id": "1"}},
+        )
+    ]
+
+
+async def test_withdraw_is_bounded_by_the_result_timeout(
+    monkeypatch, autojump_clock
+) -> None:
+    uav = FakeUAV(1177)
+
+    class StalledFTP(MarkerFTP):
+        async def rm(self, path: str) -> None:
+            self.removed.append(path)
+            await trio.sleep_forever()
+
+    ftp = StalledFTP(set())
+    monkeypatch.setattr(MAVFTP, "for_uav", lambda *_args, **_kwargs: ftp)
+    configuration = FirmwareUpdateConfiguration(result_timeout=7)
+    backend = ArduPilotUpdateBackend(cast(MAVLinkUAV, uav), configuration)
+    started = trio.current_time()
+    assert await backend.withdraw() is False
+    assert trio.current_time() - started == 7
+    assert ftp.closed is True

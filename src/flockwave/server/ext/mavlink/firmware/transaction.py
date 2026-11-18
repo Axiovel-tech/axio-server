@@ -216,7 +216,14 @@ class FirmwareUpdateCoordinator:
             detail = "Reboot was not observed after the image was committed"
             if reboot_error:
                 detail += f": {reboot_error}"
-            raise IndeterminateUpdate(detail) from reboot_error
+            if await backend.withdraw():
+                raise UpdateOperationError(
+                    "rebootNotObserved",
+                    f"{detail}; the staged image was removed and the firmware is unchanged",
+                ) from reboot_error
+            raise IndeterminateUpdate(
+                f"{detail}; the staged image could not be removed and may install at the next power-on"
+            ) from reboot_error
         if disconnect_error is not None:
             raise disconnect_error
         await backend.wait_for_reconnect()

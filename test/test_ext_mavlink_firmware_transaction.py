@@ -43,6 +43,7 @@ class FakeBackend:
     commit_error: Exception | None = None
     final_safety_error: UpdateOperationError | None = None
     reconnect_timeout: bool = False
+    withdrawn: bool = False
 
     def check_safety(self, board_id: int) -> None:
         assert board_id == 1177
@@ -77,6 +78,10 @@ class FakeBackend:
         mark_committed()
         if self.commit_error is not None:
             raise self.commit_error
+
+    async def withdraw(self) -> bool:
+        self.calls.append("withdraw")
+        return self.withdrawn
 
     async def reboot(self) -> None:
         self.calls.append("reboot")
@@ -313,8 +318,88 @@ async def test_disconnect_timeout_after_commit_is_indeterminate() -> None:
     assert job.status == "indeterminate"
     assert job.error == {
         "code": "indeterminate",
-        "detail": "Reboot was not observed after the image was committed",
+        "detail": (
+            "Reboot was not observed after the image was committed; the staged "
+            "image could not be removed and may install at the next power-on"
+        ),
     }
+    assert backend.calls[-3:] == ["disconnect", "reboot", "withdraw"]
+
+
+async def test_unobserved_reboot_withdraws_the_staged_image() -> None:
+    backend = FakeBackend(disconnect_timeout=True, withdrawn=True)
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+    assert job.status == "failed"
+    assert job.committed is True
+    assert job.error == {
+        "code": "rebootNotObserved",
+        "detail": (
+            "Reboot was not observed after the image was committed; the staged "
+            "image was removed and the firmware is unchanged"
+        ),
+    }
+    assert backend.calls[-3:] == ["disconnect", "reboot", "withdraw"]
+
+
+async def test_observed_reboot_never_withdraws_the_image() -> None:
+    backend = FakeBackend(withdrawn=True)
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+    assert job.status == "success"
+    assert "withdraw" not in backend.calls
+
+
+async def test_refused_reboot_is_reported_with_the_withdrawal() -> None:
+    backend = FakeBackend(reboot_ack_lost=True, disconnect_timeout=True, withdrawn=True)
+    async with trio.open_nursery() as nursery:
+        _, job = await start_job(nursery, backend, [])
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+    assert job.status == "failed"
+    assert job.error == {
+        "code": "rebootNotObserved",
+        "detail": (
+            "Reboot was not observed after the image was committed: ACK lost; "
+            "the staged image was removed and the firmware is unchanged"
+        ),
+    }
+
+
+async def test_descriptor_less_image_is_rejected_before_any_backend_use() -> None:
+    backends = []
+    notifications = []
+
+    async def notify(job) -> None:
+        notifications.append(job.json())
+
+    def make_backend(uav_id: str) -> ArduPilotUpdateBackend:
+        backends.append(uav_id)
+        return cast(ArduPilotUpdateBackend, FakeBackend())
+
+    payload = make_apj(b"firmware")
+    async with trio.open_nursery() as nursery:
+        coordinator = FirmwareUpdateCoordinator(nursery, make_backend, notify)
+        job = coordinator.start(
+            uav_id="1",
+            name="arducopter.apj",
+            payload=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        await wait_finished(job)
+        nursery.cancel_scope.cancel()
+    assert job.status == "failed"
+    assert job.committed is False
+    assert job.error == {
+        "code": "invalidDescriptor",
+        "detail": "Firmware image has no ArduPilot application descriptor",
+    }
+    assert backends == []
+    assert [item["phase"] for item in notifications] == ["complete"]
 
 
 async def test_reconnect_timeout_after_commit_is_indeterminate() -> None:
@@ -563,9 +648,13 @@ async def test_lost_reboot_ack_is_included_when_disconnect_is_not_observed() -> 
         _, job = await start_job(nursery, backend, [])
         await wait_finished(job)
         nursery.cancel_scope.cancel()
+    assert job.status == "indeterminate"
     assert job.error == {
         "code": "indeterminate",
-        "detail": ("Reboot was not observed after the image was committed: ACK lost"),
+        "detail": (
+            "Reboot was not observed after the image was committed: ACK lost; the "
+            "staged image could not be removed and may install at the next power-on"
+        ),
     }
 
 
