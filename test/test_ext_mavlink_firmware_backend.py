@@ -4,9 +4,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from flockwave.protocols.mavlink.introspection import import_dialect
 from trio import Lock
 
-from flockwave.server.ext.mavlink.driver import MAVLinkUAV
+from flockwave.server.ext.mavlink import driver as driver_module
+from flockwave.server.ext.mavlink.driver import MAVLinkDriver, MAVLinkUAV
 from flockwave.server.ext.mavlink.enums import (
     ConnectionState,
     MAVCommand,
@@ -520,6 +522,7 @@ def test_disconnect_invalidates_show_state_timestamp(
         _connection_state=connection_state,
         _last_drone_show_status_at=1.0,
         _reset_mavlink_version=lambda: None,
+        invalidate_version_info=lambda: None,
     )
 
     MAVLinkUAV._set_connection_state(
@@ -530,6 +533,87 @@ def test_disconnect_invalidates_show_state_timestamp(
     assert MAVLinkUAV.get_age_of_drone_show_status(
         cast(MAVLinkUAV, uav), now=2.0
     ) == float("inf")
+
+
+def test_reflashed_flight_controller_is_not_reported_with_its_old_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(driver_module, "monotonic", lambda: clock[0])
+    dialect = import_dialect("ardupilotmega")
+    link = dialect.MAVLink(None, srcSystem=1, srcComponent=1)
+    scheduled = []
+    driver = MAVLinkDriver()
+    driver.run_in_background = scheduled.append  # type: ignore[assignment]
+    uav = MAVLinkUAV("1", driver=driver)
+    uav.notify_updated = lambda: None  # type: ignore[assignment]
+    backend = ArduPilotUpdateBackend(uav, PROVISIONED)
+
+    def heartbeat() -> None:
+        message = dialect.MAVLink_heartbeat_message(
+            type=dialect.MAV_TYPE_QUADROTOR,
+            autopilot=dialect.MAV_AUTOPILOT_ARDUPILOTMEGA,
+            base_mode=0,
+            custom_mode=0,
+            system_status=dialect.MAV_STATE_STANDBY,
+            mavlink_version=3,
+        )
+        message.pack(link)
+        uav.handle_message_heartbeat(message)
+        uav.handle_message_extended_sys_state(
+            dialect.MAVLink_extended_sys_state_message(
+                vtol_state=0, landed_state=dialect.MAV_LANDED_STATE_ON_GROUND
+            )
+        )
+
+    def autopilot_version(git_hash: bytes) -> None:
+        uav.handle_message_autopilot_version(
+            dialect.MAVLink_autopilot_version_message(
+                capabilities=dialect.MAV_PROTOCOL_CAPABILITY_MAVLINK2,
+                flight_sw_version=4 << 24 | 7 << 16 | 255,
+                middleware_sw_version=0,
+                os_sw_version=0,
+                board_version=1177 << 16,
+                flight_custom_version=git_hash,
+                middleware_custom_version=b"",
+                os_custom_version=b"",
+                vendor_id=0,
+                product_id=0,
+                uid=0,
+            )
+        )
+
+    def version_requested() -> bool:
+        requests = [
+            task
+            for task in scheduled
+            if getattr(task, "__func__", None)
+            is MAVLinkUAV._request_autopilot_capabilities_and_ignore_result
+        ]
+        scheduled.clear()
+        return bool(requests)
+
+    heartbeat()
+    assert version_requested()
+    autopilot_version(b"aaaa111\x00")
+    old = backend.target_state()
+    assert (old.board_id, old.current_hash, old.compatible) == (1177, "aaaa111", True)
+
+    clock[0] += 6
+    uav.notify_disconnection()
+    lost = backend.target_state()
+    assert (lost.board_id, lost.current_hash, lost.current_version) == (None,) * 3
+    assert not lost.compatible
+
+    heartbeat()
+    unknown = backend.target_state()
+    assert unknown.reason_code == "boardUnknown"
+    assert (unknown.current_hash, unknown.compatible) == (None, False)
+    assert version_requested()
+
+    autopilot_version(b"bbbb222\x00")
+    new = backend.target_state()
+    assert (new.board_id, new.current_hash, new.compatible) == (1177, "bbbb222", True)
 
 
 def test_version_helpers_preserve_reported_identity() -> None:

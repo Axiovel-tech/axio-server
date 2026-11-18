@@ -3329,8 +3329,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
     def invalidate_version_info(self) -> None:
         """Clears the cached autopilot firmware version information.
 
-        Call this after reconnecting from a firmware update so the next version
-        request cannot return the firmware identity cached before the reboot.
+        Called when the connection is lost and after a firmware update, so a
+        reflashed or replaced flight controller is never reported with the
+        identity cached before. Unless `autopilot_type` is configured, the next
+        heartbeat requests it again.
         """
         self._last_messages.pop(MAVMessageType.AUTOPILOT_VERSION, None)
 
@@ -3437,6 +3439,9 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             # was somehow reset and it does not "understand" MAVLink v2 in its new
             # configuration
             self._reset_mavlink_version()
+
+            # The flight controller may come back reflashed or replaced
+            self.invalidate_version_info()
 
         elif value is ConnectionState.CONNECTED:
             # We assume that the autopilot type stays the same even if we lost
