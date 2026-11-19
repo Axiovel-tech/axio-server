@@ -15,6 +15,7 @@ from pytest import fixture, mark, raises
 from trio import TooSlowError
 
 from flockwave.server.ext.mavlink import driver as driver_module
+from flockwave.server.ext.mavlink.autopilots import ArduPilot
 from flockwave.server.ext.mavlink.driver import MAVLinkUAV
 from flockwave.server.ext.mavlink.enums import MAVModeFlag, MAVParamError
 from flockwave.server.ext.mavlink.errors import ParameterNotFoundError
@@ -162,7 +163,7 @@ def uav(calls, ftp, drone, monkeypatch) -> MAVLinkUAV:
     monkeypatch.setattr(uav, "remove_show", remove_show)
     monkeypatch.setattr(uav, "_configure_show_frame_and_reload", configure_and_reload)
     monkeypatch.setattr(
-        driver_module.MAVFTP, "for_uav", classmethod(lambda cls, _: ftp)
+        driver_module.MAVFTP, "for_uav", classmethod(lambda cls, _, **_kwargs: ftp)
     )
     return uav
 
@@ -421,7 +422,7 @@ async def test_param_read_tells_a_missing_parameter_from_a_value(reply, expected
     uav = MAVLinkUAV(
         "01",
         driver=SimpleNamespace(
-            autopilot_factory=None,
+            autopilot_factory=ArduPilot,
             log=logging.getLogger("t"),
             send_packet_with_retries=send_packet_with_retries,
         ),

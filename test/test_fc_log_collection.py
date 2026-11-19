@@ -85,9 +85,12 @@ class FakeFlightController:
 
     async def run_telemetry(self):
         while True:
-            self._publish("HEARTBEAT", base_mode=self.base_mode)
-            self._publish("SYS_STATUS", voltage_battery=self.millivolts)
+            self.report_telemetry()
             await trio.sleep(0.2)
+
+    def report_telemetry(self):
+        self._publish("HEARTBEAT", base_mode=self.base_mode)
+        self._publish("SYS_STATUS", voltage_battery=self.millivolts)
 
     async def send(self, message_type, **fields):
         await trio.lowlevel.checkpoint()
@@ -387,10 +390,12 @@ async def test_battery_limit_refuses_and_stops(fc, tmp_path, autojump_clock):
     def drain(offset):
         if offset > 5_000:
             fc.millivolts = 10_500
+            fc.report_telemetry()
 
     fc.on_read = drain
     stopped = await run(fc, tmp_path, min_battery_voltage=11.0)
     assert "battery 10.5 V is below 11.0 V" in stopped["error"]
+    assert not (tmp_path / "03" / "00000003.BIN").exists()
     assert fc.params["LOG_DISARMED"] == 1.0
 
 
@@ -398,11 +403,13 @@ async def test_arming_mid_collection_stops_the_transfer(fc, tmp_path, autojump_c
     def arm(offset):
         if offset > 5_000:
             fc.base_mode = 89 | 128
+            fc.report_telemetry()
 
     fc.on_read = arm
     receipt = await run(fc, tmp_path)
     assert not receipt["complete"]
     assert "armed" in receipt["error"]
+    assert not (tmp_path / "03" / "00000003.BIN").exists()
     assert fc.params["LOG_DISARMED"] == 1.0
 
 

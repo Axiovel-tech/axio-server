@@ -10,4 +10,7 @@ __all__ = ("construct", "dependencies", "description", "enhancers", "schema")
 construct = MAVLinkDronesExtension
 dependencies = ("rc", "show", "signals")
 description = "Support for drones that use the MAVLink protocol"
-enhancers = {"firmware_update": MAVLinkDronesExtension.use_firmware_update_support}
+# The legacy generic firmware-update API writes ArduPilot ABIN files directly
+# to their bootloader-visible name. Keep it unavailable so X-AP-OTA remains
+# the only MAVLink application-firmware entry point and owns all safety gates.
+enhancers = {}

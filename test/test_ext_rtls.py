@@ -9,6 +9,7 @@ pushed back through ``_process_datagram``. No sockets are involved.
 """
 
 import logging
+import math
 import socket
 import struct
 import threading
@@ -416,6 +417,9 @@ async def test_inf_site_anchor_list(extension, device, builder, hub):
     assert a1["mac"] == 2
     # no live anchor device online yet
     assert a1["active"] is False
+    assert a1["systemId"] is None
+    # the tag names the cell its anchor masks index
+    assert response.body["status"][str(DEVICE_SYSID)]["cell"] == "default"
     # origin + NED projected to global
     assert a1["position"]["lat"] == pytest.approx(41.3900898)
     assert a1["position"]["lon"] == pytest.approx(2.1501197)
@@ -457,7 +461,11 @@ async def test_site_anchor_active_when_anchor_device_online(
     response = await extension._handle_RTLS_INF(message, None, hub)
     anchors = {a["id"]: a for a in response.body["anchors"]}
     assert anchors["rtls::default::anchor_1"]["active"] is True
+    assert anchors["rtls::default::anchor_1"]["systemId"] == 102
     assert anchors["rtls::default::anchor_0"]["active"] is False
+    assert anchors["rtls::default::anchor_0"]["systemId"] is None
+    # only a tag carries a cell
+    assert "cell" not in response.body["status"]["102"]
 
 
 async def test_param_cache_registers_configured_anchors_as_beacons(extension, device):
@@ -3159,7 +3167,7 @@ async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder,
     )
     cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     drifted = list(FLEET_DISTANCES)
-    drifted[0] += 0.05  # AN1's tripod moved 5 cm for this tag only
+    drifted[0] += 0.08  # AN1's tripod moved 8 cm for this tag only
     extension._stats[DEVICE_SYSID + 1]["geometryDistancesM"] = drifted
 
     response = await verify_message(extension, builder, hub)
@@ -3249,6 +3257,88 @@ def test_stats_json_without_geometry_omits_the_fields():
     assert body["geometryDistancesM"] == [8.0, 9.0, 12.0, None, None, None, None]
 
 
+def test_stats_json_carries_link_quality_and_wifi():
+    body = _stats_json(
+        7,
+        {
+            **FULL_STATS,
+            "urssi": -81.53,
+            "nlosmask": 4.0,
+            "outmask": 32.0,
+            "rmse": 0.04213,
+            "rssi": -61.0,
+            "wdisc": 2.0,
+        },
+    )
+    assert body["uwbRssiDbm"] == -81.5
+    assert body["nlosMask"] == 4
+    assert body["outvotedMask"] == 32
+    assert body["residualRmsM"] == 0.0421
+    assert body["wifiRssiDbm"] == -61
+    assert body["wifiDisconnects"] == 2
+
+
+def test_stats_json_link_quality_sentinels_are_null():
+    # urssi 0: no row carried a reading; rmse -1: no solve in the interval
+    body = _stats_json(7, {**FULL_STATS, "urssi": 0.0, "rmse": -1.0})
+    assert body["uwbRssiDbm"] is None
+    assert body["residualRmsM"] is None
+
+
+def test_stats_json_without_link_quality_omits_the_fields():
+    body = _stats_json(7, dict(FULL_STATS))
+    for key in (
+        "uwbRssiDbm",
+        "nlosMask",
+        "outvotedMask",
+        "residualRmsM",
+        "wifiRssiDbm",
+        "wifiDisconnects",
+    ):
+        assert key not in body
+
+
+async def test_stats_carry_the_paired_drones_imu_temperatures(
+    extension, device, builder, hub
+):
+    _claim_flight_controller(device, 5, 1)
+    await discover(extension, device)
+    _set_uav_ids(extension, {5: "05"})
+    extension._refresh_uav_map()
+    temperatures = {"05": [41.5, None]}
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: temperatures.get(uav_id, [])
+    )
+
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert response.body["stats"][str(DEVICE_SYSID)]["imuTemperaturesC"] == [
+        41.5,
+        None,
+    ]
+
+    # no reading from the drone: the field is left out, not an empty list
+    temperatures.clear()
+    await _feed_stats(extension, device, FULL_STATS, now=1.0)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "imuTemperaturesC" not in response.body["stats"][str(DEVICE_SYSID)]
+
+
+async def test_stats_without_a_paired_drone_omit_imu_temperatures(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: [40.0]
+    )
+
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "imuTemperaturesC" not in response.body["stats"][str(DEVICE_SYSID)]
+
+
 async def test_geom_agreeing_fleet(extension, device, dialect, builder, hub):
     add_rtls_cell_params(device)
     second = make_second_tag(dialect)
@@ -3297,7 +3387,7 @@ async def test_geom_flags_a_deviating_tag_and_names_the_distance(
     await _feed_stats(
         extension,
         second,
-        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.05},
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
         now=time.monotonic(),
     )
 
@@ -3309,7 +3399,26 @@ async def test_geom_flags_a_deviating_tag_and_names_the_distance(
     assert deviating["status"] == "deviates"
     assert set(deviating["deviations"]) == {"AN0-AN1"}
     assert "AN0-AN1" in deviating["detail"]
+    assert "recalibrate" in deviating["detail"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
+
+    # a tag that fitted later than the fleet differs by the session's
+    # shift (centimetres); the default tolerance accepts it
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.03},
+        now=time.monotonic(),
+    )
+    response = await geom_message(extension, builder, hub)
+    assert response.body["consistent"] is True
+    assert response.body["tolerance"] == 0.05
+    await _feed_stats(
+        extension,
+        second,
+        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
+        now=time.monotonic(),
+    )
 
     # a wider tolerance accepts it
     response = await geom_message(extension, builder, hub, {"tolerance": 0.1})
@@ -3414,26 +3523,64 @@ async def test_geom_flags_live_drift_as_blocking(
     )
     cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
     await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    # same fit, but this tag's live distances moved 5 cm since (a tripod)
+    # same fit, but this tag's live distances moved 12 cm since (a tripod)
     await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+        extension, second, {**GEOM_STATS, "gdrift": 0.12}, now=time.monotonic()
     )
 
     response = await geom_message(extension, builder, hub)
     body = response.body
     assert body["consistent"] is False
+    assert body["driftTolerance"] == 0.08
     drifted = body["devices"][str(DEVICE_SYSID + 1)]
     assert drifted["status"] == "drifted"
-    assert "5.0 cm" in drifted["detail"]
+    assert "12.0 cm" in drifted["detail"]
     assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
 
     # the verify rule blocks on it too
     wire_verify_fleet(extension, device, dialect)
-    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.05
+    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.12
     response = await verify_message(extension, builder, hub)
     rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
     assert rule["status"] == "fail"
     assert "moved" in rule["detail"]
+
+
+async def test_geom_accepts_centimetres_of_drift(
+    extension, device, dialect, builder, hub
+):
+    """Warm-up and people around the rig move the live distances by a few
+    centimetres; only a moved tripod (decimetres) blocks, whatever the
+    agreement tolerance."""
+    add_rtls_cell_params(device)
+    second = make_second_tag(dialect)
+    wire_devices(extension, device, second)
+    await discover(extension, device)
+    await extension._process_datagram(
+        second.heartbeat(), second.address, time.monotonic()
+    )
+    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
+    )
+
+    for tolerance in (0.001, 0.02, 0.5):
+        response = await geom_message(extension, builder, hub, {"tolerance": tolerance})
+        assert response.body["consistent"] is True
+        assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+
+    # the bound itself is accepted; a request tolerance does not move it
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.08}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
+    await _feed_stats(
+        extension, second, {**GEOM_STATS, "gdrift": 0.081}, now=time.monotonic()
+    )
+    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
+    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "drifted"
 
 
 async def test_geom_needs_the_live_drift(extension, device, builder, hub):
@@ -3688,3 +3835,174 @@ async def test_geom_reports_requested_ids_that_are_not_online(
     body = response.body
     assert body["consistent"] is False
     assert body["devices"]["77"]["status"] == "missing"
+
+
+# ---- anchors rendered from the tag's own fit ----------------------------
+
+
+def test_fitted_anchor_positions_follow_the_convention():
+    from flockwave.server.ext.rtls.fitted_cell import fitted_anchor_positions
+
+    d1, d2, d3, h, d5, d6, d7 = FLEET_DISTANCES
+    stats = {"geometryState": 3, "geometryDistancesM": list(FLEET_DISTANCES)}
+    positions = fitted_anchor_positions(stats)
+    assert positions is not None and len(positions) == 8
+    assert positions[:4] == [
+        (0.0, 0.0, 0.0),
+        (d1, 0.0, 0.0),
+        (0.0, d2, 0.0),
+        (d1, d2, 0.0),
+    ]
+    y6 = math.sqrt(d6**2 - h**2)
+    assert positions[4] == (0.0, 0.0, -h)
+    assert positions[5] == pytest.approx((math.sqrt(d5**2 - h**2), 0.0, -h))
+    assert positions[6] == pytest.approx((0.0, y6, -h))
+    assert positions[7] == pytest.approx((math.sqrt(d7**2 - h**2 - y6**2), y6, -h))
+
+    # a four-anchor cell reports the bottom plane only
+    four = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3] + [None] * 4}
+    assert fitted_anchor_positions(four) == positions[:4]
+    # no applied fit, or an incomplete one: nothing to render
+    assert fitted_anchor_positions({**stats, "geometryState": 2}) is None
+    assert fitted_anchor_positions(None) is None
+    partial = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3, h, None, d6, d7]}
+    assert fitted_anchor_positions(partial) is None
+
+
+def add_four_anchor_cell_params(device):
+    """A tag whose provisioned UWB_AN* table is stale (not the rig it
+    fits): four anchors on a 1 m square."""
+    add_rtls_cell_params(device)
+    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
+    for index, (x, y) in enumerate(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0))):
+        for suffix, value, param_type in (
+            ("X", x, "real32"),
+            ("Y", y, "real32"),
+            ("Z", 0.0, "real32"),
+            ("MAC", index + 1, "uint16"),
+            ("BIAS_M", 0.0, "real32"),
+        ):
+            set_fake_param(device, f"UWB_AN{index}_{suffix}", value, param_type)
+
+
+async def test_anchors_render_from_the_tag_fit(extension, device, builder, hub):
+    add_four_anchor_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+
+    async def site_anchors():
+        message = make_message(builder, {"type": "X-RTLS-INF"})
+        response = await extension._handle_RTLS_INF(message, None, hub)
+        return {a["index"]: a for a in response.body["anchors"]}
+
+    # no fit yet: the provisioned table
+    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
+
+    d1, d2, d3 = FLEET_DISTANCES[:3]
+    fit = {**FULL_STATS, "geom": 3.0, "gd1": d1, "gd2": d2, "gd3": d3}
+    fit.update({f"gd{i}": 0.0 for i in range(4, 8)})
+    await _feed_stats(extension, device, fit, now=time.monotonic())
+
+    anchors = await site_anchors()
+    assert anchors[1]["ned"] == {"north": d1, "east": 0.0, "down": 0.0}
+    assert anchors[3]["ned"] == {"north": d1, "east": d2, "down": 0.0}
+    assert anchors[3]["mac"] == 4  # slot identity still from the params
+    beacon = extension._beacon_api.beacons["rtls::default::anchor_3"]
+    lat, lon, _ = ned_to_global_e7_for_test(d1, d2)
+    assert beacon.position.lat == pytest.approx(lat)
+    assert beacon.position.lon == pytest.approx(lon)
+
+    # the fit goes away (recalibrating): back to the provisioned table
+    await _feed_stats(extension, device, {"geom": 2.0}, now=time.monotonic())
+    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
+
+
+def ned_to_global_e7_for_test(north, east):
+    from flockwave.server.ext.rtls.cell_compat import ned_to_global_e7
+
+    origin = SimpleNamespace(
+        lat_e7=413900000, lon_e7=21500000, alt_mm=10000, lat_deg=41.39
+    )
+    lat_e7, lon_e7, alt_mm = ned_to_global_e7(origin, north, east, 0.0)
+    return lat_e7 * 1e-7, lon_e7 * 1e-7, alt_mm * 1e-3
+
+
+# ---- one health report per datagram ---------------------------------------
+
+
+def _bundle(device, values):
+    """A whole health report in one datagram, as the firmware sends it."""
+    return b"".join(device.named_value_float(n, v) for n, v in values.items())
+
+
+BUNDLED_REPORT = {**FULL_STATS, "urssi": -81.5, "rmse": 0.025}
+
+
+async def test_a_bundled_report_is_handled_once(extension, device):
+    _claim_flight_controller(device, 5, 1)
+    await discover(extension, device)
+    _set_uav_ids(extension, {5: "05"})
+    extension._refresh_uav_map()
+    joins = []
+    extension._mavlink_api = SimpleNamespace(
+        loaded=True, get_imu_temperatures=lambda uav_id: joins.append(uav_id) or [40.0]
+    )
+
+    await extension._process_datagram(
+        _bundle(device, BUNDLED_REPORT), device.address, 0.0
+    )
+
+    assert joins == ["05"]
+    stats = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert len(stats) == 1
+    entry = stats[0]["stats"][str(DEVICE_SYSID)]
+    # the fields after the required set ride the same, first broadcast
+    assert entry["uwbRssiDbm"] == -81.5
+    assert entry["residualRmsM"] == 0.025
+    assert entry["imuTemperaturesC"] == [40.0]
+
+
+async def test_a_report_inside_the_window_is_cached_then_flushed_once(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    await extension._process_datagram(
+        _bundle(device, BUNDLED_REPORT), device.address, 0.0
+    )
+    newer = {**BUNDLED_REPORT, "rate": 9.0}
+    await extension._process_datagram(_bundle(device, newer), device.address, 0.5)
+
+    def stats_broadcasts():
+        return [
+            b
+            for b in extension.app.message_hub.broadcasts
+            if b["type"] == "X-RTLS-STATS"
+        ]
+
+    assert len(stats_broadcasts()) == 1
+    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert response.body["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 9.0
+
+    await extension._flush_pending_stats(now=1.0)
+    await extension._flush_pending_stats(now=2.5)
+    assert len(stats_broadcasts()) == 2
+    assert stats_broadcasts()[-1]["stats"][str(DEVICE_SYSID)]["solveRateHz"] == 9.0
+
+
+async def test_watchers_get_one_stats_event_per_report(extension, device):
+    await discover(extension, device)
+    with extension._subscribed_events() as events:
+        await extension._process_datagram(
+            _bundle(device, BUNDLED_REPORT), device.address, 0.0
+        )
+        kinds = []
+        while True:
+            try:
+                kinds.append(events.receive_nowait().kind)
+            except trio.WouldBlock:
+                break
+
+    assert kinds.count("stats") == 1
