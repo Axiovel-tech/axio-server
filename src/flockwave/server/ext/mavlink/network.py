@@ -507,6 +507,11 @@ class MAVLinkNetwork:
         from its wireless stations, so a command for the whole fleet, the
         stop commands of a show among them, would be lost without a word.
 
+        Each UAV gets the broadcast itself, still addressed to all systems:
+        the drone treats a message addressed to it differently. A light
+        effect addressed to one drone takes precedence over one for the
+        whole fleet, and only a fleet-wide one is synchronized across drones.
+
         Parameters:
             spec: the specification of the MAVLink message to send
             channel: specifies the channel that the packet should be sent on;
@@ -523,10 +528,16 @@ class MAVLinkNetwork:
             error = ex
 
         reached = False
-        for uav in list(self._uav_addresses):
+        for uav, address in list(self._uav_addresses.items()):
+            message_type, fields = spec
+            copy = (
+                message_type,
+                {**fields, "_mavlink_version": uav.mavlink_version},
+            )
             try:
-                # A copy, because send_packet() writes the target into it
-                await self.send_packet((spec[0], dict(spec[1])), uav, channel=channel)
+                await self.manager.send_packet(
+                    copy, (channel or Channel.PRIMARY, address)
+                )
                 reached = True
             except Exception:
                 # A UAV that misses this one is still sent the others

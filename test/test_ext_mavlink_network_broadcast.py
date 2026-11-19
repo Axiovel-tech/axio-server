@@ -5,7 +5,10 @@ from pytest import raises
 from flockwave.server.ext.mavlink.channel import Channel
 from flockwave.server.ext.mavlink.enums import MAVCommand
 from flockwave.server.ext.mavlink.network import MAVLinkNetwork
-from flockwave.server.ext.mavlink.packets import create_show_schedule_packet
+from flockwave.server.ext.mavlink.packets import (
+    create_led_control_packet,
+    create_show_schedule_packet,
+)
 from flockwave.server.ext.mavlink.types import spec as message
 
 
@@ -41,12 +44,6 @@ def make_network(system_ids=(7, 8), *, broadcast_error=None, unreachable=()):
             broadcast_packet=broadcast_packet, send_packet=send_packet
         ),
     )
-    network.send_packet = lambda spec, target, **kwds: MAVLinkNetwork.send_packet(
-        network,  # type: ignore[arg-type]
-        spec,
-        target,
-        **kwds,
-    )
     return network, sent
 
 
@@ -67,13 +64,15 @@ async def test_a_broadcast_also_goes_to_every_drone_on_its_own_address():
         ("192.0.2.7", Channel.SHOW_CONTROL),
         ("192.0.2.8", Channel.SHOW_CONTROL),
     ]
-    # The broadcast addresses every system, each other copy its own drone
+    # Every copy is still addressed to all systems: a drone treats a message
+    # addressed to it differently (light effects take precedence, flashes are
+    # not synchronized)
     targets = [
         (fields["target_system"], fields["target_component"])
         for _, (_, fields), _ in sent
     ]
-    assert targets == [(0, 0), (7, 1), (8, 1)]
-    assert spec[1]["target_system"] == 0
+    assert targets == [(0, 0), (0, 0), (0, 0)]
+    assert "_mavlink_version" not in spec[1]
 
 
 async def test_a_custom_data_packet_goes_to_every_drone_without_a_target():
@@ -125,3 +124,13 @@ async def test_a_broadcast_without_drones_is_only_broadcast():
     await MAVLinkNetwork.broadcast_packet(network, land_all())  # type: ignore[arg-type]
 
     assert [to for to, _, _ in sent] == ["broadcast"]
+
+
+async def test_a_fleet_light_effect_stays_a_fleet_light_effect():
+    network, sent = make_network()
+
+    await MAVLinkNetwork.broadcast_packet(  # type: ignore[arg-type]
+        network, create_led_control_packet([255, 0, 0, 0x30, 0x75, 1], broadcast=True)
+    )
+
+    assert [fields["target_system"] for _, (_, fields), _ in sent] == [0, 0, 0]
