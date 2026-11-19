@@ -498,14 +498,42 @@ class MAVLinkNetwork:
     async def broadcast_packet(
         self, spec: MAVLinkMessageSpecification, channel: str | None = None
     ) -> None:
-        """Broadcasts a message to all UAVs in the network.
+        """Sends a message to all UAVs in the network: to the broadcast
+        address of the channel, and to every UAV on its own address.
+
+        The broadcast alone does not reach every UAV. A wireless bridge may
+        not listen on the broadcast port (the positioning tags' bridge to
+        their autopilots does not) and an access point may keep broadcasts
+        from its wireless stations, so a command for the whole fleet, the
+        stop commands of a show among them, would be lost without a word.
 
         Parameters:
             spec: the specification of the MAVLink message to send
             channel: specifies the channel that the packet should be sent on;
                 defaults to the primary channel of the network
+
+        Raises:
+            Exception: what the broadcast raised, if the message could not be
+                sent to any UAV on its own address either
         """
-        await self.manager.broadcast_packet(spec, destination=channel)
+        error: Exception | None = None
+        try:
+            await self.manager.broadcast_packet(spec, destination=channel)
+        except Exception as ex:
+            error = ex
+
+        reached = False
+        for uav in list(self._uav_addresses):
+            try:
+                # A copy, because send_packet() writes the target into it
+                await self.send_packet((spec[0], dict(spec[1])), uav, channel=channel)
+                reached = True
+            except Exception:
+                # A UAV that misses this one is still sent the others
+                pass
+
+        if error is not None and not reached:
+            raise error
 
     def enqueue_rc_override_packet(self, spec: MAVLinkMessageSpecification) -> None:
         """Enqueues a message containing a MAVLink RC override packet to the network,
