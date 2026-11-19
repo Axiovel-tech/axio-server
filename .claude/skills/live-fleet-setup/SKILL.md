@@ -77,11 +77,12 @@ reboot). Set + verify readback + reboot, in that order.
 
 ## RTLS device management
 
-The rtls ext (see `etc/conf/axio-rtls-indoor.jsonc`) lists device mgmt
-addresses (port 3333). A board's address is fixed: its `NET_PREFIX` /24
-plus its `MAV_SYS_ID`. Every board streams its management telemetry to
-`MGMT_HOST:MGMT_PORT` (3343) from boot, which is where the ext binds its
-management socket (`listen_port`). Device roster (stable): anchors sysid
+A board's address is fixed: its `NET_PREFIX` /24 plus its `MAV_SYS_ID`.
+Every board streams its management telemetry to `MGMT_HOST:MGMT_PORT`
+(3343) from boot, which is where the rtls ext binds its management socket
+(`listen_port`), so boards are found without a device list. The optional
+`devices` list (mgmt port 3333) only covers boards with a wrong
+`MGMT_HOST` or whose stream another client took. Device roster (stable): anchors sysid
 101–108, tags/drones 19x–200.
 
 ## Launch recipe

@@ -361,6 +361,19 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
     assert response.body == {"type": "X-RTLS-INF", "status": {}, "anchors": []}
 
 
+async def test_unlisted_board_is_found_from_its_stream(dialect, device):
+    ext = RtlsExtension()
+    ext._protocol = RtlsProtocol(dialect, targets=[])
+    ext.app = StubApp()
+    ext._send = lambda payload, address: trio.lowlevel.checkpoint()
+
+    await ext._process_datagram(device.heartbeat(), device.address, time.monotonic())
+
+    assert device.system_id in ext._protocol.devices
+    polled = ext._protocol.poll(time.monotonic() + 60)
+    assert device.address in [address for _, address in polled]
+
+
 async def test_inf_lists_discovered_devices(extension, device, builder, hub):
     await discover(extension, device)
 

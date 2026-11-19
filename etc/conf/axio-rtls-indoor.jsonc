@@ -11,32 +11,13 @@
     },
 
 
-    // RTLS-Link devices (anchors + tags) for the RTLS panel. A board's
-    // address is its NET_PREFIX plus its sysid (the last octet); the boards
-    // stream to this host's MGMT_HOST:MGMT_PORT, the default listen_port.
+    // RTLS-Link devices (anchors + tags) for the RTLS panel. The boards
+    // stream to this host's MGMT_HOST:MGMT_PORT (the default listen_port)
+    // from boot and are found from that stream; "devices" lists only boards
+    // to heartbeat from startup (a wrong MGMT_HOST, or a stream another
+    // client took while the server was down).
     "rtls": {
-      "enabled": true,
-      "devices": [
-        "192.168.0.101",
-        "192.168.0.102",
-        "192.168.0.103",
-        "192.168.0.104",
-        "192.168.0.105",
-        "192.168.0.106",
-        "192.168.0.107",
-        "192.168.0.108",
-        "192.168.0.194",
-        "192.168.0.197",
-        "192.168.0.198",
-        "192.168.0.200",
-        "192.168.0.220",
-        "192.168.0.221",
-        "192.168.0.222",
-        "192.168.0.223",
-        "192.168.0.224",
-        "192.168.0.225",
-        "192.168.0.250"
-      ]
+      "enabled": true
     },
     // MAVLink-based drones via the RTLS-Link UART bridge
     "mavlink": {

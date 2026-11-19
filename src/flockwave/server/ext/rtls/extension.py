@@ -389,8 +389,8 @@ class RtlsExtension(Extension):
         )
 
         logger.info(
-            f"rtls: managing {len(targets)} devices on UDP :{port}, "
-            f"listening on UDP :{sock.getsockname()[1]}"
+            f"rtls: listening for board streams on UDP :{sock.getsockname()[1]}, "
+            f"{len(targets)} listed devices heartbeated on UDP :{port}"
         )
 
         try:
@@ -2570,7 +2570,8 @@ schema = {
         },
         "devices": {
             "type": "array",
-            "title": "Device management addresses",
+            "title": "Device management addresses to heartbeat from startup; "
+            "boards streaming to listen_port are found without them",
             "items": {"type": "string"},
             "default": [],
         },

@@ -4,17 +4,21 @@ Manages rtls-link UWB positioning devices over their management UDP
 channel (MAVLink 2, default port 3333) and exposes them to Axio
 clients through the server's message hub:
 
-- **Discovery / presence**: the extension knows the boards only from
-  its configured `devices` (a board's address is its `NET_PREFIX` plus
-  its `MAV_SYS_ID`). Every board streams its management telemetry
-  (heartbeats on component id 197, stats, and every few seconds its
-  uptime and, on tags, `FC_SYS_ID` / `FC_STATE`) to its
+- **Discovery / presence**: every board streams its management
+  telemetry (heartbeats on component id 197, stats, and every few
+  seconds its uptime and, on tags, `FC_SYS_ID` / `FC_STATE`) to its
   `MGMT_HOST:MGMT_PORT` from boot, and answers each request at the
   request's source. The extension binds its one management socket to
-  `listen_port` (default 3343, the firmware's `MGMT_PORT` default), so
-  streams and replies arrive together; it still sends GCS heartbeats to
-  the configured `devices`. Devices are tracked with a liveness timeout,
-  and their full parameter list is fetched automatically on discovery.
+  `listen_port` (default 3343, the firmware's `MGMT_PORT` default), so a
+  board is found from its first streamed heartbeat at whatever address
+  it has (its `NET_PREFIX` plus its `MAV_SYS_ID`), and from then on gets
+  GCS heartbeats. The optional `devices` list is heartbeated from
+  startup; it reaches boards that never stream here: a wrong
+  `MGMT_HOST`, or a stream another client (a CLI, a second laptop) took
+  while the server was silent past the firmware's peer hold, since the
+  board keeps streaming to that client until someone else speaks.
+  Devices are tracked with a liveness timeout, and their full parameter
+  list is fetched automatically on discovery.
 - **Configuration**: PARAM_EXT list/read/set against the device's
   parameter registry (an accepted set persists on the device).
 - **Telemetry**: the firmware's unsolicited health stats are cached and
@@ -87,7 +91,7 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 "EXTENSIONS": {
   "rtls": {
     "port": 3333,                      // the devices' management port
-    "devices": ["192.168.4.1"],        // management addresses
+    "devices": [],                     // optional: addresses to heartbeat from startup
     "listen_port": 3343,               // the devices' MGMT_PORT
     "register_beacons": true           // anchors as map beacons (see X-RTLS-INF)
   }
