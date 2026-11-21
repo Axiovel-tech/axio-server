@@ -3,10 +3,10 @@
 
 # Axio Server
 
-> **Axiovel status:** this fork is the current production Axio Server. It
-> receives per-UAV `__show_upload` commands from the Control GUI App, compiles
-> `.skyb`, and uploads shows to AVCopter over MAVFTP. AV-Desktop is maintained
-> separately as an experimental successor candidate.
+> **Axiovel status:** this fork is Axiovel's production ground server. Control
+> sends it each drone's show as a `.skyc` (`__show_upload`, compiled to
+> `.skyb`) or a `.gdm` (`__gdm_upload`, the engine's `.gdmb` validated), and
+> the server uploads it to AVCopter's show slot over MAVFTP.
 
 Axio Server is the server component behind the Axio ecosystem; it handles
 communication channels to drones and provides an abstraction layer on top of them
@@ -23,55 +23,22 @@ extend the functionality of the server.
 
 ## About this fork (axio-server)
 
-This repository is Axiovel's fork of Skybrush Server with built-in support
-for the rtls-link UWB indoor positioning system:
-
-- **`rtls` extension** — manages rtls-link devices over their MAVLink
-  management channel (discovery/presence, parameters, sleep/wake, OTA,
-  health and position telemetry, anchor beacons) and estimates the UWB
-  cluster clock that the drones count the show start in. See
-  [`src/flockwave/server/ext/rtls/README.md`](src/flockwave/server/ext/rtls/README.md)
-  for the full client message API (`X-RTLS-*`) and configuration. The
-  extension is *not* in the default extension list; enable it in your
-  configuration file.
-- **Show start in cluster time** — drones whose firmware counts the show
-  in UWB cluster time (`SHOW_SYNC_MODE` 2) get the start from the `mavlink`
-  extension as an `AXIO_SHOW_SCHEDULE` packet (cluster microseconds under a
-  schedule ID that changes whenever the operator sets, moves or clears the
-  start), broadcast next to `START_CONFIG` every second, every 0.2 s in the
-  last 15 s before the start and at once on a change. They echo it back;
-  a drone whose echo disagrees gets it individually, never as
-  `SHOW_START_TIME` parameters. From the show's point of no return (T−12 s, 2 s before the drones freeze their start)
-  to its end the start is locked: `SHOW-SETCFG` refuses to move it, and
-  clearing it is the abort.
-- **`timecode` extension** — an SMPTE timecode clock registered under the
-  id `mtc`, so a show can be scheduled on and follow the master timecode of
-  a larger production. `source` selects the input: `ltc_audio` decodes LTC
-  from an audio input channel (`device`, `channel`, `fps`), `udp` receives
-  one `HH:MM:SS:FF` timecode per datagram (`port`, 5005 by default). From
-  the show's point of no return (T−12 s) to its end, the show clock
-  freewheels on the server clock: a timecode dropout or jump is logged and
-  reported to the operator but never stops or moves a running show.
-  `ltc_audio` needs the PortAudio library (`sudo apt install libportaudio2`)
-  and precise ADC timestamps, which PortAudio's ALSA devices provide. On a
-  PipeWire desktop use the `default` (or `pipewire`) device with the LTC
-  interface as the system's default input and `sample_rate` set to the
-  graph rate (48000 by default); PortAudio's PulseAudio devices time
-  blocks only to tens of milliseconds.
-- **`show_audio` extension** — plays the show music from the `.skyc` on an
-  audio output of the server host, sample-aligned with the show clock. It
-  needs the system PortAudio library; see
-  [`src/flockwave/server/ext/show_audio/README.md`](src/flockwave/server/ext/show_audio/README.md).
-- **`axio-fc-logs`** — verified, resumable flight-controller log collection
-  through the server's MAVLink link or a direct USB link. See
-  [`src/flockwave/server/ext/mavlink/log_collection/README.md`](src/flockwave/server/ext/mavlink/log_collection/README.md).
+Axiovel's fork adds rtls-link UWB device management, show upload in the `.gdm`
+format, the show start in UWB cluster time, show music and timecode, fleet
+health and flight-controller log collection. [`AXIOVEL.md`](AXIOVEL.md) maps
+each to its code and to the cross-repo contracts.
 
 [`etc/conf/axio-rtls-indoor.jsonc`](etc/conf/axio-rtls-indoor.jsonc) is the
-reference configuration for indoor shows. The MAVLink ingest convention for
-real fleets is a **single shared UDP 14550 listener**: every rtls-link tag
-bridges its flight controller's MAVLink stream to the server host on port
-14550 (the `mavlink` extension's `default` connection), so no per-drone
-ports or endpoints are configured.
+reference configuration for indoor shows.
+
+### Timecode input
+
+The `timecode` extension's `ltc_audio` source needs the PortAudio library
+(`sudo apt install libportaudio2`) and precise ADC timestamps, which
+PortAudio's ALSA devices provide. On a PipeWire desktop use the `default` (or
+`pipewire`) device with the LTC interface as the system's default input and
+`sample_rate` set to the graph rate (48000 by default); PortAudio's PulseAudio
+devices time blocks only to tens of milliseconds.
 
 ## Installation
 
@@ -95,18 +62,9 @@ ports or endpoints are configured.
 
 ## Development
 
-This project contains both public and private dependencies in `pyproject.toml`.
-Public dependencies are either on PyPI or in our public PyPI index at
-[Gemfury](https://gemfury.com). Private dependencies hosted in our private
-PyPI index are _not_ required to build the community version of Axio Server.
-
-However, if you are working with the project on your own and make any changes to
-`pyproject.toml` that would necessitate the regeneration of the lockfile of
-`uv` (i.e. `uv.lock`), `uv` itself may attempt to connect to our private package
-index as it needs information about _all_ dependencies to generate a consistent
-lockfile. In this case, you should remove all the dependencies from
-`pyproject.toml` that are pinned to the `collmot` package index -- these are
-the ones in the `pro` or `collmot` extras.
+Dependencies come from PyPI, Skybrush's public Gemfury index (`[tool.uv.index]`
+in `pyproject.toml`) and, for the `rtls-link` SDK, Axiovel's rtls-link-zephyr
+repository on GitHub, pinned by commit.
 
 ## License
 

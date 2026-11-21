@@ -3355,6 +3355,34 @@ async def test_geom_names_why_a_tag_rejected_the_rig(extension, device, builder,
     assert response.body["consistent"] is False
 
 
+@pytest.mark.parametrize(
+    "code,phrase",
+    [
+        (2, "fewer than 64 distance samples"),
+        (5, "does not mirror the bottom one"),
+    ],
+)
+async def test_geom_failure_reasons_match_the_firmware(
+    extension, device, builder, hub, code, phrase
+):
+    """The texts say what rtls-link-zephyr's auto_geometry.hpp ``Reason``
+    means: 2 is an anchor short of samples at the timeout, not one never
+    heard; 5 is a top rectangle that does not mirror the bottom one."""
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    await _feed_stats(
+        extension,
+        device,
+        {**FULL_STATS, "geom": 4.0, "gfail": float(code), "gdrift": 0.0},
+        now=time.monotonic(),
+    )
+
+    response = await geom_message(extension, builder, hub)
+    entry = response.body["devices"][str(DEVICE_SYSID)]
+    assert entry["reason"] == code
+    assert phrase in entry["detail"]
+
+
 async def test_geom_ids_filter_and_validation(extension, device, dialect, builder, hub):
     add_rtls_cell_params(device)
     second = make_second_tag(dialect)
