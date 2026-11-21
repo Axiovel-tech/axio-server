@@ -4455,10 +4455,13 @@ class FakeAnchor(FakeDevice):
         reboot_s=9.0,
         in_place_sleep=False,
         reports_power_state=False,
+        sleep_value=None,
     ):
         super().__init__(dialect)
         set_fake_param(self, "UWB_ROLE", 3, "uint8")
-        self.params["SLEEP"] = (bytes([1 if standby else 0]), PARAM_TYPE_UINT8)
+        if sleep_value is None:
+            sleep_value = 1 if standby else 0
+        self.params["SLEEP"] = (bytes([sleep_value]), PARAM_TYPE_UINT8)
         self.power = power or ("standby" if standby else "operating")
         self.in_place_sleep = in_place_sleep
         self.reports_power_state = reports_power_state
@@ -4907,7 +4910,8 @@ async def _power_sleep(dialect, builder, hub, anchor, sleeping, **body):
     async with trio.open_nursery() as nursery:
         nursery.start_soon(anchor.run, ext)
         await trio.sleep(1.5)
-        assert ext._power_state(DEVICE_SYSID) == anchor.power
+        if anchor.reports_power_state:
+            assert ext._power_state(DEVICE_SYSID) == anchor.power
         started = trio.current_time()
         entry = await _send_sleep(ext, builder, hub, sleeping, **body)
         elapsed = trio.current_time() - started
@@ -4974,3 +4978,44 @@ async def test_operating_anchor_sleeps_through_its_reboot(
     assert entry["accepted"] is True
     assert anchor.power == "asleep"
     assert elapsed >= anchor.reboot_s
+
+
+# ---- SLEEP 0..3 on anchors (rtls-link-zephyr#387) -----------------------
+
+
+@pytest.mark.parametrize("reports_power_state", [False, True])
+async def test_plain_standby_anchor_sleeps_in_place(
+    dialect, builder, hub, autojump_clock, sdk_with_power_state, reports_power_state
+):
+    # plain standby reads SLEEP 3; writing 1 moves it to asleep in place
+    anchor = FakeAnchor(
+        dialect,
+        standby=True,
+        sleep_value=3,
+        in_place_sleep=True,
+        reports_power_state=reports_power_state,
+    )
+
+    entry, elapsed = await _power_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True
+    assert entry["sleeping"] is True
+    assert anchor.power == "asleep"
+    assert anchor.reboot_at is None
+    assert elapsed < anchor.reboot_s
+
+
+async def test_plain_standby_is_not_asleep(dialect, builder, hub, autojump_clock):
+    # a standby anchor that keeps reading 3 after the write refused the
+    # sleep: standby is not asleep, even with STANDBY heartbeats
+    anchor = FakeAnchor(dialect, standby=True, sleep_value=3)
+    anchor.refuse_with = 3
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": False,
+        "sleeping": False,
+        "detail": "sleep refused by the anchor in its standby state",
+    }

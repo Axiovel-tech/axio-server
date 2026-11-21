@@ -1069,7 +1069,8 @@ class RtlsExtension(Extension):
                     return {
                         "requested": watch.expected,
                         "accepted": False,
-                        "sleeping": watch.readback != 0,
+                        # only 1 is asleep: 2 is off, 3 plain standby
+                        "sleeping": watch.readback == 1,
                         "detail": self._anchor_refusal(system_id, watch),
                     }
         if watch.awaits_reboot:
@@ -1087,13 +1088,15 @@ class RtlsExtension(Extension):
 
     def _anchor_refusal(self, system_id: int, watch: "_AnchorTransition") -> str:
         """Why an anchor refused a sleep/wake request, from the state its
-        SLEEP parameter reads back (0 awake, 1 standby, 2 off) and its last
-        stats."""
+        SLEEP parameter reads back (0 awake, 1 asleep, 2 off, 3 plain
+        standby) and its last stats."""
         stats = self._stats.get(system_id, {})
         if watch.readback == 2:
             return "refused: the anchor is off; only its button starts it again"
         if watch.expected:
-            state = stats.get("powerState")
+            state = stats.get("powerState") or (
+                "standby" if watch.readback == 3 else None
+            )
             return "sleep refused by the anchor" + (
                 f" in its {state} state" if state else ""
             )
@@ -2734,7 +2737,8 @@ class _AnchorTransition:
         """The anchor reports the requested state after the reboot its
         transition takes; a transition without one (standby to asleep, or
         already there) is confirmed by ``powerState`` alone, or, without
-        it, by the heartbeat with the request read back unchanged."""
+        it, by the heartbeat with the request read back unchanged (SLEEP 1
+        is asleep; plain standby reads 3 and never confirms a sleep)."""
         if not self.reached:
             return False
         if self.rebooted:

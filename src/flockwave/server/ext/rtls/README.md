@@ -378,8 +378,9 @@ The motivating case is `UWB_ROLE`, whose bounds are image-pinned
 parameter; flash/OTA the role-matched image instead. UIs should show
 `accepted: false` plus the returned value as "device rewrote this".
 
-`SLEEP` is NAKed unless the value is `0` or `1`: an anchor's `2` (off) is
-ended only by its button, so it is not a remote command.
+`SLEEP` is NAKed unless the value is `0` or `1`. An anchor reads `0`
+awake, `1` asleep, `2` off (ended only by its button) and `3` plain
+standby; `2` and `3` are not remote commands.
 
 Request — `paramType` may be omitted when the type is already known
 from an earlier listing (always the case after discovery):
