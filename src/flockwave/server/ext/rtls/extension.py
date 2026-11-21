@@ -18,6 +18,7 @@ import math
 import time
 from contextlib import contextmanager
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import trio
@@ -657,7 +658,7 @@ class RtlsExtension(Extension):
         self._lock_required_for_show = bool(
             configuration.get("lock_required_for_show", True)
         )
-        self._anchor_lock = AnchorLock(self.get_data_dir() / "anchor_lock.json")
+        self._anchor_lock = AnchorLock(self._anchor_lock_path(configuration))
         try:
             self._anchor_lock.load(
                 float(configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)),
@@ -665,6 +666,16 @@ class RtlsExtension(Extension):
             )
         except (OSError, ValueError) as ex:
             logger.warning(f"rtls: anchor lock state not restored: {ex}")
+
+    def _anchor_lock_path(self, configuration) -> Path:
+        """Where the lock state persists: the configured ``anchor_lock_file``,
+        else one file per advert listen port in the data directory, so the
+        servers one user runs (bench, sim instances) never share a lock."""
+        configured = configuration.get("anchor_lock_file")
+        if configured:
+            return Path(configured).expanduser()
+        listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
+        return self.get_data_dir() / f"anchor_lock-{listen_port}.json"
 
     def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache one inter-anchor TWR sample (decoded by the SDK from the
@@ -3157,6 +3168,11 @@ schema = {
             "type": "boolean",
             "title": "Register configured RTLS anchors as map beacons",
             "default": True,
+        },
+        "anchor_lock_file": {
+            "type": "string",
+            "title": "File the anchor cell lock persists in (default: "
+            "anchor_lock-<listen_port>.json in the extension's data directory)",
         },
         "lock_required_for_show": {
             "type": "boolean",

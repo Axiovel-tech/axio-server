@@ -333,8 +333,10 @@ Every response has the same shape:
   (or re-seal) with warnings or breaks pending and no
   `acknowledgeWarnings: true` returns `"warnings"` and does not lock.
 - `warnings`: the cell's warnings now. Codes: `no-anchors`, `offline`,
-  `a0-not-operating`, `a0-not-heard` (a responder's `rangingRateHz` is 0),
-  `low-battery`, `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
+  `a0-not-operating`, `not-operating` (a responder asleep, in standby or
+  any other state but operating), `a0-not-heard` (an operating responder's
+  `rangingRateHz` is 0), `low-battery` (low, or below its warning level; the
+  detail says which), `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
   config or hardware failure), `radio-restarts` and, on a re-seal,
   `missing` (a sealed member no longer known). `device` is a system id, or
   null for the cell.
@@ -368,8 +370,10 @@ and an anchor's entry in `X-RTLS-SLEEP` and `X-RTLS-FORGET` results
 A device of unknown role is classified by reading its `UWB_ROLE` first,
 and refused with "role unknown while anchors are locked" when that fails.
 
-The lock is kept across a server restart (`anchor_lock.json` in the
-extension's data directory).
+The lock is kept across a server restart, in `anchor_lock-<listen_port>.json`
+in the extension's data directory, so the servers one user runs (the bench
+and each sim instance) never share a lock; `anchor_lock_file` in the rtls
+configuration names another file.
 
 **Show gate.** `SHOW-SETCFG` is refused (with the reason) when it would
 authorize the show, or give an authorized show a new start, for a live or

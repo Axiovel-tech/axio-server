@@ -26,7 +26,7 @@ from rtlslink.dialect import load_dialect
 
 from flockwave.server.ext.rtls.anchor_lock import LOCKED_REASON, AnchorLock
 from flockwave.server.ext.rtls.anchor_lock_gate import lock_json
-from flockwave.server.ext.rtls.extension import AnchorsLocked
+from flockwave.server.ext.rtls.extension import AnchorsLocked, RtlsExtension
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -73,7 +73,7 @@ async def test_lock_a_healthy_cell(dialect, builder, hub):
 async def test_lock_with_warnings_needs_acknowledgement(dialect, builder, hub):
     ext, _ = await _cell(dialect)
     await ext._on_stats(201, HEALTHY_A0, 0.0)
-    await ext._on_stats(202, {**HEALTHY_A1, "lowbat": 1.0, "vbat": 6.81}, 0.0)
+    await ext._on_stats(202, {**HEALTHY_A1, "lowbat": 2.0, "vbat": 6.81}, 0.0)
 
     body = await _lock(ext, builder, hub)
     assert body["result"] == "warnings"
@@ -451,3 +451,34 @@ async def test_the_show_gate_verdict_rides_anchor_lock(dialect, builder, hub):
 
     empty, _ = await _cell(dialect, anchors=())
     assert lock_json(empty)["showGate"]["required"] is False
+
+
+def test_each_listen_port_has_its_own_lock_file(tmp_path):
+    from types import SimpleNamespace
+
+    ext = RtlsExtension()
+    ext.app = SimpleNamespace(dirs=SimpleNamespace(user_data_path=tmp_path))
+    bench = ext._anchor_lock_path({})
+    sim = ext._anchor_lock_path({"listen_port": 3443})
+    assert bench.name == "anchor_lock-3343.json"
+    assert sim.name == "anchor_lock-3443.json"
+    assert bench.parent == sim.parent
+    configured = tmp_path / "elsewhere" / "lock.json"
+    assert ext._anchor_lock_path({"anchor_lock_file": str(configured)}) == configured
+
+
+async def test_a_sleeping_responder_is_not_operating_and_a_warning_pack_is_low(
+    dialect, builder, hub
+):
+    ext, _ = await _cell(dialect)
+    await ext._on_stats(201, HEALTHY_A0, time.monotonic())
+    await ext._on_stats(
+        202, {**HEALTHY_A1, "pwrst": 3.0, "rnghz": 0.0, "lowbat": 1.0}, time.monotonic()
+    )
+
+    body = await _lock(ext, builder, hub, action="status")
+
+    assert [(w["code"], w["detail"]) for w in body["warnings"]] == [
+        ("not-operating", "RTLS anchor 202 is asleep"),
+        ("low-battery", "RTLS anchor 202: battery below its warning level"),
+    ]

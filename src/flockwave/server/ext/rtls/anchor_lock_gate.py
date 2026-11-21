@@ -95,10 +95,17 @@ def _anchor_warnings(anchor: AnchorView) -> list[LockWarning]:
     state = stats.get("powerState")
     if anchor["role"] == "anchor-initiator" and state not in (None, "operating"):
         found.append(("a0-not-operating", f"{name} (A0) is {state}"))
-    if anchor["role"] == "anchor-responder" and stats.get("rangingRateHz") == 0:
-        found.append(("a0-not-heard", f"{name} does not hear A0"))
+    if anchor["role"] == "anchor-responder":
+        if state not in (None, "operating"):
+            found.append(("not-operating", f"{name} is {state}"))
+        elif stats.get("rangingRateHz") == 0:
+            found.append(("a0-not-heard", f"{name} does not hear A0"))
     if stats.get("lowBattery"):
         found.append(("low-battery", f"{name}: low battery{_volts(stats)}"))
+    elif stats.get("batteryWarning"):
+        found.append(
+            ("low-battery", f"{name}: battery below its warning level{_volts(stats)}")
+        )
     if stats.get("moved"):
         found.append(("moved", f"{name} moved since it was placed"))
     if stats.get("uwbStatus") in UWB_START_REFUSED:
