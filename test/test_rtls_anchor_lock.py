@@ -263,3 +263,17 @@ async def test_the_lock_stat_arrives_through_the_sdk(dialect):
 
     assert ext._stats[203]["locked"] is True
     assert lock_json(ext)["locked"] is True
+
+
+async def test_a_board_without_a_power_path_locks(dialect, builder, hub):
+    # such a board reports only pwrst 5 (operating); that is enough
+    ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
+    anchor = devices[201]
+    await ext._process_datagram(
+        anchor.named_value_float("pwrst", 5.0), anchor.address, time.monotonic()
+    )
+
+    body = await _lock(ext, builder, hub)
+
+    assert (body["result"], body["reason"]) == ("locked", None)
+    assert _lock_param(anchor) == 1
