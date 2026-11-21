@@ -38,6 +38,10 @@ from rtlslink import (
 from rtlslink.dialect import load_dialect
 from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
+    ANCHOR_CHARGE_BLOCKS,
+    ANCHOR_CHARGE_PHASES,
+    ANCHOR_POWER_INPUTS,
+    ANCHOR_POWER_STATES,
     PARAM_ACK_ACCEPTED,
     PARAM_ACK_IN_PROGRESS,
 )
@@ -1391,7 +1395,9 @@ class RtlsExtension(Extension):
             self._handle_lost(event, known.get(event.system_id))
         return events
 
-    def _handle_lost(self, event: ProtocolEvent, device: Any = None) -> None:
+    def _handle_lost(
+        self, event: ProtocolEvent, device: RtlsDevice | None = None
+    ) -> None:
         """React to a device-``lost`` event: keep the device as last seen
         (listed offline in X-RTLS-INF) with its last stats marked stale, drop
         the live-only state (TWR telemetry, position stream, uptime, sleep
@@ -2167,7 +2173,6 @@ class RtlsExtension(Extension):
             "online": online,
             "address": list(device.address),
             "age": round(now - device.last_seen, 3),
-            "lastSeenAgeS": round(now - device.last_seen, 1),
             "firmwareVersion": firmware_version(device),
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
@@ -2710,47 +2715,17 @@ def _rounded(digits: int) -> Callable[[float], float]:
     return lambda value: round(value, digits)
 
 
-def _code_name(names: tuple[str, ...]) -> Callable[[float], str]:
+def _code_name(names: dict[int, str]) -> Callable[[float], str]:
     """Converter of a firmware state code (an exact small integer carried as
-    a float) to its name; any other value is ``"unknown"``."""
+    a float) to its name in one of the SDK's code tables; any other value is
+    ``"unknown"``."""
 
     def convert(value: float) -> str:
         code = int(value)
-        return names[code] if code == value and 0 <= code < len(names) else "unknown"
+        return names.get(code, "unknown") if code == value else "unknown"
 
     return convert
 
-
-#: anchor power states (``pwrst``), as the operator sees them
-POWER_STATES = (
-    "booting",
-    "preview",
-    "standby",
-    "asleep",
-    "off",
-    "operating",
-    "stopping",
-    "shutdown",
-    "fault",
-)
-#: classified power input (``pwrin``)
-POWER_INPUTS = ("unknown", "battery", "usb", "usb-1.5a", "usb-3a", "poe")
-#: charger state (``chg``)
-CHARGING_STATES = ("off", "idle", "cc", "cv", "topoff")
-#: why charging is off (``chgblk``, the firmware's ChargeBlock)
-CHARGE_BLOCKS = (
-    "none",
-    "no-profile",
-    "no-input",
-    "charger",
-    "gauge",
-    "temperature",
-    "gauge-inhibit",
-    "pack-voltage",
-    "charger-fault",
-    "overcurrent",
-    "stopping",
-)
 
 #: stats (wire name) carried 1:1 into the X-RTLS-STATS body (key, converter),
 #: each present only while its stat is. Non-finite values are dropped.
@@ -2763,10 +2738,10 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("ibat", "batteryCurrentA", _rounded(3)),
     ("btemp", "batteryTemperatureC", _rounded(1)),
     ("lowbat", "lowBattery", bool),
-    ("pwrst", "powerState", _code_name(POWER_STATES)),
-    ("pwrin", "powerInput", _code_name(POWER_INPUTS)),
-    ("chg", "charging", _code_name(CHARGING_STATES)),
-    ("chgblk", "chargeBlock", _code_name(CHARGE_BLOCKS)),
+    ("pwrst", "powerState", _code_name(ANCHOR_POWER_STATES)),
+    ("pwrin", "powerInput", _code_name(ANCHOR_POWER_INPUTS)),
+    ("chg", "charging", _code_name(ANCHOR_CHARGE_PHASES)),
+    ("chgblk", "chargeBlock", _code_name(ANCHOR_CHARGE_BLOCKS)),
     ("uwbst", "uwbStatus", int),
     ("rnghz", "rangingRateHz", _rounded(2)),
     ("urst", "radioRestarts", int),

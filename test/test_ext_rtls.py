@@ -1443,16 +1443,16 @@ async def test_lost_device_stays_listed_offline(extension, device, builder, hub)
     await discover(extension, device)
     entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
     assert entry["online"] is True
-    assert entry["lastSeenAgeS"] >= 0.0
+    assert entry["age"] >= 0.0
 
-    # the device goes silent past its timeout (axio-server#61)
+    # the device goes silent past its timeout
     events = extension._expire_devices(time.monotonic() + 1000)
     assert [event.kind for event in events] == ["lost"]
 
     entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
     assert entry["online"] is False
     later = extension._inf_status(time.monotonic() + 1000)[str(DEVICE_SYSID)]
-    assert later["lastSeenAgeS"] >= 999.0
+    assert later["age"] >= 999.0
     assert entry["role"] == "anchor-responder"
     assert entry["address"] == list(DEVICE_ADDRESS)
     # ...but nothing treats it as live

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import trio
 from rtlslink.client import UptimeSample
-from rtlslink.protocol import ANCHOR_POWER_STATES, ProtocolEvent
+from rtlslink.protocol import ProtocolEvent, RtlsDevice
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -37,9 +37,8 @@ MAV_STATE_ACTIVE = 4
 
 SLEEP_PARAM = "SLEEP"
 
-#: default deadline of an anchor's sleep/wake transaction, in seconds. An
-#: anchor that reboots is back on the network after 8-15 s; Control waits
-#: 30 s for the X-RTLS-SLEEP response.
+#: default deadline of an anchor's sleep/wake transaction, in seconds; an
+#: anchor that reboots is back on the network after 8-15 s
 ANCHOR_SLEEP_TIMEOUT = 25.0
 
 #: seconds after an accepted SLEEP write before it is read back: the firmware
@@ -72,7 +71,7 @@ def sleep_error(requested: bool, detail: str) -> dict[str, Any]:
     }
 
 
-def lacks_param(device, name: str) -> bool:
+def lacks_param(device: RtlsDevice, name: str) -> bool:
     """Whether a device's count-complete parameter snapshot proves it has
     no parameter ``name`` (an incomplete one proves nothing)."""
     return (
@@ -124,18 +123,16 @@ class AnchorTransition:
         self.already = initial == target
         self.needs_reboot = not self.already and "operating" in (initial, target)
 
-    def observe(self, event: ProtocolEvent, status: Optional[int]) -> None:
+    def observe(
+        self, event: ProtocolEvent, status: Optional[int], power_state: Optional[str]
+    ) -> None:
         """One event, with the anchor's system_status as the SDK holds it
-        (the event says only STANDBY or not; safe mode is neither)."""
+        (the event says only STANDBY or not; safe mode is neither) and its
+        ``powerState`` as the extension decoded it from the stats."""
         if event.system_id != self.system_id:
             return
-        if event.kind == "stats" and "pwrst" in event.data:
-            code = float(event.data["pwrst"])
-            self.power_state = (
-                ANCHOR_POWER_STATES.get(int(code), "unknown")
-                if code == int(code)
-                else "unknown"
-            )
+        if event.kind == "stats" and power_state is not None:
+            self.power_state = power_state
         elif event.kind in ("heartbeat", "discovered"):
             self.status = status
             # rediscovery: the anchor was off the network past its timeout
@@ -278,7 +275,11 @@ async def _await_transition(
         with trio.move_on_after(ANCHOR_PROBE_TIMEOUT):
             event = await events.receive()
             device = ext._require_protocol().devices.get(watch.system_id)
-            watch.observe(event, device.system_status if device else None)
+            watch.observe(
+                event,
+                device.system_status if device else None,
+                ext._power_state(watch.system_id),
+            )
     if outcome == "unverified":
         return {
             "requested": True,

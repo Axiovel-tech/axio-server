@@ -169,7 +169,6 @@ string), plus a site-level `anchors` list:
       "online": true,
       "address": ["192.168.4.42", 3333],
       "age": 0.52,
-      "lastSeenAgeS": 0.5,
       "firmwareVersion": "1.2.3",
       "uptimeMs": 123456,
       "paramCount": 23,
@@ -198,8 +197,7 @@ string), plus a site-level `anchors` list:
 }
 ```
 
-- `online` — `false` for a device that missed its liveness timeout
-  (axio-server#61). It stays listed with what it last reported (address,
+- `online` — `false` for a device that missed its liveness timeout. It stays listed with what it last reported (address,
   role, name, last `sleeping`) and its last stats stay answerable, marked
   `stale`, until an operator forgets it (`X-RTLS-FORGET`) or the server
   restarts; a device that returns is the same entry, `online: true` again,
@@ -208,7 +206,7 @@ string), plus a site-level `anchors` list:
   Nothing treats a lost device as live: it is no site anchor's `systemId`,
   no beacon is active for it, it pairs with no drone, and commands to it
   fail with "Device N is offline".
-- `age` / `lastSeenAgeS` — seconds since the last heartbeat from the device.
+- `age` — seconds since the last heartbeat from the device.
 - `firmwareVersion` — the `FW_VERSION` parameter if the device exposes
   one, otherwise `null`.
 - `uptimeMs` — device uptime in milliseconds, from the latest
@@ -559,7 +557,7 @@ whose `job` is `null` when the device never had a job):
 - `version` — version string of the uploaded image on success.
 - `error` — failure description when `status` is `"error"`.
 - `species` / `speciesSource` — the image's species and where it came
-  from (`"receipt"` or `"declared"`), both `null` for an unguarded upload.
+  from (`"receipt"` or `"declared"`).
 
 While a job runs, the server **broadcasts** `X-RTLS-OTA` notifications
 with the same body shape (no `refs` member, since they are not
