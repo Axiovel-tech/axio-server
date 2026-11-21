@@ -162,7 +162,18 @@ def add_anchor_device(extension, system_id, *, role, uwb_mac):
 async def test_inf_empty_before_discovery(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body == {"type": "X-RTLS-INF", "status": {}, "anchors": []}
+    assert response.body == {
+        "type": "X-RTLS-INF",
+        "status": {},
+        "anchors": [],
+        "anchorLock": {
+            "locked": False,
+            "lockedAt": None,
+            "anchors": [],
+            "acknowledgedWarnings": [],
+            "breaks": [],
+        },
+    }
 
 
 async def test_unlisted_board_is_found_from_its_stream(dialect, device):
@@ -2304,8 +2315,9 @@ class RunStubHub(StubMessageHub):
 
 
 class RunStubApp:
-    def __init__(self):
+    def __init__(self, data_path):
         self.message_hub = RunStubHub()
+        self.dirs = SimpleNamespace(user_data_path=data_path)
 
     def import_api(self, name):
         return StubBeaconAPI()
@@ -2319,12 +2331,12 @@ def _free_udp_port() -> int:
     return port
 
 
-async def test_run_binds_the_management_socket_to_listen_port():
+async def test_run_binds_the_management_socket_to_listen_port(tmp_path):
     """Board streams and replies to the server's own requests arrive on the
     one socket bound to listen_port."""
     port = _free_udp_port()
     ext = RtlsExtension()
-    ext.app = app = RunStubApp()
+    ext.app = app = RunStubApp(tmp_path)
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
@@ -2337,14 +2349,14 @@ async def test_run_binds_the_management_socket_to_listen_port():
         nursery.cancel_scope.cancel()
 
 
-async def test_run_fails_loudly_when_listen_port_is_taken():
+async def test_run_fails_loudly_when_listen_port_is_taken(tmp_path):
     """No SO_REUSEADDR: a second process on the port must stop the
     extension instead of silently splitting the boards' streams."""
     blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     blocker.bind(("0.0.0.0", 0))
     port = blocker.getsockname()[1]
     ext = RtlsExtension()
-    ext.app = app = RunStubApp()
+    ext.app = app = RunStubApp(tmp_path)
 
     try:
         with pytest.raises(RuntimeError, match=str(port)):
