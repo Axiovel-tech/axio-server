@@ -2749,7 +2749,6 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     # positive while discharging
     ("ibat", "batteryCurrentA", _rounded(3)),
     ("btemp", "batteryTemperatureC", _rounded(1)),
-    ("lowbat", "lowBattery", bool),
     ("pwrst", "powerState", _code_name(ANCHOR_POWER_STATES)),
     ("pwrin", "powerInput", _code_name(ANCHOR_POWER_INPUTS)),
     ("chg", "charging", _code_name(ANCHOR_CHARGE_PHASES)),
@@ -2837,6 +2836,12 @@ def _stats_json(
     rssi = _finite_stat(data, "urssi")
     if rssi is not None:
         body["uwbRssiDbm"] = round(rssi, 1) if rssi < 0.0 else None
+    # the pack's level: 0 ok, 1 below its warning level while running from
+    # it, 2 low (latched)
+    lowbat = _finite_stat(data, "lowbat")
+    if lowbat is not None:
+        body["lowBattery"] = lowbat >= 2
+        body["batteryWarning"] = lowbat == 1
     rmse = _finite_stat(data, "rmse")
     if rmse is not None:
         body["residualRmsM"] = round(rmse, 4) if rmse >= 0.0 else None

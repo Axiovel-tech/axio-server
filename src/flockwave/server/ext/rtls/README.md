@@ -635,7 +635,7 @@ sending leaves the entry:
 | `batteryPercent` | `soc` | %, sent only with a configured gauge profile |
 | `batteryCurrentA` | `ibat` | A, positive while discharging |
 | `batteryTemperatureC` | `btemp` | °C |
-| `lowBattery` | `lowbat` | bool, the low-battery latch |
+| `lowBattery` / `batteryWarning` | `lowbat` | bool / bool: `lowbat` 2 (low, latched) / 1 (below its warning level while running from the pack); both false at 0 |
 | `powerState` | `pwrst` | `booting`, `preview`, `standby`, `asleep`, `off`, `operating`, `stopping`, `shutdown`, `fault` |
 | `powerInput` | `pwrin` | `unknown`, `battery`, `usb`, `usb-1.5a`, `usb-3a`, `poe` |
 | `charging` | `chg` | `off`, `idle`, `cc`, `cv`, `topoff` |

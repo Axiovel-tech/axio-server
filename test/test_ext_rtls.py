@@ -3922,6 +3922,7 @@ def test_stats_json_anchor_fields():
         "batteryCurrentA": 0.432,
         "batteryTemperatureC": 24.6,
         "lowBattery": False,
+        "batteryWarning": False,
         "powerState": "operating",
         "powerInput": "poe",
         "charging": "cv",
@@ -4604,3 +4605,13 @@ async def test_the_expiry_pass_drops_stats_the_device_stopped_sending(
     assert DEVICE_SYSID in extension._protocol.devices  # not lost
     assert DEVICE_SYSID not in extension._lost
     assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID}
+
+
+@pytest.mark.parametrize(
+    ("lowbat", "low", "warning"),
+    [(0.0, False, False), (1.0, False, True), (2.0, True, False)],
+)
+def test_stats_json_battery_levels(lowbat, low, warning):
+    body = _stats_json(7, {"lowbat": lowbat}, "anchor-responder")
+    assert body["lowBattery"] is low
+    assert body["batteryWarning"] is warning
