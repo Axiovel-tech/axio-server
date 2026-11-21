@@ -137,16 +137,33 @@ class FakeDevice:
             elif kind == "PARAM_EXT_SET" and self.respond_to_set:
                 name = message.param_id
                 value = raw_field_bytes(message, "param_value") or b""
+                previous = self.params.get(name, (b"", 0))[0]
                 if self.set_result == 0 and name in self.params:
                     width = len(self.params[name][0])
                     self.params[name] = (value[:width], message.param_type)
                 out.append(
                     self._param_ack(name, value, message.param_type, self.set_result)
                 )
-                if name == "SLEEP" and self.refuse_sleep and self.sleeping:
-                    # the arming gate runs after the ack on the firmware
-                    self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
+                if name == "SLEEP" and self.set_result == 0:
+                    self.after_sleep_write(previous[:1], value[:1])
+            elif kind == "TIMESYNC" and message.tc1 == 0:
+                out.append(self._timesync(message.ts1))
         return out
+
+    def after_sleep_write(self, previous: bytes, value: bytes) -> None:
+        """What the firmware does after acking a SLEEP write."""
+        if self.refuse_sleep and self.sleeping:
+            # the arming gate runs after the ack on the firmware
+            self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
+
+    def uptime_ms(self) -> int:
+        return 100_000
+
+    def _timesync(self, token: int) -> bytes:
+        message = self.dialect.MAVLink_timesync_message(
+            tc1=self.uptime_ms() * 1_000_000, ts1=token
+        )
+        return bytes(message.pack(self._mav))
 
     def _param_value(self, name: str, index: int) -> bytes:
         value, param_type = self.params[name]
@@ -1601,17 +1618,38 @@ async def test_ota_status_query_without_job(extension, device, builder, hub):
 # ---- device loss --------------------------------------------------------
 
 
-async def test_lost_device_disappears_from_inf(extension, device, builder, hub):
-    await discover(extension, device)
-    protocol = extension._protocol
-
-    # simulate the device going silent past its timeout
-    events = protocol.expire(time.monotonic() + 1000)
-    assert [event.kind for event in events] == ["lost"]
-
+async def _inf_status(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body["status"] == {}
+    return response.body["status"]
+
+
+async def test_lost_device_stays_listed_offline(extension, device, builder, hub):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is True
+    assert entry["lastSeenAgeS"] >= 0.0
+
+    # the device goes silent past its timeout (axio-server#61)
+    events = extension._expire_devices(time.monotonic() + 1000)
+    assert [event.kind for event in events] == ["lost"]
+
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is False
+    later = extension._inf_status(time.monotonic() + 1000)[str(DEVICE_SYSID)]
+    assert later["lastSeenAgeS"] >= 999.0
+    assert entry["role"] == "anchor-responder"
+    assert entry["address"] == list(DEVICE_ADDRESS)
+    # ...but nothing treats it as live
+    assert DEVICE_SYSID not in extension._protocol.devices
+
+    # it comes back as the same entry, live again
+    await discover(extension, device)
+    status = await _inf_status(extension, builder, hub)
+    assert list(status) == [str(DEVICE_SYSID)]
+    assert status[str(DEVICE_SYSID)]["online"] is True
+    assert DEVICE_SYSID not in extension._lost
 
 
 # ---- X-RTLS-INF push notifications --------------------------------------
@@ -1659,16 +1697,14 @@ async def test_inf_broadcast_on_loss(extension, device):
 
     # the device goes silent past its timeout; the protocol loop handles the
     # lost event (which only marks the list dirty -- the handler is sync) and
-    # then runs the periodic flush, which broadcasts the now-empty list
-    events = extension._protocol.expire(1000.0)
+    # then runs the periodic flush, which broadcasts the device offline
+    events = extension._expire_devices(1000.0)
     assert [event.kind for event in events] == ["lost"]
-    for event in events:
-        extension._handle_lost(event)
     await extension._flush_pending_inf(now=1000.0)
 
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 2
-    assert broadcasts[-1]["status"] == {}
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["online"] is False
 
 
 async def test_inf_broadcast_coalesces_bursts(extension, device, dialect):
@@ -2044,31 +2080,44 @@ async def test_stats_trailing_flush_delivers_latest_within_interval(extension, d
     assert len(stats_broadcasts) == 2
 
 
-async def test_lost_device_stats_pruned_from_query(extension, device, builder, hub):
+async def test_lost_device_stats_kept_stale_until_forgotten(
+    extension, device, builder, hub
+):
     await discover(extension, device)
     await _feed_stats(extension, device, FULL_STATS, now=0.0)
 
     # the snapshot is reported before the device is lost
     message = make_message(builder, {"type": "X-RTLS-STATS"})
     response = await extension._handle_RTLS_STATS(message, None, hub)
-    assert str(DEVICE_SYSID) in response.body["stats"]
+    assert "stale" not in response.body["stats"][str(DEVICE_SYSID)]
 
-    # drive the protocol loop's expiry path: the device times out, the
-    # extension handles the lost event and prunes its cached stats
-    protocol = extension._protocol
-    events = protocol.expire(time.monotonic() + 1000)
-    assert [event.kind for event in events] == ["lost"]
-    for event in events:
-        extension._handle_lost(event)
+    # drive the protocol loop's expiry path: the device times out and its
+    # last snapshot stays answerable, marked stale
+    extension._expire_devices(time.monotonic() + 1000)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    entry = response.body["stats"][str(DEVICE_SYSID)]
+    assert entry["stale"] is True
+    assert entry["solveRateHz"] == 8.0
 
-    # the X-RTLS-STATS query no longer reports the timed-out device
-    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    # ...and is pushed once, so listening clients learn it went stale
+    await extension._flush_pending_stats(now=10.0)
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)]["stale"] is True
+
+    # forgetting the device drops the snapshot and its bookkeeping
+    assert extension.forget_device(DEVICE_SYSID) == {"forgotten": True}
     response = await extension._handle_RTLS_STATS(message, None, hub)
     assert response.body["stats"] == {}
-    # internal throttle bookkeeping was cleaned up too
-    assert DEVICE_SYSID not in extension._stats
     assert DEVICE_SYSID not in extension._last_stats_broadcast
     assert DEVICE_SYSID not in extension._last_stats_sent
+
+    # a fresh report after the device returns is no longer stale
+    await discover(extension, device)
+    await _feed_stats(extension, device, FULL_STATS, now=20.0)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "stale" not in response.body["stats"][str(DEVICE_SYSID)]
 
 
 # ---- cluster clock estimate ----
