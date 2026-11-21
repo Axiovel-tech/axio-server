@@ -4591,3 +4591,19 @@ async def test_anchor_sleep_not_confirmed_in_time(
         "detail": "the anchor accepted the request but was not seen asleep "
         "within 8 s (it may still be rebooting)",
     }
+
+
+async def test_anchor_without_sleep_mode(dialect, builder, hub, autojump_clock):
+    # an anchor without a power path (native_sim, boards without one) has
+    # no SLEEP parameter: say so instead of timing out on the write
+    anchor = FakeAnchor(dialect)
+    del anchor.params["SLEEP"]
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": False,
+        "sleeping": None,
+        "detail": "the anchor has no sleep mode (no SLEEP parameter)",
+    }

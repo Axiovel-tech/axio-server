@@ -963,6 +963,10 @@ class RtlsExtension(Extension):
         device = protocol.devices.get(system_id)
         if device is None:
             raise KeyError(system_id)
+        if _lacks_param(device, SLEEP_PARAM):
+            return _sleep_error(
+                sleeping, "the anchor has no sleep mode (no SLEEP parameter)"
+            )
         watch = _AnchorTransition(
             system_id, sleeping, already=bool(device.sleeping) == sleeping
         )
@@ -2562,6 +2566,16 @@ class _AnchorTransition:
         if self.state != self.expected:
             return False
         return self.rebooted or (self.already and self.readback == int(self.expected))
+
+
+def _lacks_param(device, name: str) -> bool:
+    """Whether a device's count-complete parameter snapshot proves it has
+    no parameter ``name`` (an incomplete one proves nothing)."""
+    return (
+        device.param_count is not None
+        and len(device.params) >= device.param_count
+        and name not in device.params
+    )
 
 
 def _sleep_error(requested: bool, detail: str) -> dict[str, Any]:

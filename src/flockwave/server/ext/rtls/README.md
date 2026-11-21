@@ -432,7 +432,9 @@ reads back as the state the anchor stays in, and `detail` names why:
 reading (last 6.81 V)`, `refused: the anchor is off; only its button
 starts it again`, or `sleep refused by the anchor in its <powerState>
 state`. A transition not seen in time reports `accepted: false`,
-`sleeping: null`. The server only sends what an operator asks for: it
+`sleeping: null`; so does an anchor without a power path (native_sim,
+boards without one), whose complete parameter list has no `SLEEP`: `the
+anchor has no sleep mode (no SLEEP parameter)`. The server only sends what an operator asks for: it
 never sleeps or wakes a device on its own.
 
 Without `timeout`, a tag's transaction takes up to 13 s (write, 3 s
