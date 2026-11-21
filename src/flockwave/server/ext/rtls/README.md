@@ -155,8 +155,8 @@ Request:
 {"type": "X-RTLS-INF"}
 ```
 
-Response — one entry per live device, keyed by system id (as string),
-plus a site-level `anchors` list:
+Response — one entry per live or lost device, keyed by system id (as
+string), plus a site-level `anchors` list:
 
 ```json
 {
@@ -164,8 +164,10 @@ plus a site-level `anchors` list:
   "status": {
     "42": {
       "id": 42,
+      "online": true,
       "address": ["192.168.4.42", 3333],
       "age": 0.52,
+      "lastSeenAgeS": 0.5,
       "firmwareVersion": "1.2.3",
       "uptimeMs": 123456,
       "paramCount": 23,
@@ -176,7 +178,7 @@ plus a site-level `anchors` list:
       "role": "tag",
       "cell": "default",
       "name": "RTLS tag 42",
-      "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
+      "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120, "madM": 0.021, "count": 40}]
     }
   },
   "anchors": [
@@ -194,7 +196,15 @@ plus a site-level `anchors` list:
 }
 ```
 
-- `age` — seconds since the last heartbeat from the device.
+- `online` — `false` for a device that missed its liveness timeout
+  (axio-server#61). It stays listed with what it last reported (address,
+  role, name, last `sleeping`) and its last stats stay answerable, marked
+  `stale`, until an operator forgets it (`X-RTLS-FORGET`) or the server
+  restarts; a device that returns is the same entry, `online: true` again.
+  Nothing treats a lost device as live: it is no site anchor's `systemId`,
+  no beacon is active for it, it pairs with no drone, and commands to it
+  fail with "Device N is offline".
+- `age` / `lastSeenAgeS` — seconds since the last heartbeat from the device.
 - `firmwareVersion` — the `FW_VERSION` parameter if the device exposes
   one, otherwise `null`.
 - `uptimeMs` — device uptime in milliseconds, from the latest
@@ -245,8 +255,10 @@ plus a site-level `anchors` list:
   `{peerMac, distanceM, ageMs}` rows, one per peer anchor the device
   currently hears on the UWB ether. The peer MAC is decoded from the
   firmware's `twr<peer-mac-hex>` NAMED_VALUE_FLOAT and `ageMs` is the time
-  since that range was last harvested. Present only on anchors that report
-  ranges.
+  since that range was last harvested. `madM` (median absolute deviation, m)
+  and `count` (inlier samples) come from the SDK's `twr_summary` of the
+  same generation and are absent while that generation is incomplete.
+  Present only on anchors that report ranges.
 
 The site-level `anchors` list mirrors the configured cell geometry: each
 anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
@@ -262,7 +274,8 @@ to clients through the existing Axio Server **beacon** layer (same stable
 ids), so the map renders them without a bespoke anchor layer. Set
 `register_beacons: false` to disable the beacon registration.
 
-Devices that miss their liveness timeout disappear from the map.
+A device that misses its liveness timeout turns its anchor slot inactive
+on the map.
 
 The server also **broadcasts** `X-RTLS-INF` notifications with the same
 body shape (no `refs` member, since they are not responses) whenever a
@@ -270,7 +283,7 @@ device is discovered or lost or its `sleeping` state changes (from a
 heartbeat flip or an accepted sleep/wake transaction) — throttled to at
 most one per second, with transitions inside the window coalesced into
 one trailing-edge notification — and every 10 s without transitions so
-`age` values keep refreshing. Each notification carries the **full** current status map;
+`age` values keep refreshing (also while only lost devices remain). Each notification carries the **full** current status map;
 clients should replace their device list wholesale rather than merge.
 
 ### X-RTLS-PARAM-LIST — full parameter list
@@ -324,6 +337,28 @@ Response:
 }
 ```
 
+### X-RTLS-FORGET — drop lost devices
+
+Removes offline devices from `X-RTLS-INF` and their stale stats from
+`X-RTLS-STATS`, then pushes the device list. A live device is not
+forgotten (its next heartbeat would list it again).
+
+```json
+{"type": "X-RTLS-FORGET", "ids": [42, 43]}
+```
+
+`id` is accepted for a single device. Response:
+
+```json
+{
+  "type": "X-RTLS-FORGET",
+  "result": {
+    "42": {"forgotten": true},
+    "43": {"forgotten": false, "detail": "Device 43 is online"}
+  }
+}
+```
+
 ### X-RTLS-PARAM-SET — write one parameter
 
 Issues a PARAM_EXT set and waits for the device-side acknowledgement;
@@ -340,6 +375,9 @@ The motivating case is `UWB_ROLE`, whose bounds are image-pinned
 (tag `1..1`, anchor `2..3`): a device can no longer change species by
 parameter; flash/OTA the role-matched image instead. UIs should show
 `accepted: false` plus the returned value as "device rewrote this".
+
+`SLEEP` is NAKed unless the value is `0` or `1`: an anchor's `2` (off) is
+ended only by its button, so it is not a remote command.
 
 Request — `paramType` may be omitted when the type is already known
 from an earlier listing (always the case after discovery):
@@ -368,7 +406,7 @@ Response:
 }
 ```
 
-### X-RTLS-SLEEP — sleep / wake drones
+### X-RTLS-SLEEP — sleep / wake drones and anchors
 
 Puts one or more devices into sleep mode, or wakes them. Sleep is
 commanded through the firmware's `SLEEP` parameter; the firmware
@@ -383,6 +421,25 @@ management channel up, stays discoverable (`sleeping: true` in
 On hardware, a woken device reboots a moment after acknowledging the
 wake (to re-initialize the power-cycled UWB module) and drops off the
 network for a few seconds before re-appearing.
+
+An **anchor** (`role` `anchor-initiator` / `anchor-responder`) reboots on
+every transition and is off the network for 8-15 s, so its outcome is
+confirmed only after that reboot (a rediscovery or a rewound uptime) by
+the heartbeat state: `STANDBY` asleep, `ACTIVE` awake. An anchor already
+in the requested state is confirmed without a reboot. A refused request
+reads back as the state the anchor stays in, and `detail` names why:
+`wake refused by the anchor: its pack is low or has no fresh voltage
+reading (last 6.81 V)`, `refused: the anchor is off; only its button
+starts it again`, or `sleep refused by the anchor in its <powerState>
+state`. A transition not seen in time reports `accepted: false`,
+`sleeping: null`; so does an anchor without a power path (native_sim,
+boards without one), whose complete parameter list has no `SLEEP`: `the
+anchor has no sleep mode (no SLEEP parameter)`. The server only sends what an operator asks for: it
+never sleeps or wakes a device on its own.
+
+Without `timeout`, a tag's transaction takes up to 13 s (write, 3 s
+settle, readback) and an anchor's up to 25 s; send both kinds in one
+request with a response timeout of 30 s.
 
 Request — `ids` lists the target devices (a single `id` is also
 accepted); `sleeping` selects the direction:
@@ -476,8 +533,9 @@ per device per second (with a trailing-edge flush, so the newest
 snapshot inside a throttle window is never lost). A notification carries
 the entry of the device that updated; the query returns every known
 device, or one with the optional `id` (an unknown id yields an empty
-snapshot, not an error). Snapshots of devices that drop off the network
-are pruned with them.
+snapshot, not an error). The snapshot of a device that drops off the
+network stays, with `"stale": true` (pushed once), until the device
+reports again or is forgotten (`X-RTLS-FORGET`).
 
 Request:
 
@@ -519,6 +577,33 @@ Response / notification body — entries keyed by system id (as string):
 }
 ```
 
+An anchor's entry carries no tag solver fields (`solveRateHz` …
+`anchorMask`); the role comes from `UWB_ROLE`, or, until it is known,
+from the report lacking every solver stat. Every other field is present
+only while its stat is (omitted = unknown), on any role:
+
+| Field | Stat | Value |
+|---|---|---|
+| `batteryPercent` | `soc` | %, sent only with a configured gauge profile |
+| `batteryCurrentA` | `ibat` | A, positive while discharging |
+| `batteryTemperatureC` | `btemp` | °C |
+| `lowBattery` | `lowbat` | bool, the low-battery latch |
+| `powerState` | `pwrst` | `booting`, `preview`, `standby`, `asleep`, `off`, `operating`, `stopping`, `shutdown`, `fault` |
+| `powerInput` | `pwrin` | `unknown`, `battery`, `usb`, `usb-1.5a`, `usb-3a`, `poe` |
+| `charging` | `chg` | `off`, `idle`, `cc`, `cv`, `topoff` |
+| `chargeBlock` | `chgblk` | `none`, `no-profile`, `no-input`, `charger`, `gauge`, `temperature`, `gauge-inhibit`, `pack-voltage`, `charger-fault`, `overcurrent`, `stopping` |
+| `uwbStatus` | `uwbst` | int, the firmware's UWB start state |
+| `rangingRateHz` | `rnghz` | ranging activity over the last report |
+| `radioRestarts` | `urst` | int, since boot |
+| `moved` / `tiltDeg` / `knocks` | `moved` / `tilt` / `knocks` | bool / ° / int |
+| `ethernetLink` / `ethernetDrops` | `elink` / `edrop` | bool / int |
+| `wifiTxErrors` | `wtxerr` | int, since boot |
+| `bootCount` / `resetCause` | `boots` / `rstc` | int |
+
+A state code the server does not know reads `"unknown"`; non-finite
+values are dropped. The firmware's meanings are in rtls-link-zephyr
+`docs/reference/anchor-health.md`.
+
 - `sleeping` — mirrors the `slp` stat; **omitted** (not `false`) for
   firmware that predates sleep mode, so a UI can tell "unknown".
 - `batteryVoltage` — the optional `vbat` stat, in volts; omitted on
@@ -554,9 +639,10 @@ Response / notification body — entries keyed by system id (as string):
   own stats.
 - The ground's green/yellow/red zones for these fields, and their evidence,
   are in AxioStack `contracts/rtls-fleet-health.md`.
-- The first broadcast for a device waits until the full legacy stat set
+- A tag's first broadcast waits until the full legacy stat set
   (`solveRateHz` … `anchorMask`) has arrived once, so it never carries a
-  half-populated snapshot; optional stats never gate the broadcast.
+  half-populated snapshot; optional stats never gate the broadcast, and
+  an anchor's reports are not gated.
 
 ### X-RTLS-POS — live position-estimate debug stream
 
@@ -732,7 +818,7 @@ Other server extensions can use the same machinery via the exports of
 this extension: `devices()`, `protocol()`, and the awaitable
 `get_param(system_id, name)`, `get_param_list(system_id)`,
 `set_param(system_id, name, value, param_type=None)`,
-`set_sleep(system_id, sleeping)`,
+`set_sleep(system_id, sleeping)`, `forget_device(system_id)`,
 `verify_species(system_id, role)` and
 `start_ota(system_id, image_path)`.
 

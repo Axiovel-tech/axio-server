@@ -48,7 +48,7 @@ dependencies = [
   "fastjsonschema>=2.21.1,<3.0.0",
   "orjson>=3.10.18,<4.0.0",
   "numpy>=2.2.6",
-  "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@fa2dd7296e2d6af83315dfdbef5b893a0f8fd1be#subdirectory=py",
+  "rtls-link[ota] @ git+https://github.com/Axiovel-tech/rtls-link-zephyr.git@9b1573bd1b19e7f1e5ea03d46f356ce5a05b1325#subdirectory=py",
   "sounddevice>=0.5.2,<0.6.0",
   "soundfile>=0.13.1,<0.14.0",
 ]
