@@ -15,10 +15,24 @@ from flockwave.server.model.log import Severity
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
-from .config import DroneShowConfiguration, LightConfiguration, StartMethod
+from .config import (
+    AuthorizationScope,
+    DroneShowConfiguration,
+    LightConfiguration,
+    StartMethod,
+)
 from .logging import ShowUploadLoggingMiddleware
 
 __all__ = ("construct", "dependencies", "description")
+
+
+def _authorizes_flight(config: DroneShowConfiguration) -> bool:
+    """Whether a configuration lets the drones fly the show (live or
+    rehearsal; lights-only authorizations do not take off)."""
+    return config.authorized_to_start and config.authorization_scope in (
+        AuthorizationScope.LIVE,
+        AuthorizationScope.REHEARSAL,
+    )
 
 
 class DroneShowExtension(Extension):
@@ -116,6 +130,7 @@ class DroneShowExtension(Extension):
                     )
 
             self._ensure_start_not_moved(config)
+            self._ensure_anchors_allow_start(config)
             self._config.update_from_json(config)
             return hub.acknowledge(message)
         except Exception as ex:
@@ -279,6 +294,44 @@ class DroneShowExtension(Extension):
                 f"The start is locked from T{point_of_no_return:.0f} s; only "
                 "abort (clear the start) is possible"
             )
+
+    def _ensure_anchors_allow_start(self, config: Any) -> None:
+        """Raises an error if the given configuration update authorizes a
+        flight (live or rehearsal), or changes the start of an authorized
+        one, while the rtls extension refuses it (its anchor cell is known
+        but not locked, or the lock is broken). Revoking or clearing a start
+        is always allowed, and so is a lights-only authorization."""
+        if not isinstance(config, dict):
+            return
+        updated = self._config.clone()
+        updated.update_from_json(config)
+        if not _authorizes_flight(updated):
+            return
+        current = self._config
+        if _authorizes_flight(current) and updated.start_method == current.start_method:
+            cleared = updated.start_time_on_clock is None
+            unchanged = (updated.start_time_on_clock, updated.clock) == (
+                current.start_time_on_clock,
+                current.clock,
+            )
+            if cleared or unchanged:
+                return
+        refusal = self._anchor_start_refusal()
+        if refusal is not None:
+            raise RuntimeError(f"Show start refused: {refusal}")
+
+    def _anchor_start_refusal(self) -> str | None:
+        """The rtls extension's reason to refuse a show start, None when it
+        has none or is not loaded (no RTLS cell, no requirement)."""
+        if self.app is None:
+            return None
+        try:
+            rtls = self.app.import_api("rtls")
+            if not rtls.loaded:
+                return None
+            return rtls.show_start_refusal()
+        except (AttributeError, KeyError, RuntimeError):
+            return None
 
     def _is_start_locked(self) -> bool:
         """Returns whether the show start is final: from the point of no

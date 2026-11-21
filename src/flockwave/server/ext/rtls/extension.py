@@ -3165,5 +3165,11 @@ schema = {
             "title": "Register configured RTLS anchors as map beacons",
             "default": True,
         },
+        "lock_required_for_show": {
+            "type": "boolean",
+            "title": "Authorize or schedule a show only with the anchor cell "
+            "locked (X-RTLS-LOCK) and its lock unbroken",
+            "default": True,
+        },
     }
 }
