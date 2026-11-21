@@ -193,11 +193,16 @@ string), plus a site-level `anchors` list:
       "active": true,
       "systemId": 101
     }
-  ]
+  ],
+  "anchorLock": {"locked": false, "lockedAt": null, "anchors": [], "...": "..."}
 }
 ```
 
-- `online` — `false` for a device that missed its liveness timeout. It stays listed with what it last reported (address,
+`anchorLock` is the anchor cell lock's state, the same object as in
+X-RTLS-LOCK (see there).
+
+- `online` — `false` for a device that missed its liveness timeout. It
+  stays listed with what it last reported (address,
   role, name, last `sleeping`) and its last stats stay answerable, marked
   `stale`, until an operator forgets it (`X-RTLS-FORGET`) or the server
   restarts; a device that returns is the same entry, `online: true` again,
@@ -317,7 +322,9 @@ Every response has the same shape:
     "acknowledgedWarnings": [
       {"code": "low-battery", "device": 205, "detail": "RTLS anchor A4: low battery (6.81 V)"}
     ],
-    "breaks": []
+    "breaks": [],
+    "persistError": null,
+    "showGate": {"required": true, "refused": false, "reason": null}
   }
 }
 ```
@@ -328,14 +335,25 @@ Every response has the same shape:
 - `warnings`: the cell's warnings now. Codes: `no-anchors`, `offline`,
   `a0-not-operating`, `a0-not-heard` (a responder's `rangingRateHz` is 0),
   `low-battery`, `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
-  config or hardware failure) and `radio-restarts`. `device` is a system id,
-  or null for the cell.
+  config or hardware failure), `radio-restarts` and, on a re-seal,
+  `missing` (a sealed member no longer known). `device` is a system id, or
+  null for the cell.
 - Locking an already locked cell re-seals it: a fresh snapshot, and the
   breaks are cleared.
 - `anchorLock.breaks`: `{"code", "device", "detail", "at"}` (`at` is UNIX
-  seconds). Codes: `offline`, `rebooted`, `param-changed`,
-  `firmware-changed`, `moved` and `left-operating`. Each occurrence is added
-  once, logged and pushed.
+  seconds). Codes: `offline` (also a sealed member not back within the
+  device timeout after a server restart), `rebooted` (the uptime did not
+  advance with the host time; the boot count only where no uptime is
+  seen), `param-changed`, `firmware-changed`, `moved`, `left-operating` and
+  `membership` (an anchor outside the seal appeared). Each occurrence is
+  added once, logged and pushed. A sealed parameter changed by someone
+  else is seen on the device's next report or read of it.
+- `anchorLock.showGate`: the server's verdict on a show start now, the one
+  `SHOW-SETCFG` applies: `required` (the gate is on and anchors are known),
+  `refused` and the `reason`.
+- `anchorLock.persistError`: why the state could not be saved, else null.
+  A lock or unlock that cannot be saved is NAKed and changes nothing; a
+  break is kept and pushed even when saving it fails.
 
 `X-RTLS-INF` carries the same `anchorLock` object, and a lock, unlock or
 break pushes it.
@@ -345,15 +363,18 @@ unlock them in Control first": `X-RTLS-PARAM-SET` and `X-RTLS-OTA` uploads
 to an anchor (an NAK; the OTA status query and `inspect` stay allowed),
 and an anchor's entry in `X-RTLS-SLEEP` and `X-RTLS-FORGET` results
 (`accepted` / `forgotten` false, with that `detail`). Tags are unaffected.
+A device of unknown role is classified by reading its `UWB_ROLE` first,
+and refused with "role unknown while anchors are locked" when that fails.
 
 The lock is kept across a server restart (`anchor_lock.json` in the
 extension's data directory).
 
 **Show gate.** `SHOW-SETCFG` is refused (with the reason) when it would
-authorize the show, or change the start of an authorized show, for a live
-or rehearsal flight while anchors are known and the cell is not locked or
-its lock has breaks. Clearing or revoking a start, and lights-only
-authorizations, are never refused. Without known anchors (no RTLS cell)
+authorize the show, or give an authorized show a new start, for a live or
+rehearsal flight while anchors are known and the cell is not locked or its
+lock has breaks. An abort is never refused: revoking, or clearing an
+existing start whatever else the update changes; nor is a lights-only
+authorization. Without known anchors (no RTLS cell)
 nothing is required. The rtls extension's `lock_required_for_show: false`
 turns the gate off.
 
@@ -940,7 +961,8 @@ this extension: `devices()`, `protocol()`, and the awaitable
 `set_sleep(system_id, sleeping)`, `verify_species(system_id, role)` and
 `start_ota(system_id, image_path, role=None)` (which refuses an image
 whose species is not established), plus the synchronous
-`forget_device(system_id)`.
+`forget_device(system_id)` and `show_start_refusal()` (the show gate's
+reason, or None).
 
 ## Testing
 

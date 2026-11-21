@@ -172,6 +172,8 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
             "anchors": [],
             "acknowledgedWarnings": [],
             "breaks": [],
+            "persistError": None,
+            "showGate": {"required": False, "refused": False, "reason": None},
         },
     }
 

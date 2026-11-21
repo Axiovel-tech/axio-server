@@ -129,8 +129,9 @@ class DroneShowExtension(Extension):
                         "live" if authorized else "none"
                     )
 
-            self._ensure_start_not_moved(config)
-            self._ensure_anchors_allow_start(config)
+            candidate = self._candidate(config)
+            self._ensure_start_not_moved(candidate)
+            self._ensure_anchors_allow_start(candidate)
             self._config.update_from_json(config)
             return hub.acknowledge(message)
         except Exception as ex:
@@ -273,17 +274,24 @@ class DroneShowExtension(Extension):
                 "authorizationScope": self._config.authorization_scope.value,
             }
         }
-        self._ensure_start_not_moved(config)
+        self._ensure_start_not_moved(self._candidate(config))
         self._config.update_from_json(config)
 
-    def _ensure_start_not_moved(self, config: Any) -> None:
-        """Raises an error if the given configuration update moves a locked
-        start. Clearing a locked start (aborting the show) is allowed.
-        """
-        if not self._is_start_locked() or not isinstance(config, dict):
-            return
+    def _candidate(self, config: Any) -> DroneShowConfiguration | None:
+        """The configuration a SHOW-SETCFG update would produce, for the
+        start guards to judge; None for an update that is not a dict."""
+        if not isinstance(config, dict):
+            return None
         updated = self._config.clone()
         updated.update_from_json(config)
+        return updated
+
+    def _ensure_start_not_moved(self, updated: DroneShowConfiguration | None) -> None:
+        """Raises an error if the updated configuration moves a locked
+        start. Clearing a locked start (aborting the show) is allowed.
+        """
+        if updated is None or not self._is_start_locked():
+            return
         if updated.start_time_on_clock is not None and (
             updated.clock != self._config.clock
             or updated.start_time_on_clock != self._config.start_time_on_clock
@@ -295,26 +303,29 @@ class DroneShowExtension(Extension):
                 "abort (clear the start) is possible"
             )
 
-    def _ensure_anchors_allow_start(self, config: Any) -> None:
-        """Raises an error if the given configuration update authorizes a
-        flight (live or rehearsal), or changes the start of an authorized
-        one, while the rtls extension refuses it (its anchor cell is known
-        but not locked, or the lock is broken). Revoking or clearing a start
-        is always allowed, and so is a lights-only authorization."""
-        if not isinstance(config, dict):
-            return
-        updated = self._config.clone()
-        updated.update_from_json(config)
-        if not _authorizes_flight(updated):
+    def _ensure_anchors_allow_start(
+        self, updated: DroneShowConfiguration | None
+    ) -> None:
+        """Raises an error if the updated configuration authorizes a flight
+        (live or rehearsal), or gives an authorized one a new start, while
+        the rtls extension refuses it (its anchor cell is known but not
+        locked, or the lock is broken). An abort is never refused: revoking,
+        and clearing an existing start whatever else the update changes;
+        nor is a lights-only authorization."""
+        if updated is None or not _authorizes_flight(updated):
             return
         current = self._config
-        if _authorizes_flight(current) and updated.start_method == current.start_method:
-            cleared = updated.start_time_on_clock is None
-            unchanged = (updated.start_time_on_clock, updated.clock) == (
+        if _authorizes_flight(current):
+            if (
+                updated.start_time_on_clock is None
+                and current.start_time_on_clock is not None
+            ):
+                return
+            if (updated.start_time_on_clock, updated.clock, updated.start_method) == (
                 current.start_time_on_clock,
                 current.clock,
-            )
-            if cleared or unchanged:
+                current.start_method,
+            ):
                 return
         refusal = self._anchor_start_refusal()
         if refusal is not None:

@@ -22,8 +22,9 @@ from flockwave.server.ext.rtls.anchor_lock import (
     LOCKED_REASON,
     AnchorLock,
     cell_warnings,
+    lock_json,
 )
-from flockwave.server.ext.rtls.extension import RtlsExtension
+from flockwave.server.ext.rtls.extension import AnchorsLocked, RtlsExtension
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -78,9 +79,18 @@ async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2))):
             await ext._process_datagram(reply, device.address, time.monotonic())
 
     ext._send = fake_send
+    ext.routes = by_address  # lets a test add a device later
     for device in devices.values():
         await discover(ext, device)
     return ext, devices
+
+
+def _anchor(dialect, system_id, role=3, mac=9):
+    anchor = FakeDevice(dialect, system_id=system_id)
+    anchor.address = (f"192.168.4.{system_id}", 3333)
+    set_fake_param(anchor, "UWB_ROLE", role, "uint8")
+    set_fake_param(anchor, "UWB_MAC", mac, "uint16")
+    return anchor
 
 
 HEALTHY_A0 = {"pwrst": 5.0, "boots": 3.0, "moved": 0.0, "uwbst": 1.0}
@@ -300,19 +310,67 @@ async def test_lock_breaks_once_per_occurrence(dialect, builder, hub):
     assert body["anchorLock"]["breaks"] == []
 
 
-async def test_uptime_rewind_is_a_reboot_without_a_boot_count(dialect, builder, hub):
-    ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
-    await ext._on_stats(201, {"pwrst": 5.0}, 0.0)
-    await _lock(ext, builder, hub)
-    anchor = devices[201]
+def _system_time(dialect, anchor, uptime_ms):
+    message = dialect.MAVLink_system_time_message(0, uptime_ms)
+    return bytes(message.pack(anchor._mav))
 
-    for uptime in (50_000, 60_000, 2_000):
-        message = dialect.MAVLink_system_time_message(0, uptime)
-        await ext._process_datagram(
-            bytes(message.pack(anchor._mav)), anchor.address, time.monotonic()
+
+async def test_reboots_are_judged_against_the_host_time(dialect, builder, hub):
+    ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
+    anchor = devices[201]
+    t = time.monotonic()
+    # the uptime cached when sealing is the baseline
+    await ext._process_datagram(
+        _system_time(dialect, anchor, 50_000), anchor.address, t
+    )
+    await ext._on_stats(201, {"pwrst": 5.0, "boots": 0.0}, t)
+    await _lock(ext, builder, hub)
+
+    def feed(uptime, at):
+        return ext._process_datagram(
+            _system_time(dialect, anchor, uptime), anchor.address, t + at
         )
 
-    assert [b["code"] for b in ext._anchor_lock.breaks] == ["rebooted"]
+    await feed(60_000, 10.0)  # advanced with the host time
+    assert ext._anchor_lock.breaks == []
+    # a cold boot: the boot counter stays 0, the uptime starts over; a second
+    # reboot right after reads a higher uptime but lags the host time
+    await feed(2_000, 20.0)
+    await ext._on_stats(201, {"boots": 0.0}, t + 20.0)
+    await feed(9_000, 40.0)
+    assert [b["detail"] for b in ext._anchor_lock.breaks] == [
+        "RTLS anchor 201 rebooted (uptime reset)",
+        "RTLS anchor 201 rebooted (uptime reset)",
+    ]
+
+
+def test_the_uptime_wrap_is_no_reboot():
+    lock = AnchorLock()
+    lock.seal(
+        {201: _sealed(uptimeMs=2**32 - 4_000)},
+        [],
+        1000.0,
+        {201: 0.0},
+    )
+    # 10 s later the 32-bit uptime wrapped to 6 s
+    assert lock.on_uptime(201, 6_000, 10.0, 1010.0) == []
+    assert [b["code"] for b in lock.on_uptime(201, 1_000, 20.0, 1020.0)] == ["rebooted"]
+
+
+def _sealed(**changes):
+    entry = {
+        "name": "RTLS anchor A0",
+        "role": "anchor-initiator",
+        "firmware": "1.2.3",
+        "params": {"UWB_CHANNEL": 9},
+        "bootCount": 3,
+        "uptimeMs": None,
+        "powerState": "operating",
+        "moved": False,
+        "online": True,
+    }
+    entry.update(changes)
+    return entry
 
 
 async def test_show_refusal_needs_a_lock(dialect, builder, hub):
@@ -335,6 +393,7 @@ def test_lock_persists_across_a_restart(tmp_path):
                 "firmware": "1.2.3",
                 "params": {"UWB_CHANNEL": 9},
                 "bootCount": 3,
+                "uptimeMs": None,
                 "powerState": "operating",
                 "moved": False,
                 "online": True,
@@ -345,15 +404,203 @@ def test_lock_persists_across_a_restart(tmp_path):
     )
     lock.on_stats(201, {"moved": True}, 1001.0)
 
+    lock.on_param(201, "UWB_CHANNEL", 7, 1001.5)
+
     restored = AnchorLock(path)
-    restored.load()
+    restored.load(6.0, 0.0)
     assert restored.json() == lock.json()
     assert restored.covers(201)
-    # what changed while the server was down still breaks the lock
-    restored.on_param(201, "UWB_CHANNEL", 5, 1002.0)
+    # the last compared values survive: the change already recorded does
+    # not break again, a change back while the server was down does
+    restored.on_param(201, "UWB_CHANNEL", 7, 1002.0)
+    restored.on_param(201, "UWB_CHANNEL", 9, 1002.0)
     restored.on_stats(201, {"bootCount": 4}, 1002.0)
     assert [b["code"] for b in restored.breaks] == [
         "moved",
         "param-changed",
+        "param-changed",
         "rebooted",
     ]
+
+
+# ---- audit round: guards, restarts, saving, membership, the show gate ----
+
+
+async def test_a_write_queued_before_sealing_is_refused_at_dispatch(
+    dialect, builder, hub
+):
+    ext, devices = await _cell(dialect)
+    await _healthy(ext)
+    # another write of the same parameter holds the per-parameter lock
+    write_lock = ext._param_write_locks.setdefault((202, "UWB_MAC"), trio.Lock())
+    outcome = []
+
+    async def queued_write():
+        try:
+            await ext.set_param(202, "UWB_MAC", 7, "uint16")
+            outcome.append("written")
+        except AnchorsLocked as ex:
+            outcome.append(str(ex))
+
+    async with trio.open_nursery() as nursery:
+        await write_lock.acquire()
+        nursery.start_soon(queued_write)
+        await trio.testing.wait_all_tasks_blocked()
+        await _lock(ext, builder, hub)  # sealed while the write waits
+        write_lock.release()
+
+    assert outcome == [LOCKED_REASON]
+
+
+async def test_a_write_acked_after_sealing_breaks_the_lock(dialect, builder, hub):
+    ext, devices = await _cell(dialect)
+    await _healthy(ext)
+    anchor = devices[202]
+    anchor.respond_to_set = False  # the ACK comes later, by hand
+    ack = anchor._param_ack("UWB_MAC", (7).to_bytes(2, "little"), 2, 0)
+    guard = ext._require_unlocked
+
+    async def seal_after_the_guard(system_id):
+        # the write passes the guard, then the operator seals the cell
+        await guard(system_id)
+        await _lock(ext, builder, hub)
+
+    ext._require_unlocked = seal_after_the_guard
+    async with trio.open_nursery() as nursery:
+
+        async def ack_after_the_seal():
+            await trio.testing.wait_all_tasks_blocked()
+            await ext._process_datagram(ack, anchor.address, time.monotonic())
+
+        nursery.start_soon(ack_after_the_seal)
+        result = await ext.set_param(202, "UWB_MAC", 7, "uint16")
+
+    assert result["accepted"] is True
+    assert [(b["code"], b["device"]) for b in ext._anchor_lock.breaks] == [
+        ("param-changed", 202)
+    ]
+
+
+async def test_a_target_of_unknown_role_is_classified_first(
+    dialect, builder, hub, autojump_clock
+):
+    ext, devices = await _cell(dialect)
+    await _healthy(ext)
+    await _lock(ext, builder, hub)
+
+    # a device whose parameters have not arrived
+    newcomer = _anchor(dialect, 203)
+    newcomer.respond_to_list = False
+    newcomer.respond_to_read = False
+    ext.routes[newcomer.address] = newcomer
+    await discover(ext, newcomer)
+    with pytest.raises(AnchorsLocked, match="role unknown while anchors are locked"):
+        await ext.set_param(203, "UWB_MAC", 7, "uint16")
+
+    # it answers the role read: an anchor is refused, a tag proceeds
+    newcomer.respond_to_read = True
+    with pytest.raises(AnchorsLocked, match="anchors are locked"):
+        await ext.set_param(203, "UWB_MAC", 7, "uint16")
+    tag = _anchor(dialect, 204, role=1)
+    tag.respond_to_list = False
+    ext.routes[tag.address] = tag
+    await discover(ext, tag)
+    result = await ext.set_param(204, "UWB_MAC", 7, "uint16")
+    assert result["accepted"] is True
+
+
+async def test_a_sealed_member_missing_after_a_restart_breaks_the_lock(
+    dialect, builder, hub, tmp_path
+):
+    ext, _ = await _cell(dialect)
+    await _healthy(ext)
+    ext._anchor_lock.path = tmp_path / "anchor_lock.json"
+    await _lock(ext, builder, hub)
+
+    # the server restarts; only A0 (201) and the tag come back
+    restarted, back = await _cell(dialect, anchors=((201, 2, 1),))
+    lock = AnchorLock(tmp_path / "anchor_lock.json")
+    start = time.monotonic()
+    lock.load(6.0, start)
+    restarted._anchor_lock = lock
+    restarted._expire_devices(start + 5.0)
+    assert lock.breaks == []
+    for device in back.values():  # still heartbeating
+        await restarted._process_datagram(
+            device.heartbeat(), device.address, start + 6.0
+        )
+    restarted._expire_devices(start + 6.5)
+    assert [(b["code"], b["device"]) for b in lock.breaks] == [("offline", 202)]
+    assert "did not return after the server restarted" in lock.breaks[0]["detail"]
+
+    # a re-seal names the missing member and needs an acknowledgement
+    body = await _lock(restarted, builder, hub)
+    assert body["result"] == "warnings"
+    assert {"code": "missing", "device": 202} in [
+        {"code": w["code"], "device": w["device"]} for w in body["warnings"]
+    ]
+
+
+async def test_saving_the_lock_fails_safe(dialect, builder, hub, tmp_path):
+    ext, _ = await _cell(dialect)
+    await _healthy(ext)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    ext._anchor_lock.path = blocker / "anchor_lock.json"
+
+    # an operator transition that cannot be saved does not happen
+    message = make_message(builder, {"type": "X-RTLS-LOCK", "action": "lock"})
+    response = await ext._handle_RTLS_LOCK(message, None, hub)
+    assert response.body["type"] == "ACK-NAK"
+    assert "could not be saved" in response.body["reason"]
+    assert ext._anchor_lock.locked is False
+
+    ext._anchor_lock.path = tmp_path / "anchor_lock.json"
+    await _lock(ext, builder, hub)
+    ext._anchor_lock.path = blocker / "anchor_lock.json"
+    message = make_message(builder, {"type": "X-RTLS-LOCK", "action": "unlock"})
+    response = await ext._handle_RTLS_LOCK(message, None, hub)
+    assert response.body["type"] == "ACK-NAK"
+    assert ext._anchor_lock.locked is True
+
+    # a telemetry break is kept, pushed and reported, never raised
+    ext._expire_devices(time.monotonic() + 1000)
+    assert [b["code"] for b in ext._anchor_lock.breaks] == ["offline", "offline"]
+    assert ext._anchor_lock.json()["persistError"]
+
+
+async def test_an_anchor_outside_the_seal_is_a_membership_break(dialect, builder, hub):
+    ext, _ = await _cell(dialect)
+    await _healthy(ext)
+    await _lock(ext, builder, hub)
+
+    newcomer = _anchor(dialect, 203)
+    ext.routes[newcomer.address] = newcomer
+    await discover(ext, newcomer)  # its dump names it an anchor
+    await discover(ext, newcomer)
+
+    assert [(b["code"], b["device"]) for b in ext._anchor_lock.breaks] == [
+        ("membership", 203)
+    ]
+    assert "not part of the sealed cell" in ext._anchor_lock.breaks[0]["detail"]
+
+
+async def test_the_show_gate_verdict_rides_anchor_lock(dialect, builder, hub):
+    ext, _ = await _cell(dialect)
+    await _healthy(ext)
+
+    def gate():
+        return lock_json(ext)["showGate"]
+
+    assert gate() == {
+        "required": True,
+        "refused": True,
+        "reason": ext.show_start_refusal(),
+    }
+    await _lock(ext, builder, hub)
+    assert gate() == {"required": True, "refused": False, "reason": None}
+    ext._lock_required_for_show = False
+    assert gate() == {"required": False, "refused": False, "reason": None}
+
+    empty, _ = await _cell(dialect, anchors=())
+    assert lock_json(empty)["showGate"]["required"] is False

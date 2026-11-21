@@ -77,3 +77,17 @@ def test_without_an_rtls_cell_there_is_no_requirement():
         assert setcfg(
             extension, time=time() + 600, authorized=True, authorizationScope="live"
         ) == (True, None)
+
+
+def test_an_abort_switching_to_rc_is_never_refused():
+    extension = show()
+    start = time() + 600
+    assert setcfg(
+        extension, time=start, method="auto", authorized=True, authorizationScope="live"
+    ) == (True, None)
+    extension.app = show(REFUSAL).app
+
+    # clearing the AUTO start and switching to RC in one update is an abort
+    assert setcfg(extension, time=None, method="rc") == (True, None)
+    assert extension._config.start_time_on_clock is None
+    assert extension._config.start_method.value == "rc"
