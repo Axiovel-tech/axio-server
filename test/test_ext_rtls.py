@@ -38,6 +38,7 @@ from rtlslink.protocol import (
 )
 
 from flockwave.server.ext.rtls.extension import (
+    DEFAULT_DEVICE_TIMEOUT,
     REFILL_INITIAL_DELAY,
     REFILL_MAX_ATTEMPTS,
     REFILL_READ_SPACING,
@@ -4068,3 +4069,525 @@ async def test_watchers_get_one_stats_event_per_report(extension, device):
                 break
 
     assert kinds.count("stats") == 1
+
+
+# ---- anchor health stats ------------------------------------------------
+
+ANCHOR_STATS = {
+    "vbat": 7.9123,
+    "soc": 81.25,
+    "ibat": 0.4321,
+    "btemp": 24.56,
+    "lowbat": 0.0,
+    "pwrst": 5.0,
+    "pwrin": 5.0,
+    "chg": 3.0,
+    "chgblk": 0.0,
+    "uwbst": 2.0,
+    "rnghz": 49.876,
+    "urst": 1.0,
+    "moved": 1.0,
+    "tilt": 3.21,
+    "knocks": 4.0,
+    "elink": 1.0,
+    "edrop": 2.0,
+    "rssi": -61.0,
+    "wdisc": 3.0,
+    "wtxerr": 7.0,
+    "boots": 12.0,
+    "rstc": 1.0,
+}
+
+
+def test_stats_json_anchor_fields():
+    body = _stats_json(7, ANCHOR_STATS, "anchor-responder")
+
+    assert body == {
+        "id": 7,
+        "batteryVoltage": 7.912,
+        "batteryPercent": 81.2,
+        "batteryCurrentA": 0.432,
+        "batteryTemperatureC": 24.6,
+        "lowBattery": False,
+        "powerState": "operating",
+        "powerInput": "poe",
+        "charging": "cv",
+        "chargeBlock": "none",
+        "uwbStatus": 2,
+        "rangingRateHz": 49.88,
+        "radioRestarts": 1,
+        "moved": True,
+        "tiltDeg": 3.2,
+        "knocks": 4,
+        "ethernetLink": True,
+        "ethernetDrops": 2,
+        "wifiRssiDbm": -61,
+        "wifiDisconnects": 3,
+        "wifiTxErrors": 7,
+        "bootCount": 12,
+        "resetCause": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "key", "names"),
+    [
+        (
+            "pwrst",
+            "powerState",
+            [
+                "booting",
+                "preview",
+                "standby",
+                "asleep",
+                "off",
+                "operating",
+                "stopping",
+                "shutdown",
+                "fault",
+            ],
+        ),
+        (
+            "pwrin",
+            "powerInput",
+            ["unknown", "battery", "usb", "usb-1.5a", "usb-3a", "poe"],
+        ),
+        ("chg", "charging", ["off", "idle", "cc", "cv", "topoff"]),
+        (
+            "chgblk",
+            "chargeBlock",
+            [
+                "none",
+                "no-profile",
+                "no-input",
+                "charger",
+                "gauge",
+                "temperature",
+                "gauge-inhibit",
+                "pack-voltage",
+                "charger-fault",
+                "overcurrent",
+                "stopping",
+            ],
+        ),
+    ],
+)
+def test_stats_json_maps_state_codes(name, key, names):
+    for code, expected in enumerate(names):
+        assert _stats_json(7, {name: float(code)}, "anchor-initiator")[key] == expected
+    # a code the server does not know, or not an exact integer, is unknown
+    for value in (float(len(names)), -1.0, 1.5):
+        assert _stats_json(7, {name: value}, "anchor-initiator")[key] == "unknown"
+    # a non-finite value is dropped like every other stat
+    assert key not in _stats_json(7, {name: math.nan}, "anchor-initiator")
+
+
+def test_stats_json_anchor_omits_absent_fields():
+    # every field is present only while its stat is: omitted means unknown
+    assert _stats_json(7, {"vbat": 8.0}, "anchor-initiator") == {
+        "id": 7,
+        "batteryVoltage": 8.0,
+    }
+
+
+def test_stats_json_role_unknown_infers_an_anchor_from_its_stats():
+    # before the parameter dump names the role, a report without any tag
+    # solver stat is an anchor's...
+    assert "solveRateHz" not in _stats_json(7, {"vbat": 8.0, "pwrst": 5.0})
+    # ...and one with them a tag's
+    assert _stats_json(7, dict(FULL_STATS))["solveRateHz"] == 8.0
+
+
+def test_stats_json_tag_keeps_its_solver_defaults():
+    body = _stats_json(7, {"vbat": 8.0, "uwbst": 2.0, "boots": 3.0}, "tag")
+
+    assert body["solveRateHz"] == 0.0
+    assert body["anchorMask"] == 0
+    assert body["uwbStatus"] == 2
+    assert body["bootCount"] == 3
+
+
+async def test_anchor_stats_broadcast_without_the_tag_stat_set(extension, device):
+    add_rtls_cell_params(device, role=2, uwb_mac=1)
+    await discover(extension, device)
+
+    # stats the pinned SDK already accepts (pwrst, rnghz... need its bump)
+    await extension._process_datagram(
+        _bundle(device, {"vbat": 7.9, "soc": 80.0, "uwbst": 2.0}),
+        device.address,
+        0.0,
+    )
+
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)] == {
+        "id": DEVICE_SYSID,
+        "batteryVoltage": 7.9,
+        "batteryPercent": 80.0,
+        "uwbStatus": 2,
+    }
+
+
+# ---- TWR summary spread -------------------------------------------------
+
+
+def _twr_generation(device, time_boot_ms, *, distance=14.0, mad=0.0234, count=40):
+    """One responder TWR summary generation in one datagram, as the
+    firmware sends it (docs/reference/twr-summary.md)."""
+    frames = (
+        ("trcap", 1.0),
+        ("trseq", 7.0),
+        ("trmask", 1.0),
+        ("twr0001", distance),
+        ("twm0001", mad),
+        ("twn0001", float(count)),
+    )
+    return b"".join(
+        device.named_value_float(name, value, time_boot_ms) for name, value in frames
+    )
+
+
+async def test_twr_rows_carry_the_summary_spread(extension, device):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+
+    await extension._process_datagram(
+        _twr_generation(device, 1000), device.address, 10.0
+    )
+    row = extension._inf_status(10.5)[str(DEVICE_SYSID)]["twr"][0]
+    assert row == {
+        "peerMac": 0x0001,
+        "distanceM": 14.0,
+        "ageMs": 500,
+        "madM": 0.0234,
+        "count": 40,
+    }
+
+    # a later distance without its complete generation (a lost frame) is
+    # not paired with the previous generation's spread
+    await extension._process_datagram(
+        device.named_value_float("twr0001", 14.2, 2000), device.address, 11.0
+    )
+    row = extension._inf_status(11.0)[str(DEVICE_SYSID)]["twr"][0]
+    assert row["distanceM"] == 14.2
+    assert "madM" not in row and "count" not in row
+
+    # loss drops the summary with the rows
+    extension._expire_devices(time.monotonic() + 1000.0)
+    assert DEVICE_SYSID not in extension._twr_summary
+
+
+# ---- lost devices and X-RTLS-FORGET -------------------------------------
+
+
+async def test_forget_drops_a_lost_device(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    extension._expire_devices(time.monotonic() + 1000)
+    pushes = len(_inf_broadcasts(extension))
+
+    response = await extension._handle_RTLS_FORGET(
+        make_message(builder, {"type": "X-RTLS-FORGET", "ids": [DEVICE_SYSID, 99]}),
+        None,
+        hub,
+    )
+
+    assert response.body == {
+        "type": "X-RTLS-FORGET",
+        "result": {
+            str(DEVICE_SYSID): {"forgotten": True},
+            "99": {"forgotten": False, "detail": "No such device: 99"},
+        },
+    }
+    assert await _inf_status(extension, builder, hub) == {}
+    assert DEVICE_SYSID not in extension._stats
+    # the device list is pushed without the forgotten device
+    await extension._flush_pending_inf(now=time.monotonic() + 10.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == pushes + 1
+    assert broadcasts[-1]["status"] == {}
+
+
+async def test_forget_refuses_a_live_device(extension, device, builder, hub):
+    await discover(extension, device)
+
+    response = await extension._handle_RTLS_FORGET(
+        make_message(builder, {"type": "X-RTLS-FORGET", "id": DEVICE_SYSID}),
+        None,
+        hub,
+    )
+
+    assert response.body["result"] == {
+        str(DEVICE_SYSID): {
+            "forgotten": False,
+            "detail": f"Device {DEVICE_SYSID} is online",
+        }
+    }
+    assert str(DEVICE_SYSID) in await _inf_status(extension, builder, hub)
+
+
+async def test_forget_rejects_malformed_requests(extension, builder, hub):
+    for body in (
+        {"type": "X-RTLS-FORGET"},
+        {"type": "X-RTLS-FORGET", "ids": []},
+        {"type": "X-RTLS-FORGET", "ids": [True]},
+        {"type": "X-RTLS-FORGET", "id": "x"},
+    ):
+        response = await extension._handle_RTLS_FORGET(
+            make_message(builder, body), None, hub
+        )
+        assert response.body.get("type") == "ACK-NAK", body
+
+
+async def test_lost_anchor_is_not_active_anywhere(extension, device, dialect):
+    """A lost anchor stays listed, but no consumer counts it as live: the
+    site anchor list, the map beacons and command targets."""
+    extension._beacon_api = StubBeaconAPI()
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    anchor = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
+    anchor.address = ("192.168.4.43", 3333)
+    set_fake_param(anchor, "UWB_ROLE", 3, "uint8")
+    set_fake_param(anchor, "UWB_MAC", 2, "uint16")
+    await extension._process_datagram(anchor.heartbeat(), anchor.address, 0.0)
+    extension._send = lambda payload, address: _noop()  # the tag stays quiet
+    await extension._process_datagram(
+        anchor._param_value("UWB_ROLE", 0), anchor.address, 0.0
+    )
+    await extension._process_datagram(
+        anchor._param_value("UWB_MAC", 1), anchor.address, 0.0
+    )
+    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
+    assert slot["active"] is True
+
+    # only the anchor times out (the tag was seen at the real clock)
+    extension._expire_devices(5.0 + DEFAULT_DEVICE_TIMEOUT)
+
+    assert str(anchor.system_id) in extension._inf_status(10.0)
+    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
+    assert slot["active"] is False
+    assert slot["systemId"] is None
+    beacon = extension._beacon_api.beacons["rtls::default::anchor_1"]
+    assert beacon.active is False
+    with pytest.raises(KeyError):
+        await extension.set_param(anchor.system_id, "SLEEP", 1, "uint8")
+
+
+async def _noop():
+    return None
+
+
+async def test_sleep_on_an_offline_device_says_so(
+    extension, device, builder, hub, autojump_clock
+):
+    await discover(extension, device)
+    extension._expire_devices(time.monotonic() + 1000)
+
+    response = await extension._handle_RTLS_SLEEP(
+        make_message(
+            builder, {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": True}
+        ),
+        None,
+        hub,
+    )
+
+    entry = response.body["result"][str(DEVICE_SYSID)]
+    assert entry["accepted"] is False
+    assert entry["detail"] == f"Device {DEVICE_SYSID} is offline"
+
+
+async def test_param_set_refuses_remote_off(extension, device, builder, hub):
+    await discover(extension, device)
+    for value in (2, True, "1"):
+        response = await extension._handle_RTLS_PARAM_SET(
+            make_message(
+                builder,
+                {
+                    "type": "X-RTLS-PARAM-SET",
+                    "id": DEVICE_SYSID,
+                    "name": "SLEEP",
+                    "value": value,
+                },
+            ),
+            None,
+            hub,
+        )
+        assert response.body.get("type") == "ACK-NAK", value
+    assert device.params["SLEEP"][0] == bytes([0])
+
+
+# ---- anchor sleep/wake --------------------------------------------------
+
+
+class FakeAnchor(FakeDevice):
+    """Scripted anchor power path: a SLEEP change is acked, then the anchor
+    reboots into the requested state, off the network for ``reboot_s``
+    seconds, like rtls-link-zephyr's anchor (docs/reference/
+    anchor-power-path.md). ``refuse_with`` makes it refuse instead,
+    reading back as that SLEEP value; ``hang`` accepts and never reboots."""
+
+    def __init__(self, dialect, *, standby=False, reboot_s=9.0):
+        super().__init__(dialect)
+        set_fake_param(self, "UWB_ROLE", 3, "uint8")
+        self.params["SLEEP"] = (bytes([1 if standby else 0]), PARAM_TYPE_UINT8)
+        self.standby = standby
+        self.reboot_s = reboot_s
+        self.boot_at = -100.0
+        self.reboot_at = None
+        self.target = None
+        self.refuse_with = None
+        self.hang = False
+        self.expired = False
+
+    @property
+    def sleeping(self) -> bool:
+        return self.standby
+
+    @property
+    def down(self) -> bool:
+        return self.reboot_at is not None and trio.current_time() >= self.reboot_at
+
+    def uptime_ms(self) -> int:
+        return int((trio.current_time() - self.boot_at) * 1000)
+
+    def handle(self, data: bytes) -> list[bytes]:
+        return [] if self.down else super().handle(data)
+
+    def after_sleep_write(self, previous: bytes, value: bytes) -> None:
+        if self.refuse_with is not None:
+            self.params["SLEEP"] = (bytes([self.refuse_with]), PARAM_TYPE_UINT8)
+        elif value != previous and not self.hang:
+            self.target = value == b"\x01"
+            self.reboot_at = trio.current_time() + 0.5
+
+    async def run(self, extension):
+        """Heartbeats once a second while up; the server loop's expiry is
+        emulated once the reboot outlasts the device timeout."""
+        while True:
+            now = trio.current_time()
+            if self.down:
+                if not self.expired and now - self.reboot_at > DEFAULT_DEVICE_TIMEOUT:
+                    self.expired = True
+                    extension._expire_devices(time.monotonic() + 1000.0)
+                if now >= self.reboot_at + self.reboot_s:
+                    self.standby, self.boot_at = self.target, now
+                    self.reboot_at = None
+            if not self.down:
+                await extension._process_datagram(
+                    self.heartbeat(), self.address, time.monotonic()
+                )
+            await trio.sleep(1.0)
+
+
+async def _anchor_sleep(dialect, builder, hub, anchor, sleeping, **body):
+    """Discover the anchor, run it, and send it one X-RTLS-SLEEP; returns the
+    extension and the anchor's result entry."""
+    ext = RtlsExtension()
+    ext._protocol = RtlsProtocol(dialect, targets=[anchor.address])
+    ext.app = StubApp()
+
+    async def fake_send(payload, address):
+        for reply in anchor.handle(payload):
+            await ext._process_datagram(reply, anchor.address, time.monotonic())
+
+    ext._send = fake_send
+    await discover(ext, anchor)
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(anchor.run, ext)
+        response = await ext._handle_RTLS_SLEEP(
+            make_message(
+                builder,
+                {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": sleeping}
+                | body,
+            ),
+            None,
+            hub,
+        )
+        nursery.cancel_scope.cancel()
+    return ext, response.body["result"][str(DEVICE_SYSID)]
+
+
+async def test_anchor_sleep_waits_for_the_reboot(dialect, builder, hub, autojump_clock):
+    anchor = FakeAnchor(dialect)
+    started = trio.current_time()
+
+    ext, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": True,
+        "sleeping": True,
+        "detail": "asleep",
+    }
+    # confirmed only after the reboot: off the network, lost, rediscovered
+    assert anchor.expired
+    assert trio.current_time() - started >= anchor.reboot_s
+    assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is True
+
+
+async def test_anchor_wake_confirmed_by_the_rewound_uptime(
+    dialect, builder, hub, autojump_clock
+):
+    # a reboot shorter than the device timeout: never lost, the uptime
+    # probe shows the reboot
+    anchor = FakeAnchor(dialect, standby=True, reboot_s=3.0)
+
+    ext, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+
+    assert entry["accepted"] is True
+    assert entry["sleeping"] is False
+    assert not anchor.expired
+    assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is False
+
+
+async def test_anchor_wake_refused_on_a_low_pack(dialect, builder, hub, autojump_clock):
+    anchor = FakeAnchor(dialect, standby=True)
+    anchor.refuse_with = 1
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+
+    assert entry["accepted"] is False
+    assert entry["sleeping"] is True
+    assert "pack is low or has no fresh voltage" in entry["detail"]
+    assert "arming" not in entry["detail"]
+
+
+async def test_anchor_off_only_wakes_from_its_button(
+    dialect, builder, hub, autojump_clock
+):
+    anchor = FakeAnchor(dialect, standby=True)
+    anchor.params["SLEEP"] = (bytes([2]), PARAM_TYPE_UINT8)
+    anchor.refuse_with = 2
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+
+    assert entry["accepted"] is False
+    assert "only its button" in entry["detail"]
+
+
+async def test_anchor_already_asleep(dialect, builder, hub, autojump_clock):
+    anchor = FakeAnchor(dialect, standby=True)
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True
+    assert entry["sleeping"] is True
+    assert anchor.reboot_at is None and not anchor.expired
+
+
+async def test_anchor_sleep_not_confirmed_in_time(
+    dialect, builder, hub, autojump_clock
+):
+    anchor = FakeAnchor(dialect)
+    anchor.hang = True
+
+    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True, timeout=8)
+
+    assert entry == {
+        "requested": True,
+        "accepted": False,
+        "sleeping": None,
+        "detail": "the anchor accepted the request but was not seen asleep "
+        "within 8 s (it may still be rebooting)",
+    }
