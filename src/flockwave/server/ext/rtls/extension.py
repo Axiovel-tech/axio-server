@@ -2507,6 +2507,7 @@ class RtlsExtension(Extension):
             "get_param_list": self.get_param_list,
             "set_param": self.set_param,
             "set_sleep": self.set_sleep,
+            "forget_device": self.forget_device,
             "start_ota": self.start_ota,
             "verify_species": self.verify_species,
         }
