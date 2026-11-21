@@ -1,751 +1,108 @@
-# rtls — Axiovel rtls-link device management
+# rtls — rtls-link device management
 
-Manages rtls-link UWB positioning devices over their management UDP
-channel (MAVLink 2, default port 3333) and exposes them to Axio
-clients through the server's message hub:
+Manages rtls-link UWB anchors and tags over their MAVLink management link
+and exposes them to Control as the `X-RTLS-*` messages: discovery and
+presence, parameters, sleep and wake, OTA, health and position telemetry,
+anchors as map beacons, the fleet geometry check and the pre-flight
+verification. It also owns the server's estimate of the UWB cluster clock,
+which the `mavlink` extension needs to send a show start in cluster time.
 
-- **Discovery / presence**: every board streams its management
-  telemetry (heartbeats on component id 197, stats, and every few
-  seconds its uptime and, on tags, `FC_SYS_ID` / `FC_STATE`) to its
-  `MGMT_HOST:MGMT_PORT` from boot, and answers each request at the
-  request's source. The extension binds its one management socket to
-  `listen_port` (default 3343, the firmware's `MGMT_PORT` default), so a
-  board is found from its first streamed heartbeat at whatever address
-  it has (its `NET_PREFIX` plus its `MAV_SYS_ID`), and from then on gets
-  GCS heartbeats. The optional `devices` list is heartbeated from
-  startup; it reaches boards that never stream here: a wrong
-  `MGMT_HOST`, or a stream another client (a CLI, a second laptop) took
-  while the server was silent past the firmware's peer hold, since the
-  board keeps streaming to that client until someone else speaks.
-  Devices are tracked with a liveness timeout, and their full parameter
-  list is fetched automatically on discovery.
-- **Configuration**: PARAM_EXT list/read/set against the device's
-  parameter registry (an accepted set persists on the device).
-- **Telemetry**: the firmware's unsolicited health stats are cached and
-  re-broadcast as `X-RTLS-STATS`, the tag's opt-in position-estimate
-  debug stream as `X-RTLS-POS`, and inter-anchor TWR ranges surface in
-  `X-RTLS-INF`. The same stats feed drives the cluster clock estimate
-  (see below) and the fleet geometry agreement check
-  (`X-RTLS-GEOM`): every tag fits the cell itself at boot and streams
-  its fit as stats, so the server never writes anchor tables.
-- **OTA**: MCUmgr/SMP upload → mark pending → reset, via
-  `rtlslink.ota` / `smpclient` (asyncio; run in a worker thread from
-  Trio). On the ESP32-S3 MCUboot is overwrite-only — no bootloader
-  revert — so the recovery path is health-check + re-upload of the
-  previous artifact. `smpclient` is an optional dependency of the SDK and
-  the server installs the SDK's `ota` extra because OTA is a first-class
-  RTLS operation.
+What other repos rely on lives in [AxioStack `contracts/`](https://github.com/Axiovel-tech/AxioStack/tree/main/contracts):
 
-## Firmware requirements
+| Topic | Contract |
+|---|---|
+| the `X-RTLS-*` messages Control and axio-e2e use | [`rtls-client-api.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-client-api.md) |
+| the tag's geometry stats and what each failure code means | [`rtls-geometry-stats.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-geometry-stats.md) |
+| the pre-show health metrics and their zones | [`rtls-fleet-health.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-fleet-health.md) |
+| the cluster clock and the show start | [`show-timing.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/show-timing.md) |
 
-This extension speaks only the **zephyr-generation** rtls-link protocol
-(`rtls-link-zephyr`): management heartbeats on component id 197, stats
-as `NAMED_VALUE_FLOAT`, PARAM_EXT configuration and MCUmgr/SMP OTA.
-Legacy `rtls-link` (ESP32/Arduino) devices use a different dialect
-(component id 191, `RTLS_DEVICE_STATUS`/`RTLS_COMMAND`, HTTP OTA) and
-are **invisible to this extension by design** — manage them with the
-standalone `rtls-link-manager` application instead.
+## Firmware it speaks to
 
-## The rtls-link SDK
+Only rtls-link-zephyr boards: management heartbeats on component id 197,
+stats as `NAMED_VALUE_FLOAT`, `PARAM_EXT` parameters and MCUmgr/SMP OTA.
+Boards with the legacy ESP32/Arduino rtls-link firmware use another dialect
+and are invisible here by design.
 
-The protocol and OTA code lives in the standalone **`rtls-link`**
-Python package (module `rtlslink`), maintained in the firmware repo
-([Axiovel-tech/rtls-link-zephyr](https://github.com/Axiovel-tech/rtls-link-zephyr),
-directory `py/`) and pulled in as a git dependency in `pyproject.toml`.
-This extension is only the message-hub glue over the SDK:
+The protocol and OTA code is the `rtls-link` Python SDK (module `rtlslink`)
+from rtls-link-zephyr `py/`, pinned by commit in `pyproject.toml`. This
+extension is the Trio and message-hub glue over it. A firmware change that
+adds stats reaches the server only after that pin moves.
 
-- `rtlslink.protocol.RtlsProtocol` — the sans-IO protocol core (also
-  hosts the PARAM_EXT value codec and the raw-payload extraction that
-  works around pymavlink's lossy `char[]` decoding). The extension
-  drives it from its own Trio UDP socket.
-- `rtlslink.ota.upgrade` — the blocking SMP upgrade helper, run in a
-  worker thread.
+The SDK's `rtls-link` CLI talks to boards without a server (`discover`,
+`param`, `monitor`, `ota`, `selfcheck`); `--debug` traces raw frames.
+Inside the server, raise the `rtlslink` logger to DEBUG for the same traces.
 
-The SDK also ships the `rtls-link` CLI for debugging devices directly,
-without a running server: `discover`, `param list/get/set`, `monitor`,
-`ota`, and `selfcheck` (end-to-end protocol check against a live
-firmware; `selfcheck.py` in this directory is just a deprecated shim
-for it). Pass `--debug` for raw frame tracing; inside the server the
-same traces are available by raising the `rtlslink` logger to DEBUG.
+## How boards are found
 
-## Layout
+Every board streams its management telemetry to `MGMT_HOST:MGMT_PORT` from
+boot. The extension listens on `listen_port` (the firmware's `MGMT_PORT`
+default, 3343) and finds a board from its first heartbeat, at whatever
+address it has; it then sends it GCS heartbeats and fetches its parameter
+list. The extension does not start when `listen_port` is taken.
 
-- `extension.py` — the Trio/flockwave glue over the SDK: discovery
-  loop, the awaitable parameter transactions, OTA jobs and the client
-  message handlers documented below.
-- `cluster_clock.py` — the wall-clock estimate of the UWB cluster clock
-  (see below).
-- `geometry_agreement.py` — the `X-RTLS-GEOM` fleet geometry agreement
-  check: a pure function over the cached geometry stats (see below).
-- `verify.py` — the `X-RTLS-VERIFY` fleet pre-flight rule set (see
-  below).
-- `cell_compat.py` — fallback cell-model helpers (role, origin + anchor
-  NED table, NED->global) for SDK pins that predate them; the
-  `rtlslink` implementations are used when present.
-- `selfcheck.py` — deprecated shim forwarding to
-  `rtls-link selfcheck`.
+The optional `devices` list, heartbeated on `port` from startup, is only for
+boards that do not stream here: a wrong `MGMT_HOST`, or a stream that another
+client (the CLI, a second laptop) took while the server was silent; a board
+keeps streaming to that client until someone else speaks to it.
 
 ## Configuration
 
 ```jsonc
-"EXTENSIONS": {
-  "rtls": {
-    "port": 3333,                      // the devices' management port
-    "devices": [],                     // optional: addresses to heartbeat from startup
-    "listen_port": 3343,               // the devices' MGMT_PORT
-    "register_beacons": true           // anchors as map beacons (see X-RTLS-INF)
-  }
+"rtls": {
+  "enabled": true,
+  "listen_port": 3343,        // the boards' MGMT_PORT
+  "devices": [],              // optional, see above
+  "port": 3333,               // management port of the boards in "devices"
+  "register_beacons": true,   // anchors as map beacons
+  "heartbeat_interval": 2,    // s
+  "device_timeout": 6         // s without a heartbeat before a board is lost
 }
 ```
 
-`heartbeat_interval` and `device_timeout` (seconds) may also be set to
-override the presence cadence; the defaults are 2 s / 6 s. The
-extension does not start when `listen_port` is taken.
-
-## Cluster clock (UWB-timebase show start)
-
-Tags recover a shared absolute cluster time from the UWB anchor cluster
-and report it in their health stats (`clkh`/`clks` cluster seconds, with
-a `clkok` freshness flag); each tag streams it to its flight controller as
-the show clock, in cluster microseconds. The drones count the show start
-in this cluster time, so inter-drone agreement rides entirely on the
-shared cluster clock. The extension is the only place that relates
-cluster time to wall time. It exports the estimate as `cluster_clock`
-(`estimate()`, `cluster_us_at(wall)`, `wall_at(cluster_us)`, `epoch`),
-which the `mavlink` extension uses to send the show start to the drones
-in cluster time and to read back the starts they hold. Nothing is written
-to the tags.
-
-- Every report arrives some latency after the tag sampled its cluster
-  time, so the estimate of wall minus cluster time is the smallest one
-  over the last 20 s across all tags (the least delayed report). Its
-  absolute accuracy only offsets the show against the server's wall clock
-  (and the music it plays), equally for every drone.
-- A cluster restart (a tag's cluster time deviating from the estimate's
-  prediction by more than 5 s in two consecutive distinct reports — e.g.
-  the time-reference anchor power-cycled) starts a new timebase: the
-  estimate is re-seeded, `epoch` is incremented and a warning is logged.
-  A single deviating report is a torn `clkh`/`clks` pair (the two arrive
-  in separate frames) and is ignored.
-
-## Client message API
-
-The extension registers experimental (`X-` prefixed, schema-exempt)
-message types on the server's message hub. All messages follow the
-usual Flockwave envelope (`{"$fw.version": ..., "id": ..., "body":
-{...}}`); only bodies are shown below. Requests that fail validation,
-address an unknown device, or time out are answered with a standard
-`ACK-NAK` body carrying a human-readable `reason`.
-
-Devices are addressed by their MAVLink **system id** (`id`, an
-integer; numeric strings are accepted). Parameter-transaction requests
-accept an optional `timeout` (seconds, capped at 60) overriding the
-defaults (5 s for single-parameter operations, 10 s for full lists).
-
-Parameter types are the MAV_PARAM_EXT_TYPE names, lower-case:
-`uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `uint64`,
-`int64`, `real32`, `real64`, `custom`. Numeric values travel as JSON
-numbers; `custom` values as UTF-8 strings.
-
-### X-RTLS-INF — list discovered devices
-
-Request:
-
-```json
-{"type": "X-RTLS-INF"}
-```
-
-Response — one entry per live device, keyed by system id (as string),
-plus a site-level `anchors` list:
-
-```json
-{
-  "type": "X-RTLS-INF",
-  "status": {
-    "42": {
-      "id": 42,
-      "address": ["192.168.4.42", 3333],
-      "age": 0.52,
-      "firmwareVersion": "1.2.3",
-      "uptimeMs": 123456,
-      "paramCount": 23,
-      "otaStatus": null,
-      "sleeping": false,
-      "uav": "05",
-      "flightController": {"systemId": 5, "state": "live"},
-      "role": "tag",
-      "cell": "default",
-      "name": "RTLS tag 42",
-      "twr": [{"peerMac": 1, "distanceM": 14.1, "ageMs": 120}]
-    }
-  },
-  "anchors": [
-    {
-      "id": "rtls::default::anchor_0",
-      "cell": "default",
-      "index": 0,
-      "mac": 1,
-      "position": {"lat": 41.39, "lon": 2.15, "amsl": 10.0},
-      "ned": {"north": -10.0, "east": -10.0, "down": 0.0},
-      "active": true,
-      "systemId": 101
-    }
-  ]
-}
-```
-
-- `age` — seconds since the last heartbeat from the device.
-- `firmwareVersion` — the `FW_VERSION` parameter if the device exposes
-  one, otherwise `null`.
-- `uptimeMs` — device uptime in milliseconds, from the latest
-  SYSTEM_TIME in the device's stream; absent until one arrives (the
-  underlying counter wraps after ~49.7 days, like the firmware's).
-- `paramCount` — size of the device's parameter registry once known
-  (the list is auto-fetched on discovery), otherwise `null`.
-- `otaStatus` — status of the device's last OTA job
-  (`"running"` / `"success"` / `"error"`) or `null` if there was none.
-- `sleeping` — `true` while the drone is in sleep mode (power rails to
-  the motors/flight controller, ELRS receiver and UWB module cut; WiFi
-  and this management link still up). Derived from the device's
-  heartbeat (`MAV_STATE_STANDBY`), so it is live even though sleep is
-  commanded through the `SLEEP` parameter. An `X-RTLS-INF` notification
-  is pushed (throttled) whenever a device's `sleeping` flips, and an
-  accepted sleep/wake transaction updates the flag optimistically —
-  a woken device reads `sleeping: false` immediately, even though it
-  reboots off the network for a few seconds before its first `ACTIVE`
-  heartbeat. The transaction's outcome is pinned for up to 30 s:
-  contradicting in-flight heartbeats (the firmware acks the `SLEEP`
-  write before its power task cuts over) are overridden until a
-  heartbeat confirms the new state or the pin expires.
-- `uav` — the flockwave id of the drone this device belongs to: the UAV
-  whose MAVLink system id is the `systemId` of this device's
-  `flightController` claim (live or remembered, never ambiguous). It
-  therefore stays while the drone sleeps, provided the server has heard
-  from that drone since it started. Absent otherwise (anchors, spare
-  tags, a drone the server has not heard from yet). An `X-RTLS-INF`
-  notification is pushed (throttled) whenever a device's `uav` or
-  `flightController` changes.
-- `flightController` — the autopilot this device itself reports through
-  its `FC_SYS_ID` / `FC_STATE` parameters, which its stream carries
-  also while it sleeps: `systemId` is that autopilot's MAVLink
-  system id and `state` is `"live"` (heard on the device's UART now),
-  `"remembered"` (the persisted id of the last confirmed autopilot, not
-  heard now; always so while the device sleeps) or `"ambiguous"` (with a
-  `reason`: the device hears conflicting heartbeats, reports inconsistent
-  values, or another device claims the same `systemId` — only a single
-  device hearing it `"live"` keeps it). `systemId` may be absent only when
-  ambiguous. Absent on devices without an identity (anchors,
-  never-associated tags, firmware without the parameters).
-- `role` — `"tag"`, `"anchor-initiator"`, `"anchor-responder"` or
-  `"disabled"`, from the device's `UWB_ROLE` parameter; absent when the
-  device does not expose it.
-- `name` — a human-readable role-aware label (e.g. `"RTLS anchor A0"`);
-  absent for devices with no recognised role.
-- `twr` — inter-anchor TWR telemetry: a list (freshest first) of
-  `{peerMac, distanceM, ageMs}` rows, one per peer anchor the device
-  currently hears on the UWB ether. The peer MAC is decoded from the
-  firmware's `twr<peer-mac-hex>` NAMED_VALUE_FLOAT and `ageMs` is the time
-  since that range was last harvested. Present only on anchors that report
-  ranges.
-
-The site-level `anchors` list mirrors the configured cell geometry: each
-anchor carries a stable id `rtls::<cell>::anchor_<i>`, its GPS position
-(cell origin + NED), its native cell-frame NED coordinates in meters
-(`ned` — the frame the X-RTLS-POS estimates are expressed in, so a
-debug view can plot both without a lossy GPS round-trip), `active`
-— true only when a live anchor device with the matching `UWB_MAC` is
-online — and that device's `systemId` (null while none is). A tag's
-`cell` names the cell whose anchor slots its `nlosMask` and
-`outvotedMask` bits index, so a client can name a flagged anchor by its
-system id. These anchors are also published
-to clients through the existing Axio Server **beacon** layer (same stable
-ids), so the map renders them without a bespoke anchor layer. Set
-`register_beacons: false` to disable the beacon registration.
-
-Devices that miss their liveness timeout disappear from the map.
-
-The server also **broadcasts** `X-RTLS-INF` notifications with the same
-body shape (no `refs` member, since they are not responses) whenever a
-device is discovered or lost or its `sleeping` state changes (from a
-heartbeat flip or an accepted sleep/wake transaction) — throttled to at
-most one per second, with transitions inside the window coalesced into
-one trailing-edge notification — and every 10 s without transitions so
-`age` values keep refreshing. Each notification carries the **full** current status map;
-clients should replace their device list wholesale rather than merge.
-
-### X-RTLS-PARAM-LIST — full parameter list
-
-Drives a full PARAM_EXT list transaction against the device and
-responds once **all** parameters have been received (or NAKs on
-timeout).
-
-Request:
-
-```json
-{"type": "X-RTLS-PARAM-LIST", "id": 42, "timeout": 10}
-```
-
-Response:
-
-```json
-{
-  "type": "X-RTLS-PARAM-LIST",
-  "id": 42,
-  "count": 4,
-  "params": {
-    "MAV_SYS_ID": {"value": 42, "type": "uint8", "index": 0},
-    "UWB_CHANNEL": {"value": 5, "type": "int32", "index": 1},
-    "POS_X": {"value": 1.5, "type": "real32", "index": 2},
-    "FW_VERSION": {"value": "1.2.3", "type": "custom", "index": 3}
-  }
-}
-```
-
-### X-RTLS-PARAM-GET — read one parameter
-
-Issues a PARAM_EXT read and responds with the value reported by the
-device (NAK on timeout).
-
-Request:
-
-```json
-{"type": "X-RTLS-PARAM-GET", "id": 42, "name": "UWB_CHANNEL"}
-```
-
-Response:
-
-```json
-{
-  "type": "X-RTLS-PARAM-GET",
-  "id": 42,
-  "name": "UWB_CHANNEL",
-  "value": 5,
-  "paramType": "int32"
-}
-```
-
-### X-RTLS-PARAM-SET — write one parameter
-
-Issues a PARAM_EXT set and waits for the device-side acknowledgement;
-the response carries the value **as acknowledged by the device** and
-the raw PARAM_ACK result code (`0` accepted, `1` value unsupported,
-`2` failed; in-progress acks are awaited transparently). A device-side
-rejection is still a normal response (`accepted: false`); only
-timeouts and malformed requests are NAKed.
-
-Since the firmware's tag/anchor application split, an out-of-bounds
-numeric set is acked `1` (value unsupported) with the **clamped value
-the device actually applied** in the response — not a silent success.
-The motivating case is `UWB_ROLE`, whose bounds are image-pinned
-(tag `1..1`, anchor `2..3`): a device can no longer change species by
-parameter; flash/OTA the role-matched image instead. UIs should show
-`accepted: false` plus the returned value as "device rewrote this".
-
-Request — `paramType` may be omitted when the type is already known
-from an earlier listing (always the case after discovery):
-
-```json
-{
-  "type": "X-RTLS-PARAM-SET",
-  "id": 42,
-  "name": "UWB_CHANNEL",
-  "value": 9,
-  "paramType": "int32"
-}
-```
-
-Response:
-
-```json
-{
-  "type": "X-RTLS-PARAM-SET",
-  "id": 42,
-  "name": "UWB_CHANNEL",
-  "value": 9,
-  "paramType": "int32",
-  "result": 0,
-  "accepted": true
-}
-```
-
-### X-RTLS-SLEEP — sleep / wake drones
-
-Puts one or more devices into sleep mode, or wakes them. Sleep is
-commanded through the firmware's `SLEEP` parameter; the firmware
-**refuses** to sleep while its flight controller is armed (or, in the
-default strict gate mode, while a live disarmed heartbeat cannot be
-confirmed) by flipping the parameter back to `0` — the server detects
-that by reading the parameter back after a settle delay and reports
-the refusal per device. A sleeping drone keeps WiFi and the
-management channel up, stays discoverable (`sleeping: true` in
-`X-RTLS-INF`) and can be woken with the same message.
-
-On hardware, a woken device reboots a moment after acknowledging the
-wake (to re-initialize the power-cycled UWB module) and drops off the
-network for a few seconds before re-appearing.
-
-Request — `ids` lists the target devices (a single `id` is also
-accepted); `sleeping` selects the direction:
-
-```json
-{
-  "type": "X-RTLS-SLEEP",
-  "ids": [42, 43],
-  "sleeping": true
-}
-```
-
-Response — one entry per device; `accepted: false` with a `detail`
-of the refusal is a normal response (only malformed requests NAK):
-
-```json
-{
-  "type": "X-RTLS-SLEEP",
-  "sleeping": true,
-  "result": {
-    "42": {"requested": true, "accepted": true, "sleeping": true, "detail": "asleep"},
-    "43": {"requested": true, "accepted": false, "sleeping": false, "detail": "refused by device (arming gate: vehicle armed or flight controller not confirmed disarmed)"}
-  }
-}
-```
-
-### X-RTLS-OTA — firmware update
-
-With an `image` field the message **starts** an OTA job for the device
-(NAK if the device is unknown, the file does not exist, or a job is
-already running for that device); without it, it **queries** the
-status of the device's last job. One job per device at a time; the
-image path is a server-side filesystem path.
-
-The firmware ships as **two role-matched artifacts** since the
-tag/anchor application split (`build/<board>/tag/...` and
-`build/<board>/anchor/...`); a device's role is image-pinned and OTA
-must upload the matching one. The optional `role` field declares which
-species the artifact was built for — the server then reads the
-device's `UWB_ROLE` and NAKs the upload on a mismatch instead of
-letting a wrong-species image strip the device of its function:
-
-Start:
-
-```json
-{
-  "type": "X-RTLS-OTA",
-  "id": 42,
-  "image": "/srv/firmware/rtls-link-anchor-1.4.0.bin",
-  "role": "anchor"
-}
-```
-
-Without `role` the upload is unguarded (pre-split behavior).
-
-Response (job snapshot; also the shape of the status query response,
-whose `job` is `null` when the device never had a job):
-
-```json
-{
-  "type": "X-RTLS-OTA",
-  "id": 42,
-  "job": {
-    "id": 42,
-    "image": "/srv/firmware/rtls-link-1.3.0.bin",
-    "status": "running",
-    "progress": 0.0,
-    "version": null,
-    "error": null
-  }
-}
-```
-
-- `status` — `"running"`, then `"success"` or `"error"`.
-- `progress` — upload progress, `0.0 … 1.0`.
-- `version` — version string of the uploaded image on success.
-- `error` — failure description when `status` is `"error"`.
-
-While a job runs, the server **broadcasts** `X-RTLS-OTA` notifications
-with the same body shape (no `refs` member, since they are not
-responses) on progress changes (at most every 0.5 s) and once on
-completion. UIs may rely on the notifications or poll with the status
-query.
-
-### X-RTLS-STATS — health telemetry
-
-The firmware streams health stats unsolicited (one `NAMED_VALUE_FLOAT`
-per stat, ~2 Hz); the server caches the latest snapshot per device and
-**broadcasts** `X-RTLS-STATS` notifications, throttled to at most one
-per device per second (with a trailing-edge flush, so the newest
-snapshot inside a throttle window is never lost). A notification carries
-the entry of the device that updated; the query returns every known
-device, or one with the optional `id` (an unknown id yields an empty
-snapshot, not an error). Snapshots of devices that drop off the network
-are pruned with them.
-
-Request:
-
-```json
-{"type": "X-RTLS-STATS"}
-```
-
-Response / notification body — entries keyed by system id (as string):
-
-```json
-{
-  "type": "X-RTLS-STATS",
-  "stats": {
-    "42": {
-      "id": 42,
-      "solveRateHz": 12.5,
-      "solvePct": 98.0,
-      "anchorsSeen": 4,
-      "fixAgeMs": 80,
-      "clockPpm": 1.2,
-      "anchorMask": 15,
-      "sleeping": false,
-      "batteryVoltage": 7.812,
-      "clockSyncOk": true,
-      "geometryState": 3,
-      "geometryReason": 0,
-      "geometryResidualM": -0.075,
-      "geometryDriftM": 0.002,
-      "geometryDistancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-      "uwbRssiDbm": -81.5,
-      "nlosMask": 4,
-      "outvotedMask": 0,
-      "residualRmsM": 0.0312,
-      "wifiRssiDbm": -58,
-      "wifiDisconnects": 0,
-      "imuTemperaturesC": [41.25, 39.8]
-    }
-  }
-}
-```
-
-- `sleeping` — mirrors the `slp` stat; **omitted** (not `false`) for
-  firmware that predates sleep mode, so a UI can tell "unknown".
-- `batteryVoltage` — the optional `vbat` stat, in volts; omitted on
-  boards that cannot measure it.
-- `geometryState` / `geometryReason` / `geometryResidualM` /
-  `geometryDriftM` / `geometryDistancesM` — the tag's automatic cell
-  geometry (rtls-link-zephyr#210; firmware
-  `geom`/`gfail`/`gres`/`gdrift`/`gd1..gd7`):
-  fit state (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed),
-  why the last fit was rejected (0 none, 1 anchor count not 4 or 8,
-  2 anchor missing, 3 side too short, 4 not a rectangle, 5 top plane not
-  above the bottom one), rectangle-diagonal residual (m), largest live initiator-distance drift
-  since calibration (m), and the seven fitted AN0-ANi distances (m; the
-  last four are `null` for a four-anchor cell). Present only on firmware
-  with automatic geometry; the distances arrive once calibrated.
-- `uwbRssiDbm` / `nlosMask` / `outvotedMask` / `residualRmsM` — the tag's
-  UWB link quality over its last report interval (firmware
-  `urssi`/`nlosmask`/`outmask`/`rmse`): the weakest anchor's mean RSSI
-  (dBm), the anchors the chip flagged NLOS on most rows, the anchors the
-  solver is outvoting, and the solver's mean residual RMS (m).
-  `uwbRssiDbm` is `null` when no row carried a reading and `residualRmsM`
-  when the tag did not solve in the interval.
-- `wifiRssiDbm` / `wifiDisconnects` — the tag's WiFi association (firmware
-  `rssi`, sent only while associated) and the associations it lost since
-  boot (`wdisc`).
-- `imuTemperaturesC` — not a tag stat: the die temperature of each IMU of
-  the drone the tag belongs to (the `uav` of X-RTLS-INF), IMU 0 first, from
-  the SCALED_IMU/SCALED_IMU2/SCALED_IMU3 messages the drone streams on its
-  own (AVCopter's standard show telemetry sends the first two at 1 Hz from
-  boot; the server never requests them). An IMU silent for over 5 s is
-  `null`; omitted while the tag has no drone or the drone no reading, which
-  includes autopilots without that telemetry. It is refreshed with the tag's
-  own stats.
-- The ground's green/yellow/red zones for these fields, and their evidence,
-  are in AxioStack `contracts/rtls-fleet-health.md`.
-- The first broadcast for a device waits until the full legacy stat set
-  (`solveRateHz` … `anchorMask`) has arrived once, so it never carries a
-  half-populated snapshot; optional stats never gate the broadcast.
-
-### X-RTLS-POS — live position-estimate debug stream
-
-Surfaces the tag firmware's position-estimate debug emit
-([rtls-link-zephyr#14](https://github.com/Axiovel-tech/rtls-link-zephyr/issues/14)):
-when a tag's `POS_DBG_HZ` parameter is nonzero (off by default; set it
-with `X-RTLS-PARAM-SET`), every solved NED position streams to the
-server as `NAMED_VALUE_FLOAT pn`/`pe`/`pd`/`psig`, and the server
-**broadcasts** `X-RTLS-POS` notifications with the latest estimate per
-device, throttled to at most one per device per 100 ms. Intended for
-the "Debug Pos Estimates" pre-flight view in control; anchors for the
-same plot come from the `ned` member of the `X-RTLS-INF` anchor list.
-
-The same body shape is available as a **query** (optional `id` narrows
-it to one device; unknown ids yield an empty snapshot, not an error):
-
-```json
-{"type": "X-RTLS-POS"}
-```
-
-Response / notification body — one entry per device that has reported
-a complete estimate, keyed by system id (as string):
-
-```json
-{
-  "type": "X-RTLS-POS",
-  "positions": {
-    "42": {
-      "id": 42,
-      "north": 1.204,
-      "east": -0.351,
-      "down": -0.82,
-      "sigma": 0.12,
-      "timeBootMs": 123456,
-      "ageMs": 3
-    }
-  }
-}
-```
-
-- `north` / `east` / `down` — the solved position in the cell's NED
-  frame, meters.
-- `sigma` — the firmware's reported NE sigma (meters); absent when the
-  solver had no covariance for this estimate.
-- `timeBootMs` — the device-side timestamp of the estimate (the stamp
-  that groups one emit cycle on the wire).
-- `ageMs` — server-side age of the estimate at send time; with the
-  stream on, notifications carry ~0, while a query answered from cache
-  can be older. Clients should fade/flag entries whose updates stop.
-
-Estimates of a device that drops off the network are pruned with it.
-
-### X-RTLS-GEOM — fleet cell-geometry agreement
-
-Every tag fits the anchor table itself at boot from the initiator
-distances it receives (rtls-link-zephyr#210, `docs/auto-geometry.md`
-there): no anchor table is written from the ground any more, and
-`UWB_GEOM_MODE=0` keeps a provisioned `UWB_AN*` table for layouts
-outside the stacked-rectangle convention. The fitted table is a
-deterministic function of the seven fitted AN0-ANi distances the tag
-streams as stats, so "did every drone converge on the same cell?" is a
-comparison of those distances against the fleet's per-distance median.
-The check is a pure function over the cached `X-RTLS-STATS` snapshots:
-no device I/O, instant, swarm-sized.
-
-```json
-{"type": "X-RTLS-GEOM", "ids": [42, 43], "tolerance": 0.05}
-```
-
-`ids` (optional) restricts the grading to those system ids; `tolerance`
-(metres, default 0.05) is the largest accepted deviation of one distance
-from the reference. Fits taken at different times differ by the slow shift of
-the live distances, so a deviating tag usually means "recalibrate the fleet"
-(`UWB_GEOM_RECAL=1` on every tag; Control's Recalibrate button). `driftTolerance` in the response (0.08 m, fixed) is the
-largest accepted live drift. Response:
-
-```json
-{
-  "type": "X-RTLS-GEOM",
-  "tolerance": 0.05,
-  "driftTolerance": 0.08,
-  "reference": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-  "references": {"default": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233]},
-  "consistent": false,
-  "devices": {
-    "42": {"id": 42, "cell": "default", "status": "agree", "state": 3, "stateName": "calibrated",
-           "residualM": -0.075, "driftM": 0.002,
-           "distancesM": [8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-           "maxDeviationM": 0.001},
-    "43": {"id": 43, "status": "deviates", "state": 3, "stateName": "calibrated",
-           "residualM": -0.074, "driftM": 0.001,
-           "distancesM": [8.657, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233],
-           "maxDeviationM": 0.07, "deviations": {"AN0-AN1": 0.07},
-           "detail": "off the fleet reference by AN0-AN1 7.0 cm — recalibrate the fleet so every tag fits at the same time"},
-    "44": {"id": 44, "status": "calibrating", "state": 2, "stateName": "calibrating",
-           "detail": "still fitting the cell"}
-  }
-}
-```
-
-Per-tag `status`: `agree` / `deviates` (graded against the reference of
-the tag's cell, with `maxDeviationM` and the offending `deviations`),
-`drifted` (the live initiator distances moved more than `driftTolerance` away
-from the fit — a tripod moved after calibration; recalibrate), `frame`
-(the tag's `ORIGIN_*` / `POS_YAW_DEG` / `UWB_AN_COUNT` / `UWB_AN{i}_MAC` /
-`UWB_AN{i}_BIAS_M` differ from the rest of its cell — same distances, different world placement or
-slot-to-anchor binding; `frame` lists the parameters), `incomplete` (those
-parameters are not all in the cache yet; `missingParams` lists them),
-`missing` (an explicitly requested id that is not online), or
-`manual` (uses its provisioned table), `calibrating`, `failed`
-(the tag rejected the rig — a placement outside the convention, such as
-two anchors swapped, or an anchor never heard; `reason` carries the
-firmware's code and `detail` names it; the firmware retries), `stale` (stats older
-than 10 s) and `unknown` (no geometry telemetry, i.e. firmware without
-automatic geometry). A candidate needs a complete fit — the three
-bottom-plane distances and all or none of the top plane (the firmware
-sends `0` for a plane it did not fit) — before it is graded. Every entry
-names its `cell` (`CELL_ID`); tags are
-compared within their cell only, `references` holds one reference per
-cell and `reference` is that of the only cell (`null` with none or
-several). Anchors (by `UWB_ROLE`) are never graded. `consistent` is true when at
-least one cell has a reference and no tag deviates, drifted, differs in
-frame, is still
-calibrating, failed, went silent or is unknown; manual tags are reported
-but do not block — the table is the operator's deliberate choice.
-
-A fit is repeated on the tag with `UWB_GEOM_RECAL=1` (through
-`X-RTLS-PARAM-SET`). The stats contract is pinned in AxioStack's
-`contracts/rtls-geometry-stats.md`.
-
-### X-RTLS-VERIFY — fleet pre-flight verification
-
-Runs the whole "are my drones consistent?" rule set in one message:
-**geometry** (the X-RTLS-GEOM agreement: every tag has fitted the cell
-and the fleet agrees on it), **firmware** uniformity per role,
-tag↔drone **pairing** coverage, the ArduPilot **yaw-source** rule
-(`EK3_SRC1_YAW == 9`, the axio fork's virtual compass, and a
-fleet-consistent `EK3_SRC_VC_YAW`, read live over MAVLink with
-per-drone error isolation; the tags' `POS_YAW_DEG` is reported
-alongside), and the **uwb** solving state (rate, fix age, solve
-quality, cluster-clock sync from the live stats). With
-`"inDepth": true` a sixth rule reads the ArduPilot navigation/tuning
-set (EKF sources, VISO, WPNAV, LOIT, position/attitude controllers,
-IMU filters) from every paired drone and reports cross-drone
-differences — always as warnings: deliberate per-drone tuning exists.
-
-```json
-{"type": "X-RTLS-VERIFY", "inDepth": false}
-```
-
-Response: `rules` (each with `id`, `label`, `severity`
-(`error`/`warning`), `status` (`pass`/`fail`/`skipped`), a
-human-readable `detail` and rule-specific extras), `passed` (no
-error-severity rule failed) and the embedded `geometry` agreement body
-for UI reuse. Concurrent runs are NAKed; expect the in-depth pass to
-take a few seconds per fleet (live MAVLink parameter reads).
-
-### Notes for control-UI developers
-
-- The server treats `X-`-prefixed messages as experimental: they skip
-  JSON schema validation, so unknown body members are ignored rather
-  than rejected — keep client payloads tidy.
-- `X-RTLS-PARAM-LIST` / `-GET` / `-SET` block server-side until the
-  device transaction completes; expect responses to arrive up to
-  `timeout` seconds after the request. Responses reference the request
-  message id in the `refs` member of their envelope, as usual.
-- Parameter writes that the device accepts are persisted on the device
-  by the firmware's parameter registry.
-
-## Extension exports
-
-Other server extensions can use the same machinery via the exports of
-this extension: `devices()`, `protocol()`, and the awaitable
-`get_param(system_id, name)`, `get_param_list(system_id)`,
-`set_param(system_id, name, value, param_type=None)`,
-`set_sleep(system_id, sleeping)`,
-`verify_species(system_id, role)` and
-`start_ota(system_id, image_path)`.
-
-## Testing
-
-`test/test_ext_rtls.py` exercises the message handlers against the
-SDK's sans-IO protocol core with a fake transport and a scripted fake
-device (no sockets):
+The extension is not loaded by default; `etc/conf/axio-rtls-indoor.jsonc`
+enables it.
+
+## Things the code does not make obvious
+
+- **The server never writes anchor tables.** Every tag fits the cell itself
+  at boot. `X-RTLS-GEOM` only compares the fits across the fleet, and a tag
+  refits on `UWB_GEOM_RECAL=1`.
+- **OTA has no bootloader revert.** MCUboot on the ESP32-S3 is
+  overwrite-only, so a bad image is recovered by uploading the previous one.
+  Tag and anchor images are different artifacts. Pass `role` with
+  `X-RTLS-OTA` so the server checks `UWB_ROLE` first; `UWB_ROLE` itself
+  cannot be changed by parameter.
+- **Sleep is a parameter write the firmware may undo.** `SLEEP` is written
+  back to `0` while the drone's autopilot is armed or not confirmed disarmed.
+  The server reads it back after a settle delay to report the refusal. A
+  woken board reboots and is off the network for a few seconds.
+- **Drone pairing comes from the tag.** A tag reports its autopilot's system
+  id (`FC_SYS_ID` / `FC_STATE`) and keeps reporting it while asleep; the
+  server pairs the tag with the drone of that system id.
+- **The IMU temperatures in `X-RTLS-STATS` are not tag stats.** They are the
+  paired drone's own `SCALED_IMU*` messages, joined in by the server.
+
+## Code
+
+- `extension.py`: discovery, parameter transactions, sleep, OTA, stats and
+  the message handlers. Its exports (`devices()`, `get_param()`,
+  `set_param()`, `set_sleep()`, `start_ota()`, `cluster_clock`, …) are the
+  entry points for other extensions.
+- `cluster_clock.py`: the wall-clock estimate of the cluster clock.
+- `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
+  stats.
+- `verify.py`: `X-RTLS-VERIFY`.
+- `fc_identity.py`: the tag-to-drone pairing.
+- `fitted_cell.py`, `cell_compat.py`: the anchor cell built from a tag's
+  fit, and fallbacks for SDK pins that predate the cell helpers.
+- `selfcheck.py`: deprecated shim for `rtls-link selfcheck`.
+
+## Tests
 
 ```sh
 uv run pytest test/test_ext_rtls.py
 ```
 
-Protocol-level tests (codec roundtrips, heartbeat/param state machine,
-client, CLI) live in the SDK's own test suite in the firmware repo
-(`py/tests/`), not here.
+The tests drive the handlers against the SDK's sans-IO protocol core with a
+scripted fake device, without sockets. Protocol tests belong to the SDK, in
+rtls-link-zephyr `py/tests/`.
