@@ -2393,14 +2393,12 @@ def _stats_json(system_id: int, data: dict[str, Any]) -> dict[str, Any]:
         # UI both need it; previously only the show-clock pin manager
         # consumed it internally
         body["clockSyncOk"] = bool(data["clkok"])
-    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state
-    # (0 manual, 1 waiting, 2 calibrating, 3 calibrated, 4 failed), why the
-    # last fit was rejected (0 none, 1 anchor count not 4 or 8, 2 anchor
-    # missing, 3 side too short, 4 not a rectangle, 5 top plane not above
-    # the bottom one), the rectangle-diagonal residual, the largest live
-    # drift since calibration and the seven fitted AN0-ANi distances (0
-    # without a fit; a four-anchor cell reports the first three). The fleet
-    # agreement check (X-RTLS-GEOM) compares the distances.
+    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state,
+    # why the last fit was rejected (codes in geometry_agreement.py), the
+    # rectangle-diagonal residual, the largest live drift since calibration
+    # and the seven fitted AN0-ANi distances (0 without a fit; a four-anchor
+    # cell reports the first three). The fleet agreement check (X-RTLS-GEOM)
+    # compares the distances.
     # non-finite floats cannot be JSON and cannot be graded: drop them
     if "geom" in data and math.isfinite(float(data["geom"])):
         body["geometryState"] = int(data["geom"])
