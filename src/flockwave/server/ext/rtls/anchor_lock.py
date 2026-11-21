@@ -1,10 +1,10 @@
 """The anchor cell lock (X-RTLS-LOCK).
 
-The firmware owns the lock: an anchor with ``LOCK=1`` refuses every remote
-change, accepts the lock only while operating and drops it when it stops
-operating, and reports it as the ``lock`` stat. The server only writes
-``LOCK`` to the online anchors, warns before locking, derives the cell's lock
-state from the stats, and gates the show start on it.
+The firmware owns the lock (rtls-link-zephyr
+``docs/reference/anchor-power-path.md``, "Lock") and reports it as the
+``lock`` stat. The server writes ``LOCK`` to the online anchors, warns before
+locking, derives the cell's lock state from the stats and gates the show
+start on it.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ _STATE_PHRASES = {
     "standby": "is in standby",
     "asleep": "is asleep",
     "off": "is off",
-    "operating": "is operating",
     "stopping": "is stopping",
     "shutdown": "is shutting down",
     "fault": "has a power fault",
@@ -136,12 +135,16 @@ def lock_warnings(views: list[AnchorView]) -> list[LockWarning]:
 
 
 def lock_refusal(views: list[AnchorView]) -> Optional[str]:
-    """Why the cell cannot be locked now: an online anchor that is not
-    operating (only an operating anchor accepts the lock)."""
+    """Why the cell cannot be locked now: an online anchor that has not
+    reported operating (only an operating anchor accepts the lock)."""
     reasons = []
     for view in views:
         state = view["stats"].get("powerState")
-        if view["online"] and state not in (None, "operating"):
+        if not view["online"] or state == "operating":
+            continue
+        if state is None:
+            reasons.append(f"{view['name']} has not reported its power state")
+        else:
             todo = (
                 "wake it first" if state in ("asleep", "standby") else "start it first"
             )
@@ -161,10 +164,10 @@ async def handle_lock_request(
         )
     views = anchor_views(ext)
     warnings = lock_warnings(views)
-    refusal = lock_refusal(views)
-    result, results = action, {}
+    reason = lock_refusal(views)
+    result, results = action, None
     if action == "lock":
-        if refusal:
+        if reason:
             result = "refused"
         elif warnings and body.get("acknowledgeWarnings") is not True:
             result = "warnings"
@@ -172,18 +175,19 @@ async def handle_lock_request(
             results = await _write_lock(ext, views, 1)
     elif action == "unlock":
         results = await _write_lock(ext, views, 0)
-    if results:
-        done = all(entry["accepted"] for entry in results.values())
+    if results is not None:
+        done = bool(results) and all(entry["accepted"] for entry in results.values())
         result = (
             ("locked" if action == "lock" else "unlocked") if done else "incomplete"
         )
+        reason = None if results else "No online anchors"
     return {
         "type": "X-RTLS-LOCK",
         "action": action,
         "result": result,
-        "reason": refusal,
+        "reason": reason,
         "warnings": warnings,
-        "results": results,
+        "results": results or {},
         "anchorLock": lock_json(ext),
     }
 
@@ -236,13 +240,16 @@ def show_gate(
     ext: "RtlsExtension", views: Optional[list[AnchorView]] = None
 ) -> ShowGate:
     """Whether the server refuses to authorize or schedule a flight now:
-    with the gate on and anchors known, every online anchor must be locked.
-    SHOW-SETCFG and ``anchorLock.showGate`` both use this verdict."""
+    with the gate on, at least one online anchor and every online anchor
+    must report its lock. SHOW-SETCFG and ``anchorLock.showGate`` both use
+    this verdict."""
     views = anchor_views(ext) if views is None else views
     state = lock_state(views)
-    required = ext._lock_required_for_show and bool(views)
+    required = ext._lock_required_for_show
     reason = None
-    if required and not state["locked"]:
+    if required and not state["anchorCount"]:
+        reason = "no anchors locked; lock them in Control first"
+    elif required and not state["locked"]:
         reason = (
             f"the anchors are not locked ({state['lockedCount']}/"
             f"{state['anchorCount']} online anchors locked); lock them in Control first"

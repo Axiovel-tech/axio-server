@@ -274,7 +274,9 @@ class DroneShowExtension(Extension):
                 "authorizationScope": self._config.authorization_scope.value,
             }
         }
-        self._ensure_start_not_moved(self._candidate(config))
+        candidate = self._candidate(config)
+        self._ensure_start_not_moved(candidate)
+        self._ensure_anchors_allow_start(candidate)
         self._config.update_from_json(config)
 
     def _candidate(self, config: Any) -> DroneShowConfiguration | None:
@@ -307,11 +309,11 @@ class DroneShowExtension(Extension):
         self, updated: DroneShowConfiguration | None
     ) -> None:
         """Raises an error if the updated configuration authorizes a flight
-        (live or rehearsal), or gives an authorized one a new start, while
-        the rtls extension refuses it (its anchor cell is known but not
-        locked, or the lock is broken). An abort is never refused: revoking,
-        and clearing an existing start whatever else the update changes;
-        nor is a lights-only authorization."""
+        (live or rehearsal), or gives an authorized one a new start or more
+        drones, while the rtls extension refuses it (the anchors are not
+        locked). An abort is never refused: revoking, and clearing an
+        existing start whatever else the update changes; nor is a
+        lights-only authorization or removing drones."""
         if updated is None or not _authorizes_flight(updated):
             return
         current = self._config
@@ -321,7 +323,12 @@ class DroneShowExtension(Extension):
                 and current.start_time_on_clock is not None
             ):
                 return
-            if (updated.start_time_on_clock, updated.clock, updated.start_method) == (
+            added = {i for i in updated.uav_ids if i} - set(current.uav_ids)
+            if not added and (
+                updated.start_time_on_clock,
+                updated.clock,
+                updated.start_method,
+            ) == (
                 current.start_time_on_clock,
                 current.clock,
                 current.start_method,

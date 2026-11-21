@@ -931,8 +931,7 @@ class RtlsExtension(Extension):
                 sleeping,
                 timeout=ANCHOR_SLEEP_TIMEOUT if timeout is None else timeout,
             )
-            locked = None if result["accepted"] else locked_detail(self, system_id)
-            return result if locked is None else {**result, "detail": locked}
+            return {**result, **self._refusal_detail(system_id, result["accepted"])}
         return await self._set_tag_sleep(
             system_id,
             sleeping,

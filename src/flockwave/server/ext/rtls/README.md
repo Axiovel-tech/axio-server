@@ -57,7 +57,7 @@ keeps streaming to that client until someone else speaks to it.
   "heartbeat_interval": 2,    // s
   "device_timeout": 6,        // s without a heartbeat before a board is lost
   "lock_required_for_show": true  // SHOW-SETCFG authorizes a flight only
-                                  // with every online anchor locked
+                                  // with anchors online, all locked
 }
 ```
 

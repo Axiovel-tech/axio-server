@@ -60,7 +60,7 @@ def test_an_authorized_show_is_never_withheld():
         extension, time=start, method="auto", authorized=True, authorizationScope="live"
     ) == (True, None)
 
-    # the lock breaks after the authorization
+    # an anchor unlocks after the authorization
     extension.app = show(REFUSAL).app
     # unchanged resends, revoking and clearing the start pass...
     assert setcfg(extension, time=start, authorized=True) == (True, None)
@@ -91,3 +91,34 @@ def test_an_abort_switching_to_rc_is_never_refused():
     assert setcfg(extension, time=None, method="rc") == (True, None)
     assert extension._config.start_time_on_clock is None
     assert extension._config.start_method.value == "rc"
+
+
+def test_adding_drones_to_an_authorized_start_needs_locked_anchors():
+    extension = show()
+    start = time() + 600
+    assert setcfg(
+        extension,
+        time=start,
+        method="auto",
+        authorized=True,
+        authorizationScope="live",
+        uavIds=["01"],
+    ) == (True, None)
+    extension.app = show(REFUSAL).app
+
+    outcome, reason = setcfg(extension, uavIds=["01", "02"])
+    assert not outcome and REFUSAL in reason
+    # removing one is never refused
+    assert setcfg(extension, uavIds=[]) == (True, None)
+
+
+def test_a_scheduled_start_needs_locked_anchors():
+    from pytest import raises
+
+    extension = show()
+    assert setcfg(extension, authorized=True, authorizationScope="live") == (True, None)
+    extension.app = show(REFUSAL).app
+
+    with raises(RuntimeError, match="Show start refused"):
+        extension._schedule_start(time() + 60)
+    assert extension._config.start_time_on_clock is None

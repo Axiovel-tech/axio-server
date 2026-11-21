@@ -23,12 +23,7 @@ async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2))):
     set_fake_param(tag, "UWB_ROLE", 1, "uint8")
     devices = {tag.system_id: tag}
     for system_id, role, mac in anchors:
-        anchor = FakeDevice(dialect, system_id=system_id)
-        anchor.address = (f"192.168.4.{system_id}", 3333)
-        set_fake_param(anchor, "UWB_ROLE", role, "uint8")
-        set_fake_param(anchor, "UWB_MAC", mac, "uint16")
-        set_fake_param(anchor, "LOCK", 0, "uint8")
-        devices[system_id] = anchor
+        devices[system_id] = _anchor(dialect, system_id, role, mac)
     ext = RtlsExtension()
     ext._protocol = RtlsProtocol(dialect, targets=[])
     ext.app = StubApp()

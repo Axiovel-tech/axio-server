@@ -171,7 +171,11 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
             "lockedCount": 0,
             "anchorCount": 0,
             "unlocked": [],
-            "showGate": {"required": False, "refused": False, "reason": None},
+            "showGate": {
+                "required": True,
+                "refused": True,
+                "reason": "no anchors locked; lock them in Control first",
+            },
         },
     }
 

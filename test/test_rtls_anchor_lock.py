@@ -11,12 +11,13 @@ import trio.testing
 from anchor_lock_support import (
     HEALTHY_A0,
     HEALTHY_A1,
+    _anchor,
     _cell,
     _healthy,
     _inf_broadcasts,
     _lock,
 )
-from rtls_support import make_message
+from rtls_support import discover, make_message
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import PARAM_TYPE_UINT8
 
@@ -174,10 +175,32 @@ async def test_anchor_lock_follows_the_lock_stats(dialect, builder, hub):
     }
 
 
-async def test_no_anchors_no_lock_and_no_requirement(dialect):
+async def test_no_anchors_are_not_locked(dialect, builder, hub):
+    # a server with the rtls extension and the gate on refuses a flight
+    # until anchors are found and locked
     ext, _ = await _cell(dialect, anchors=())
     assert lock_json(ext)["locked"] is False
-    assert lock_json(ext)["showGate"]["required"] is False
+    assert lock_json(ext)["showGate"] == {
+        "required": True,
+        "refused": True,
+        "reason": "no anchors locked; lock them in Control first",
+    }
+    # nothing to write to
+    for action in ("unlock", "lock"):
+        body = await _lock(ext, builder, hub, action=action, acknowledgeWarnings=True)
+        assert (body["result"], body["reason"]) == ("incomplete", "No online anchors")
+
+
+async def test_lock_needs_each_anchors_power_state(dialect, builder, hub):
+    ext, devices = await _cell(dialect)
+    await ext._on_stats(201, HEALTHY_A0, time.monotonic())
+    await ext._on_stats(202, {"boots": 3.0}, time.monotonic())  # no pwrst
+
+    body = await _lock(ext, builder, hub, acknowledgeWarnings=True)
+
+    assert body["result"] == "refused"
+    assert body["reason"] == "RTLS anchor 202 has not reported its power state"
+    assert _lock_param(devices[201]) == 0
 
 
 async def test_a_locked_anchors_refusals_say_so(
@@ -228,8 +251,6 @@ def test_power_states_read_naturally():
 
 
 async def test_the_lock_stat_arrives_through_the_sdk(dialect):
-    from anchor_lock_support import _anchor
-    from rtls_support import discover
 
     ext, _ = await _cell(dialect, anchors=())
     anchor = _anchor(dialect, 203, role=2, mac=1)
