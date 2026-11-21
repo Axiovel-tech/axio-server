@@ -71,10 +71,13 @@ GEOMETRY_STATE_NAMES = {
 GEOMETRY_REASON_NAMES = {
     0: "",
     1: "the provisioned anchor count is not 4 or 8",
-    2: "an anchor was never heard",
+    2: "an anchor gave fewer than 64 distance samples before the timeout",
     3: "a side or the height is under 1 m",
     4: "not a rectangle: the diagonal disagrees with the sides (anchors swapped?)",
-    5: "the top plane is not above the bottom one (anchors swapped?)",
+    5: (
+        "the top rectangle (AN4-AN7) does not mirror the bottom one (AN0-AN3)"
+        " within 0.30 m, or its distances are impossible (anchors swapped?)"
+    ),
 }
 
 STATE_MANUAL = 0
@@ -399,9 +402,13 @@ def _grade_cells(
     """Grades the candidates of every cell against that cell's reference
     (in place) and returns the references."""
     references: dict[str, list[Optional[float]]] = {}
-    for cell in sorted({entry["cell"] for entry in entries.values() if "cell" in entry}):
+    for cell in sorted(
+        {entry["cell"] for entry in entries.values() if "cell" in entry}
+    ):
         candidates = [
-            e for e in entries.values() if e["status"] == "candidate" and e["cell"] == cell
+            e
+            for e in entries.values()
+            if e["status"] == "candidate" and e["cell"] == cell
         ]
         reference = _reference(candidates)
         if reference is None:
