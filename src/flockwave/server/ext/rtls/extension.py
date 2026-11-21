@@ -388,14 +388,7 @@ class RtlsExtension(Extension):
         )
         listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
         register_beacons = bool(configuration.get("register_beacons", True))
-        self._lock_required_for_show = bool(
-            configuration.get("lock_required_for_show", True)
-        )
-        self._anchor_lock = AnchorLock(self.get_data_dir() / "anchor_lock.json")
-        try:
-            self._anchor_lock.load()
-        except (OSError, ValueError) as ex:
-            logger.warning(f"rtls: anchor lock state not restored: {ex}")
+        self._load_anchor_lock(configuration, logger)
         self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
@@ -616,23 +609,37 @@ class RtlsExtension(Extension):
             elif event.kind == "twr_summary":
                 self._on_twr_summary(event.system_id, event.data, now)
             elif event.kind == "param_value":
-                # a freshly learned parameter may complete a tag's cell or
-                # change an anchor's MAC/role; resync the anchor beacons
-                self._sync_anchor_beacons_for_system(event.system_id)
-                self._refresh_anchor_cells()
-                # a reply to a refill round may have just plugged the last
-                # hole: finish promptly instead of on the next poll round
-                self._check_refill_completion(event.system_id)
-                self._release_retained_params(event.system_id)
-                self._record_breaks(
-                    self._anchor_lock.on_param(
-                        event.system_id,
-                        event.data["name"],
-                        decode_param_value(event.data["value"], event.data["type"]),
-                        time.time(),
-                    )
-                )
+                self._on_param_value(event)
             self._dispatch_event(event)
+
+    def _on_param_value(self, event: ProtocolEvent) -> None:
+        system_id = event.system_id
+        # a freshly learned parameter may complete a tag's cell or change an
+        # anchor's MAC/role; resync the anchor beacons
+        self._sync_anchor_beacons_for_system(system_id)
+        self._refresh_anchor_cells()
+        # a reply to a refill round may have just plugged the last hole:
+        # finish promptly instead of on the next poll round
+        self._check_refill_completion(system_id)
+        self._release_retained_params(system_id)
+        value = decode_param_value(event.data["value"], event.data["type"])
+        self._record_breaks(
+            self._anchor_lock.on_param(
+                system_id, event.data["name"], value, time.time()
+            )
+        )
+
+    def _load_anchor_lock(self, configuration, logger) -> None:
+        """The lock state persisted in the data directory, and whether a
+        show needs it."""
+        self._lock_required_for_show = bool(
+            configuration.get("lock_required_for_show", True)
+        )
+        self._anchor_lock = AnchorLock(self.get_data_dir() / "anchor_lock.json")
+        try:
+            self._anchor_lock.load()
+        except (OSError, ValueError) as ex:
+            logger.warning(f"rtls: anchor lock state not restored: {ex}")
 
     def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache one inter-anchor TWR sample (decoded by the SDK from the
