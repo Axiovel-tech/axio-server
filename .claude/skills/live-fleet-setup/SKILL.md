@@ -1,121 +1,117 @@
 ---
 name: live-fleet-setup
-description: How the LIVE indoor drone fleet reaches this server (network topology, the single UDP 14550 MAVLink ingest convention, device-side bridge params, ports, launch recipe). Read BEFORE touching mavlink connection config, assigning ports, or configuring RTLS-Link devices for a live/bench session — the multi-port patterns you may find elsewhere belong to SIMULATION isolation only.
+description: How the live indoor fleet reaches this server - one shared MAVLink listener on UDP 14550, the RTLS management stream, the tag bridge parameters, broadcast, sysids, launch and checks. Read before touching mavlink connection config, assigning ports, or configuring rtls-link boards for a bench or show session. Per-instance port layouts belong to the simulator only.
 ---
 
-# Live fleet setup (singu-server bench / indoor shows)
+# Live fleet setup
 
-The rules in this file are for the **real fleet** (physical drones with
-RTLS-Link tags on the board network). Simulations have different,
-deliberately isolated conventions — see "Sim vs live" below. The most
-common agent mistake this skill exists to prevent: **inventing new ports
-or per-drone listeners for live MAVLink. Don't. Everything arrives on
-UDP 14550.**
+For the real fleet: drones whose rtls-link tags join the private board
+network. The simulator shifts every port per instance on purpose; never copy
+its layout into a live config (see the end).
 
-## Topology
+Board-side rules (static addressing, the access point, the management
+stream, the firewall, identity) are the firmware's: read
+rtls-link-zephyr `docs/guidance/bench.md` ("Network") and
+`docs/reference/networking.md`. This skill covers the server side.
 
-The host (`singu-server`) is multi-homed:
+## Addresses: discover them, never hard-code them
 
-| Interface | Address | Role |
-|---|---|---|
-| `enp2s0` | fixed, equal to the boards' `MGMT_HOST` | Board network (private AP). All RTLS-Link devices live here. |
-| `wlp1s0` | `10.10.10.x/24` | Internet uplink, default route. |
+- A board's address is `NET_PREFIX` /24 plus its `MAV_SYS_ID` (no DHCP).
+- The server host is the boards' `MGMT_HOST`: its address on the board
+  network. Read `MGMT_HOST` and `NET_PREFIX` from any board
+  (`rtls-link param get sysid:<N> MGMT_HOST`, or Control's RTLS parameter
+  dialog), then find the host interface in that /24 with `ip -4 addr`.
+- Which sysids are in use: the fleet records (`repos/ops/axio-fleet` in
+  AxioStack) and the boards the server has found (`X-RTLS-INF`, Control's
+  RTLS panels).
 
-`ufw` is default-deny incoming: any **board-initiated** flow needs an
-explicit allow on `enp2s0`. Existing allows: 3333/udp (mgmt), 3334/udp
-(logs), 3335/udp (anchor telemetry), 3343/udp (rtls management stream), 14550/udp
-(mavlink). Conntrack masks the deny for host-initiated flows, which
-makes firewall problems look intermittent — check `sudo ufw status`
-first when a board-initiated feature seems dead.
+## MAVLink: one listener on UDP 14550
 
-## MAVLink ingest: ONE listener, UDP 14550
+Every tag bridges its autopilot's MAVLink to `WIFI_UART_HOST:WIFI_UART_PORT`,
+and every tag sends to the same place: the server host, port 14550. Drones
+are told apart by MAVLink system id, not by port. The server needs exactly
+one connection, as in `etc/conf/axio-rtls-indoor.jsonc`:
+`udp-listen://:14550?broadcast_port=…`.
 
-Every drone's flight-controller MAVLink reaches this server through its
-RTLS-Link tag's WiFi-UART bridge, and **every tag sends to the same
-place: `192.168.0.100:14550`**. Drones are distinguished by MAVLink
-sysid, not by port. The server therefore needs exactly one connection in
-the `mav` network:
+- Listen on all interfaces. A `127.0.0.1` listener receives nothing from
+  the board network; four per-drone localhost listeners once showed zero
+  drones for that reason.
+- Never add per-drone connections or ports. A new drone appears with no
+  server change once its tag bridges to 14550.
 
-```jsonc
-"mavlink": {
-  "enabled": true,
-  "networks": {
-    "mav": {
-      "connections": [
-        "udp-listen://:14550?broadcast_port=14555"
-      ]
-    }
-  }
-}
-```
+Tag parameters for a drone to appear:
 
-- Bind all interfaces (or `192.168.0.100`) — **never `127.0.0.1`**: the
-  packets arrive on `enp2s0`, and a localhost bind silently receives
-  nothing (this exact bug cost a live troubleshooting round on
-  2026-07-21: four `127.0.0.1:1460x` listeners, zero drones visible).
-- Always keep the `?broadcast_port=` suffix — a bare `udp-listen`
-  crashes the mavlink ext on broadcast-address updates.
-- Do NOT add per-drone connections/ports for live drones. New drones
-  appear with zero server config changes as long as their tag bridges
-  to 14550.
+| Parameter | Value |
+|---|---|
+| `WIFI_UART_EN` | 1 |
+| `WIFI_UART_PORT` | 14550 |
+| `WIFI_UART_HOST` | the server host's board-network address (= `MGMT_HOST`) |
 
-## Device-side bridge (RTLS-Link tag params)
+They apply at the tag's next boot: set, read back, reboot the tag (the
+autopilot keeps power). An empty or non-IPv4 `WIFI_UART_HOST` makes the tag
+wait for the ground to speak first, so a drone missing while the others
+stream usually has a wrong `WIFI_UART_HOST`.
 
-For a drone's ArduPilot to appear, its tag must have:
+## Broadcast: decided, not finished
 
-```
-WIFI_UART_EN   = 1
-WIFI_UART_PORT = 14550
-WIFI_UART_HOST = 192.168.0.100
-```
+Decision on axio-server#60 (read it with `gh pr view 60 -R Axiovel-tech/axio-server --comments`):
+fleet-wide messages (broadcast-mode commands, lights, start and authorization
+config, the show schedule) go out once, as a broadcast to port **14550**,
+with no per-drone copies; show authorization goes by broadcast only, so a
+drone that misses broadcasts visibly stays unauthorized; the access point
+must pass wired-to-wireless broadcast.
 
-`WIFI_UART_HOST` is the usual culprit when one drone is missing while
-others stream: an empty host means the bridge never transmits. These
-params are applied **at tag boot** — after changing them, reboot the tag
-(`kernel reboot cold` over SMP; the FC keeps power through a tag
-reboot). Set + verify readback + reboot, in that order.
+Until that change lands:
 
-## RTLS device management
+- The configs still say `broadcast_port=14555`, a Skybrush convention. The
+  tags listen only on `WIFI_UART_PORT` (14550), and the bench access point
+  filters wired-to-wireless broadcast, so **no broadcast reaches a drone**.
+  That includes Control's broadcast mode, which it switches to when a show
+  start is authorized: the show page's stop buttons do not reach the drones.
+- Do not "fix" it with per-drone copies or new ports, and do not treat 14555
+  as correct. The switch to 14550 waits on the bench test #60 describes.
 
-A board's address is fixed: its `NET_PREFIX` /24 plus its `MAV_SYS_ID`.
-Every board streams its management telemetry to `MGMT_HOST:MGMT_PORT`
-(3343) from boot, which is where the rtls ext binds its management socket
-(`listen_port`), so boards are found without a device list. The optional
-`devices` list (mgmt port 3333) only covers boards with a wrong
-`MGMT_HOST` or whose stream another client took. Device roster (stable): anchors sysid
-101–108, tags/drones 19x–200.
+## RTLS management
 
-## Launch recipe
+Boards stream their management telemetry to `MGMT_HOST:MGMT_PORT` (3343 by
+default) from boot; the `rtls` extension listens there and finds them
+without a device list. See `src/flockwave/server/ext/rtls/README.md`.
+
+## Sysids
+
+- `199` is the factory default (`CONFIG_RTLS_LINK_MAVLINK_SYSTEM_ID`). A
+  board still on it gets no address and its network stays down; it is set up
+  over its serial or USB shell. 199 is never a fleet sysid.
+- Every board needs its own sysid. A board given a fleet board's sysid takes
+  that board's address, and the server keys devices by sysid, so commands for
+  the real drone silently go to the spare (seen live: "drone stuck" was a
+  bench rig answering under the drone's sysid with no autopilot). Find the
+  culprit by MAC.
+
+## Launch and checks
 
 ```sh
-cd ~/dev/fw/axiovel/axio-server
-.venv/bin/skybrushd -c etc/conf/axio-rtls-indoor.jsonc
-# GUI (dev server): cd ~/dev/fw/axiovel/control && npm start -- --host 0.0.0.0
+# in the axio-server checkout
+uv run skybrushd -c etc/conf/axio-rtls-indoor.jsonc
 ```
 
-Before starting, check nothing stale holds 5000/5001 (`ss -tlnp`); a
-stale skybrushd makes the new one fail its HTTP bind. Verify ingest
-with `ss -ulnp | grep 14550` (must show `0.0.0.0:14550`) and, when in
-doubt, `sudo tcpdump -ni enp2s0 udp port 14550` — if packets arrive but
-no UAVs appear, the listener is wrong, not the drones.
+- Before starting, check nothing stale holds the HTTP ports
+  (`ss -tlnp | grep -E ':500[01]'`); a stale `skybrushd` makes the new one
+  fail its bind.
+- Ingest: `ss -ulnp | grep 14550` must show `0.0.0.0:14550`. If
+  `sudo tcpdump -ni <board interface> udp port 14550` sees packets but no
+  drone appears, the listener is wrong, not the drones.
+- A board-initiated flow that seems dead: check the host firewall first
+  (firmware `docs/guidance/bench.md`). The server needs UDP from the board
+  subnet allowed to `MGMT_PORT` and 14550.
 
-## Sim vs live (why you may have seen other port schemes)
+## Simulation is different on purpose
 
-The simulation stack (`rtls-link sim up`, `SIM_INSTANCE`) deliberately
-shifts every well-known port per instance (e.g. mgmt 3333+100·n,
-per-vehicle gcs_out on 14600+10·n) so concurrent sims don't collide.
-Those schemes are correct **in sim scenarios only**. Never copy
-per-instance or per-vehicle port layouts into the live config, and
-never "fix" a live problem by assigning fresh ports — align the device
-side to 14550 instead.
-
-## Spare boards and duplicate sysids
-
-A factory-fresh board boots with `MAV_SYS_ID = 199`, which the firmware
-refuses to address: it keeps Wi-Fi down until it is set up. A board given
-a fleet board's sysid also takes that board's address, and the server keys
-devices by sysid, so powering it next to the live fleet hijacks that
-identity: commands for the real drone silently go to the spare (observed
-live 2026-07-21: "drone 11 is stuck" was a bench test rig answering as 200
-with no FC attached). Give every board its own sysid and identify a
-culprit by MAC.
+`rtls-link sim up` runs instance `n` on loopback: boards on `127.77.*`, the
+RTLS management listener on `3343 + 100·n`, the MAVLink listener on
+`14550 + 100·n` (rtls-link-zephyr `py/rtlslink/sim/plan.py`). Take the
+server config from `rtls-link sim gcs-config`, never by hand (AxioStack
+`contracts/production-simulation.md`, `contracts/rtls-sim-run-directory.md`).
+Broadcast does not reach the sim tags either; #60 covers that too. Never
+copy these ports into a live config, and never fix a live problem with fresh
+ports: align the tags to 14550.

@@ -1,8 +1,7 @@
 // Axiovel indoor show configuration: MAVLink drones positioned by the
-// RTLS-Link UWB system. Each Zephyr RTLS tag exposes the FC's MAVLink stream
-// on UDP 14550 and learns its peer from the first inbound datagram. The local
-// listener ports below are paired with unicast adapters to each tag because
-// wired-to-wireless broadcast is blocked on the bench AP.
+// RTLS-Link UWB system. Every tag bridges its flight controller's MAVLink to
+// this host on UDP 14550 (WIFI_UART_HOST / WIFI_UART_PORT), so one shared
+// listener serves the whole fleet and drones are told apart by system id.
 {
   "EXTENSIONS": {
     // Listen on all interfaces so Axio Control can connect from anywhere

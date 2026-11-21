@@ -105,3 +105,5 @@ uv run pytest --cov=src/flockwave/server
 - `src/flockwave/server/model/` - data model classes
 - `src/flockwave/server/utils/` - utility functions
 - `test/` - tests mirroring source structure
+
+Axiovel fork: read [AXIOVEL.md](AXIOVEL.md) for what the fork adds, its invariants and the cross-repo contracts.
