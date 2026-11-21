@@ -39,6 +39,7 @@ from rtlslink.protocol import (
 
 from flockwave.server.ext.rtls.extension import (
     DEFAULT_DEVICE_TIMEOUT,
+    POWER_STATES,
     REFILL_INITIAL_DELAY,
     REFILL_MAX_ATTEMPTS,
     REFILL_READ_SPACING,
@@ -4440,13 +4441,27 @@ class FakeAnchor(FakeDevice):
     reboots into the requested state, off the network for ``reboot_s``
     seconds, like rtls-link-zephyr's anchor (docs/reference/
     anchor-power-path.md). ``refuse_with`` makes it refuse instead,
-    reading back as that SLEEP value; ``hang`` accepts and never reboots."""
+    reading back as that SLEEP value; ``hang`` accepts and never reboots.
+    With ``in_place_sleep`` a sleep request in plain standby moves it to
+    asleep without a reboot; with ``reports_power_state`` it streams
+    ``pwrst``."""
 
-    def __init__(self, dialect, *, standby=False, reboot_s=9.0):
+    def __init__(
+        self,
+        dialect,
+        *,
+        standby=False,
+        power=None,
+        reboot_s=9.0,
+        in_place_sleep=False,
+        reports_power_state=False,
+    ):
         super().__init__(dialect)
         set_fake_param(self, "UWB_ROLE", 3, "uint8")
         self.params["SLEEP"] = (bytes([1 if standby else 0]), PARAM_TYPE_UINT8)
-        self.standby = standby
+        self.power = power or ("standby" if standby else "operating")
+        self.in_place_sleep = in_place_sleep
+        self.reports_power_state = reports_power_state
         self.reboot_s = reboot_s
         self.boot_at = -100.0
         self.reboot_at = None
@@ -4457,7 +4472,7 @@ class FakeAnchor(FakeDevice):
 
     @property
     def sleeping(self) -> bool:
-        return self.standby
+        return self.power in ("standby", "asleep", "off")
 
     @property
     def down(self) -> bool:
@@ -4471,10 +4486,13 @@ class FakeAnchor(FakeDevice):
         return [] if self.down else super().handle(data)
 
     def after_sleep_write(self, previous: bytes, value: bytes) -> None:
+        asleep = value == b"\x01"
         if self.refuse_with is not None:
             self.params["SLEEP"] = (bytes([self.refuse_with]), PARAM_TYPE_UINT8)
+        elif asleep and self.power == "standby" and self.in_place_sleep:
+            self.power = "asleep"
         elif value != previous and not self.hang:
-            self.target = value == b"\x01"
+            self.target = "asleep" if asleep else "operating"
             self.reboot_at = trio.current_time() + 0.5
 
     async def run(self, extension):
@@ -4487,12 +4505,19 @@ class FakeAnchor(FakeDevice):
                     self.expired = True
                     extension._expire_devices(time.monotonic() + 1000.0)
                 if now >= self.reboot_at + self.reboot_s:
-                    self.standby, self.boot_at = self.target, now
+                    self.power, self.boot_at = self.target, now
                     self.reboot_at = None
             if not self.down:
                 await extension._process_datagram(
                     self.heartbeat(), self.address, time.monotonic()
                 )
+                if self.reports_power_state:
+                    code = POWER_STATES.index(self.power)
+                    await extension._process_datagram(
+                        self.named_value_float("pwrst", float(code)),
+                        self.address,
+                        time.monotonic(),
+                    )
             await trio.sleep(1.0)
 
 
@@ -4858,3 +4883,94 @@ async def test_ota_inspect_reports_the_receipt(extension, builder, hub, tmp_path
     assert response.body["speciesSource"] is None
     response = await inspect(tmp_path / "missing.bin")
     assert response.body["type"] == "ACK-NAK"
+
+
+# ---- anchor sleep/wake judged by powerState -----------------------------
+
+
+@pytest.fixture
+def sdk_with_power_state(monkeypatch):
+    """The SDK accepting ``pwrst``, as its pending bump will."""
+    import rtlslink.protocol as protocol
+
+    monkeypatch.setattr(
+        protocol, "_STATS_WIRE_FIELDS", protocol._STATS_WIRE_FIELDS | {"pwrst"}
+    )
+    monkeypatch.setattr(
+        protocol, "STATS_OUTPUT_FIELDS", (*protocol.STATS_OUTPUT_FIELDS, "pwrst")
+    )
+
+
+async def _power_sleep(dialect, builder, hub, anchor, sleeping, **body):
+    """Like _anchor_sleep, once the anchor has reported its powerState."""
+    ext = await _anchor_extension(dialect, anchor)
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(anchor.run, ext)
+        await trio.sleep(1.5)
+        assert ext._power_state(DEVICE_SYSID) == anchor.power
+        started = trio.current_time()
+        entry = await _send_sleep(ext, builder, hub, sleeping, **body)
+        elapsed = trio.current_time() - started
+        nursery.cancel_scope.cancel()
+    return entry, elapsed
+
+
+async def test_standby_anchor_sleeps_in_place(
+    dialect, builder, hub, autojump_clock, sdk_with_power_state
+):
+    anchor = FakeAnchor(
+        dialect, standby=True, in_place_sleep=True, reports_power_state=True
+    )
+
+    entry, elapsed = await _power_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": True,
+        "sleeping": True,
+        "detail": "asleep",
+    }
+    assert anchor.power == "asleep"
+    assert anchor.reboot_at is None and not anchor.expired
+    assert elapsed < anchor.reboot_s
+
+
+async def test_standby_anchor_is_not_reported_asleep_while_in_standby(
+    dialect, builder, hub, autojump_clock, sdk_with_power_state
+):
+    # firmware that leaves a standby anchor in standby on SLEEP=1 (it already
+    # reads 1): STANDBY heartbeats alone must not count as asleep
+    anchor = FakeAnchor(dialect, standby=True, reports_power_state=True)
+
+    entry, _ = await _power_sleep(dialect, builder, hub, anchor, True, timeout=6)
+
+    assert entry["accepted"] is False
+    assert entry["sleeping"] is None
+    assert "not seen asleep" in entry["detail"]
+
+
+async def test_standby_anchor_wakes_through_its_reboot(
+    dialect, builder, hub, autojump_clock, sdk_with_power_state
+):
+    anchor = FakeAnchor(dialect, standby=True, reports_power_state=True)
+
+    entry, elapsed = await _power_sleep(dialect, builder, hub, anchor, False)
+
+    assert entry["accepted"] is True
+    assert entry["sleeping"] is False
+    assert anchor.power == "operating"
+    # confirmed only after the reboot, not on a pre-reboot report
+    assert anchor.expired
+    assert elapsed >= anchor.reboot_s
+
+
+async def test_operating_anchor_sleeps_through_its_reboot(
+    dialect, builder, hub, autojump_clock, sdk_with_power_state
+):
+    anchor = FakeAnchor(dialect, reports_power_state=True, reboot_s=3.0)
+
+    entry, elapsed = await _power_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True
+    assert anchor.power == "asleep"
+    assert elapsed >= anchor.reboot_s

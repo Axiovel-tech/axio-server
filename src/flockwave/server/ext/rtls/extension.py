@@ -978,13 +978,15 @@ class RtlsExtension(Extension):
         """Puts an anchor to sleep or wakes it, and verifies the outcome
         within ``timeout`` seconds.
 
-        An anchor reboots on every transition, into standby when put to
-        sleep, and is off the network for 8-15 s. The outcome is the
-        heartbeat state (STANDBY asleep, ACTIVE awake) it reports after
-        that reboot, which a rediscovery or a rewound uptime proves. A
-        request the anchor refuses causes no reboot and reads back as the
-        state it stays in. ``SLEEP`` 2 (off: only the button starts the
-        anchor again) is never written here."""
+        The outcome is the anchor's ``powerState``: ``asleep`` for a sleep,
+        ``operating`` for a wake. Leaving or entering ``operating`` takes a
+        reboot (8-15 s off the network), which a rediscovery or a rewound
+        uptime proves, so it is waited for; standby to asleep happens in
+        place. Firmware without ``pwrst`` falls back to the heartbeat state
+        (STANDBY asleep, ACTIVE awake) after the reboot every transition
+        took there. A request the anchor refuses causes no reboot and reads
+        back as the state it stays in. ``SLEEP`` 2 (off: only the button
+        starts the anchor again) is never written here."""
         protocol = self._require_protocol()
         device = protocol.devices.get(system_id)
         if device is None:
@@ -996,6 +998,9 @@ class RtlsExtension(Extension):
         watch = _AnchorTransition(
             system_id, sleeping, already=bool(device.sleeping) == sleeping
         )
+        power_state = self._power_state(system_id)
+        if power_state is not None:
+            watch.follow_power_state(power_state)
         acked = False
         with trio.move_on_after(timeout):
             with self._subscribed_events() as events:
@@ -1067,9 +1072,18 @@ class RtlsExtension(Extension):
                         "sleeping": watch.readback != 0,
                         "detail": self._anchor_refusal(system_id, watch),
                     }
-        if watch.state == watch.expected:
+        if watch.awaits_reboot:
             watch.observe_uptime(await self._probe_uptime(system_id))
         return None
+
+    def _power_state(self, system_id: int) -> str | None:
+        """A device's current ``powerState`` from its fresh stats; None
+        without one (firmware without ``pwrst``, or a stale snapshot)."""
+        stats = self._stats.get(system_id)
+        if stats is None or stats.get("stale"):
+            return None
+        state = stats.get("powerState")
+        return None if state in (None, "unknown") else state
 
     def _anchor_refusal(self, system_id: int, watch: "_AnchorTransition") -> str:
         """Why an anchor refused a sleep/wake request, from the state its
@@ -2664,11 +2678,30 @@ class _AnchorTransition:
     rebooted: bool = False
     #: the SLEEP value read back after the request
     readback: Optional[int] = None
+    #: whether the outcome is the reported ``powerState`` (firmware with
+    #: ``pwrst``) rather than the heartbeat state
+    by_power_state: bool = False
+    #: the ``powerState`` of the latest stats report since the request
+    power_state: Optional[str] = None
+    #: whether the transition takes a reboot (into or out of operating)
+    needs_reboot: bool = True
+
+    @property
+    def target_power_state(self) -> str:
+        return "asleep" if self.expected else "operating"
+
+    def follow_power_state(self, initial: str) -> None:
+        """Judge the outcome by ``powerState``, starting from ``initial``."""
+        self.by_power_state = True
+        target = self.target_power_state
+        self.needs_reboot = initial != target and "operating" in (initial, target)
 
     def observe(self, event: ProtocolEvent) -> None:
         if event.system_id != self.system_id:
             return
-        if event.kind in ("heartbeat", "discovered") and "sleeping" in event.data:
+        if event.kind == "stats" and "pwrst" in event.data:
+            self.power_state = _code_name(POWER_STATES)(float(event.data["pwrst"]))
+        elif event.kind in ("heartbeat", "discovered") and "sleeping" in event.data:
             self.state = bool(event.data["sleeping"])
             # rediscovery: the anchor was off the network past its timeout
             self.rebooted = self.rebooted or event.kind == "discovered"
@@ -2685,13 +2718,30 @@ class _AnchorTransition:
             self.rebooted = True
 
     @property
+    def reached(self) -> bool:
+        """Whether the latest report since the request shows the target."""
+        if self.by_power_state:
+            return self.power_state == self.target_power_state
+        return self.state == self.expected
+
+    @property
+    def awaits_reboot(self) -> bool:
+        """The target is reported, but the reboot it needs is not proven."""
+        return self.reached and self.needs_reboot and not self.rebooted
+
+    @property
     def confirmed(self) -> bool:
-        """The anchor reports the requested state, either after the reboot
-        of its transition or, when it was already in that state, with the
-        request read back unchanged (no transition, so no reboot)."""
-        if self.state != self.expected:
+        """The anchor reports the requested state after the reboot its
+        transition takes; a transition without one (standby to asleep, or
+        already there) is confirmed by ``powerState`` alone, or, without
+        it, by the heartbeat with the request read back unchanged."""
+        if not self.reached:
             return False
-        return self.rebooted or (self.already and self.readback == int(self.expected))
+        if self.rebooted:
+            return True
+        if self.by_power_state:
+            return not self.needs_reboot
+        return self.already and self.readback == int(self.expected)
 
 
 def _lacks_param(device, name: str) -> bool:

@@ -424,11 +424,14 @@ On hardware, a woken device reboots a moment after acknowledging the
 wake (to re-initialize the power-cycled UWB module) and drops off the
 network for a few seconds before re-appearing.
 
-An **anchor** (`role` `anchor-initiator` / `anchor-responder`) reboots on
-every transition and is off the network for 8-15 s, so its outcome is
-confirmed only after that reboot (a rediscovery or a rewound uptime) by
-the heartbeat state: `STANDBY` asleep, `ACTIVE` awake. An anchor already
-in the requested state is confirmed without a reboot. A refused request
+An **anchor** (`role` `anchor-initiator` / `anchor-responder`) is judged
+by its `powerState`: a sleep is confirmed at `asleep`, a wake at
+`operating`. Entering or leaving `operating` takes a reboot (8-15 s off the
+network), which is waited for (a rediscovery or a rewound uptime); standby
+to asleep happens in place, and a standby anchor is not reported asleep
+until its `powerState` says so. Firmware without `pwrst` is judged by the
+heartbeat state after the reboot instead (`STANDBY` asleep, `ACTIVE`
+awake); an anchor already in that state is confirmed without one. A refused request
 reads back as the state the anchor stays in, and `detail` names why:
 `wake refused by the anchor: its pack is low or has no fresh voltage
 reading (last 6.81 V)`, `refused: the anchor is off; only its button
