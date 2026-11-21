@@ -168,11 +168,9 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
         "anchors": [],
         "anchorLock": {
             "locked": False,
-            "lockedAt": None,
-            "anchors": [],
-            "acknowledgedWarnings": [],
-            "breaks": [],
-            "persistError": None,
+            "lockedCount": 0,
+            "anchorCount": 0,
+            "unlocked": [],
             "showGate": {"required": False, "refused": False, "reason": None},
         },
     }
@@ -2317,9 +2315,8 @@ class RunStubHub(StubMessageHub):
 
 
 class RunStubApp:
-    def __init__(self, data_path):
+    def __init__(self):
         self.message_hub = RunStubHub()
-        self.dirs = SimpleNamespace(user_data_path=data_path)
 
     def import_api(self, name):
         return StubBeaconAPI()
@@ -2333,12 +2330,12 @@ def _free_udp_port() -> int:
     return port
 
 
-async def test_run_binds_the_management_socket_to_listen_port(tmp_path):
+async def test_run_binds_the_management_socket_to_listen_port():
     """Board streams and replies to the server's own requests arrive on the
     one socket bound to listen_port."""
     port = _free_udp_port()
     ext = RtlsExtension()
-    ext.app = app = RunStubApp(tmp_path)
+    ext.app = app = RunStubApp()
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(
@@ -2351,14 +2348,14 @@ async def test_run_binds_the_management_socket_to_listen_port(tmp_path):
         nursery.cancel_scope.cancel()
 
 
-async def test_run_fails_loudly_when_listen_port_is_taken(tmp_path):
+async def test_run_fails_loudly_when_listen_port_is_taken():
     """No SO_REUSEADDR: a second process on the port must stop the
     extension instead of silently splitting the boards' streams."""
     blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     blocker.bind(("0.0.0.0", 0))
     port = blocker.getsockname()[1]
     ext = RtlsExtension()
-    ext.app = app = RunStubApp(tmp_path)
+    ext.app = app = RunStubApp()
 
     try:
         with pytest.raises(RuntimeError, match=str(port)):

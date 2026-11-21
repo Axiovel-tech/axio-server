@@ -18,7 +18,6 @@ import math
 import time
 from contextlib import contextmanager
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 import trio
@@ -59,8 +58,7 @@ except ImportError:  # pragma: no cover
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
-from .anchor_lock import LOCKED_REASON, ROLE_UNKNOWN_REASON, AnchorLock, LockBreak
-from .anchor_lock_gate import handle_lock_request, lock_json, show_gate
+from .anchor_lock import handle_lock_request, lock_json, locked_detail, show_gate
 from .anchor_sleep import (
     ANCHOR_SLEEP_TIMEOUT,
     MAV_STATE_ACTIVE,
@@ -228,13 +226,6 @@ TAG_IDENTITY_PARAMS = (
 SLEEP_PIN_TIMEOUT = 30.0
 
 
-class AnchorsLocked(RuntimeError):
-    """A command would change an anchor of the locked cell."""
-
-    def __init__(self, reason: str = LOCKED_REASON):
-        super().__init__(reason)
-
-
 class RtlsExtension(Extension):
     """Manages rtls-link UWB positioning devices on the show network."""
 
@@ -333,8 +324,6 @@ class RtlsExtension(Extension):
         #: latest uptime per device from its periodic SYSTEM_TIME, in ms;
         #: pruned on device loss
         self._uptime_ms: dict[int, int] = {}
-        #: monotonic receive time of each device's latest uptime sample
-        self._uptime_at: dict[int, float] = {}
         #: last-known sleep latch per device: system_id -> (sleeping, stamp)
         #: where the stamp is the monotonic time of the heartbeat (or
         #: authoritative sleep/wake transaction) that reported it; drives
@@ -367,10 +356,7 @@ class RtlsExtension(Extension):
         #: :meth:`_poll_uav_map` -- never persisted
         self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
-        #: the anchor cell lock (X-RTLS-LOCK); persisted once run() knows
-        #: the data directory
-        self._anchor_lock = AnchorLock()
-        #: whether a show may be authorized only with the anchors locked
+        #: whether a flight may be authorized only with the anchors locked
         self._lock_required_for_show = True
 
     async def run(self, app, configuration, logger):
@@ -392,7 +378,9 @@ class RtlsExtension(Extension):
         )
         listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
         register_beacons = bool(configuration.get("register_beacons", True))
-        self._load_anchor_lock(configuration, logger)
+        self._lock_required_for_show = bool(
+            configuration.get("lock_required_for_show", True)
+        )
         self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
@@ -468,7 +456,6 @@ class RtlsExtension(Extension):
         self._nursery = None
         self._sock = None
         self._uptime_ms.clear()
-        self._uptime_at.clear()
         self._lost.clear()
         self._retained_params.clear()
         self._sleeping.clear()
@@ -551,7 +538,6 @@ class RtlsExtension(Extension):
                 # a lost device that returns is the same entry, live again,
                 # named from what it reported before until its dump lands
                 lost = self._lost.pop(event.system_id, None)
-                self._anchor_lock.on_online(event.system_id)
                 if lost is not None:
                     self._retained_params[event.system_id] = _decoded_device_params(
                         lost
@@ -600,15 +586,6 @@ class RtlsExtension(Extension):
             elif event.kind == "uptime":
                 if event.system_id in self._protocol.devices:
                     self._uptime_ms[event.system_id] = int(event.data["uptime_ms"])
-                    self._uptime_at[event.system_id] = now
-                    self._record_breaks(
-                        self._anchor_lock.on_uptime(
-                            event.system_id,
-                            int(event.data["uptime_ms"]),
-                            now,
-                            time.time(),
-                        )
-                    )
             elif event.kind == "stats":
                 # health telemetry arrives unsolicited; cache the latest
                 # snapshot and broadcast it (throttled) so live GCS clients
@@ -623,59 +600,15 @@ class RtlsExtension(Extension):
             elif event.kind == "twr_summary":
                 self._on_twr_summary(event.system_id, event.data, now)
             elif event.kind == "param_value":
-                self._on_param_value(event)
+                # a freshly learned parameter may complete a tag's cell or
+                # change an anchor's MAC/role; resync the anchor beacons
+                self._sync_anchor_beacons_for_system(event.system_id)
+                self._refresh_anchor_cells()
+                # a reply to a refill round may have just plugged the last
+                # hole: finish promptly instead of on the next poll round
+                self._check_refill_completion(event.system_id)
+                self._release_retained_params(event.system_id)
             self._dispatch_event(event)
-
-    def _on_param_value(self, event: ProtocolEvent) -> None:
-        system_id = event.system_id
-        # a freshly learned parameter may complete a tag's cell or change an
-        # anchor's MAC/role; resync the anchor beacons
-        self._sync_anchor_beacons_for_system(system_id)
-        self._refresh_anchor_cells()
-        # a reply to a refill round may have just plugged the last hole:
-        # finish promptly instead of on the next poll round
-        self._check_refill_completion(system_id)
-        self._release_retained_params(system_id)
-        name = event.data["name"]
-        value = decode_param_value(event.data["value"], event.data["type"])
-        breaks = self._anchor_lock.on_param(system_id, name, value, time.time())
-        if name == "UWB_ROLE" and self._device_role(system_id) in ANCHOR_ROLES:
-            # an anchor outside the seal turned up while locked
-            device = self._require_protocol().devices.get(system_id)
-            label = (
-                _device_name(system_id, self._identity_params(device), None)
-                if device
-                else None
-            )
-            breaks += self._anchor_lock.on_anchor(
-                system_id, label or f"RTLS anchor {system_id}", time.time()
-            )
-        self._record_breaks(breaks)
-
-    def _load_anchor_lock(self, configuration, logger) -> None:
-        """The lock state persisted in the data directory, and whether a
-        show needs it."""
-        self._lock_required_for_show = bool(
-            configuration.get("lock_required_for_show", True)
-        )
-        self._anchor_lock = AnchorLock(self._anchor_lock_path(configuration))
-        try:
-            self._anchor_lock.load(
-                float(configuration.get("device_timeout", DEFAULT_DEVICE_TIMEOUT)),
-                time.monotonic(),
-            )
-        except (OSError, ValueError) as ex:
-            logger.warning(f"rtls: anchor lock state not restored: {ex}")
-
-    def _anchor_lock_path(self, configuration) -> Path:
-        """Where the lock state persists: the configured ``anchor_lock_file``,
-        else one file per advert listen port in the data directory, so the
-        servers one user runs (bench, sim instances) never share a lock."""
-        configured = configuration.get("anchor_lock_file")
-        if configured:
-            return Path(configured).expanduser()
-        listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
-        return self.get_data_dir() / f"anchor_lock-{listen_port}.json"
 
     def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
         """Cache one inter-anchor TWR sample (decoded by the SDK from the
@@ -908,9 +841,6 @@ class RtlsExtension(Extension):
                 device = protocol.devices.get(system_id)
                 if device is None:
                     raise KeyError(system_id)
-                # checked right before the write goes out, so a write that
-                # queued behind another cannot slip past a lock sealed meanwhile
-                await self._require_unlocked(system_id)
                 with self._subscribed_events() as events:
                     request = protocol.set_param(system_id, name, encoded, param_type)
                     if request is None:
@@ -949,15 +879,6 @@ class RtlsExtension(Extension):
                                 live, _decoded_device_params(live)
                             )
                             self._refresh_anchor_cells()
-                            # a write in flight when the cell was sealed
-                            self._record_breaks(
-                                self._anchor_lock.on_param(
-                                    system_id,
-                                    name,
-                                    decode_param_value(event.data["value"], param_type),
-                                    time.time(),
-                                )
-                            )
                     return {
                         "value": decode_param_value(event.data["value"], param_type),
                         "type": param_type_to_name(param_type),
@@ -997,7 +918,6 @@ class RtlsExtension(Extension):
         Returns ``{"requested", "accepted", "sleeping", "detail"}``.
         Raises KeyError for unknown devices and trio.TooSlowError on
         timeout."""
-        await self._require_unlocked(system_id)
         role = await self._command_role(system_id, timeout)
         if role is None:
             return sleep_error(
@@ -1005,12 +925,14 @@ class RtlsExtension(Extension):
                 f"Device {system_id}: role unknown (UWB_ROLE not read); not commanded",
             )
         if role in ANCHOR_ROLES:
-            return await set_anchor_sleep(
+            result = await set_anchor_sleep(
                 self,
                 system_id,
                 sleeping,
                 timeout=ANCHOR_SLEEP_TIMEOUT if timeout is None else timeout,
             )
+            locked = None if result["accepted"] else locked_detail(self, system_id)
+            return result if locked is None else {**result, "detail": locked}
         return await self._set_tag_sleep(
             system_id,
             sleeping,
@@ -1172,7 +1094,6 @@ class RtlsExtension(Extension):
         not running."""
         if system_id not in self._require_protocol().devices:
             raise KeyError(system_id)
-        await self._require_unlocked(system_id)
         species, source = _image_species(image_path, role)
         if species is None:
             raise ValueError(
@@ -1243,8 +1164,9 @@ class RtlsExtension(Extension):
                 nursery.cancel_scope.cancel()
 
         if error is not None:
+            locked = locked_detail(self, job["id"])
             job["status"] = "error"
-            job["error"] = error
+            job["error"] = error if locked is None else f"{locked} ({error})"
             if self.log:
                 self.log.warning(f"rtls: OTA for sysid {job['id']} failed: {error}")
         else:
@@ -1291,9 +1213,10 @@ class RtlsExtension(Extension):
             # The drone's own telemetry rides its tag's snapshot so that one
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
+        if body.get("locked") != (self._stats.get(system_id) or {}).get("locked"):
+            self._inf_pending = True  # anchorLock follows the anchors' lock
         self._stats[system_id] = body
         self._stats_at[system_id] = now
-        self._record_breaks(self._anchor_lock.on_stats(system_id, body, time.time()))
         self._cluster_clock.on_stats(system_id, data)
         await self._follow_fitted_cell(system_id, now)
         # STATS_FIELDS is the SDK's required legacy set of a tag; newer stats
@@ -1487,9 +1410,6 @@ class RtlsExtension(Extension):
         for event in events:
             if event.kind == "lost":
                 self._handle_lost(event, known.get(event.system_id))
-        self._record_breaks(
-            self._anchor_lock.on_missing(now, protocol.devices, time.time())
-        )
         return events
 
     async def _process_expiry(self, now: float, logger) -> None:
@@ -1511,7 +1431,6 @@ class RtlsExtension(Extension):
         itself)."""
         if device is not None:
             self._lost[event.system_id] = device
-        self._record_breaks(self._anchor_lock.on_offline(event.system_id, time.time()))
         stats = self._stats.get(event.system_id)
         if stats is not None:
             self._stats[event.system_id] = {**stats, "stale": True}
@@ -1521,7 +1440,6 @@ class RtlsExtension(Extension):
         self._twr.pop(event.system_id, None)
         self._twr_summary.pop(event.system_id, None)
         self._uptime_ms.pop(event.system_id, None)
-        self._uptime_at.pop(event.system_id, None)
         self._sleeping.pop(event.system_id, None)
         # _sleep_pins deliberately survives loss: a woken device reboots off
         # the network (lost + rediscovered) inside its pin window
@@ -1885,7 +1803,7 @@ class RtlsExtension(Extension):
             )
         except KeyError:
             return hub.reject(message, reason=self._no_device(system_id))
-        except (ValueError, AnchorsLocked) as ex:
+        except ValueError as ex:
             return hub.reject(message, reason=str(ex))
         except trio.TooSlowError:
             return hub.reject(
@@ -1903,6 +1821,7 @@ class RtlsExtension(Extension):
                 "paramType": result["type"],
                 "result": result["result"],
                 "accepted": result["accepted"],
+                **self._refusal_detail(system_id, result["accepted"]),
             },
             in_response_to=message,
         )
@@ -2156,10 +2075,6 @@ class RtlsExtension(Extension):
         """Drop everything kept about an offline device: its X-RTLS-INF
         entry and its stale stats. A live device cannot be forgotten (it
         would be listed again on its next heartbeat)."""
-        target = self._locked_target(system_id)
-        if target is not None:
-            reason = LOCKED_REASON if target == "anchor" else ROLE_UNKNOWN_REASON
-            return {"forgotten": False, "detail": reason}
         if self._protocol is not None and system_id in self._protocol.devices:
             return {"forgotten": False, "detail": f"Device {system_id} is online"}
         if system_id not in self._lost and system_id not in self._stats:
@@ -2174,66 +2089,23 @@ class RtlsExtension(Extension):
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
         try:
-            body = handle_lock_request(self, message.body)
+            body = await handle_lock_request(self, message.body)
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-        if body["result"] in ("locked", "unlocked"):
-            if self.log:
-                self.log.info(f"rtls: anchor cell {body['result']} by an operator")
+        if body["results"]:
             await self._on_inf_change(time.monotonic())
         return hub.create_response_or_notification(body=body, in_response_to=message)
 
-    def _locked_target(self, system_id: int) -> str | None:
-        """What stands in the way of a command to this device while the cell
-        is locked: ``"anchor"`` (a sealed member or any known anchor),
-        ``"unknown"`` (no role known yet), or None (unlocked, or a tag)."""
-        lock = self._anchor_lock
-        if not lock.locked:
-            return None
-        if system_id in lock.snapshot:
-            return "anchor"
-        role = self._device_role(system_id)
-        lost = self._lost.get(system_id)
-        if role is None and lost is not None:
-            role = role_from_params(_decoded_device_params(lost, ("UWB_ROLE",)))
-        if role is None:
-            return "unknown"
-        return "anchor" if role in ANCHOR_ROLES else None
-
-    async def _require_unlocked(self, system_id: int) -> None:
-        """Raises AnchorsLocked when the locked cell forbids a command to
-        this device; a live device of unknown role is classified by reading
-        its UWB_ROLE first."""
-        target = self._locked_target(system_id)
-        if (
-            target == "unknown"
-            and self._protocol
-            and system_id in self._protocol.devices
-        ):
-            role = await self._command_role(system_id, None)
-            if role is not None:
-                target = "anchor" if role in ANCHOR_ROLES else None
-        if target == "anchor":
-            raise AnchorsLocked()
-        if target == "unknown":
-            raise AnchorsLocked(ROLE_UNKNOWN_REASON)
-
-    def _record_breaks(self, breaks: list[LockBreak]) -> None:
-        """Log new lock breaks and mark the device list for a push (the
-        periodic flush delivers it within the INF throttle window)."""
-        for entry in breaks:
-            if self.log:
-                self.log.warning(f"rtls: anchor lock broken: {entry['detail']}")
-        if breaks:
-            self._inf_pending = True
-            error = self._anchor_lock.persist_error
-            if error and self.log:
-                self.log.error(f"rtls: anchor lock state not saved: {error}")
-
     def show_start_refusal(self) -> str | None:
-        """Why a show may not be authorized or scheduled now, or None (see
+        """Why a flight may not be authorized or scheduled now, or None (see
         :func:`.anchor_lock.show_gate`). Exported to the show extension."""
         return show_gate(self)["reason"]
+
+    def _refusal_detail(self, system_id: int, accepted: bool) -> dict[str, str]:
+        """``{"detail": "RTLS anchor A3 is locked"}`` for a write a locked
+        anchor refused, else nothing."""
+        locked = None if accepted else locked_detail(self, system_id)
+        return {} if locked is None else {"detail": locked}
 
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2922,6 +2794,8 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("rnghz", "rangingRateHz", _rounded(2)),
     ("urst", "radioRestarts", int),
     ("moved", "moved", bool),
+    # the anchor's LOCK: it refuses every remote change while set
+    ("lock", "locked", bool),
     ("tilt", "tiltDeg", _rounded(1)),
     ("knocks", "knocks", int),
     ("elink", "ethernetLink", bool),
@@ -3167,15 +3041,10 @@ schema = {
             "title": "Register configured RTLS anchors as map beacons",
             "default": True,
         },
-        "anchor_lock_file": {
-            "type": "string",
-            "title": "File the anchor cell lock persists in (default: "
-            "anchor_lock-<listen_port>.json in the extension's data directory)",
-        },
         "lock_required_for_show": {
             "type": "boolean",
-            "title": "Authorize or schedule a show only with the anchor cell "
-            "locked (X-RTLS-LOCK) and its lock unbroken",
+            "title": "Authorize or schedule a flight only while every online "
+            "anchor reports its lock",
             "default": True,
         },
     }

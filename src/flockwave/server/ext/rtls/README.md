@@ -56,10 +56,8 @@ keeps streaming to that client until someone else speaks to it.
   "register_beacons": true,   // anchors as map beacons
   "heartbeat_interval": 2,    // s
   "device_timeout": 6,        // s without a heartbeat before a board is lost
-  "lock_required_for_show": true, // SHOW-SETCFG authorizes a flight only
-                                  // with the anchor cell locked
-  "anchor_lock_file": null    // default anchor_lock-<listen_port>.json in
-                              // the extension's data directory
+  "lock_required_for_show": true  // SHOW-SETCFG authorizes a flight only
+                                  // with every online anchor locked
 }
 ```
 
@@ -85,11 +83,11 @@ enables it.
   the network) and falls asleep in place from standby; `anchor_sleep.py`
   verifies the outcome from its `powerState`, or, on firmware without
   `pwrst`, from heartbeats and readbacks. A woken board reboots.
-- **The anchor cell lock never acts on devices.** It refuses
-  anchor-changing commands and records breaks from the events the extension
-  already handles; the show extension asks it (`show_start_refusal()`)
-  before authorizing a flight. Its state persists per `listen_port`, so the
-  bench server and sim instances run by one user never share a lock.
+- **The anchor lock lives in the firmware.** A locked anchor (`LOCK=1`,
+  reported as its `lock` stat) refuses every remote change itself. The
+  server only writes `LOCK`, derives the cell's lock from the stats, and
+  answers the show extension (`show_start_refusal()`) before it authorizes a
+  flight.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -106,9 +104,8 @@ enables it.
   `set_param()`, `set_sleep()`, `start_ota()`, `cluster_clock`, …) are the
   entry points for other extensions.
 - `anchor_sleep.py`: an anchor's sleep and wake and their verification.
-- `anchor_lock.py`: the anchor cell lock's state, integrity watch and
-  persistence; `anchor_lock_gate.py`: the lock request, the warnings and
-  the show gate.
+- `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
+  and the show gate.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.

@@ -1,42 +1,42 @@
-"""The anchor cell lock (X-RTLS-LOCK): a sealed snapshot of the anchors, and
-the breaks seen since, judged from the events the extension already handles.
+"""The anchor cell lock (X-RTLS-LOCK).
 
-The lock never acts on devices. The extension refuses anchor-changing
-commands while it is locked and records a break whenever an anchor of the
-snapshot changes on its own; :mod:`.anchor_lock_gate` holds the operator's
-side (views, warnings, requests) and the show gate.
+The firmware owns the lock: an anchor with ``LOCK=1`` refuses every remote
+change, accepts the lock only while operating and drops it when it stops
+operating, and reports it as the ``lock`` stat. The server only writes
+``LOCK`` to the online anchors, warns before locking, derives the cell's lock
+state from the stats, and gates the show start on it.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any, Iterable, Optional, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
+
+import trio
+
+if TYPE_CHECKING:
+    from .extension import RtlsExtension
 
 __all__ = (
-    "AnchorLock",
-    "LOCKED_REASON",
-    "LockBreak",
-    "LockWarning",
-    "ROLE_UNKNOWN_REASON",
-    "SealedAnchor",
+    "handle_lock_request",
+    "lock_json",
+    "locked_detail",
+    "show_gate",
 )
 
-LOCKED_REASON = "anchors are locked; unlock them in Control first"
-ROLE_UNKNOWN_REASON = "role unknown while anchors are locked; not commanded"
+LOCK_PARAM = "LOCK"
 
-#: the parameter that carries the firmware version
-FIRMWARE_PARAM = "FW_VERSION"
-
-#: parameters outside the ``UWB_`` session and table set that define the cell
-CELL_PARAMS = frozenset(("MAV_SYS_ID", "BAT_PROFILE"))
-
-
-#: how far an uptime may fall behind the host time elapsed between two of
-#: its samples before it counts as a reboot, in ms. A late advert makes the
-#: host time run ahead by its delay; a reboot keeps an anchor off the network
-#: for 8-15 s.
-UPTIME_SLACK_MS = 5000
+#: how a message says an anchor is in a power state
+_STATE_PHRASES = {
+    "booting": "is booting",
+    "preview": "is in preview",
+    "standby": "is in standby",
+    "asleep": "is asleep",
+    "off": "is off",
+    "operating": "is operating",
+    "stopping": "is stopping",
+    "shutdown": "is shutting down",
+    "fault": "has a power fault",
+}
 
 
 class LockWarning(TypedDict):
@@ -45,357 +45,225 @@ class LockWarning(TypedDict):
     detail: str
 
 
-class LockBreak(TypedDict):
-    code: str
-    device: int
-    detail: str
-    at: float
+class ShowGate(TypedDict):
+    required: bool
+    refused: bool
+    reason: Optional[str]
 
 
-class SealedAnchor(TypedDict):
+class AnchorView(TypedDict):
+    """An anchor as the lock sees it, live or lost."""
+
+    systemId: int
     name: str
     role: Optional[str]
-    firmware: Optional[str]
-    params: dict[str, Any]
-    bootCount: Optional[int]
-    uptimeMs: Optional[int]
-    powerState: Optional[str]
-    moved: Optional[bool]
     online: bool
+    stats: dict[str, Any]
 
 
-class LastSeen(TypedDict):
-    """The last values seen of a sealed anchor, which its next reports are
-    compared with."""
-
-    firmware: Optional[str]
-    params: dict[str, Any]
-    bootCount: Optional[int]
-    uptimeMs: Optional[int]
-    #: monotonic receive time of ``uptimeMs``; not persisted
-    uptimeAt: Optional[float]
-    powerState: Optional[str]
-    moved: Optional[bool]
-    online: bool
+def state_phrase(state: str) -> str:
+    return _STATE_PHRASES.get(state, f"is in power state {state}")
 
 
-def is_cell_param(name: str) -> bool:
-    """Whether a parameter defines the cell (part of the lock snapshot)."""
-    return name.startswith("UWB_") or name in CELL_PARAMS
+def anchor_views(ext: "RtlsExtension") -> list[AnchorView]:
+    """Every known anchor: the live ones with their fresh stats, the lost
+    ones without."""
+    from .extension import ANCHOR_ROLES, _device_name, role_from_params
 
-
-class AnchorLock:
-    """The lock state: whether the cell is locked, its sealed snapshot, the
-    warnings acknowledged when sealing it and the breaks seen since.
-
-    The ``on_*`` observers compare each event with the last value seen for
-    that anchor (starting from the snapshot, persisted with the breaks), so
-    every change becomes one break; they return the new breaks. An operator
-    transition is kept only once it is saved; a telemetry break is kept even
-    when saving it fails (``persist_error`` says why)."""
-
-    def __init__(self, path: Optional[Path] = None):
-        #: where the state persists; None keeps it in memory only
-        self.path = path
-        self.locked = False
-        self.locked_at: Optional[float] = None
-        self.acknowledged: list[LockWarning] = []
-        self.breaks: list[LockBreak] = []
-        self.snapshot: dict[int, SealedAnchor] = {}
-        #: anchors outside the seal that already have a membership break
-        self.outsiders: set[int] = set()
-        #: why the last save failed, None after a successful one
-        self.persist_error: Optional[str] = None
-        #: last values seen per sealed anchor
-        self._seen: dict[int, LastSeen] = {}
-        #: sealed members not rediscovered since a restart: their deadline
-        #: on the extension's monotonic clock
-        self._awaiting: dict[int, float] = {}
-
-    def json(self) -> dict[str, Any]:
-        return {
-            "locked": self.locked,
-            "lockedAt": self.locked_at,
-            "anchors": sorted(self.snapshot),
-            "acknowledgedWarnings": list(self.acknowledged),
-            "breaks": list(self.breaks),
-            "persistError": self.persist_error,
-        }
-
-    def covers(self, system_id: int) -> bool:
-        return self.locked and system_id in self.snapshot
-
-    def name(self, system_id: int) -> str:
-        return self.snapshot[system_id]["name"]
-
-    def seal(
-        self,
-        snapshot: dict[int, SealedAnchor],
-        acknowledged: list[LockWarning],
-        now: float,
-        uptime_at: Optional[dict[int, Optional[float]]] = None,
-    ) -> None:
-        """Lock (or re-seal) the cell: a fresh snapshot, no breaks. Raises
-        OSError, keeping the previous state, when it cannot be saved.
-        ``uptime_at`` gives the host time of each sealed uptime sample."""
-        seen = _seen_from(snapshot, uptime_at or {})
-        self._write(_state(True, now, acknowledged, [], snapshot, set(), seen))
-        self.locked, self.locked_at = True, now
-        self.snapshot, self.acknowledged, self.breaks = snapshot, acknowledged, []
-        self.outsiders, self._seen, self._awaiting = set(), seen, {}
-
-    def unseal(self) -> None:
-        """Unlock; raises OSError, keeping the lock, when it cannot be saved."""
-        self._write(_state(False, None, [], [], {}, set(), {}))
-        self.locked, self.locked_at = False, None
-        self.snapshot, self.acknowledged, self.breaks = {}, [], []
-        self.outsiders, self._seen, self._awaiting = set(), {}, {}
-
-    # ---- integrity watch ----
-
-    def on_online(self, system_id: int) -> None:
-        """A sealed anchor was (re)discovered."""
-        self._awaiting.pop(system_id, None)
-        if self.covers(system_id):
-            self._seen[system_id]["online"] = True
-
-    def on_offline(self, system_id: int, now: float) -> list[LockBreak]:
-        if not self.covers(system_id):
-            return []
-        self._awaiting.pop(system_id, None)
-        self._seen[system_id]["online"] = False
-        return self._break(
-            "offline", system_id, f"{self.name(system_id)} went offline", now
-        )
-
-    def on_missing(
-        self, monotonic: float, live: Iterable[int], now: float
-    ) -> list[LockBreak]:
-        """The expiry pass: a sealed member that was online when the state
-        was saved and is not rediscovered within the device timeout after a
-        restart went offline while the server was down."""
-        live = set(live)
-        found: list[LockBreak] = []
-        for system_id, deadline in list(self._awaiting.items()):
-            if system_id in live:
-                self._awaiting.pop(system_id)
-            elif monotonic >= deadline:
-                self._awaiting.pop(system_id)
-                self._seen[system_id]["online"] = False
-                found += self._break(
-                    "offline",
-                    system_id,
-                    f"{self.name(system_id)} did not return after the server restarted",
-                    now,
-                )
-        return found
-
-    def on_anchor(self, system_id: int, name: str, now: float) -> list[LockBreak]:
-        """An anchor outside the seal appeared while locked: once per anchor."""
-        if not self.locked or system_id in self.snapshot or system_id in self.outsiders:
-            return []
-        self.outsiders.add(system_id)
-        return self._break(
-            "membership", system_id, f"{name} is not part of the sealed cell", now
-        )
-
-    def on_stats(
-        self, system_id: int, stats: dict[str, Any], now: float
-    ) -> list[LockBreak]:
-        if not self.covers(system_id):
-            return []
-        seen = self._seen[system_id]
-        found: list[LockBreak] = []
-        boots = stats.get("bootCount")
-        if boots is not None:
-            # the boot count only stands in for the uptime it cannot see
-            # (it also stays 0 across cold boots)
-            if (
-                seen["uptimeAt"] is None
-                and seen["bootCount"] is not None
-                and boots != seen["bootCount"]
-            ):
-                found += self._rebooted(
-                    system_id, f"boot count {seen['bootCount']} -> {boots}", now
-                )
-            seen["bootCount"] = boots
-        if "moved" in stats:
-            if stats["moved"] and not seen["moved"]:
-                found += self._break(
-                    "moved", system_id, f"{self.name(system_id)} moved", now
-                )
-            seen["moved"] = stats["moved"]
-        state = stats.get("powerState")
-        if state is not None:
-            if seen["powerState"] == "operating" and state != "operating":
-                found += self._break(
-                    "left-operating",
-                    system_id,
-                    f"{self.name(system_id)} left operating ({state})",
-                    now,
-                )
-            seen["powerState"] = state
-        return found
-
-    def on_uptime(
-        self, system_id: int, uptime_ms: int, monotonic: float, now: float
-    ) -> list[LockBreak]:
-        """A reboot is an uptime that went back (counted modulo 2**32, so
-        the 49.7-day wrap is no reboot) or fell behind the host time since
-        the previous sample by more than UPTIME_SLACK_MS. An uptime that runs
-        ahead (the previous advert arrived late) is no reboot."""
-        if not self.covers(system_id):
-            return []
-        seen = self._seen[system_id]
-        previous, previous_at = seen["uptimeMs"], seen["uptimeAt"]
-        seen["uptimeMs"], seen["uptimeAt"] = uptime_ms, monotonic
-        if previous is None or previous_at is None:
-            return []
-        advance = (uptime_ms - previous) & 0xFFFFFFFF
-        elapsed = (monotonic - previous_at) * 1000.0
-        rewound = advance >= 2**31
-        if not rewound and advance >= elapsed - UPTIME_SLACK_MS:
-            return []
-        return self._rebooted(system_id, "uptime reset", now)
-
-    def on_param(
-        self, system_id: int, name: str, value: Any, now: float
-    ) -> list[LockBreak]:
-        if not self.covers(system_id):
-            return []
-        seen = self._seen[system_id]
-        label = self.name(system_id)
-        if name == FIRMWARE_PARAM:
-            previous, seen["firmware"] = seen["firmware"], value
-            if previous is None or previous == value:
-                return []
-            return self._break(
-                "firmware-changed",
-                system_id,
-                f"{label} firmware {previous} -> {value}",
-                now,
+    devices = ext._protocol.devices if ext._protocol else {}
+    candidates = [(d, True) for d in devices.values()] + [
+        (d, False) for sid, d in ext._lost.items() if sid not in devices
+    ]
+    views: list[AnchorView] = []
+    for device, online in sorted(candidates, key=lambda c: c[0].system_id):
+        params = ext._identity_params(device)
+        role = role_from_params(params)
+        if role in ANCHOR_ROLES:
+            system_id = device.system_id
+            views.append(
+                {
+                    "systemId": system_id,
+                    "name": _device_name(system_id, params, role)
+                    or f"RTLS anchor {system_id}",
+                    "role": role,
+                    "online": online,
+                    "stats": (ext._fresh_stats(system_id) or {}) if online else {},
+                }
             )
-        if not is_cell_param(name):
-            return []
-        params = seen["params"]
-        known, previous = name in params, params.get(name)
-        params[name] = value
-        if not known or previous == value:
-            return []
-        return self._break(
-            "param-changed", system_id, f"{label} {name} {previous} -> {value}", now
-        )
+    return views
 
-    def _rebooted(self, system_id: int, why: str, now: float) -> list[LockBreak]:
-        return self._break(
-            "rebooted", system_id, f"{self.name(system_id)} rebooted ({why})", now
-        )
 
-    def _break(
-        self, code: str, system_id: int, detail: str, now: float
-    ) -> list[LockBreak]:
-        entry: LockBreak = {
-            "code": code,
-            "device": system_id,
-            "detail": detail,
-            "at": now,
-        }
-        self.breaks.insert(0, entry)  # newest first
-        self._persist()
-        return [entry]
-
-    # ---- persistence ----
-
-    def _persist(self) -> None:
-        """Saves the current state; a failure is recorded, not raised (the
-        receive loop must keep running and the break must still be pushed)."""
-        try:
-            self._write(
-                _state(
-                    self.locked,
-                    self.locked_at,
-                    self.acknowledged,
-                    self.breaks,
-                    self.snapshot,
-                    self.outsiders,
-                    self._seen,
+def lock_warnings(views: list[AnchorView]) -> list[LockWarning]:
+    """What the operator acknowledges before locking."""
+    if not views:
+        return [_warning("no-anchors", None, "no anchors are known")]
+    warnings: list[LockWarning] = []
+    for view in views:
+        system_id, name, stats = view["systemId"], view["name"], view["stats"]
+        if not view["online"]:
+            warnings.append(_warning("offline", system_id, f"{name} is offline"))
+            continue
+        if (
+            view["role"] == "anchor-responder"
+            and stats.get("powerState") in (None, "operating")
+            and stats.get("rangingRateHz") == 0
+        ):
+            warnings.append(
+                _warning("a0-not-heard", system_id, f"{name} does not hear A0")
+            )
+        if stats.get("lowBattery"):
+            warnings.append(_warning("low-battery", system_id, f"{name}: low battery"))
+        elif stats.get("batteryWarning"):
+            warnings.append(
+                _warning(
+                    "battery-warning",
+                    system_id,
+                    f"{name}: battery below its warning level",
                 )
             )
-        except OSError as ex:
-            self.persist_error = str(ex) or type(ex).__name__
-
-    def _write(self, state: dict[str, Any]) -> None:
-        if self.path is None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state, indent=2))
-        temporary.replace(self.path)
-        self.persist_error = None
-
-    def load(self, device_timeout: float, monotonic: float) -> None:
-        """Restores the persisted state; an absent file is an unlocked cell.
-        Sealed members that were online must be rediscovered within
-        ``device_timeout`` seconds of ``monotonic`` (see :meth:`on_missing`)."""
-        if self.path is None or not self.path.exists():
-            return
-        state = json.loads(self.path.read_text())
-        self.locked = bool(state.get("locked"))
-        self.locked_at = state.get("lockedAt")
-        self.acknowledged = list(state.get("acknowledgedWarnings", []))
-        self.breaks = list(state.get("breaks", []))
-        self.snapshot = {int(k): v for k, v in state.get("snapshot", {}).items()}
-        self.outsiders = {int(k) for k in state.get("outsiders", [])}
-        seen = {
-            int(k): cast(LastSeen, {**v, "uptimeAt": None})
-            for k, v in state.get("lastSeen", {}).items()
-        }
-        self._seen = seen or _seen_from(self.snapshot, {})
-        self._awaiting = {
-            system_id: monotonic + device_timeout
-            for system_id, values in self._seen.items()
-            if self.locked and values.get("online")
-        }
+        if stats.get("moved"):
+            warnings.append(
+                _warning("moved", system_id, f"{name} moved since it was placed")
+            )
+        if stats.get("radioRestarts"):
+            restarts = stats["radioRestarts"]
+            warnings.append(
+                _warning(
+                    "radio-restarts", system_id, f"{name}: radio restarted {restarts}x"
+                )
+            )
+    return warnings
 
 
-def _seen_from(
-    snapshot: dict[int, SealedAnchor], uptime_at: dict[int, Optional[float]]
-) -> dict[int, LastSeen]:
-    return {
-        system_id: {
-            "firmware": entry["firmware"],
-            "params": dict(entry["params"]),
-            "bootCount": entry["bootCount"],
-            "uptimeMs": entry["uptimeMs"],
-            "uptimeAt": uptime_at.get(system_id)
-            if entry["uptimeMs"] is not None
-            else None,
-            "powerState": entry["powerState"],
-            "moved": entry["moved"],
-            "online": entry["online"],
-        }
-        for system_id, entry in snapshot.items()
-    }
+def lock_refusal(views: list[AnchorView]) -> Optional[str]:
+    """Why the cell cannot be locked now: an online anchor that is not
+    operating (only an operating anchor accepts the lock)."""
+    reasons = []
+    for view in views:
+        state = view["stats"].get("powerState")
+        if view["online"] and state not in (None, "operating"):
+            todo = (
+                "wake it first" if state in ("asleep", "standby") else "start it first"
+            )
+            reasons.append(f"{view['name']} {state_phrase(state)}; {todo}")
+    return "; ".join(reasons) or None
 
 
-def _state(
-    locked: bool,
-    locked_at: Optional[float],
-    acknowledged: list[LockWarning],
-    breaks: list[LockBreak],
-    snapshot: dict[int, SealedAnchor],
-    outsiders: set[int],
-    seen: dict[int, LastSeen],
+async def handle_lock_request(
+    ext: "RtlsExtension", body: dict[str, Any]
 ) -> dict[str, Any]:
+    """The X-RTLS-LOCK response body. Raises ValueError for an invalid
+    action."""
+    action = body.get("action", "status")
+    if action not in ("status", "lock", "unlock"):
+        raise ValueError(
+            f"Invalid action: {action!r} (expected status, lock or unlock)"
+        )
+    views = anchor_views(ext)
+    warnings = lock_warnings(views)
+    refusal = lock_refusal(views)
+    result, results = action, {}
+    if action == "lock":
+        if refusal:
+            result = "refused"
+        elif warnings and body.get("acknowledgeWarnings") is not True:
+            result = "warnings"
+        else:
+            results = await _write_lock(ext, views, 1)
+    elif action == "unlock":
+        results = await _write_lock(ext, views, 0)
+    if results:
+        done = all(entry["accepted"] for entry in results.values())
+        result = (
+            ("locked" if action == "lock" else "unlocked") if done else "incomplete"
+        )
     return {
-        "locked": locked,
-        "lockedAt": locked_at,
-        "acknowledgedWarnings": acknowledged,
-        "breaks": breaks,
-        "snapshot": {str(k): v for k, v in snapshot.items()},
-        "outsiders": sorted(outsiders),
-        "lastSeen": {
-            str(k): {name: v for name, v in values.items() if name != "uptimeAt"}
-            for k, values in seen.items()
-        },
+        "type": "X-RTLS-LOCK",
+        "action": action,
+        "result": result,
+        "reason": refusal,
+        "warnings": warnings,
+        "results": results,
+        "anchorLock": lock_json(ext),
     }
+
+
+async def _write_lock(
+    ext: "RtlsExtension", views: list[AnchorView], value: int
+) -> dict[str, dict[str, Any]]:
+    """Writes ``LOCK`` to every online anchor at once; per anchor whether it
+    took the value."""
+    results: dict[str, dict[str, Any]] = {}
+
+    async def write(view: AnchorView) -> None:
+        system_id = view["systemId"]
+        try:
+            ack = await ext.set_param(system_id, LOCK_PARAM, value, "uint8")
+        except (KeyError, ValueError, trio.TooSlowError) as ex:
+            detail = (
+                ext._no_device(system_id)
+                if isinstance(ex, KeyError)
+                else (str(ex) or "no answer")
+            )
+            results[str(system_id)] = {"accepted": False, "detail": detail}
+            return
+        accepted = ack["accepted"] and int(ack["value"]) == value
+        entry: dict[str, Any] = {"accepted": accepted}
+        if not accepted:
+            entry["detail"] = f"{view['name']} refused LOCK={value}"
+        results[str(system_id)] = entry
+
+    async with trio.open_nursery() as nursery:
+        for view in views:
+            if view["online"]:
+                nursery.start_soon(write, view)
+    return results
+
+
+def lock_state(views: list[AnchorView]) -> dict[str, Any]:
+    """The cell's lock as the online anchors report it (``lock`` stat)."""
+    online = [view for view in views if view["online"]]
+    unlocked = [view["systemId"] for view in online if not view["stats"].get("locked")]
+    return {
+        "locked": bool(online) and not unlocked,
+        "lockedCount": len(online) - len(unlocked),
+        "anchorCount": len(online),
+        "unlocked": unlocked,
+    }
+
+
+def show_gate(
+    ext: "RtlsExtension", views: Optional[list[AnchorView]] = None
+) -> ShowGate:
+    """Whether the server refuses to authorize or schedule a flight now:
+    with the gate on and anchors known, every online anchor must be locked.
+    SHOW-SETCFG and ``anchorLock.showGate`` both use this verdict."""
+    views = anchor_views(ext) if views is None else views
+    state = lock_state(views)
+    required = ext._lock_required_for_show and bool(views)
+    reason = None
+    if required and not state["locked"]:
+        reason = (
+            f"the anchors are not locked ({state['lockedCount']}/"
+            f"{state['anchorCount']} online anchors locked); lock them in Control first"
+        )
+    return {"required": required, "refused": reason is not None, "reason": reason}
+
+
+def lock_json(ext: "RtlsExtension") -> dict[str, Any]:
+    """``anchorLock`` as X-RTLS-INF and X-RTLS-LOCK carry it."""
+    views = anchor_views(ext)
+    return {**lock_state(views), "showGate": show_gate(ext, views)}
+
+
+def locked_detail(ext: "RtlsExtension", system_id: int) -> Optional[str]:
+    """``RTLS anchor A3 is locked`` when a refused command's anchor reports
+    its lock, else None."""
+    for view in anchor_views(ext):
+        if view["systemId"] == system_id and view["stats"].get("locked"):
+            return f"{view['name']} is locked"
+    return None
+
+
+def _warning(code: str, device: Optional[int], detail: str) -> LockWarning:
+    return {"code": code, "device": device, "detail": detail}

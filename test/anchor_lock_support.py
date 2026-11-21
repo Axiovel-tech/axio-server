@@ -27,6 +27,7 @@ async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2))):
         anchor.address = (f"192.168.4.{system_id}", 3333)
         set_fake_param(anchor, "UWB_ROLE", role, "uint8")
         set_fake_param(anchor, "UWB_MAC", mac, "uint16")
+        set_fake_param(anchor, "LOCK", 0, "uint8")
         devices[system_id] = anchor
     ext = RtlsExtension()
     ext._protocol = RtlsProtocol(dialect, targets=[])
@@ -50,6 +51,7 @@ def _anchor(dialect, system_id, role=3, mac=9):
     anchor.address = (f"192.168.4.{system_id}", 3333)
     set_fake_param(anchor, "UWB_ROLE", role, "uint8")
     set_fake_param(anchor, "UWB_MAC", mac, "uint16")
+    set_fake_param(anchor, "LOCK", 0, "uint8")
     return anchor
 
 
