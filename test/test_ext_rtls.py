@@ -4584,3 +4584,23 @@ async def test_commands_ignore_the_role_retained_from_before_a_loss(
     assert extension._device_role(DEVICE_SYSID) == "anchor-responder"
     # ...but not commanded on that memory
     assert await extension._command_role(DEVICE_SYSID, 1.0) is None
+
+
+async def test_the_expiry_pass_drops_stats_the_device_stopped_sending(
+    extension, device
+):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    t = time.monotonic()
+    await extension._process_datagram(
+        _bundle(device, {"vbat": 7.9, "chgblk": 2.0}), device.address, t
+    )
+    assert extension._stats[DEVICE_SYSID]["chargeBlock"] == "no-input"
+    # the device keeps heartbeating but stops sending both stats
+    await extension._process_datagram(device.heartbeat(), device.address, t + 4.0)
+
+    await extension._process_expiry(t + 4.0, logging.getLogger("test"))
+
+    assert DEVICE_SYSID in extension._protocol.devices  # not lost
+    assert DEVICE_SYSID not in extension._lost
+    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID}

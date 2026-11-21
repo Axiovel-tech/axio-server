@@ -460,8 +460,7 @@ class RtlsExtension(Extension):
             for payload, address in protocol.poll(now):
                 await self._send(payload, address)
 
-            for event in self._expire_devices(now):
-                logger.warning(f"rtls: device sysid {event.system_id} lost")
+            await self._process_expiry(now, logger)
 
             # re-resolve each tag's flight-controller claim against the known
             # UAVs; a change pushes the (throttled) device list
@@ -1387,13 +1386,26 @@ class RtlsExtension(Extension):
     def _expire_devices(self, now: float) -> list[ProtocolEvent]:
         """Expire the devices that went silent past their timeout, keeping
         each one's last state (see :meth:`_handle_lost`); returns the
-        ``lost`` events."""
+        expiry pass's events: ``lost`` ones, and ``stats`` ones for live
+        devices whose stats the SDK aged out."""
         protocol = self._require_protocol()
         known = dict(protocol.devices)
         events = protocol.expire(now)
         for event in events:
-            self._handle_lost(event, known.get(event.system_id))
+            if event.kind == "lost":
+                self._handle_lost(event, known.get(event.system_id))
         return events
+
+    async def _process_expiry(self, now: float, logger) -> None:
+        """The protocol loop's expiry pass: logs the lost devices and takes
+        the snapshots the SDK reassembled without the stats a device
+        stopped sending."""
+        for event in self._expire_devices(now):
+            if event.kind == "lost":
+                logger.warning(f"rtls: device sysid {event.system_id} lost")
+            elif event.kind == "stats":
+                await self._on_stats(event.system_id, event.data, now)
+                self._dispatch_event(event)
 
     def _handle_lost(
         self, event: ProtocolEvent, device: RtlsDevice | None = None

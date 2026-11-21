@@ -625,8 +625,8 @@ An anchor's entry carries no tag solver fields (`solveRateHz` …
 entry is tag-shaped (a tag's 10 s status report carries no solver stats
 either). Every other field is present only while its stat is (omitted =
 unknown), on any role. The SDK drops a stat its device has not refreshed
-within three of its report periods (3 s for the 1 Hz health report, 30 s
-for `bootCount`/`resetCause`; the gauge stats go with a stale `vbat`) and
+within three of its report periods (3 s for the 1 Hz health report, 10.5 s
+for the geometry distances, 30 s for `bootCount`/`resetCause`) and
 every cached stat when the device reboots, so a field the device stopped
 sending leaves the entry:
 
