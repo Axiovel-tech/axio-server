@@ -225,3 +225,20 @@ def test_power_states_read_naturally():
         "is off",
         "has a power fault",
     ]
+
+
+async def test_the_lock_stat_arrives_through_the_sdk(dialect):
+    from anchor_lock_support import _anchor
+    from rtls_support import discover
+
+    ext, _ = await _cell(dialect, anchors=())
+    anchor = _anchor(dialect, 203, role=2, mac=1)
+    ext.routes[anchor.address] = anchor
+    await discover(ext, anchor)
+
+    await ext._process_datagram(
+        anchor.named_value_float("lock", 1.0), anchor.address, time.monotonic()
+    )
+
+    assert ext._stats[203]["locked"] is True
+    assert lock_json(ext)["locked"] is True
