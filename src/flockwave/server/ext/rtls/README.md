@@ -200,7 +200,9 @@ string), plus a site-level `anchors` list:
   (axio-server#61). It stays listed with what it last reported (address,
   role, name, last `sleeping`) and its last stats stay answerable, marked
   `stale`, until an operator forgets it (`X-RTLS-FORGET`) or the server
-  restarts; a device that returns is the same entry, `online: true` again.
+  restarts; a device that returns is the same entry, `online: true` again,
+  keeping its `role` and `name` from before until its new parameter dump
+  is complete.
   Nothing treats a lost device as live: it is no site anchor's `systemId`,
   no beacon is active for it, it pairs with no drone, and commands to it
   fail with "Device N is offline".
@@ -476,11 +478,16 @@ image path is a server-side filesystem path.
 
 The firmware ships as **two role-matched artifacts** since the
 tag/anchor application split (`build/<board>/tag/...` and
-`build/<board>/anchor/...`); a device's role is image-pinned and OTA
-must upload the matching one. The optional `role` field declares which
-species the artifact was built for — the server then reads the
-device's `UWB_ROLE` and NAKs the upload on a mismatch instead of
-letting a wrong-species image strip the device of its function:
+`build/<board>/anchor/...`); a device's role is image-pinned, and the
+uploaded image is confirmed (permanent), so a wrong-species image strips
+the device of its function for good. The server therefore reads the
+device's `UWB_ROLE` and NAKs an upload whose species differs. The species
+comes from the image's build receipt, the `<image>.receipt.json` that
+rtls-link-zephyr's `scripts/build.sh` writes beside every signed image
+(what `rtls-link ota` checks too). The optional `role` field (`"tag"` /
+`"anchor"`) is only the fallback for an image without a receipt; a `role`
+that contradicts the receipt is NAKed, as is a receipt that does not
+describe the file (another build) or cannot be read:
 
 Start:
 
@@ -493,7 +500,28 @@ Start:
 }
 ```
 
-Without `role` the upload is unguarded (pre-split behavior).
+Without a receipt and without `role` the upload is unguarded.
+
+Inspect an image before choosing the device (no upload; `id` is not
+needed), e.g. to show and lock its species:
+
+```json
+{"type": "X-RTLS-OTA", "image": "/srv/firmware/zephyr.signed.bin", "inspect": true}
+```
+
+```json
+{
+  "type": "X-RTLS-OTA",
+  "image": "/srv/firmware/zephyr.signed.bin",
+  "species": "anchor",
+  "speciesSource": "receipt",
+  "board": "axio_anchor",
+  "git": "9b1573bd"
+}
+```
+
+`species` and `speciesSource` are `null` (and `board` / `git` absent) for
+an image without a receipt.
 
 Response (job snapshot; also the shape of the status query response,
 whose `job` is `null` when the device never had a job):
@@ -508,7 +536,9 @@ whose `job` is `null` when the device never had a job):
     "status": "running",
     "progress": 0.0,
     "version": null,
-    "error": null
+    "error": null,
+    "species": "tag",
+    "speciesSource": "receipt"
   }
 }
 ```
@@ -517,6 +547,8 @@ whose `job` is `null` when the device never had a job):
 - `progress` — upload progress, `0.0 … 1.0`.
 - `version` — version string of the uploaded image on success.
 - `error` — failure description when `status` is `"error"`.
+- `species` / `speciesSource` — the image's species and where it came
+  from (`"receipt"` or `"declared"`), both `null` for an unguarded upload.
 
 While a job runs, the server **broadcasts** `X-RTLS-OTA` notifications
 with the same body shape (no `refs` member, since they are not
@@ -535,7 +567,9 @@ the entry of the device that updated; the query returns every known
 device, or one with the optional `id` (an unknown id yields an empty
 snapshot, not an error). The snapshot of a device that drops off the
 network stays, with `"stale": true` (pushed once), until the device
-reports again or is forgotten (`X-RTLS-FORGET`).
+reports again or is forgotten (`X-RTLS-FORGET`). A live device whose
+reports stop for over 30 s (three periods of the slowest one) is marked
+stale the same way.
 
 Request:
 
@@ -578,9 +612,11 @@ Response / notification body — entries keyed by system id (as string):
 ```
 
 An anchor's entry carries no tag solver fields (`solveRateHz` …
-`anchorMask`); the role comes from `UWB_ROLE`, or, until it is known,
-from the report lacking every solver stat. Every other field is present
-only while its stat is (omitted = unknown), on any role:
+`anchorMask`) once its `UWB_ROLE` says anchor; until the role is known an
+entry is tag-shaped (a tag's 10 s status report carries no solver stats
+either). Every other field is present only while its stat is (omitted =
+unknown), on any role. A stat the device stops sending leaves the entry
+with the SDK, which ages it out after about three report periods:
 
 | Field | Stat | Value |
 |---|---|---|

@@ -43,6 +43,7 @@ from flockwave.server.ext.rtls.extension import (
     REFILL_MAX_ATTEMPTS,
     REFILL_READ_SPACING,
     SLEEP_PIN_TIMEOUT,
+    STATS_STALE_AFTER,
     RtlsExtension,
     _stats_json,
 )
@@ -4190,12 +4191,26 @@ def test_stats_json_anchor_omits_absent_fields():
     }
 
 
-def test_stats_json_role_unknown_infers_an_anchor_from_its_stats():
-    # before the parameter dump names the role, a report without any tag
-    # solver stat is an anchor's...
-    assert "solveRateHz" not in _stats_json(7, {"vbat": 8.0, "pwrst": 5.0})
-    # ...and one with them a tag's
-    assert _stats_json(7, dict(FULL_STATS))["solveRateHz"] == 8.0
+def test_stats_json_unknown_role_is_tag_shaped():
+    # a tag's 10 s status report carries no solver stats either: only
+    # UWB_ROLE switches a device to the anchor shape
+    assert _stats_json(7, {"boots": 3.0, "rstc": 1.0})["solveRateHz"] == 0.0
+
+
+async def test_stats_take_the_anchor_shape_once_the_role_says_anchor(
+    extension, device, builder, hub
+):
+    device.respond_to_list = False  # the dump has not delivered UWB_ROLE
+    await discover(extension, device)
+    await extension._on_stats(DEVICE_SYSID, {"boots": 3.0}, 0.0)
+    assert extension._stats[DEVICE_SYSID]["solveRateHz"] == 0.0
+
+    set_fake_param(device, "UWB_ROLE", 3, "uint8")
+    await extension._process_datagram(
+        device._param_value("UWB_ROLE", 0), device.address, 1.0
+    )
+    await extension._on_stats(DEVICE_SYSID, {"boots": 3.0}, 2.0)
+    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID, "bootCount": 3}
 
 
 def test_stats_json_tag_keeps_its_solver_defaults():
@@ -4449,7 +4464,8 @@ class FakeAnchor(FakeDevice):
         return self.reboot_at is not None and trio.current_time() >= self.reboot_at
 
     def uptime_ms(self) -> int:
-        return int((trio.current_time() - self.boot_at) * 1000)
+        # a booted board reports a few ms at least (TIMESYNC tc1 0 is no reply)
+        return 2 + int((trio.current_time() - self.boot_at) * 1000)
 
     def handle(self, data: bytes) -> list[bytes]:
         return [] if self.down else super().handle(data)
@@ -4480,9 +4496,8 @@ class FakeAnchor(FakeDevice):
             await trio.sleep(1.0)
 
 
-async def _anchor_sleep(dialect, builder, hub, anchor, sleeping, **body):
-    """Discover the anchor, run it, and send it one X-RTLS-SLEEP; returns the
-    extension and the anchor's result entry."""
+async def _anchor_extension(dialect, anchor):
+    """An extension wired to ``anchor`` that has discovered it."""
     ext = RtlsExtension()
     ext._protocol = RtlsProtocol(dialect, targets=[anchor.address])
     ext.app = StubApp()
@@ -4493,19 +4508,31 @@ async def _anchor_sleep(dialect, builder, hub, anchor, sleeping, **body):
 
     ext._send = fake_send
     await discover(ext, anchor)
+    return ext
+
+
+async def _send_sleep(ext, builder, hub, sleeping, **body):
+    response = await ext._handle_RTLS_SLEEP(
+        make_message(
+            builder,
+            {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": sleeping}
+            | body,
+        ),
+        None,
+        hub,
+    )
+    return response.body["result"][str(DEVICE_SYSID)]
+
+
+async def _anchor_sleep(dialect, builder, hub, anchor, sleeping, **body):
+    """Discover the anchor, run it, and send it one X-RTLS-SLEEP; returns the
+    extension and the anchor's result entry."""
+    ext = await _anchor_extension(dialect, anchor)
     async with trio.open_nursery() as nursery:
         nursery.start_soon(anchor.run, ext)
-        response = await ext._handle_RTLS_SLEEP(
-            make_message(
-                builder,
-                {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": sleeping}
-                | body,
-            ),
-            None,
-            hub,
-        )
+        entry = await _send_sleep(ext, builder, hub, sleeping, **body)
         nursery.cancel_scope.cancel()
-    return ext, response.body["result"][str(DEVICE_SYSID)]
+    return ext, entry
 
 
 async def test_anchor_sleep_waits_for_the_reboot(dialect, builder, hub, autojump_clock):
@@ -4607,3 +4634,227 @@ async def test_anchor_without_sleep_mode(dialect, builder, hub, autojump_clock):
         "sleeping": None,
         "detail": "the anchor has no sleep mode (no SLEEP parameter)",
     }
+
+
+async def test_anchor_wake_right_after_a_sleep(dialect, builder, hub, autojump_clock):
+    """The uptime sampled before the wake is a few ms past the sleep's own
+    reboot, so the wake's reboot does not lower it: the reboot shows as
+    uptime that advanced less than the host time since that sample. The
+    second reboot is shorter than the device timeout (no rediscovery)."""
+    anchor = FakeAnchor(dialect)
+    ext = await _anchor_extension(dialect, anchor)
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(anchor.run, ext)
+        slept = await _send_sleep(ext, builder, hub, True)
+        anchor.reboot_s = 3.0
+        woke = await _send_sleep(ext, builder, hub, False)
+        nursery.cancel_scope.cancel()
+
+    assert slept["accepted"] is True and slept["sleeping"] is True
+    assert woke == {
+        "requested": False,
+        "accepted": True,
+        "sleeping": False,
+        "detail": "awake",
+    }
+
+
+# ---- retained identity across loss --------------------------------------
+
+
+async def test_a_returning_anchor_keeps_its_name(extension, device, builder, hub):
+    add_anchor_identity_params(device, uwb_mac=2)
+    await discover(extension, device)
+    assert (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)][
+        "name"
+    ] == "RTLS anchor A1"
+
+    extension._expire_devices(time.monotonic() + 1000)
+    # it returns, but its parameter dump has not landed (lost or slow)
+    device.respond_to_list = False
+    await discover(extension, device)
+
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is True
+    assert entry["name"] == "RTLS anchor A1"
+    assert entry["role"] == "anchor-responder"
+    # live checks read only the new cache
+    assert extension._protocol.devices[DEVICE_SYSID].params == {}
+
+    # once the new snapshot is complete, the retained copy is dropped
+    device.respond_to_list = True
+    request = extension._protocol.request_param_list(DEVICE_SYSID)
+    await extension._send(*request)
+    assert DEVICE_SYSID not in extension._retained_params
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["name"] == "RTLS anchor A1"
+
+
+# ---- stats freshness ----------------------------------------------------
+
+
+async def test_a_stat_the_device_stopped_sending_leaves_the_body(extension, device):
+    add_anchor_identity_params(device)
+    await discover(extension, device)
+
+    # the SDK ages out a stat the device stops sending (PoE pulled: no
+    # chargeBlock; gauge profile removed: no soc); the body follows it
+    await extension._on_stats(
+        DEVICE_SYSID, {"vbat": 7.9, "soc": 80.0, "chgblk": 0.0}, 0.0
+    )
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.9}, 1.0)
+
+    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID, "batteryVoltage": 7.9}
+
+
+async def test_a_silent_stats_stream_goes_stale(extension, device):
+    add_anchor_identity_params(device)
+    await discover(extension, device)
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.9}, 0.0)
+
+    await extension._flush_pending_stats(now=STATS_STALE_AFTER)
+    assert "stale" not in extension._stats[DEVICE_SYSID]
+
+    # no report for longer than three periods of the slowest one
+    await extension._flush_pending_stats(now=STATS_STALE_AFTER + 1.0)
+    assert extension._stats[DEVICE_SYSID]["stale"] is True
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)]["stale"] is True
+
+    # the next report is fresh again
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.8}, STATS_STALE_AFTER + 2.0)
+    assert "stale" not in extension._stats[DEVICE_SYSID]
+
+
+# ---- OTA species from the image's build receipt -------------------------
+
+
+def _signed_image(tmp_path, app, *, stale=False):
+    """An image with the receipt rtls-link-zephyr's scripts/build.sh writes
+    beside it."""
+    import hashlib
+    import json
+
+    image = tmp_path / "zephyr.signed.bin"
+    image.write_bytes(b"\x3d\xb8\xf3\x96" + b"\x00" * 60)
+    digest = hashlib.sha256(b"other build" if stale else image.read_bytes())
+    (tmp_path / "zephyr.signed.bin.receipt.json").write_text(
+        json.dumps(
+            {
+                "app": app,
+                "board": "axio_anchor" if app == "anchor" else "axiolight_esp32s3",
+                "git": "9b1573bd",
+                "sha256": digest.hexdigest(),
+                "mcuboot_digest": "00" * 32,
+            }
+        )
+    )
+    return image
+
+
+async def _start_ota(extension, builder, hub, image, **body):
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)} | body,
+    )
+    return await extension._handle_RTLS_OTA(message, None, hub)
+
+
+@pytest.mark.parametrize("declared", [None, "anchor"])
+async def test_ota_refuses_an_image_whose_receipt_names_another_species(
+    extension, device, builder, hub, tmp_path, declared
+):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "anchor")
+
+    body = {} if declared is None else {"role": declared}
+    response = await _start_ota(extension, builder, hub, image, **body)
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "refusing to upload a anchor image" in response.body["reason"]
+    assert DEVICE_SYSID not in extension._ota_jobs
+
+
+async def test_ota_receipt_overrides_a_contradicting_declared_role(
+    extension, device, builder, hub, tmp_path
+):
+    # the operator flipped the declared role to match the device: the
+    # receipt still says anchor
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "anchor")
+
+    response = await _start_ota(extension, builder, hub, image, role="tag")
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "its build receipt" in response.body["reason"]
+
+
+async def test_ota_refuses_a_stale_receipt(extension, device, builder, hub, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "tag", stale=True)
+
+    response = await _start_ota(extension, builder, hub, image)
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "stale receipt" in response.body["reason"]
+
+
+async def test_ota_job_names_the_species_and_its_source(
+    extension, device, builder, hub, tmp_path
+):
+    device.params["UWB_ROLE"] = (bytes([3]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    extension._ota_upgrade = (
+        lambda address, image_path, *, timeout=10.0, on_progress=None: "9.9.9"
+    )
+    receipted = _signed_image(tmp_path, "anchor")
+    bare = tmp_path / "bare.bin"
+    bare.write_bytes(b"\x00" * 16)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        response = await _start_ota(extension, builder, hub, receipted)
+        assert response.body["job"]["species"] == "anchor"
+        assert response.body["job"]["speciesSource"] == "receipt"
+        with trio.fail_after(5):
+            while extension._ota_jobs[DEVICE_SYSID]["status"] == "running":
+                await trio.sleep(0.01)
+        # without a receipt, the declared role is the fallback
+        response = await _start_ota(extension, builder, hub, bare, role="anchor")
+        assert response.body["job"]["speciesSource"] == "declared"
+        with trio.fail_after(5):
+            while extension._ota_jobs[DEVICE_SYSID]["status"] == "running":
+                await trio.sleep(0.01)
+    extension._nursery = None
+
+
+async def test_ota_inspect_reports_the_receipt(extension, builder, hub, tmp_path):
+    image = _signed_image(tmp_path, "anchor")
+    bare = tmp_path / "bare.bin"
+    bare.write_bytes(b"\x00" * 16)
+
+    def inspect(path):
+        message = make_message(
+            builder, {"type": "X-RTLS-OTA", "image": str(path), "inspect": True}
+        )
+        return extension._handle_RTLS_OTA(message, None, hub)
+
+    response = await inspect(image)
+    assert response.body == {
+        "type": "X-RTLS-OTA",
+        "image": str(image),
+        "species": "anchor",
+        "speciesSource": "receipt",
+        "board": "axio_anchor",
+        "git": "9b1573bd",
+    }
+    response = await inspect(bare)
+    assert response.body["species"] is None
+    assert response.body["speciesSource"] is None
+    response = await inspect(tmp_path / "missing.bin")
+    assert response.body["type"] == "ACK-NAK"

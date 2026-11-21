@@ -13,6 +13,7 @@ experimental (``X-`` prefixed) message types on the message hub; see
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import time
 from contextlib import contextmanager
@@ -33,7 +34,9 @@ from rtlslink import (
     param_type_to_name,
     parse_address,
 )
+from rtlslink.client import UptimeSample
 from rtlslink.dialect import load_dialect
+from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
     PARAM_ACK_ACCEPTED,
     PARAM_ACK_IN_PROGRESS,
@@ -119,6 +122,12 @@ ROLE_SPECIES = {1: "tag", 2: "anchor", 3: "anchor"}
 
 #: how often per-device stats notifications are broadcast at most, in seconds
 STATS_INTERVAL = 1.0
+
+#: seconds without any stats report after which a live device's snapshot is
+#: marked stale: three periods of the slowest report (the 10 s status one).
+#: Single stats the device stops sending are aged out by the SDK, and the
+#: snapshot is rebuilt from the SDK's on every report.
+STATS_STALE_AFTER = 30.0
 
 #: NAMED_VALUE_FLOAT names of the tag's position-estimate debug stream
 #: (rtls-link-zephyr#14): the solved NED triple plus the reported NE sigma,
@@ -245,6 +254,10 @@ class RtlsExtension(Extension):
         #: listed offline in X-RTLS-INF until an operator forgets them
         #: (X-RTLS-FORGET) or the extension stops. Never consulted as live.
         self._lost: dict[int, Any] = {}
+        #: decoded parameters of a lost device that came back, standing in
+        #: for its role and name until its new snapshot is complete (the
+        #: SDK starts a rediscovered device with an empty cache)
+        self._retained_params: dict[int, dict[str, Any]] = {}
         #: feed-clock harvest time of each stats snapshot: consumers that
         #: judge "is this tag healthy NOW" (fleet verify) must not trust
         #: an indefinitely cached snapshot from a stream that went silent
@@ -445,6 +458,7 @@ class RtlsExtension(Extension):
             self._sock = None
             self._uptime_ms.clear()
             self._lost.clear()
+            self._retained_params.clear()
             self._sleeping.clear()
             self._sleep_pins.clear()
             self._mavlink_api = None
@@ -519,8 +533,13 @@ class RtlsExtension(Extension):
             if event.kind == "stats" and last_stats[event.system_id] is not event:
                 continue
             if event.kind == "discovered":
-                # a lost device that returns is the same entry, live again
-                self._lost.pop(event.system_id, None)
+                # a lost device that returns is the same entry, live again,
+                # named from what it reported before until its dump lands
+                lost = self._lost.pop(event.system_id, None)
+                if lost is not None:
+                    self._retained_params[event.system_id] = _decoded_device_params(
+                        lost
+                    )
                 if self.log:
                     self.log.info(
                         f"rtls: device sysid {event.system_id} discovered "
@@ -586,6 +605,7 @@ class RtlsExtension(Extension):
                 # a reply to a refill round may have just plugged the last
                 # hole: finish promptly instead of on the next poll round
                 self._check_refill_completion(event.system_id)
+                self._release_retained_params(event.system_id)
             self._dispatch_event(event)
 
     def _on_twr(self, system_id: int, data: dict[str, Any], now: float) -> None:
@@ -925,15 +945,17 @@ class RtlsExtension(Extension):
             return None
         return result["value"]
 
-    async def _probe_uptime(self, system_id: int) -> int | None:
-        """The device's uptime in ms from a correlated TIMESYNC request, or
-        None when it does not answer within ANCHOR_PROBE_TIMEOUT."""
+    async def _probe_uptime(self, system_id: int) -> UptimeSample | None:
+        """The device's uptime from a correlated TIMESYNC request, bounded
+        by the host time of the request and of the reply, or None when it
+        does not answer within ANCHOR_PROBE_TIMEOUT."""
         protocol = self._require_protocol()
         token = time.monotonic_ns()
         with self._subscribed_events() as events:
             request = protocol.request_uptime(system_id, token)
             if request is None:
                 return None
+            requested_at = trio.current_time()
             await self._send(*request)
             with trio.move_on_after(ANCHOR_PROBE_TIMEOUT):
                 while True:
@@ -943,7 +965,11 @@ class RtlsExtension(Extension):
                         and event.system_id == system_id
                         and event.data.get("token") == token
                     ):
-                        return int(event.data["uptime_ms"])
+                        return UptimeSample(
+                            int(event.data["uptime_ms"]),
+                            requested_at,
+                            trio.current_time(),
+                        )
         return None
 
     async def _set_anchor_sleep(
@@ -973,10 +999,7 @@ class RtlsExtension(Extension):
         acked = False
         with trio.move_on_after(timeout):
             with self._subscribed_events() as events:
-                uptime = await self._probe_uptime(system_id)
-                watch.before_uptime = (
-                    uptime if uptime is not None else self._uptime_ms.get(system_id)
-                )
+                watch.before = await self._probe_uptime(system_id)
                 ack = await self.set_param(
                     system_id,
                     SLEEP_PARAM,
@@ -1167,9 +1190,18 @@ class RtlsExtension(Extension):
                 "image-pinned — OTA the matching artifact)"
             )
 
-    async def start_ota(self, system_id: int, image_path: str) -> dict[str, Any]:
+    async def start_ota(
+        self,
+        system_id: int,
+        image_path: str,
+        *,
+        species: str | None = None,
+        species_source: str | None = None,
+    ) -> dict[str, Any]:
         """Starts an OTA upgrade for a device in the background; returns
-        a snapshot of the newly created job record.
+        a snapshot of the newly created job record, which carries the
+        image's ``species`` and where it was established
+        (``speciesSource``), when known.
 
         Raises KeyError for unknown devices and RuntimeError if an OTA
         job is already running for the device or the extension is not
@@ -1192,6 +1224,8 @@ class RtlsExtension(Extension):
             "progress": 0.0,
             "version": None,
             "error": None,
+            "species": species,
+            "speciesSource": species_source,
         }
         self._ota_jobs[system_id] = job
         self._nursery.start_soon(self._run_ota, device.address[0], image_path, job)
@@ -1288,7 +1322,7 @@ class RtlsExtension(Extension):
         # are optional and must not gate the broadcast, or firmware without
         # them would never get a health snapshot out. Anchors send none of
         # the set, so their reports are not gated at all.
-        if not _is_anchor_stats(data, role) and not all(
+        if not _is_anchor_stats(role) and not all(
             field in data for field in STATS_FIELDS
         ):
             return
@@ -1311,8 +1345,17 @@ class RtlsExtension(Extension):
 
     async def _flush_pending_stats(self, now: float) -> None:
         """Broadcast any cached stats snapshot that is newer than the last
-        one sent and whose throttle window has elapsed (trailing edge)."""
+        one sent and whose throttle window has elapsed (trailing edge). A
+        snapshot not refreshed within STATS_STALE_AFTER is marked stale
+        first, so the push tells clients the stream went silent."""
         for system_id, stats in list(self._stats.items()):
+            harvested = self._stats_at.get(system_id)
+            if (
+                not stats.get("stale")
+                and harvested is not None
+                and now - harvested > STATS_STALE_AFTER
+            ):
+                stats = self._stats[system_id] = {**stats, "stale": True}
             if stats == self._last_stats_sent.get(system_id):
                 continue
             last = self._last_stats_broadcast.get(system_id)
@@ -1942,6 +1985,8 @@ class RtlsExtension(Extension):
     async def _handle_RTLS_OTA(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
+        if message.body.get("inspect"):
+            return self._inspect_ota_image(message, hub)
         try:
             system_id = _get_device_id(message)
         except ValueError as ex:
@@ -1968,18 +2013,23 @@ class RtlsExtension(Extension):
         if not os.path.isfile(image):
             return hub.reject(message, reason=f"No such image file: {image}")
 
-        # Optional species guardrail: the client declares which role the
-        # artifact was built for and the server verifies the device
-        # against it before uploading (the tag/anchor split made the
-        # role image-pinned).
+        # Species guardrail: the uploaded image is confirmed (permanent),
+        # and a wrong-species image strips the device of its function, so
+        # the device's UWB_ROLE is checked against the image's species. The
+        # image's build receipt names it; the role the client declares is
+        # only the fallback for an image without one.
         role = message.body.get("role")
-        if role is not None:
-            if role not in ("tag", "anchor"):
-                return hub.reject(
-                    message, reason=f"Invalid role: {role!r} (expected tag or anchor)"
-                )
+        if role is not None and role not in ("tag", "anchor"):
+            return hub.reject(
+                message, reason=f"Invalid role: {role!r} (expected tag or anchor)"
+            )
+        try:
+            species, source = _image_species(image, role)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        if species is not None:
             try:
-                await self.verify_species(system_id, role)
+                await self.verify_species(system_id, species)
             except KeyError:
                 return hub.reject(message, reason=f"No such device: {system_id}")
             except ValueError as ex:
@@ -1992,7 +2042,9 @@ class RtlsExtension(Extension):
                 )
 
         try:
-            job = await self.start_ota(system_id, image)
+            job = await self.start_ota(
+                system_id, image, species=species, species_source=source
+            )
         except KeyError:
             return hub.reject(message, reason=f"No such device: {system_id}")
         except RuntimeError as ex:
@@ -2002,6 +2054,30 @@ class RtlsExtension(Extension):
             body={"type": "X-RTLS-OTA", "id": system_id, "job": job},
             in_response_to=message,
         )
+
+    def _inspect_ota_image(self, message: "FlockwaveMessage", hub: "MessageHub"):
+        """Answers an ``inspect`` request: the species an image's build
+        receipt names, so a client can show (and lock) it before the upload.
+        ``species`` is null for an image without a receipt."""
+        import os
+
+        image = message.body.get("image")
+        if not isinstance(image, str) or not os.path.isfile(image):
+            return hub.reject(message, reason=f"No such image file: {image}")
+        try:
+            receipt = _read_image_receipt(image)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        body: dict[str, Any] = {
+            "type": "X-RTLS-OTA",
+            "image": image,
+            "species": receipt.app if receipt else None,
+            "speciesSource": "receipt" if receipt else None,
+        }
+        if receipt is not None:
+            body["board"] = receipt.board
+            body["git"] = receipt.git
+        return hub.create_response_or_notification(body=body, in_response_to=message)
 
     async def _handle_RTLS_STATS(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2099,6 +2175,7 @@ class RtlsExtension(Extension):
         if system_id not in self._lost and system_id not in self._stats:
             return {"forgotten": False, "detail": f"No such device: {system_id}"}
         self._lost.pop(system_id, None)
+        self._retained_params.pop(system_id, None)
         self._prune_stats(system_id)
         self._sleep_pins.pop(system_id, None)
         return {"forgotten": True}
@@ -2148,7 +2225,28 @@ class RtlsExtension(Extension):
         device = self._protocol.devices.get(system_id) if self._protocol else None
         if device is None:
             return None
-        return role_from_params(_decoded_device_params(device, ("UWB_ROLE",)))
+        return role_from_params(self._identity_params(device))
+
+    def _identity_params(self, device) -> dict[str, Any]:
+        """A device's decoded parameters, filled in from what it reported
+        before it was lost while its new snapshot is incomplete. For naming
+        and display only: live checks read the device's own cache."""
+        retained = self._retained_params.get(device.system_id)
+        params = _decoded_device_params(device)
+        return params if retained is None else {**retained, **params}
+
+    def _release_retained_params(self, system_id: int) -> None:
+        """Drop a returned device's retained parameters once its new
+        snapshot is count-complete."""
+        if system_id not in self._retained_params or self._protocol is None:
+            return
+        device = self._protocol.devices.get(system_id)
+        if (
+            device is not None
+            and device.param_count is not None
+            and len(device.params) >= device.param_count
+        ):
+            del self._retained_params[system_id]
 
     def _inf_status(self, now: float) -> dict[str, dict[str, Any]]:
         """The full X-RTLS-INF status map: one entry per live or lost
@@ -2179,7 +2277,7 @@ class RtlsExtension(Extension):
         online: bool = True,
     ) -> dict[str, Any]:
         job = self._ota_jobs.get(device.system_id)
-        params = _decoded_device_params(device)
+        params = self._identity_params(device)
         role = role_from_params(params)
 
         body = {
@@ -2522,6 +2620,33 @@ class RtlsExtension(Extension):
         return dict(self._protocol.devices)
 
 
+def _read_image_receipt(image: str):
+    """The build receipt beside an image (rtls-link-zephyr
+    ``scripts/build.sh``), None without one. Raises ValueError when it
+    cannot vouch for the image: stale (another build), unreadable, or for
+    an unknown app."""
+    try:
+        return read_receipt(image)
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as ex:
+        raise ValueError(f"unreadable image receipt beside {image}: {ex}") from ex
+
+
+def _image_species(image: str, declared: str | None) -> tuple[str | None, str | None]:
+    """The species (``"tag"`` / ``"anchor"``) of an OTA image and its
+    source: the image's build receipt, else the role the client declared,
+    else unknown. Raises ValueError when the receipt cannot vouch for the
+    image or contradicts the declared role."""
+    receipt = _read_image_receipt(image)
+    if receipt is None:
+        return declared, ("declared" if declared else None)
+    if declared is not None and declared != receipt.app:
+        raise ValueError(
+            f"the image is a {receipt.app} image (its build receipt), not a "
+            f"{declared} image; refusing the upload"
+        )
+    return receipt.app, "receipt"
+
+
 @dataclasses.dataclass
 class _AnchorTransition:
     """What an anchor reported since a sleep/wake request was sent to it."""
@@ -2531,8 +2656,8 @@ class _AnchorTransition:
     expected: bool
     #: whether the heartbeat already reported that state before the request
     already: bool
-    #: the uptime before the request in ms, None when unknown
-    before_uptime: Optional[int] = None
+    #: the uptime sampled before the request, None when unknown
+    before: Optional[UptimeSample] = None
     #: the state of the latest heartbeat since the request
     state: Optional[bool] = None
     #: whether the anchor rebooted since the request
@@ -2547,14 +2672,15 @@ class _AnchorTransition:
             self.state = bool(event.data["sleeping"])
             # rediscovery: the anchor was off the network past its timeout
             self.rebooted = self.rebooted or event.kind == "discovered"
-        elif event.kind in ("uptime", "timesync"):
-            self.observe_uptime(event.data.get("uptime_ms"))
 
-    def observe_uptime(self, uptime_ms: Optional[int]) -> None:
+    def observe_uptime(self, sample: Optional[UptimeSample]) -> None:
+        """A reboot is an uptime that advanced less than the host time
+        elapsed since the sample before the request (the SDK's rule): a
+        lower uptime alone misses a second reboot right after another."""
         if (
-            uptime_ms is not None
-            and self.before_uptime is not None
-            and int(uptime_ms) < self.before_uptime
+            sample is not None
+            and self.before is not None
+            and sample.follows_reboot(self.before)
         ):
             self.rebooted = True
 
@@ -2871,12 +2997,11 @@ def _finite_stat(data: dict[str, Any], name: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _is_anchor_stats(data: dict[str, Any], role: str | None) -> bool:
-    """Whether a stats snapshot belongs to an anchor: by its role, or, while
-    the role is not yet known, by the absence of every tag solver stat."""
-    if role is not None:
-        return role in ANCHOR_ROLES
-    return not any(name in data for name, _, _ in TAG_SOLVER_FIELDS)
+def _is_anchor_stats(role: str | None) -> bool:
+    """Whether a stats snapshot takes the anchor shape: only once UWB_ROLE
+    says anchor. A tag's 10 s status report carries no solver stats either,
+    so an unknown role stays tag-shaped."""
+    return role in ANCHOR_ROLES
 
 
 def _stats_json(
@@ -2887,7 +3012,7 @@ def _stats_json(
     Integer-semantic floats (counts, milliseconds, bitmasks) are cast to int
     and state codes to their names."""
     body: dict[str, Any] = {"id": int(system_id)}
-    if not _is_anchor_stats(data, role):
+    if not _is_anchor_stats(role):
         for name, key, convert in TAG_SOLVER_FIELDS:
             body[key] = convert(data.get(name, 0.0))
     for name, key, convert in STATS_BODY_FIELDS:
