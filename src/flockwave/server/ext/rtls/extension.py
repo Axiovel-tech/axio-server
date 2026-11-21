@@ -26,6 +26,7 @@ from flockwave.gps.vectors import GPSCoordinate
 from rtlslink import (
     STATS_FIELDS,
     ProtocolEvent,
+    RtlsDevice,
     RtlsProtocol,
     decode_param_value,
     encode_param_value,
@@ -34,7 +35,6 @@ from rtlslink import (
     param_type_to_name,
     parse_address,
 )
-from rtlslink.client import UptimeSample
 from rtlslink.dialect import load_dialect
 from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
@@ -53,6 +53,14 @@ except ImportError:  # pragma: no cover
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
+from .anchor_sleep import (
+    ANCHOR_SLEEP_TIMEOUT,
+    MAV_STATE_ACTIVE,
+    MAV_STATE_STANDBY,
+    lacks_param,
+    set_anchor_sleep,
+    sleep_error,
+)
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
@@ -80,25 +88,6 @@ DEFAULT_SLEEP_TIMEOUT = 10.0
 #: disarmed heartbeat that postdates the request, refusing by flipping
 #: the parameter to 0 -- so the settle must exceed that window
 DEFAULT_SLEEP_SETTLE = 3.0
-
-#: default deadline of an anchor's sleep/wake transaction, in seconds. An
-#: anchor reboots on every transition and is back on the network after
-#: 8-15 s; Control waits 30 s for the X-RTLS-SLEEP response.
-ANCHOR_SLEEP_TIMEOUT = 25.0
-
-#: seconds after an accepted anchor SLEEP write before it is read back: the
-#: firmware queues the request on its comms lane and, when the power state
-#: machine refuses it a tick later, rewrites SLEEP to the state it stays in
-ANCHOR_SLEEP_SETTLE = 2.0
-
-#: spacing of the SLEEP readbacks and uptime probes while an anchor's
-#: transition is awaited, in seconds
-ANCHOR_SLEEP_POLL = 1.0
-
-#: per-request timeout of those readbacks and probes, in seconds (a
-#: rebooting anchor does not answer; the transaction deadline bounds the
-#: wait, not this)
-ANCHOR_PROBE_TIMEOUT = 0.5
 
 #: upper bound for client-supplied transaction timeouts, in seconds
 MAX_PARAM_TIMEOUT = 60.0
@@ -179,12 +168,6 @@ DEFAULT_LISTEN_PORT = 3343
 DEFAULT_HEARTBEAT_INTERVAL = 2.0
 DEFAULT_DEVICE_TIMEOUT = 6.0
 
-#: heartbeat system_status values the sleep latch derives from (STANDBY =
-#: sleeping, ACTIVE = awake); numeric MAVLink enum values mirrored here --
-#: like rtlslink.protocol mirrors them -- so the optimistic sleep/wake
-#: update needs neither the dialect module nor a post-sleep SDK pin
-MAV_STATE_STANDBY = 3
-MAV_STATE_ACTIVE = 4
 
 #: seconds after discovery before a device's param snapshot is first
 #: checked for identity holes: the discovery-triggered full dump (~80
@@ -253,7 +236,7 @@ class RtlsExtension(Extension):
         #: devices that went silent, as last seen (the SDK's device object):
         #: listed offline in X-RTLS-INF until an operator forgets them
         #: (X-RTLS-FORGET) or the extension stops. Never consulted as live.
-        self._lost: dict[int, Any] = {}
+        self._lost: dict[int, RtlsDevice] = {}
         #: decoded parameters of a lost device that came back, standing in
         #: for its role and name until its new snapshot is complete (the
         #: SDK starts a rediscovered device with an empty cache)
@@ -531,6 +514,10 @@ class RtlsExtension(Extension):
         last_stats = {e.system_id: e for e in events if e.kind == "stats"}
         for event in events:
             if event.kind == "stats" and last_stats[event.system_id] is not event:
+                continue
+            if event.kind in _LIVE_ONLY_EVENTS and event.system_id in self._lost:
+                # a lost device's late datagram: its retained snapshot stays
+                # as it was until a heartbeat rediscovers it
                 continue
             if event.kind == "discovered":
                 # a lost device that returns is the same entry, live again,
@@ -909,13 +896,22 @@ class RtlsExtension(Extension):
         """Puts a device to sleep (``sleeping=True``) or wakes it, and
         verifies the outcome through the ``SLEEP`` parameter: a tag as
         :meth:`_set_tag_sleep` describes, an anchor as
-        :meth:`_set_anchor_sleep` does. ``timeout`` defaults per role.
+        :func:`.anchor_sleep.set_anchor_sleep` does. ``timeout`` defaults
+        per role. A device whose role cannot be established is not
+        commanded.
 
         Returns ``{"requested", "accepted", "sleeping", "detail"}``.
         Raises KeyError for unknown devices and trio.TooSlowError on
         timeout."""
-        if await self._sleep_role(system_id) in ANCHOR_ROLES:
-            return await self._set_anchor_sleep(
+        role = await self._command_role(system_id, timeout)
+        if role is None:
+            return sleep_error(
+                sleeping,
+                f"Device {system_id}: role unknown (UWB_ROLE not read); not commanded",
+            )
+        if role in ANCHOR_ROLES:
+            return await set_anchor_sleep(
+                self,
                 system_id,
                 sleeping,
                 timeout=ANCHOR_SLEEP_TIMEOUT if timeout is None else timeout,
@@ -927,185 +923,39 @@ class RtlsExtension(Extension):
             timeout=DEFAULT_SLEEP_TIMEOUT if timeout is None else timeout,
         )
 
-    async def _sleep_role(self, system_id: int) -> str | None:
-        """A device's role for a sleep request; read from the device when
-        its parameter dump has not delivered ``UWB_ROLE`` yet."""
-        role = self._device_role(system_id)
-        if role is not None:
-            return role
-        value = await self._read_param_or_none(system_id, "UWB_ROLE")
-        return None if value is None else role_from_params({"UWB_ROLE": value})
+    async def _command_role(self, system_id: int, timeout: float | None) -> str | None:
+        """A live device's role for a command: its cached ``UWB_ROLE``, a
+        complete snapshot without one (a legacy tag), or a fresh read within
+        the request's deadline; None when none of them gives it. Never the
+        role retained from before a loss.
 
-    async def _read_param_or_none(self, system_id: int, name: str) -> Any:
-        """One parameter's value, or None when the device does not answer
-        within ANCHOR_PROBE_TIMEOUT (offline or rebooting)."""
-        try:
-            result = await self.get_param(system_id, name, timeout=ANCHOR_PROBE_TIMEOUT)
-        except (KeyError, trio.TooSlowError):
-            return None
-        return result["value"]
-
-    async def _probe_uptime(self, system_id: int) -> UptimeSample | None:
-        """The device's uptime from a correlated TIMESYNC request, bounded
-        by the host time of the request and of the reply, or None when it
-        does not answer within ANCHOR_PROBE_TIMEOUT."""
-        protocol = self._require_protocol()
-        token = time.monotonic_ns()
-        with self._subscribed_events() as events:
-            request = protocol.request_uptime(system_id, token)
-            if request is None:
-                return None
-            requested_at = trio.current_time()
-            await self._send(*request)
-            with trio.move_on_after(ANCHOR_PROBE_TIMEOUT):
-                while True:
-                    event = await events.receive()
-                    if (
-                        event.kind == "timesync"
-                        and event.system_id == system_id
-                        and event.data.get("token") == token
-                    ):
-                        return UptimeSample(
-                            int(event.data["uptime_ms"]),
-                            requested_at,
-                            trio.current_time(),
-                        )
-        return None
-
-    async def _set_anchor_sleep(
-        self, system_id: int, sleeping: bool, *, timeout: float
-    ) -> dict[str, Any]:
-        """Puts an anchor to sleep or wakes it, and verifies the outcome
-        within ``timeout`` seconds.
-
-        The outcome is the anchor's ``powerState``: ``asleep`` for a sleep,
-        ``operating`` for a wake. Leaving or entering ``operating`` takes a
-        reboot (8-15 s off the network), which a rediscovery or a rewound
-        uptime proves, so it is waited for; standby to asleep happens in
-        place. Firmware without ``pwrst`` falls back to the heartbeat state
-        (STANDBY asleep, ACTIVE awake) after the reboot every transition
-        took there. A request the anchor refuses causes no reboot and reads
-        back as the state it stays in. ``SLEEP`` 2 (off: only the button
-        starts the anchor again) is never written here."""
-        protocol = self._require_protocol()
-        device = protocol.devices.get(system_id)
+        Raises KeyError when the device is not live."""
+        device = self._require_protocol().devices.get(system_id)
         if device is None:
             raise KeyError(system_id)
-        if _lacks_param(device, SLEEP_PARAM):
-            return _sleep_error(
-                sleeping, "the anchor has no sleep mode (no SLEEP parameter)"
-            )
-        watch = _AnchorTransition(
-            system_id, sleeping, already=bool(device.sleeping) == sleeping
-        )
-        power_state = self._power_state(system_id)
-        if power_state is not None:
-            watch.follow_power_state(power_state)
-        acked = False
-        with trio.move_on_after(timeout):
-            with self._subscribed_events() as events:
-                watch.before = await self._probe_uptime(system_id)
-                ack = await self.set_param(
-                    system_id,
-                    SLEEP_PARAM,
-                    int(sleeping),
-                    "uint8",
-                    timeout=min(timeout, DEFAULT_PARAM_TIMEOUT),
-                )
-                if not ack["accepted"]:
-                    return _sleep_error(
-                        sleeping, f"parameter write rejected (code {ack['result']})"
-                    )
-                acked = True
-                result = await self._await_anchor_transition(watch, events)
-            if result["accepted"]:
-                self._mark_sleeping(system_id, sleeping)
-                await self._on_inf_change(time.monotonic())
-            return result
-        if not acked:
-            raise trio.TooSlowError
-        return _sleep_error(
-            sleeping,
-            f"the anchor accepted the request but was not seen "
-            f"{'asleep' if sleeping else 'awake'} within {timeout:g} s "
-            "(it may still be rebooting)",
-        )
+        role = role_from_params(_decoded_device_params(device, ("UWB_ROLE",)))
+        if role is not None:
+            return role
+        if lacks_param(device, "UWB_ROLE"):
+            return "tag"
+        read_timeout = min(timeout or DEFAULT_PARAM_TIMEOUT, DEFAULT_PARAM_TIMEOUT)
+        try:
+            result = await self.get_param(system_id, "UWB_ROLE", timeout=read_timeout)
+        except trio.TooSlowError:
+            return None
+        return role_from_params({"UWB_ROLE": result["value"]})
 
-    async def _await_anchor_transition(
-        self, watch: "_AnchorTransition", events: trio.MemoryReceiveChannel
-    ) -> dict[str, Any]:
-        """Follows an anchor's events after an accepted SLEEP write until
-        its transition is confirmed or it refuses the request (no deadline
-        of its own). Until the reboot is seen, SLEEP is read back and the
-        uptime probed every ANCHOR_SLEEP_POLL seconds, starting
-        ANCHOR_SLEEP_SETTLE seconds after the write."""
-        next_poll = trio.current_time() + ANCHOR_SLEEP_SETTLE
-        while not watch.confirmed:
-            if not watch.rebooted and trio.current_time() >= next_poll:
-                next_poll = trio.current_time() + ANCHOR_SLEEP_POLL
-                refusal = await self._poll_anchor_transition(watch)
-                if refusal is not None:
-                    return refusal
-            with trio.move_on_after(ANCHOR_PROBE_TIMEOUT):
-                watch.observe(await events.receive())
-        return {
-            "requested": watch.expected,
-            "accepted": True,
-            "sleeping": watch.expected,
-            "detail": "asleep" if watch.expected else "awake",
-        }
-
-    async def _poll_anchor_transition(
-        self, watch: "_AnchorTransition"
-    ) -> dict[str, Any] | None:
-        """One readback/probe round of :meth:`_await_anchor_transition`;
-        returns the refusal result when SLEEP reads back another state."""
-        system_id = watch.system_id
-        if watch.readback is None:
-            value = await self._read_param_or_none(system_id, SLEEP_PARAM)
-            if value is not None:
-                watch.readback = int(value)
-                if watch.readback != int(watch.expected):
-                    return {
-                        "requested": watch.expected,
-                        "accepted": False,
-                        # only 1 is asleep: 2 is off, 3 plain standby
-                        "sleeping": watch.readback == 1,
-                        "detail": self._anchor_refusal(system_id, watch),
-                    }
-        if watch.awaits_reboot:
-            watch.observe_uptime(await self._probe_uptime(system_id))
-        return None
+    def _fresh_stats(self, system_id: int) -> dict[str, Any] | None:
+        """A device's stats snapshot unless it is stale (kept from before a
+        loss, or from a stream that went silent)."""
+        stats = self._stats.get(system_id)
+        return None if stats is None or stats.get("stale") else stats
 
     def _power_state(self, system_id: int) -> str | None:
         """A device's current ``powerState`` from its fresh stats; None
         without one (firmware without ``pwrst``, or a stale snapshot)."""
-        stats = self._stats.get(system_id)
-        if stats is None or stats.get("stale"):
-            return None
-        state = stats.get("powerState")
+        state = (self._fresh_stats(system_id) or {}).get("powerState")
         return None if state in (None, "unknown") else state
-
-    def _anchor_refusal(self, system_id: int, watch: "_AnchorTransition") -> str:
-        """Why an anchor refused a sleep/wake request, from the state its
-        SLEEP parameter reads back (0 awake, 1 asleep, 2 off, 3 plain
-        standby) and its last stats."""
-        stats = self._stats.get(system_id, {})
-        if watch.readback == 2:
-            return "refused: the anchor is off; only its button starts it again"
-        if watch.expected:
-            state = stats.get("powerState") or (
-                "standby" if watch.readback == 3 else None
-            )
-            return "sleep refused by the anchor" + (
-                f" in its {state} state" if state else ""
-            )
-        voltage = stats.get("batteryVoltage")
-        return (
-            "wake refused by the anchor: its pack is low or has no fresh "
-            "voltage reading"
-            + (f" (last {voltage:.2f} V)" if voltage is not None else "")
-        )
 
     async def _set_tag_sleep(
         self,
@@ -1208,31 +1058,33 @@ class RtlsExtension(Extension):
             )
 
     async def start_ota(
-        self,
-        system_id: int,
-        image_path: str,
-        *,
-        species: str | None = None,
-        species_source: str | None = None,
+        self, system_id: int, image_path: str, *, role: str | None = None
     ) -> dict[str, Any]:
         """Starts an OTA upgrade for a device in the background; returns
         a snapshot of the newly created job record, which carries the
         image's ``species`` and where it was established
-        (``speciesSource``), when known.
+        (``speciesSource``).
 
-        Raises KeyError for unknown devices and RuntimeError if an OTA
-        job is already running for the device or the extension is not
-        running."""
-        protocol = self._require_protocol()
-        device = protocol.devices.get(system_id)
-        if device is None:
+        The uploaded image is confirmed (permanent), and a wrong-species
+        image strips the device of its function, so the device's UWB_ROLE
+        must match the image's species: from the image's build receipt, or,
+        for an image without one, the ``role`` the caller declares. An image
+        with neither is refused.
+
+        Raises KeyError for unknown devices, ValueError for a refused image,
+        trio.TooSlowError when the role read times out, and RuntimeError if
+        an OTA job is already running for the device or the extension is
+        not running."""
+        if system_id not in self._require_protocol().devices:
             raise KeyError(system_id)
-
-        job = self._ota_jobs.get(system_id)
-        if job is not None and job["status"] == "running":
-            raise RuntimeError(f"OTA already in progress for device {system_id}")
-        if self._nursery is None:
-            raise RuntimeError("extension is not running")
+        species, source = _image_species(image_path, role)
+        if species is None:
+            raise ValueError(
+                "the image has no build receipt and no declared role; "
+                "refusing a permanent upload of an unchecked image"
+            )
+        await self.verify_species(system_id, species)
+        device, nursery = self._require_ota_slot(system_id)
 
         job = {
             "id": system_id,
@@ -1242,11 +1094,24 @@ class RtlsExtension(Extension):
             "version": None,
             "error": None,
             "species": species,
-            "speciesSource": species_source,
+            "speciesSource": source,
         }
         self._ota_jobs[system_id] = job
-        self._nursery.start_soon(self._run_ota, device.address[0], image_path, job)
+        nursery.start_soon(self._run_ota, device.address[0], image_path, job)
         return dict(job)
+
+    def _require_ota_slot(self, system_id: int) -> tuple[RtlsDevice, trio.Nursery]:
+        """The live device and the nursery to run its job, when an OTA job
+        may start for it now."""
+        device = self._require_protocol().devices.get(system_id)
+        if device is None:
+            raise KeyError(system_id)
+        job = self._ota_jobs.get(system_id)
+        if job is not None and job["status"] == "running":
+            raise RuntimeError(f"OTA already in progress for device {system_id}")
+        if self._nursery is None:
+            raise RuntimeError("extension is not running")
+        return device, self._nursery
 
     async def _run_ota(
         self, address: str, image_path: str, job: dict[str, Any]
@@ -1373,6 +1238,11 @@ class RtlsExtension(Extension):
                 and now - harvested > STATS_STALE_AFTER
             ):
                 stats = self._stats[system_id] = {**stats, "stale": True}
+                # the cell this tag sources falls back to its provisioned
+                # table; a returning identical fit then re-renders it
+                if self._fitted_cells.pop(system_id, None) is not None:
+                    self._sync_anchor_beacons_for_system(system_id)
+                    self._inf_pending = True
             if stats == self._last_stats_sent.get(system_id):
                 continue
             last = self._last_stats_broadcast.get(system_id)
@@ -1825,7 +1695,7 @@ class RtlsExtension(Extension):
         try:
             params = await self.get_param_list(system_id, timeout=timeout)
         except KeyError:
-            return hub.reject(message, reason=f"No such device: {system_id}")
+            return hub.reject(message, reason=self._no_device(system_id))
         except trio.TooSlowError:
             return hub.reject(
                 message,
@@ -1855,7 +1725,7 @@ class RtlsExtension(Extension):
         try:
             result = await self.get_param(system_id, name, timeout=timeout)
         except KeyError:
-            return hub.reject(message, reason=f"No such device: {system_id}")
+            return hub.reject(message, reason=self._no_device(system_id))
         except trio.TooSlowError:
             return hub.reject(
                 message,
@@ -1901,7 +1771,7 @@ class RtlsExtension(Extension):
                 system_id, name, value, param_type, timeout=timeout
             )
         except KeyError:
-            return hub.reject(message, reason=f"No such device: {system_id}")
+            return hub.reject(message, reason=self._no_device(system_id))
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
         except trio.TooSlowError:
@@ -1971,17 +1841,17 @@ class RtlsExtension(Extension):
                     system_id, sleeping, timeout=timeout
                 )
             except KeyError:
-                results[key] = _sleep_error(sleeping, self._no_device(system_id))
+                results[key] = sleep_error(sleeping, self._no_device(system_id))
             except ValueError as ex:
-                results[key] = _sleep_error(sleeping, str(ex))
+                results[key] = sleep_error(sleeping, str(ex))
             except trio.TooSlowError:
-                results[key] = _sleep_error(
+                results[key] = sleep_error(
                     sleeping,
                     f"Timeout while waiting for device {system_id}",
                 )
             except Exception as ex:  # noqa: BLE001
                 # never let one device's failure cancel the siblings
-                results[key] = _sleep_error(sleeping, str(ex))
+                results[key] = sleep_error(sleeping, str(ex))
 
         # one request per device, concurrently: the sleep verification
         # includes a settle delay, so a serial loop over a fleet would
@@ -2030,42 +1900,23 @@ class RtlsExtension(Extension):
         if not os.path.isfile(image):
             return hub.reject(message, reason=f"No such image file: {image}")
 
-        # Species guardrail: the uploaded image is confirmed (permanent),
-        # and a wrong-species image strips the device of its function, so
-        # the device's UWB_ROLE is checked against the image's species. The
-        # image's build receipt names it; the role the client declares is
-        # only the fallback for an image without one.
         role = message.body.get("role")
         if role is not None and role not in ("tag", "anchor"):
             return hub.reject(
                 message, reason=f"Invalid role: {role!r} (expected tag or anchor)"
             )
         try:
-            species, source = _image_species(image, role)
-        except ValueError as ex:
-            return hub.reject(message, reason=str(ex))
-        if species is not None:
-            try:
-                await self.verify_species(system_id, species)
-            except KeyError:
-                return hub.reject(message, reason=f"No such device: {system_id}")
-            except ValueError as ex:
-                return hub.reject(message, reason=str(ex))
-            except trio.TooSlowError:
-                return hub.reject(
-                    message,
-                    reason=f"Timeout while reading UWB_ROLE of device "
-                    f"{system_id} for the species check",
-                )
-
-        try:
-            job = await self.start_ota(
-                system_id, image, species=species, species_source=source
-            )
+            job = await self.start_ota(system_id, image, role=role)
         except KeyError:
-            return hub.reject(message, reason=f"No such device: {system_id}")
-        except RuntimeError as ex:
+            return hub.reject(message, reason=self._no_device(system_id))
+        except (ValueError, RuntimeError) as ex:
             return hub.reject(message, reason=str(ex))
+        except trio.TooSlowError:
+            return hub.reject(
+                message,
+                reason=f"Timeout while reading UWB_ROLE of device "
+                f"{system_id} for the species check",
+            )
 
         return hub.create_response_or_notification(
             body={"type": "X-RTLS-OTA", "id": system_id, "job": job},
@@ -2169,13 +2020,18 @@ class RtlsExtension(Extension):
     async def _handle_RTLS_FORGET(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
+        body = message.body
         try:
-            ids = _get_optional_device_ids(message.body)
-            if ids is None:
-                ids = [_get_device_id(message)]
+            # a single id follows the ids rule too (JSON true is not 1)
+            ids = _get_optional_device_ids(
+                body if "ids" in body else {"ids": [body.get("id")]}
+            )
         except ValueError as ex:
             return hub.reject(message, reason=str(ex))
-        result = {str(system_id): self.forget_device(system_id) for system_id in ids}
+        result = {
+            str(system_id): self.forget_device(system_id)
+            for system_id in dict.fromkeys(ids or ())
+        }
         if any(entry["forgotten"] for entry in result.values()):
             await self._on_inf_change(time.monotonic())
         return hub.create_response_or_notification(
@@ -2237,12 +2093,21 @@ class RtlsExtension(Extension):
         return self._protocol
 
     def _device_role(self, system_id: int) -> str | None:
-        """A live device's role from its cached ``UWB_ROLE``; None while
-        the device is offline or its role is not yet known."""
+        """A live device's role for display and the stats shape: its cached
+        ``UWB_ROLE``, else the one it had before it was lost; None while the
+        device is offline or its role is not yet known. Commands use
+        :meth:`_command_role`."""
         device = self._protocol.devices.get(system_id) if self._protocol else None
         if device is None:
             return None
-        return role_from_params(self._identity_params(device))
+        params = _decoded_device_params(device, ("UWB_ROLE",))
+        if "UWB_ROLE" not in params:
+            params = {
+                k: v
+                for k, v in self._retained_params.get(system_id, {}).items()
+                if k == "UWB_ROLE"
+            }
+        return role_from_params(params)
 
     def _identity_params(self, device) -> dict[str, Any]:
         """A device's decoded parameters, filled in from what it reported
@@ -2307,8 +2172,14 @@ class RtlsExtension(Extension):
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
-        # getattr: tolerate an SDK that predates sleep mode
-        body["sleeping"] = bool(getattr(device, "sleeping", False))
+        # an anchor in standby or off heartbeats STANDBY too: its power
+        # state, when reported, says whether it is asleep
+        power_state = self._power_state(device.system_id) if online else None
+        if role in ANCHOR_ROLES and power_state is not None:
+            body["sleeping"] = power_state == "asleep"
+        else:
+            # getattr: tolerate an SDK that predates sleep mode
+            body["sleeping"] = bool(getattr(device, "sleeping", False))
         uptime_ms = self._uptime_ms.get(device.system_id)
         if uptime_ms is not None:
             body["uptimeMs"] = uptime_ms
@@ -2664,108 +2535,8 @@ def _image_species(image: str, declared: str | None) -> tuple[str | None, str | 
     return receipt.app, "receipt"
 
 
-@dataclasses.dataclass
-class _AnchorTransition:
-    """What an anchor reported since a sleep/wake request was sent to it."""
-
-    system_id: int
-    #: the requested state: True asleep, False awake
-    expected: bool
-    #: whether the heartbeat already reported that state before the request
-    already: bool
-    #: the uptime sampled before the request, None when unknown
-    before: Optional[UptimeSample] = None
-    #: the state of the latest heartbeat since the request
-    state: Optional[bool] = None
-    #: whether the anchor rebooted since the request
-    rebooted: bool = False
-    #: the SLEEP value read back after the request
-    readback: Optional[int] = None
-    #: whether the outcome is the reported ``powerState`` (firmware with
-    #: ``pwrst``) rather than the heartbeat state
-    by_power_state: bool = False
-    #: the ``powerState`` of the latest stats report since the request
-    power_state: Optional[str] = None
-    #: whether the transition takes a reboot (into or out of operating)
-    needs_reboot: bool = True
-
-    @property
-    def target_power_state(self) -> str:
-        return "asleep" if self.expected else "operating"
-
-    def follow_power_state(self, initial: str) -> None:
-        """Judge the outcome by ``powerState``, starting from ``initial``."""
-        self.by_power_state = True
-        target = self.target_power_state
-        self.needs_reboot = initial != target and "operating" in (initial, target)
-
-    def observe(self, event: ProtocolEvent) -> None:
-        if event.system_id != self.system_id:
-            return
-        if event.kind == "stats" and "pwrst" in event.data:
-            self.power_state = _code_name(POWER_STATES)(float(event.data["pwrst"]))
-        elif event.kind in ("heartbeat", "discovered") and "sleeping" in event.data:
-            self.state = bool(event.data["sleeping"])
-            # rediscovery: the anchor was off the network past its timeout
-            self.rebooted = self.rebooted or event.kind == "discovered"
-
-    def observe_uptime(self, sample: Optional[UptimeSample]) -> None:
-        """A reboot is an uptime that advanced less than the host time
-        elapsed since the sample before the request (the SDK's rule): a
-        lower uptime alone misses a second reboot right after another."""
-        if (
-            sample is not None
-            and self.before is not None
-            and sample.follows_reboot(self.before)
-        ):
-            self.rebooted = True
-
-    @property
-    def reached(self) -> bool:
-        """Whether the latest report since the request shows the target."""
-        if self.by_power_state:
-            return self.power_state == self.target_power_state
-        return self.state == self.expected
-
-    @property
-    def awaits_reboot(self) -> bool:
-        """The target is reported, but the reboot it needs is not proven."""
-        return self.reached and self.needs_reboot and not self.rebooted
-
-    @property
-    def confirmed(self) -> bool:
-        """The anchor reports the requested state after the reboot its
-        transition takes; a transition without one (standby to asleep, or
-        already there) is confirmed by ``powerState`` alone, or, without
-        it, by the heartbeat with the request read back unchanged (SLEEP 1
-        is asleep; plain standby reads 3 and never confirms a sleep)."""
-        if not self.reached:
-            return False
-        if self.rebooted:
-            return True
-        if self.by_power_state:
-            return not self.needs_reboot
-        return self.already and self.readback == int(self.expected)
-
-
-def _lacks_param(device, name: str) -> bool:
-    """Whether a device's count-complete parameter snapshot proves it has
-    no parameter ``name`` (an incomplete one proves nothing)."""
-    return (
-        device.param_count is not None
-        and len(device.params) >= device.param_count
-        and name not in device.params
-    )
-
-
-def _sleep_error(requested: bool, detail: str) -> dict[str, Any]:
-    """Uniform per-device error entry for an X-RTLS-SLEEP result."""
-    return {
-        "requested": requested,
-        "accepted": False,
-        "sleeping": None,
-        "detail": detail,
-    }
+#: events that only a live device's data may come from
+_LIVE_ONLY_EVENTS = frozenset(("stats", "twr", "twr_summary"))
 
 
 def _configured_devices(

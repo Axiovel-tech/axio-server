@@ -73,6 +73,8 @@ same traces are available by raising the `rtlslink` logger to DEBUG.
 - `extension.py` — the Trio/flockwave glue over the SDK: discovery
   loop, the awaitable parameter transactions, OTA jobs and the client
   message handlers documented below.
+- `anchor_sleep.py` — an anchor's sleep/wake and its verification from
+  the power state, heartbeat and SLEEP readback.
 - `cluster_clock.py` — the wall-clock estimate of the UWB cluster clock
   (see below).
 - `geometry_agreement.py` — the `X-RTLS-GEOM` fleet geometry agreement
@@ -430,9 +432,14 @@ by its `powerState`: a sleep is confirmed at `asleep`, a wake at
 `operating`. Entering or leaving `operating` takes a reboot (8-15 s off the
 network), which is waited for (a rediscovery or a rewound uptime); standby
 to asleep happens in place, and a standby anchor is not reported asleep
-until its `powerState` says so. Firmware without `pwrst` is judged by the
-heartbeat state after the reboot instead (`STANDBY` asleep, `ACTIVE`
-awake); an anchor already in that state is confirmed without one. A refused request
+until its `powerState` says so. Older firmware without `pwrst` is judged
+by an explicit heartbeat after the reboot instead (`ACTIVE` awake; a
+`STANDBY` sleep also needs `SLEEP` to read back 1, since off heartbeats
+`STANDBY` too; safe mode's `EMERGENCY` confirms neither). There a sleep
+without a reboot cannot tell asleep from standby and returns
+`accepted: true`, `sleeping: null` and a detail starting `sleep accepted
+but unverified`. A device whose role cannot be read within the request's
+deadline is not commanded (`Device N: role unknown`). A refused request
 reads back as the state the anchor stays in, and `detail` names why:
 `wake refused by the anchor: its pack is low or has no fresh voltage
 reading (last 6.81 V)`, `refused: the anchor is off; only its button
@@ -504,7 +511,7 @@ Start:
 }
 ```
 
-Without a receipt and without `role` the upload is unguarded.
+An image with neither a receipt nor `role` is refused: the upload is permanent.
 
 Inspect an image before choosing the device (no upload; `id` is not
 needed), e.g. to show and lock its species:
@@ -619,8 +626,11 @@ An anchor's entry carries no tag solver fields (`solveRateHz` …
 `anchorMask`) once its `UWB_ROLE` says anchor; until the role is known an
 entry is tag-shaped (a tag's 10 s status report carries no solver stats
 either). Every other field is present only while its stat is (omitted =
-unknown), on any role. A stat the device stops sending leaves the entry
-with the SDK, which ages it out after about three report periods:
+unknown), on any role. The SDK drops a stat its device has not refreshed
+within three of its report periods (3 s for the 1 Hz health report, 30 s
+for `bootCount`/`resetCause`; the gauge stats go with a stale `vbat`) and
+every cached stat when the device reboots, so a field the device stopped
+sending leaves the entry:
 
 | Field | Stat | Value |
 |---|---|---|
@@ -858,9 +868,10 @@ Other server extensions can use the same machinery via the exports of
 this extension: `devices()`, `protocol()`, and the awaitable
 `get_param(system_id, name)`, `get_param_list(system_id)`,
 `set_param(system_id, name, value, param_type=None)`,
-`set_sleep(system_id, sleeping)`, `forget_device(system_id)`,
-`verify_species(system_id, role)` and
-`start_ota(system_id, image_path)`.
+`set_sleep(system_id, sleeping)`, `verify_species(system_id, role)` and
+`start_ota(system_id, image_path, role=None)` (which refuses an image
+whose species is not established), plus the synchronous
+`forget_device(system_id)`.
 
 ## Testing
 

@@ -392,7 +392,7 @@ def _uwb_rule(ext: "RtlsExtension") -> dict[str, Any]:
         role = params.get("UWB_ROLE")
         if role is not None and role != 1:
             continue  # anchors have no solver
-        stats = ext._stats.get(system_id)
+        stats = ext._fresh_stats(system_id)
         if not stats:
             errors.append(f"tag {system_id}: no telemetry")
             continue
