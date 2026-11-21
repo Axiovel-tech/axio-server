@@ -2,29 +2,24 @@
 the breaks seen since, judged from the events the extension already handles.
 
 The lock never acts on devices. The extension refuses anchor-changing
-commands while it is locked, records a break whenever an anchor of the
-snapshot changes on its own, and answers the show extension whether a show
-may be authorized (:func:`show_gate`).
+commands while it is locked and records a break whenever an anchor of the
+snapshot changes on its own; :mod:`.anchor_lock_gate` holds the operator's
+side (views, warnings, requests) and the show gate.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Optional, TypedDict
-
-if TYPE_CHECKING:
-    from .extension import RtlsExtension
+from typing import Any, Iterable, Optional, TypedDict, cast
 
 __all__ = (
     "AnchorLock",
     "LOCKED_REASON",
+    "LockBreak",
+    "LockWarning",
     "ROLE_UNKNOWN_REASON",
-    "cell_warnings",
-    "handle_lock_request",
-    "lock_json",
-    "show_gate",
+    "SealedAnchor",
 )
 
 LOCKED_REASON = "anchors are locked; unlock them in Control first"
@@ -36,13 +31,12 @@ FIRMWARE_PARAM = "FW_VERSION"
 #: parameters outside the ``UWB_`` session and table set that define the cell
 CELL_PARAMS = frozenset(("MAV_SYS_ID", "BAT_PROFILE"))
 
-#: ``uwbStatus`` values of a UWB start the anchor refused or could not make
-#: (disabled, invalid config, hardware failure)
-UWB_START_REFUSED = frozenset((2, 3, 4))
 
-#: how far an uptime may drift from the host time elapsed between two of its
-#: samples before it counts as a reboot, in ms (report and network jitter)
-UPTIME_SLACK_MS = 1000
+#: how far an uptime may fall behind the host time elapsed between two of
+#: its samples before it counts as a reboot, in ms. A late advert makes the
+#: host time run ahead by its delay; a reboot keeps an anchor off the network
+#: for 8-15 s.
+UPTIME_SLACK_MS = 5000
 
 
 class LockWarning(TypedDict):
@@ -58,16 +52,10 @@ class LockBreak(TypedDict):
     at: float
 
 
-class ShowGate(TypedDict):
-    required: bool
-    refused: bool
-    reason: Optional[str]
-
-
 class SealedAnchor(TypedDict):
     name: str
     role: Optional[str]
-    firmware: Any
+    firmware: Optional[str]
     params: dict[str, Any]
     bootCount: Optional[int]
     uptimeMs: Optional[int]
@@ -76,86 +64,24 @@ class SealedAnchor(TypedDict):
     online: bool
 
 
-class AnchorView(TypedDict):
-    """An anchor as the lock judges it, live or lost."""
+class LastSeen(TypedDict):
+    """The last values seen of a sealed anchor, which its next reports are
+    compared with."""
 
-    systemId: int
-    name: str
-    role: Optional[str]
-    online: bool
-    stats: Optional[dict[str, Any]]
+    firmware: Optional[str]
     params: dict[str, Any]
+    bootCount: Optional[int]
     uptimeMs: Optional[int]
+    #: monotonic receive time of ``uptimeMs``; not persisted
     uptimeAt: Optional[float]
+    powerState: Optional[str]
+    moved: Optional[bool]
+    online: bool
 
 
 def is_cell_param(name: str) -> bool:
     """Whether a parameter defines the cell (part of the lock snapshot)."""
     return name.startswith("UWB_") or name in CELL_PARAMS
-
-
-def snapshot_entry(view: AnchorView) -> SealedAnchor:
-    """The sealed record of one anchor from its view."""
-    params = view["params"]
-    stats = view["stats"] or {}
-    return {
-        "name": view["name"],
-        "role": view["role"],
-        "firmware": params.get(FIRMWARE_PARAM),
-        "params": {k: v for k, v in params.items() if is_cell_param(k)},
-        "bootCount": stats.get("bootCount"),
-        "uptimeMs": view["uptimeMs"],
-        "powerState": stats.get("powerState"),
-        "moved": stats.get("moved"),
-        "online": view["online"],
-    }
-
-
-def cell_warnings(anchors: Iterable[AnchorView]) -> list[LockWarning]:
-    """What an operator acknowledges when locking the cell."""
-    anchors = list(anchors)
-    if not anchors:
-        return [_warning("no-anchors", None, "no anchors are known")]
-    warnings: list[LockWarning] = []
-    initiators = [a for a in anchors if a["role"] == "anchor-initiator"]
-    if not any(a["online"] for a in initiators):
-        warnings.append(_warning("a0-not-operating", None, "no initiator (A0) online"))
-    for anchor in anchors:
-        warnings.extend(_anchor_warnings(anchor))
-    return warnings
-
-
-def _anchor_warnings(anchor: AnchorView) -> list[LockWarning]:
-    system_id, name = anchor["systemId"], anchor["name"]
-    if not anchor["online"]:
-        return [_warning("offline", system_id, f"{name} is offline")]
-    stats = anchor["stats"] or {}
-    found = []
-    state = stats.get("powerState")
-    if anchor["role"] == "anchor-initiator" and state not in (None, "operating"):
-        found.append(("a0-not-operating", f"{name} (A0) is {state}"))
-    if anchor["role"] == "anchor-responder" and stats.get("rangingRateHz") == 0:
-        found.append(("a0-not-heard", f"{name} does not hear A0"))
-    if stats.get("lowBattery"):
-        found.append(("low-battery", f"{name}: low battery{_volts(stats)}"))
-    if stats.get("moved"):
-        found.append(("moved", f"{name} moved since it was placed"))
-    if stats.get("uwbStatus") in UWB_START_REFUSED:
-        found.append(("uwb-start-refused", f"{name}: UWB did not start"))
-    if stats.get("radioRestarts"):
-        found.append(
-            ("radio-restarts", f"{name}: radio restarted {stats['radioRestarts']}x")
-        )
-    return [_warning(code, system_id, detail) for code, detail in found]
-
-
-def _volts(stats: dict[str, Any]) -> str:
-    voltage = stats.get("batteryVoltage")
-    return f" ({voltage:.2f} V)" if voltage is not None else ""
-
-
-def _warning(code: str, device: Optional[int], detail: str) -> LockWarning:
-    return {"code": code, "device": device, "detail": detail}
 
 
 class AnchorLock:
@@ -181,7 +107,7 @@ class AnchorLock:
         #: why the last save failed, None after a successful one
         self.persist_error: Optional[str] = None
         #: last values seen per sealed anchor
-        self._seen: dict[int, dict[str, Any]] = {}
+        self._seen: dict[int, LastSeen] = {}
         #: sealed members not rediscovered since a restart: their deadline
         #: on the extension's monotonic clock
         self._awaiting: dict[int, float] = {}
@@ -314,9 +240,10 @@ class AnchorLock:
     def on_uptime(
         self, system_id: int, uptime_ms: int, monotonic: float, now: float
     ) -> list[LockBreak]:
-        """A reboot is an uptime that did not advance with the host time
-        since the previous sample (counted modulo 2**32, so the 49.7-day
-        wrap is no reboot)."""
+        """A reboot is an uptime that went back (counted modulo 2**32, so
+        the 49.7-day wrap is no reboot) or fell behind the host time since
+        the previous sample by more than UPTIME_SLACK_MS. An uptime that runs
+        ahead (the previous advert arrived late) is no reboot."""
         if not self.covers(system_id):
             return []
         seen = self._seen[system_id]
@@ -326,7 +253,8 @@ class AnchorLock:
             return []
         advance = (uptime_ms - previous) & 0xFFFFFFFF
         elapsed = (monotonic - previous_at) * 1000.0
-        if abs(advance - elapsed) <= UPTIME_SLACK_MS:
+        rewound = advance >= 2**31
+        if not rewound and advance >= elapsed - UPTIME_SLACK_MS:
             return []
         return self._rebooted(system_id, "uptime reset", now)
 
@@ -372,7 +300,7 @@ class AnchorLock:
             "detail": detail,
             "at": now,
         }
-        self.breaks.append(entry)
+        self.breaks.insert(0, entry)  # newest first
         self._persist()
         return [entry]
 
@@ -418,11 +346,11 @@ class AnchorLock:
         self.breaks = list(state.get("breaks", []))
         self.snapshot = {int(k): v for k, v in state.get("snapshot", {}).items()}
         self.outsiders = {int(k) for k in state.get("outsiders", [])}
-        seen = {int(k): v for k, v in state.get("lastSeen", {}).items()}
+        seen = {
+            int(k): cast(LastSeen, {**v, "uptimeAt": None})
+            for k, v in state.get("lastSeen", {}).items()
+        }
         self._seen = seen or _seen_from(self.snapshot, {})
-        for values in self._seen.values():
-            # host times do not survive a restart
-            values["uptimeAt"] = None
         self._awaiting = {
             system_id: monotonic + device_timeout
             for system_id, values in self._seen.items()
@@ -432,7 +360,7 @@ class AnchorLock:
 
 def _seen_from(
     snapshot: dict[int, SealedAnchor], uptime_at: dict[int, Optional[float]]
-) -> dict[int, dict[str, Any]]:
+) -> dict[int, LastSeen]:
     return {
         system_id: {
             "firmware": entry["firmware"],
@@ -457,7 +385,7 @@ def _state(
     breaks: list[LockBreak],
     snapshot: dict[int, SealedAnchor],
     outsiders: set[int],
-    seen: dict[int, dict[str, Any]],
+    seen: dict[int, LastSeen],
 ) -> dict[str, Any]:
     return {
         "locked": locked,
@@ -471,121 +399,3 @@ def _state(
             for k, values in seen.items()
         },
     }
-
-
-# ---- the extension's side: views, requests, the show gate ----
-
-
-def anchor_views(ext: "RtlsExtension") -> list[AnchorView]:
-    """Every known anchor, live or lost, as the lock judges it: its
-    identity, whether it is online, its fresh stats, parameters and uptime."""
-    from .extension import ANCHOR_ROLES, _device_name, role_from_params
-
-    devices = ext._protocol.devices if ext._protocol else {}
-    candidates = [(d, True) for d in devices.values()] + [
-        (d, False) for sid, d in ext._lost.items() if sid not in devices
-    ]
-    views: list[AnchorView] = []
-    for device, online in sorted(candidates, key=lambda c: c[0].system_id):
-        params = ext._identity_params(device)
-        role = role_from_params(params)
-        if role not in ANCHOR_ROLES:
-            continue
-        system_id = device.system_id
-        views.append(
-            {
-                "systemId": system_id,
-                "name": _device_name(system_id, params, role) or f"device {system_id}",
-                "role": role,
-                "online": online,
-                "stats": ext._fresh_stats(system_id) if online else None,
-                "params": params,
-                "uptimeMs": ext._uptime_ms.get(system_id) if online else None,
-                "uptimeAt": ext._uptime_at.get(system_id) if online else None,
-            }
-        )
-    return views
-
-
-def lock_warnings(lock: AnchorLock, views: list[AnchorView]) -> list[LockWarning]:
-    """The cell's warnings, plus, for a re-seal, the sealed members that are
-    no longer known at all (dropping them needs an acknowledgement)."""
-    warnings = cell_warnings(views)
-    known = {view["systemId"] for view in views}
-    for system_id in sorted(set(lock.snapshot) - known):
-        warnings.append(
-            _warning(
-                "missing", system_id, f"{lock.name(system_id)} of the seal is not seen"
-            )
-        )
-    return warnings
-
-
-def handle_lock_request(ext: "RtlsExtension", body: dict[str, Any]) -> dict[str, Any]:
-    """The X-RTLS-LOCK response body. Raises ValueError for an invalid
-    action or a lock state that cannot be saved."""
-    action = body.get("action", "status")
-    if action not in ("status", "lock", "unlock"):
-        raise ValueError(
-            f"Invalid action: {action!r} (expected status, lock or unlock)"
-        )
-    lock = ext._anchor_lock
-    views = anchor_views(ext)
-    warnings = lock_warnings(lock, views)
-    result = action
-    try:
-        if action == "lock":
-            pending = warnings or lock.breaks
-            if pending and body.get("acknowledgeWarnings") is not True:
-                result = "warnings"
-            else:
-                lock.seal(
-                    {view["systemId"]: snapshot_entry(view) for view in views},
-                    warnings,
-                    time.time(),
-                    {view["systemId"]: view["uptimeAt"] for view in views},
-                )
-                result = "locked"
-        elif action == "unlock":
-            lock.unseal()
-            result = "unlocked"
-    except OSError as ex:
-        raise ValueError(
-            f"the anchor lock could not be saved ({ex}); nothing changed"
-        ) from ex
-    return {
-        "type": "X-RTLS-LOCK",
-        "action": action,
-        "result": result,
-        "warnings": warnings,
-        "anchorLock": lock_json(ext),
-    }
-
-
-def show_gate(ext: "RtlsExtension") -> ShowGate:
-    """Whether the server refuses to authorize or schedule a show now, and
-    why: with the gate on and anchors known, the cell must be locked without
-    breaks. SHOW-SETCFG and X-RTLS-INF's ``anchorLock.showGate`` both use
-    this verdict."""
-    lock = ext._anchor_lock
-    required = ext._lock_required_for_show and bool(lock.locked or anchor_views(ext))
-    reason = None
-    if required and not lock.locked:
-        reason = (
-            "the anchors are not locked; lock them in Control before "
-            "authorizing or scheduling the show"
-        )
-    elif required and lock.breaks:
-        details = "; ".join(entry["detail"] for entry in lock.breaks[:3])
-        more = len(lock.breaks) - 3
-        reason = (
-            f"the anchor lock is broken ({details}"
-            + (f"; {more} more" if more > 0 else "")
-            + "); review and re-seal it in Control first"
-        )
-    return {"required": required, "refused": reason is not None, "reason": reason}
-
-
-def lock_json(ext: "RtlsExtension") -> dict[str, Any]:
-    """``anchorLock`` as X-RTLS-INF and X-RTLS-LOCK carry it."""
-    return {**ext._anchor_lock.json(), "showGate": show_gate(ext)}

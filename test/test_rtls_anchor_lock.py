@@ -7,24 +7,26 @@ import time
 import pytest
 import trio
 import trio.testing
+from anchor_lock_support import (
+    HEALTHY_A0,
+    HEALTHY_A1,
+    _anchor,
+    _cell,
+    _healthy,
+    _inf_broadcasts,
+    _lock,
+)
 from rtls_support import (
     DEVICE_SYSID,
-    FakeDevice,
-    StubApp,
     discover,
     make_message,
     set_fake_param,
 )
 from rtlslink.dialect import load_dialect
-from rtlslink.protocol import RtlsProtocol
 
-from flockwave.server.ext.rtls.anchor_lock import (
-    LOCKED_REASON,
-    AnchorLock,
-    cell_warnings,
-    lock_json,
-)
-from flockwave.server.ext.rtls.extension import AnchorsLocked, RtlsExtension
+from flockwave.server.ext.rtls.anchor_lock import LOCKED_REASON, AnchorLock
+from flockwave.server.ext.rtls.anchor_lock_gate import lock_json
+from flockwave.server.ext.rtls.extension import AnchorsLocked
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -47,65 +49,6 @@ def builder():
 @pytest.fixture
 def autojump_clock():
     return trio.testing.MockClock(autojump_threshold=0)
-
-
-def _inf_broadcasts(extension):
-    return [
-        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-INF"
-    ]
-
-
-async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2))):
-    """An extension that discovered a tag (42) and the anchors given as
-    (system id, UWB_ROLE, UWB_MAC), routed by address; returns it and the
-    devices by system id."""
-    tag = FakeDevice(dialect)
-    set_fake_param(tag, "UWB_ROLE", 1, "uint8")
-    devices = {tag.system_id: tag}
-    for system_id, role, mac in anchors:
-        anchor = FakeDevice(dialect, system_id=system_id)
-        anchor.address = (f"192.168.4.{system_id}", 3333)
-        set_fake_param(anchor, "UWB_ROLE", role, "uint8")
-        set_fake_param(anchor, "UWB_MAC", mac, "uint16")
-        devices[system_id] = anchor
-    ext = RtlsExtension()
-    ext._protocol = RtlsProtocol(dialect, targets=[])
-    ext.app = StubApp()
-    by_address = {d.address: d for d in devices.values()}
-
-    async def fake_send(payload, address):
-        device = by_address.get(address)
-        for reply in device.handle(payload) if device else ():
-            await ext._process_datagram(reply, device.address, time.monotonic())
-
-    ext._send = fake_send
-    ext.routes = by_address  # lets a test add a device later
-    for device in devices.values():
-        await discover(ext, device)
-    return ext, devices
-
-
-def _anchor(dialect, system_id, role=3, mac=9):
-    anchor = FakeDevice(dialect, system_id=system_id)
-    anchor.address = (f"192.168.4.{system_id}", 3333)
-    set_fake_param(anchor, "UWB_ROLE", role, "uint8")
-    set_fake_param(anchor, "UWB_MAC", mac, "uint16")
-    return anchor
-
-
-HEALTHY_A0 = {"pwrst": 5.0, "boots": 3.0, "moved": 0.0, "uwbst": 1.0}
-HEALTHY_A1 = {**HEALTHY_A0, "rnghz": 50.0}
-
-
-async def _healthy(ext):
-    await ext._on_stats(201, HEALTHY_A0, time.monotonic())
-    await ext._on_stats(202, HEALTHY_A1, time.monotonic())
-
-
-async def _lock(ext, builder, hub, action="lock", **body):
-    message = make_message(builder, {"type": "X-RTLS-LOCK", "action": action} | body)
-    response = await ext._handle_RTLS_LOCK(message, None, hub)
-    return response.body
 
 
 async def test_lock_a_healthy_cell(dialect, builder, hub):
@@ -166,38 +109,6 @@ async def test_status_and_unlock(dialect, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-LOCK", "action": "open"})
     response = await ext._handle_RTLS_LOCK(message, None, hub)
     assert response.body["type"] == "ACK-NAK"
-
-
-def test_cell_warnings():
-    def view(system_id, role, online=True, **stats):
-        return {
-            "systemId": system_id,
-            "name": f"A{system_id}",
-            "role": role,
-            "online": online,
-            "stats": stats,
-        }
-
-    warnings = cell_warnings(
-        [
-            view(1, "anchor-initiator", powerState="standby"),
-            view(2, "anchor-responder", rangingRateHz=0.0, moved=True),
-            view(3, "anchor-responder", uwbStatus=3, radioRestarts=2),
-            view(4, "anchor-responder", online=False),
-        ]
-    )
-    assert [(w["code"], w["device"]) for w in warnings] == [
-        ("a0-not-operating", 1),
-        ("a0-not-heard", 2),
-        ("moved", 2),
-        ("uwb-start-refused", 3),
-        ("radio-restarts", 3),
-        ("offline", 4),
-    ]
-    # an initiator that is offline, or missing, is a cell warning
-    assert cell_warnings([view(2, "anchor-responder")])[0]["code"] == (
-        "a0-not-operating"
-    )
 
 
 async def test_locked_anchors_refuse_changes_tags_do_not(
@@ -272,8 +183,8 @@ async def test_lock_breaks_once_per_occurrence(dialect, builder, hub):
     await _healthy(ext)
     await _lock(ext, builder, hub)
 
-    def codes():
-        return [(b["code"], b["device"]) for b in ext._anchor_lock.breaks]
+    def codes():  # oldest first (the lock keeps them newest first)
+        return [(b["code"], b["device"]) for b in reversed(ext._anchor_lock.breaks)]
 
     # stats: a reboot (boot count), moved, leaving operating; each once
     for _ in range(2):
@@ -292,7 +203,7 @@ async def test_lock_breaks_once_per_occurrence(dialect, builder, hub):
             anchor._param_value(name, index), anchor.address, time.monotonic()
         )
     assert codes()[3:] == [("param-changed", 202), ("firmware-changed", 202)]
-    assert ext._anchor_lock.breaks[3]["detail"] == "RTLS anchor 202 UWB_CH 5 -> 9"
+    assert ext._anchor_lock.breaks[-4]["detail"] == "RTLS anchor 202 UWB_CH 5 -> 9"
 
     # an anchor goes offline; the tag does not count
     ext._expire_devices(time.monotonic() + 1000)
@@ -303,6 +214,12 @@ async def test_lock_breaks_once_per_occurrence(dialect, builder, hub):
     assert len(_inf_broadcasts(ext)[-1]["anchorLock"]["breaks"]) == 7
     assert "the anchor lock is broken" in ext.show_start_refusal()
     assert "; 4 more" in ext.show_start_refusal()
+    # newest first, in the list and in the reason
+    newest = ext._anchor_lock.breaks[0]
+    assert (newest["code"], newest["device"]) == ("offline", 202)
+    assert ext.show_start_refusal().startswith(
+        f"the anchor lock is broken ({newest['detail']};"
+    )
     body = await _lock(ext, builder, hub)
     assert body["result"] == "warnings"
     body = await _lock(ext, builder, hub, acknowledgeWarnings=True)
@@ -344,35 +261,6 @@ async def test_reboots_are_judged_against_the_host_time(dialect, builder, hub):
     ]
 
 
-def test_the_uptime_wrap_is_no_reboot():
-    lock = AnchorLock()
-    lock.seal(
-        {201: _sealed(uptimeMs=2**32 - 4_000)},
-        [],
-        1000.0,
-        {201: 0.0},
-    )
-    # 10 s later the 32-bit uptime wrapped to 6 s
-    assert lock.on_uptime(201, 6_000, 10.0, 1010.0) == []
-    assert [b["code"] for b in lock.on_uptime(201, 1_000, 20.0, 1020.0)] == ["rebooted"]
-
-
-def _sealed(**changes):
-    entry = {
-        "name": "RTLS anchor A0",
-        "role": "anchor-initiator",
-        "firmware": "1.2.3",
-        "params": {"UWB_CHANNEL": 9},
-        "bootCount": 3,
-        "uptimeMs": None,
-        "powerState": "operating",
-        "moved": False,
-        "online": True,
-    }
-    entry.update(changes)
-    return entry
-
-
 async def test_show_refusal_needs_a_lock(dialect, builder, hub):
     ext, _ = await _cell(dialect)
     await _healthy(ext)
@@ -380,47 +268,6 @@ async def test_show_refusal_needs_a_lock(dialect, builder, hub):
 
     ext._lock_required_for_show = False
     assert ext.show_start_refusal() is None
-
-
-def test_lock_persists_across_a_restart(tmp_path):
-    path = tmp_path / "anchor_lock.json"
-    lock = AnchorLock(path)
-    lock.seal(
-        {
-            201: {
-                "name": "RTLS anchor A0",
-                "role": "anchor-initiator",
-                "firmware": "1.2.3",
-                "params": {"UWB_CHANNEL": 9},
-                "bootCount": 3,
-                "uptimeMs": None,
-                "powerState": "operating",
-                "moved": False,
-                "online": True,
-            }
-        },
-        [],
-        1000.0,
-    )
-    lock.on_stats(201, {"moved": True}, 1001.0)
-
-    lock.on_param(201, "UWB_CHANNEL", 7, 1001.5)
-
-    restored = AnchorLock(path)
-    restored.load(6.0, 0.0)
-    assert restored.json() == lock.json()
-    assert restored.covers(201)
-    # the last compared values survive: the change already recorded does
-    # not break again, a change back while the server was down does
-    restored.on_param(201, "UWB_CHANNEL", 7, 1002.0)
-    restored.on_param(201, "UWB_CHANNEL", 9, 1002.0)
-    restored.on_stats(201, {"bootCount": 4}, 1002.0)
-    assert [b["code"] for b in restored.breaks] == [
-        "moved",
-        "param-changed",
-        "param-changed",
-        "rebooted",
-    ]
 
 
 # ---- audit round: guards, restarts, saving, membership, the show gate ----

@@ -342,12 +342,14 @@ Every response has the same shape:
   breaks are cleared.
 - `anchorLock.breaks`: `{"code", "device", "detail", "at"}` (`at` is UNIX
   seconds). Codes: `offline` (also a sealed member not back within the
-  device timeout after a server restart), `rebooted` (the uptime did not
-  advance with the host time; the boot count only where no uptime is
-  seen), `param-changed`, `firmware-changed`, `moved`, `left-operating` and
+  device timeout after a server restart), `rebooted` (the uptime went back,
+  or fell more than 5 s behind the host time since its previous sample; a
+  late advert alone is none; the boot count only where no uptime is seen),
+  `param-changed`, `firmware-changed`, `moved`, `left-operating` and
   `membership` (an anchor outside the seal appeared). Each occurrence is
-  added once, logged and pushed. A sealed parameter changed by someone
-  else is seen on the device's next report or read of it.
+  added once, newest first, logged and pushed; the show gate's reason
+  names the three newest. A sealed parameter changed by someone else is
+  seen on the device's next report or read of it.
 - `anchorLock.showGate`: the server's verdict on a show start now, the one
   `SHOW-SETCFG` applies: `required` (the gate is on and anchors are known),
   `refused` and the `reason`.

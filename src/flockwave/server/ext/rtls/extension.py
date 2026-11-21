@@ -58,15 +58,8 @@ except ImportError:  # pragma: no cover
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
-from .anchor_lock import (
-    LOCKED_REASON,
-    ROLE_UNKNOWN_REASON,
-    AnchorLock,
-    LockBreak,
-    handle_lock_request,
-    lock_json,
-    show_gate,
-)
+from .anchor_lock import LOCKED_REASON, ROLE_UNKNOWN_REASON, AnchorLock, LockBreak
+from .anchor_lock_gate import handle_lock_request, lock_json, show_gate
 from .anchor_sleep import (
     ANCHOR_SLEEP_TIMEOUT,
     MAV_STATE_ACTIVE,
@@ -2003,8 +1996,6 @@ class RtlsExtension(Extension):
 
         if not isinstance(image, str):
             return hub.reject(message, reason="Image path must be a string")
-        if self._locked_target(system_id) == "anchor":
-            return hub.reject(message, reason=LOCKED_REASON)
 
         import os
 
