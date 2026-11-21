@@ -288,6 +288,75 @@ one trailing-edge notification — and every 10 s without transitions so
 `age` values keep refreshing (also while only lost devices remain). Each notification carries the **full** current status map;
 clients should replace their device list wholesale rather than merge.
 
+### X-RTLS-LOCK — anchor cell lock
+
+The operator locks the anchor cell before a show. The lock lives on the
+server, so every client sees and honours it. It never acts on devices: it
+refuses anchor-changing commands and raises alarms.
+
+Request; `action` is `"status"` (the default), `"lock"` or `"unlock"`:
+
+```json
+{"type": "X-RTLS-LOCK", "action": "lock", "acknowledgeWarnings": true}
+```
+
+Every response has the same shape:
+
+```json
+{
+  "type": "X-RTLS-LOCK",
+  "action": "lock",
+  "result": "locked",
+  "warnings": [
+    {"code": "low-battery", "device": 205, "detail": "RTLS anchor A4: low battery (6.81 V)"}
+  ],
+  "anchorLock": {
+    "locked": true,
+    "lockedAt": 1795290000.0,
+    "anchors": [201, 202, 203, 204, 205, 206, 207, 208],
+    "acknowledgedWarnings": [
+      {"code": "low-battery", "device": 205, "detail": "RTLS anchor A4: low battery (6.81 V)"}
+    ],
+    "breaks": []
+  }
+}
+```
+
+- `result`: `"status"`, `"locked"`, `"unlocked"` or `"warnings"`. A lock
+  (or re-seal) with warnings or breaks pending and no
+  `acknowledgeWarnings: true` returns `"warnings"` and does not lock.
+- `warnings`: the cell's warnings now. Codes: `no-anchors`, `offline`,
+  `a0-not-operating`, `a0-not-heard` (a responder's `rangingRateHz` is 0),
+  `low-battery`, `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
+  config or hardware failure) and `radio-restarts`. `device` is a system id,
+  or null for the cell.
+- Locking an already locked cell re-seals it: a fresh snapshot, and the
+  breaks are cleared.
+- `anchorLock.breaks`: `{"code", "device", "detail", "at"}` (`at` is UNIX
+  seconds). Codes: `offline`, `rebooted`, `param-changed`,
+  `firmware-changed`, `moved` and `left-operating`. Each occurrence is added
+  once, logged and pushed.
+
+`X-RTLS-INF` carries the same `anchorLock` object, and a lock, unlock or
+break pushes it.
+
+While the cell is locked, these are refused with "anchors are locked;
+unlock them in Control first": `X-RTLS-PARAM-SET` and `X-RTLS-OTA` uploads
+to an anchor (an NAK; the OTA status query and `inspect` stay allowed),
+and an anchor's entry in `X-RTLS-SLEEP` and `X-RTLS-FORGET` results
+(`accepted` / `forgotten` false, with that `detail`). Tags are unaffected.
+
+The lock is kept across a server restart (`anchor_lock.json` in the
+extension's data directory).
+
+**Show gate.** `SHOW-SETCFG` is refused (with the reason) when it would
+authorize the show, or change the start of an authorized show, for a live
+or rehearsal flight while anchors are known and the cell is not locked or
+its lock has breaks. Clearing or revoking a start, and lights-only
+authorizations, are never refused. Without known anchors (no RTLS cell)
+nothing is required. The rtls extension's `lock_required_for_show: false`
+turns the gate off.
+
 ### X-RTLS-PARAM-LIST — full parameter list
 
 Drives a full PARAM_EXT list transaction against the device and
