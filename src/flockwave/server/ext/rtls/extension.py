@@ -40,6 +40,7 @@ from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
     ANCHOR_CHARGE_BLOCKS,
     ANCHOR_CHARGE_PHASES,
+    ANCHOR_LOW_BATTERY,
     ANCHOR_POWER_INPUTS,
     ANCHOR_POWER_STATES,
     PARAM_ACK_ACCEPTED,
@@ -1386,8 +1387,7 @@ class RtlsExtension(Extension):
     def _expire_devices(self, now: float) -> list[ProtocolEvent]:
         """Expire the devices that went silent past their timeout, keeping
         each one's last state (see :meth:`_handle_lost`); returns the
-        expiry pass's events: ``lost`` ones, and ``stats`` ones for live
-        devices whose stats the SDK aged out."""
+        ``lost`` events."""
         protocol = self._require_protocol()
         known = dict(protocol.devices)
         events = protocol.expire(now)
@@ -1397,15 +1397,10 @@ class RtlsExtension(Extension):
         return events
 
     async def _process_expiry(self, now: float, logger) -> None:
-        """The protocol loop's expiry pass: logs the lost devices and takes
-        the snapshots the SDK reassembled without the stats a device
-        stopped sending."""
+        """The protocol loop's expiry pass: the lost devices are logged."""
         for event in self._expire_devices(now):
             if event.kind == "lost":
                 logger.warning(f"rtls: device sysid {event.system_id} lost")
-            elif event.kind == "stats":
-                await self._on_stats(event.system_id, event.data, now)
-                self._dispatch_event(event)
 
     def _handle_lost(
         self, event: ProtocolEvent, device: RtlsDevice | None = None
@@ -2836,12 +2831,13 @@ def _stats_json(
     rssi = _finite_stat(data, "urssi")
     if rssi is not None:
         body["uwbRssiDbm"] = round(rssi, 1) if rssi < 0.0 else None
-    # the pack's level: 0 ok, 1 below its warning level while running from
-    # it, 2 low (latched)
+    # the pack's level: ok, warning (below its warning level while running
+    # from it) or low (latched)
     lowbat = _finite_stat(data, "lowbat")
     if lowbat is not None:
-        body["lowBattery"] = lowbat >= 2
-        body["batteryWarning"] = lowbat == 1
+        level = _code_name(ANCHOR_LOW_BATTERY)(lowbat)
+        body["lowBattery"] = level == "low"
+        body["batteryWarning"] = level == "warning"
     rmse = _finite_stat(data, "rmse")
     if rmse is not None:
         body["residualRmsM"] = round(rmse, 4) if rmse >= 0.0 else None

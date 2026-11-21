@@ -4587,24 +4587,30 @@ async def test_commands_ignore_the_role_retained_from_before_a_loss(
     assert await extension._command_role(DEVICE_SYSID, 1.0) is None
 
 
-async def test_the_expiry_pass_drops_stats_the_device_stopped_sending(
+async def test_a_stat_ages_out_on_the_next_frame_and_a_lost_anchor_keeps_its_last(
     extension, device
 ):
     add_rtls_cell_params(device, role=3, uwb_mac=2)
     await discover(extension, device)
     t = time.monotonic()
-    await extension._process_datagram(
-        _bundle(device, {"vbat": 7.9, "chgblk": 2.0}), device.address, t
-    )
+    report = {"vbat": 7.9, "lowbat": 1.0, "pwrst": 5.0, "chgblk": 2.0}
+    await extension._process_datagram(_bundle(device, report), device.address, t)
     assert extension._stats[DEVICE_SYSID]["chargeBlock"] == "no-input"
-    # the device keeps heartbeating but stops sending both stats
-    await extension._process_datagram(device.heartbeat(), device.address, t + 4.0)
 
-    await extension._process_expiry(t + 4.0, logging.getLogger("test"))
+    # PoE is pulled: the next reports carry no chgblk, which ages out once
+    # a frame arrives after three report periods
+    later = {"vbat": 7.8, "lowbat": 1.0, "pwrst": 5.0}
+    await extension._process_datagram(_bundle(device, later), device.address, t + 4.0)
+    assert "chargeBlock" not in extension._stats[DEVICE_SYSID]
 
-    assert DEVICE_SYSID in extension._protocol.devices  # not lost
-    assert DEVICE_SYSID not in extension._lost
-    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID}
+    # the anchor goes silent and is lost: its stale snapshot still has the
+    # last battery and power state (a silent device's stats do not age)
+    await extension._process_expiry(t + 1000.0, logging.getLogger("test"))
+    kept = extension._stats[DEVICE_SYSID]
+    assert kept["stale"] is True
+    assert kept["batteryVoltage"] == 7.8
+    assert kept["batteryWarning"] is True
+    assert kept["powerState"] == "operating"
 
 
 @pytest.mark.parametrize(
