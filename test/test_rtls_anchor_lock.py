@@ -480,5 +480,20 @@ async def test_a_sleeping_responder_is_not_operating_and_a_warning_pack_is_low(
 
     assert [(w["code"], w["detail"]) for w in body["warnings"]] == [
         ("not-operating", "RTLS anchor 202 is asleep"),
-        ("low-battery", "RTLS anchor 202: battery below its warning level"),
+        ("battery-warning", "RTLS anchor 202: battery below its warning level"),
     ]
+
+
+def test_power_states_read_naturally():
+    from flockwave.server.ext.rtls.anchor_lock_gate import _state_phrase
+
+    assert {
+        state: f"RTLS anchor A1 {_state_phrase(state)}"
+        for state in ("standby", "asleep", "off", "booting", "fault")
+    } == {
+        "standby": "RTLS anchor A1 is in standby",
+        "asleep": "RTLS anchor A1 is asleep",
+        "off": "RTLS anchor A1 is off",
+        "booting": "RTLS anchor A1 is booting",
+        "fault": "RTLS anchor A1 has a power fault",
+    }

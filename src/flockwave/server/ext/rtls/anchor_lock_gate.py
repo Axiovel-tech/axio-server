@@ -94,17 +94,20 @@ def _anchor_warnings(anchor: AnchorView) -> list[LockWarning]:
     found = []
     state = stats.get("powerState")
     if anchor["role"] == "anchor-initiator" and state not in (None, "operating"):
-        found.append(("a0-not-operating", f"{name} (A0) is {state}"))
+        found.append(("a0-not-operating", f"{name} (A0) {_state_phrase(state)}"))
     if anchor["role"] == "anchor-responder":
         if state not in (None, "operating"):
-            found.append(("not-operating", f"{name} is {state}"))
+            found.append(("not-operating", f"{name} {_state_phrase(state)}"))
         elif stats.get("rangingRateHz") == 0:
             found.append(("a0-not-heard", f"{name} does not hear A0"))
     if stats.get("lowBattery"):
         found.append(("low-battery", f"{name}: low battery{_volts(stats)}"))
     elif stats.get("batteryWarning"):
         found.append(
-            ("low-battery", f"{name}: battery below its warning level{_volts(stats)}")
+            (
+                "battery-warning",
+                f"{name}: battery below its warning level{_volts(stats)}",
+            )
         )
     if stats.get("moved"):
         found.append(("moved", f"{name} moved since it was placed"))
@@ -115,6 +118,24 @@ def _anchor_warnings(anchor: AnchorView) -> list[LockWarning]:
             ("radio-restarts", f"{name}: radio restarted {stats['radioRestarts']}x")
         )
     return [_warning(code, system_id, detail) for code, detail in found]
+
+
+#: how a warning says an anchor is in a power state
+_STATE_PHRASES = {
+    "booting": "is booting",
+    "preview": "is in preview",
+    "standby": "is in standby",
+    "asleep": "is asleep",
+    "off": "is off",
+    "operating": "is operating",
+    "stopping": "is stopping",
+    "shutdown": "is shutting down",
+    "fault": "has a power fault",
+}
+
+
+def _state_phrase(state: str) -> str:
+    return _STATE_PHRASES.get(state, f"is in power state {state}")
 
 
 def _volts(stats: dict[str, Any]) -> str:

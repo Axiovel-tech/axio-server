@@ -335,8 +335,9 @@ Every response has the same shape:
 - `warnings`: the cell's warnings now. Codes: `no-anchors`, `offline`,
   `a0-not-operating`, `not-operating` (a responder asleep, in standby or
   any other state but operating), `a0-not-heard` (an operating responder's
-  `rangingRateHz` is 0), `low-battery` (low, or below its warning level; the
-  detail says which), `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
+  `rangingRateHz` is 0), `low-battery` (the low-battery latch),
+  `battery-warning` (below its warning level while running from the pack),
+  `moved`, `uwb-start-refused` (`uwbStatus` disabled, invalid
   config or hardware failure), `radio-restarts` and, on a re-seal,
   `missing` (a sealed member no longer known). `device` is a system id, or
   null for the cell.
