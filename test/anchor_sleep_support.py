@@ -28,8 +28,8 @@ class FakeAnchor(FakeDevice):
     anchor-power-path.md). ``refuse_with`` makes it refuse instead,
     reading back as that SLEEP value; ``hang`` accepts and never reboots.
     With ``in_place_sleep`` a sleep request in plain standby moves it to
-    asleep without a reboot; with ``reports_power_state`` it streams
-    ``pwrst``."""
+    asleep without a reboot; it streams ``pwrst`` unless
+    ``reports_power_state`` is off."""
 
     def __init__(
         self,
@@ -39,7 +39,7 @@ class FakeAnchor(FakeDevice):
         power=None,
         reboot_s=9.0,
         in_place_sleep=False,
-        reports_power_state=False,
+        reports_power_state=True,
         sleep_value=None,
     ):
         super().__init__(dialect)
@@ -51,42 +51,19 @@ class FakeAnchor(FakeDevice):
         self.in_place_sleep = in_place_sleep
         self.reports_power_state = reports_power_state
         self.reboot_s = reboot_s
-        self.boot_at = -100.0
         self.reboot_at = None
         self.target = None
         self.refuse_with = None
         self.hang = False
         self.expired = False
 
-    #: heartbeat EMERGENCY after the next reboot, like firmware safe mode
-    safe_mode_after_reboot = False
-    safe_mode = False
-
     @property
     def sleeping(self) -> bool:
         return self.power in ("standby", "asleep", "off")
 
-    def heartbeat(self) -> bytes:
-        if not self.safe_mode:
-            return super().heartbeat()
-        d = self.dialect
-        message = d.MAVLink_heartbeat_message(
-            type=d.MAV_TYPE_GENERIC,
-            autopilot=d.MAV_AUTOPILOT_INVALID,
-            base_mode=0,
-            custom_mode=0,
-            system_status=d.MAV_STATE_EMERGENCY,
-            mavlink_version=3,
-        )
-        return bytes(message.pack(self._mav))
-
     @property
     def down(self) -> bool:
         return self.reboot_at is not None and trio.current_time() >= self.reboot_at
-
-    def uptime_ms(self) -> int:
-        # a booted board reports a few ms at least (TIMESYNC tc1 0 is no reply)
-        return 2 + int((trio.current_time() - self.boot_at) * 1000)
 
     def handle(self, data: bytes) -> list[bytes]:
         return [] if self.down else super().handle(data)
@@ -111,9 +88,8 @@ class FakeAnchor(FakeDevice):
                     self.expired = True
                     extension._expire_devices(time.monotonic() + 1000.0)
                 if now >= self.reboot_at + self.reboot_s:
-                    self.power, self.boot_at = self.target, now
+                    self.power = self.target
                     self.reboot_at = None
-                    self.safe_mode = self.safe_mode_after_reboot
                     if self.power == "off":
                         self.params["SLEEP"] = (bytes([2]), PARAM_TYPE_UINT8)
             if not self.down:
@@ -159,18 +135,9 @@ async def _send_sleep(ext, builder, hub, sleeping, **body):
 
 
 async def _anchor_sleep(dialect, builder, hub, anchor, sleeping, **body):
-    """Discover the anchor, run it, and send it one X-RTLS-SLEEP; returns the
-    extension and the anchor's result entry."""
-    ext = await _anchor_extension(dialect, anchor)
-    async with trio.open_nursery() as nursery:
-        nursery.start_soon(anchor.run, ext)
-        entry = await _send_sleep(ext, builder, hub, sleeping, **body)
-        nursery.cancel_scope.cancel()
-    return ext, entry
-
-
-async def _power_sleep(dialect, builder, hub, anchor, sleeping, **body):
-    """Like _anchor_sleep, once the anchor has reported its powerState."""
+    """Discover the anchor, run it until it has reported its powerState, and
+    send it one X-RTLS-SLEEP; returns the extension, the anchor's result
+    entry and the seconds the request took."""
     ext = await _anchor_extension(dialect, anchor)
     async with trio.open_nursery() as nursery:
         nursery.start_soon(anchor.run, ext)
@@ -181,4 +148,4 @@ async def _power_sleep(dialect, builder, hub, anchor, sleeping, **body):
         entry = await _send_sleep(ext, builder, hub, sleeping, **body)
         elapsed = trio.current_time() - started
         nursery.cancel_scope.cancel()
-    return entry, elapsed
+    return ext, entry, elapsed

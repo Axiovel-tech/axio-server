@@ -1,6 +1,6 @@
-"""X-RTLS-SLEEP on anchors (rtls/anchor_sleep.py) judged from heartbeats
-and SLEEP readbacks: firmware without ``pwrst``, reboots, refusals and the
-deadline."""
+"""X-RTLS-SLEEP on anchors (rtls/anchor_sleep.py) judged by their
+``powerState``: reboots into and out of operating, sleep in place from
+standby, refusals read back from SLEEP, and the deadline."""
 
 import time
 
@@ -15,7 +15,7 @@ from anchor_sleep_support import (
 )
 from rtls_support import DEVICE_SYSID, StubApp, discover
 from rtlslink.dialect import load_dialect
-from rtlslink.protocol import PARAM_TYPE_UINT8, RtlsProtocol
+from rtlslink.protocol import RtlsProtocol
 
 from flockwave.server.ext.rtls.extension import RtlsExtension
 from flockwave.server.message_hub import MessageHub
@@ -44,9 +44,8 @@ def autojump_clock():
 
 async def test_anchor_sleep_waits_for_the_reboot(dialect, builder, hub, autojump_clock):
     anchor = FakeAnchor(dialect)
-    started = trio.current_time()
 
-    ext, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+    ext, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
 
     assert entry == {
         "requested": True,
@@ -56,30 +55,110 @@ async def test_anchor_sleep_waits_for_the_reboot(dialect, builder, hub, autojump
     }
     # confirmed only after the reboot: off the network, lost, rediscovered
     assert anchor.expired
-    assert trio.current_time() - started >= anchor.reboot_s
+    assert elapsed >= anchor.reboot_s
     assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is True
 
 
-async def test_anchor_wake_confirmed_by_the_rewound_uptime(
+async def test_operating_anchor_sleeps_through_its_reboot(
     dialect, builder, hub, autojump_clock
 ):
-    # a reboot shorter than the device timeout: never lost, the uptime
-    # probe shows the reboot
-    anchor = FakeAnchor(dialect, standby=True, reboot_s=3.0)
+    anchor = FakeAnchor(dialect, reboot_s=3.0)
 
-    ext, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+    _, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True
+    assert anchor.power == "asleep"
+    assert elapsed >= anchor.reboot_s
+
+
+async def test_standby_anchor_wakes_through_its_reboot(
+    dialect, builder, hub, autojump_clock
+):
+    anchor = FakeAnchor(dialect, standby=True)
+
+    ext, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, False)
 
     assert entry["accepted"] is True
     assert entry["sleeping"] is False
-    assert not anchor.expired
+    assert anchor.power == "operating"
+    # confirmed only after the reboot, not on a pre-reboot report
+    assert anchor.expired
+    assert elapsed >= anchor.reboot_s
     assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is False
+
+
+async def test_anchor_already_asleep(dialect, builder, hub, autojump_clock):
+    anchor = FakeAnchor(dialect, power="asleep", standby=True)
+
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True and entry["sleeping"] is True
+
+
+async def test_standby_anchor_sleeps_in_place(dialect, builder, hub, autojump_clock):
+    anchor = FakeAnchor(dialect, standby=True, in_place_sleep=True)
+
+    _, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": True,
+        "sleeping": True,
+        "detail": "asleep",
+    }
+    assert anchor.power == "asleep"
+    assert anchor.reboot_at is None and not anchor.expired
+    assert elapsed < anchor.reboot_s
+
+
+async def test_plain_standby_anchor_sleeps_in_place(
+    dialect, builder, hub, autojump_clock
+):
+    # plain standby reads SLEEP 3; writing 1 moves it to asleep in place
+    anchor = FakeAnchor(dialect, standby=True, sleep_value=3, in_place_sleep=True)
+
+    _, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry["accepted"] is True and entry["sleeping"] is True
+    assert anchor.power == "asleep"
+    assert anchor.reboot_at is None
+    assert elapsed < anchor.reboot_s
+
+
+async def test_standby_anchor_is_not_reported_asleep_while_in_standby(
+    dialect, builder, hub, autojump_clock
+):
+    # firmware that leaves a standby anchor in standby on SLEEP=1 (it already
+    # reads 1): STANDBY heartbeats alone must not count as asleep
+    anchor = FakeAnchor(dialect, standby=True)
+
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True, timeout=6)
+
+    assert entry["accepted"] is False
+    assert entry["sleeping"] is None
+    assert "not seen asleep" in entry["detail"]
+
+
+async def test_plain_standby_is_not_asleep(dialect, builder, hub, autojump_clock):
+    # a standby anchor that keeps reading 3 after the write refused the sleep
+    anchor = FakeAnchor(dialect, standby=True, sleep_value=3)
+    anchor.refuse_with = 3
+
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": False,
+        "sleeping": False,
+        "detail": "sleep refused by the anchor in its standby state",
+    }
 
 
 async def test_anchor_wake_refused_on_a_low_pack(dialect, builder, hub, autojump_clock):
     anchor = FakeAnchor(dialect, standby=True)
     anchor.refuse_with = 1
 
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, False)
 
     assert entry["accepted"] is False
     assert entry["sleeping"] is True
@@ -90,29 +169,13 @@ async def test_anchor_wake_refused_on_a_low_pack(dialect, builder, hub, autojump
 async def test_anchor_off_only_wakes_from_its_button(
     dialect, builder, hub, autojump_clock
 ):
-    anchor = FakeAnchor(dialect, standby=True)
-    anchor.params["SLEEP"] = (bytes([2]), PARAM_TYPE_UINT8)
+    anchor = FakeAnchor(dialect, power="off", standby=True, sleep_value=2)
     anchor.refuse_with = 2
 
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, False)
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, False)
 
     assert entry["accepted"] is False
     assert "only its button" in entry["detail"]
-
-
-async def test_anchor_already_asleep_is_unverified_without_power_state(
-    dialect, builder, hub, autojump_clock
-):
-    # without pwrst, an anchor in standby that reads SLEEP 1 may be asleep or
-    # in plain standby (older firmware): never reported asleep
-    anchor = FakeAnchor(dialect, standby=True)
-
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
-
-    assert entry["accepted"] is True
-    assert entry["sleeping"] is None
-    assert "unverified" in entry["detail"]
-    assert anchor.reboot_at is None and not anchor.expired
 
 
 async def test_anchor_sleep_not_confirmed_in_time(
@@ -121,7 +184,7 @@ async def test_anchor_sleep_not_confirmed_in_time(
     anchor = FakeAnchor(dialect)
     anchor.hang = True
 
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True, timeout=8)
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True, timeout=8)
 
     assert entry == {
         "requested": True,
@@ -132,13 +195,29 @@ async def test_anchor_sleep_not_confirmed_in_time(
     }
 
 
+async def test_anchor_without_power_state_is_not_commanded(
+    dialect, builder, hub, autojump_clock
+):
+    anchor = FakeAnchor(dialect, reports_power_state=False)
+
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True)
+
+    assert entry == {
+        "requested": True,
+        "accepted": False,
+        "sleeping": None,
+        "detail": "the anchor does not report its power state; update its firmware",
+    }
+    assert anchor.params["SLEEP"][0] == bytes([0])  # nothing was written
+
+
 async def test_anchor_without_sleep_mode(dialect, builder, hub, autojump_clock):
     # an anchor without a power path (native_sim, boards without one) has
     # no SLEEP parameter: say so instead of timing out on the write
     anchor = FakeAnchor(dialect)
     del anchor.params["SLEEP"]
 
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True)
 
     assert entry == {
         "requested": True,
@@ -149,14 +228,13 @@ async def test_anchor_without_sleep_mode(dialect, builder, hub, autojump_clock):
 
 
 async def test_anchor_wake_right_after_a_sleep(dialect, builder, hub, autojump_clock):
-    """The uptime sampled before the wake is a few ms past the sleep's own
-    reboot, so the wake's reboot does not lower it: the reboot shows as
-    uptime that advanced less than the host time since that sample. The
-    second reboot is shorter than the device timeout (no rediscovery)."""
+    """A wake sent as soon as a sleep is confirmed waits for its own reboot;
+    the second reboot is shorter than the device timeout (no rediscovery)."""
     anchor = FakeAnchor(dialect)
     ext = await _anchor_extension(dialect, anchor)
     async with trio.open_nursery() as nursery:
         nursery.start_soon(anchor.run, ext)
+        await trio.sleep(1.5)
         slept = await _send_sleep(ext, builder, hub, True)
         anchor.reboot_s = 3.0
         woke = await _send_sleep(ext, builder, hub, False)
@@ -169,42 +247,7 @@ async def test_anchor_wake_right_after_a_sleep(dialect, builder, hub, autojump_c
         "sleeping": False,
         "detail": "awake",
     }
-
-
-async def test_safe_mode_after_a_wake_is_not_awake(
-    dialect, builder, hub, autojump_clock
-):
-    # after the wake's reboot the firmware sits in safe mode (EMERGENCY): it
-    # is neither STANDBY nor ACTIVE and must not confirm "awake"
-    anchor = FakeAnchor(dialect, standby=True, reboot_s=3.0)
-    anchor.safe_mode_after_reboot = True
-
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, False, timeout=12)
-
-    assert entry["accepted"] is False
-    assert entry["sleeping"] is None
-    assert "not seen awake" in entry["detail"]
-
-
-async def test_sleep_landing_off_is_refused_after_the_reboot(
-    dialect, builder, hub, autojump_clock
-):
-    # STANDBY after a sleep's reboot also covers off: the readback after the
-    # reboot tells (older firmware, no pwrst)
-    anchor = FakeAnchor(dialect, reboot_s=3.0)
-    original = anchor.after_sleep_write
-
-    def lands_off(previous, value):
-        original(previous, value)
-        anchor.target = "off"
-
-    anchor.after_sleep_write = lands_off
-
-    _, entry = await _anchor_sleep(dialect, builder, hub, anchor, True)
-
-    assert entry["accepted"] is False
-    assert entry["sleeping"] is False
-    assert "only its button" in entry["detail"]
+    assert anchor.power == "operating"
 
 
 async def test_role_unknown_is_not_commanded(dialect, builder, hub, autojump_clock):

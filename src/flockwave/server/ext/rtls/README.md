@@ -79,8 +79,8 @@ enables it.
   disarmed; the server reads it back after a settle delay to report the
   refusal. An anchor reboots when it enters or leaves operating (8-15 s off
   the network) and falls asleep in place from standby; `anchor_sleep.py`
-  verifies the outcome from its `powerState`, or, on firmware without
-  `pwrst`, from heartbeats and readbacks. A woken board reboots.
+  verifies the outcome from the `powerState` it reports after the write and
+  does not command an anchor that reports none. A woken board reboots.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.

@@ -60,8 +60,6 @@ from flockwave.server.registries.errors import RegistryFull
 
 from .anchor_sleep import (
     ANCHOR_SLEEP_TIMEOUT,
-    MAV_STATE_ACTIVE,
-    MAV_STATE_STANDBY,
     lacks_param,
     set_anchor_sleep,
     sleep_error,
@@ -173,6 +171,12 @@ DEFAULT_LISTEN_PORT = 3343
 DEFAULT_HEARTBEAT_INTERVAL = 2.0
 DEFAULT_DEVICE_TIMEOUT = 6.0
 
+#: heartbeat system_status values the sleep latch derives from (STANDBY =
+#: sleeping, ACTIVE = awake); numeric MAVLink enum values mirrored here --
+#: like rtlslink.protocol mirrors them -- so the optimistic sleep/wake
+#: update needs neither the dialect module nor a post-sleep SDK pin
+MAV_STATE_STANDBY = 3
+MAV_STATE_ACTIVE = 4
 
 #: seconds after discovery before a device's param snapshot is first
 #: checked for identity holes: the discovery-triggered full dump (~80
@@ -1084,8 +1088,9 @@ class RtlsExtension(Extension):
         species, source = _image_species(image_path, role)
         if species is None:
             raise ValueError(
-                "the image has no build receipt and no declared role; "
-                "refusing a permanent upload of an unchecked image"
+                "the image has no build receipt and no declared role; build "
+                "it with rtls-link-zephyr scripts/build.sh (refusing a "
+                "permanent upload of an unchecked image)"
             )
         await self.verify_species(system_id, species)
         device, nursery = self._require_ota_slot(system_id)
@@ -1885,8 +1890,6 @@ class RtlsExtension(Extension):
     async def _handle_RTLS_OTA(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
-        if message.body.get("inspect"):
-            return self._inspect_ota_image(message, hub)
         try:
             system_id = _get_device_id(message)
         except ValueError as ex:
@@ -1935,30 +1938,6 @@ class RtlsExtension(Extension):
             body={"type": "X-RTLS-OTA", "id": system_id, "job": job},
             in_response_to=message,
         )
-
-    def _inspect_ota_image(self, message: "FlockwaveMessage", hub: "MessageHub"):
-        """Answers an ``inspect`` request: the species an image's build
-        receipt names, so a client can show (and lock) it before the upload.
-        ``species`` is null for an image without a receipt."""
-        import os
-
-        image = message.body.get("image")
-        if not isinstance(image, str) or not os.path.isfile(image):
-            return hub.reject(message, reason=f"No such image file: {image}")
-        try:
-            receipt = _read_image_receipt(image)
-        except ValueError as ex:
-            return hub.reject(message, reason=str(ex))
-        body: dict[str, Any] = {
-            "type": "X-RTLS-OTA",
-            "image": image,
-            "species": receipt.app if receipt else None,
-            "speciesSource": "receipt" if receipt else None,
-        }
-        if receipt is not None:
-            body["board"] = receipt.board
-            body["git"] = receipt.git
-        return hub.create_response_or_notification(body=body, in_response_to=message)
 
     async def _handle_RTLS_STATS(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2520,23 +2499,16 @@ class RtlsExtension(Extension):
         return dict(self._protocol.devices)
 
 
-def _read_image_receipt(image: str):
-    """The build receipt beside an image (rtls-link-zephyr
-    ``scripts/build.sh``), None without one. Raises ValueError when it
-    cannot vouch for the image: stale (another build), unreadable, or for
-    an unknown app."""
-    try:
-        return read_receipt(image)
-    except (json.JSONDecodeError, KeyError, TypeError, OSError) as ex:
-        raise ValueError(f"unreadable image receipt beside {image}: {ex}") from ex
-
-
 def _image_species(image: str, declared: str | None) -> tuple[str | None, str | None]:
     """The species (``"tag"`` / ``"anchor"``) of an OTA image and its
-    source: the image's build receipt, else the role the client declared,
-    else unknown. Raises ValueError when the receipt cannot vouch for the
-    image or contradicts the declared role."""
-    receipt = _read_image_receipt(image)
+    source: the image's build receipt (rtls-link-zephyr ``scripts/build.sh``),
+    else the role the client declared, else unknown. Raises ValueError when
+    the receipt cannot vouch for the image (stale, unreadable, an unknown
+    app) or contradicts the declared role."""
+    try:
+        receipt = read_receipt(image)
+    except (json.JSONDecodeError, KeyError, TypeError, OSError) as ex:
+        raise ValueError(f"unreadable image receipt beside {image}: {ex}") from ex
     if receipt is None:
         return declared, ("declared" if declared else None)
     if declared is not None and declared != receipt.app:
