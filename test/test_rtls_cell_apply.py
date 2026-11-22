@@ -9,13 +9,17 @@ from cell_settings_support import (
     CODE_50,
     CODE_83,
     TAG,
+    _boots,
     _converged_cell,
     _dropped_from_dump,
     _lose_acks,
     _param,
+    _record_writes,
     _request,
     _running,
+    _schedule,
     _states,
+    _steps,
 )
 from rtlslink import ota
 from rtlslink.dialect import load_dialect
@@ -79,6 +83,28 @@ async def test_an_unanswered_write_is_rolled_back_too(
     # 202 stored 12 ms though its ack was lost: the rollback restores it
     assert all(_param(device, "UWB_BLOCK_MS") == 20 for device in devices.values())
     assert resets == []
+
+
+async def test_every_stored_step_boots_on_the_way_and_back(
+    dialect, builder, hub, resets, autojump_clock
+):
+    # 8 slots of 2 ms in 20 ms: twelve slots of that length outgrow the block
+    ext, devices = await _converged_cell(dialect)
+    for system_id in devices:
+        await ext.set_param(system_id, "UWB_SLOTS_RR", 8, "uint8")
+        await ext.set_param(system_id, "UWB_SLOT_RSTU", 2400, "uint16")
+    start = _schedule(devices[TAG])
+    _lose_acks(devices[TAG], dialect, "UWB_SLOTS_RR")
+    writes = _record_writes(ext)
+
+    body = await _request(ext, builder, hub, rateHz=83)
+
+    # the tag stored its last write, the slot count, though the ack was lost
+    assert body["result"] == "incomplete"
+    steps = _steps(start, writes[TAG])
+    assert (12, 12, 1200) in steps
+    assert steps[-1] == tuple(start.values())
+    assert all(map(_boots, steps))
 
 
 async def test_rollback_attempts_every_restore(

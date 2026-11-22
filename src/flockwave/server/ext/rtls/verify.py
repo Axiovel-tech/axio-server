@@ -16,7 +16,7 @@ used to be checked by hand before every flight:
 - **uwb** — every online tag is actually solving (rate, fix age,
   cluster-clock sync, solve quality from the live stats stream);
 - **cell** — every online anchor and tag runs the cell's settings
-  (cell_settings.py);
+  (cell_state.py);
 - **params** (in-depth only, warnings only) — cross-drone consistency
   of the ArduPilot navigation/tuning set (EKF sources, VISO, WPNAV,
   LOIT, position/attitude controllers, IMU filters).
@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import trio
 
-from .cell_settings import cell_rule
+from .cell_state import cell_rule
 from .extension import _decoded_device_params
 from .geometry_agreement import run_agreement
 

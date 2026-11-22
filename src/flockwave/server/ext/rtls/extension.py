@@ -68,7 +68,8 @@ from .anchor_sleep import (
     sleep_error,
 )
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .cell_settings import cell_view, handle_cell_request
+from .cell_settings import handle_cell_request
+from .cell_state import cell_view
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
@@ -2822,7 +2823,7 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("wdisc", "wifiDisconnects", int),
     ("wtxerr", "wifiTxErrors", int),
     ("boots", "bootCount", int),
-    # the code and TX level of the session the device runs (cell_settings.py)
+    # the code and TX level of the session the device runs (cell_state.py)
     ("cellcfg", "cellConfig", int),
     ("txgain", "txGain", int),
     ("rstc", "resetCause", int),

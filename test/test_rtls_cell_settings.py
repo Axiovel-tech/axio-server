@@ -1,7 +1,7 @@
-"""Cell settings (X-RTLS-CELL, rtls/cell_settings.py): the state derived from
-each device's stored parameters and reported ``cellcfg``, the lock warning and
-Verify rule, and an apply that writes and reboots the running devices with A0
-last."""
+"""Cell settings (X-RTLS-CELL, rtls/cell_state.py and rtls/cell_settings.py):
+the state derived from each device's stored parameters and reported
+``cellcfg``, the lock warning and Verify rule, and an apply that writes and
+reboots the running devices with A0 last."""
 
 import pytest
 import trio.testing
@@ -11,6 +11,7 @@ from cell_settings_support import (
     CODE_83,
     TAG,
     _a_cell_without_a0,
+    _boots,
     _cell_settings,
     _converged_cell,
     _dropped_from_dump,
@@ -18,7 +19,9 @@ from cell_settings_support import (
     _record_writes,
     _request,
     _running,
+    _schedule,
     _states,
+    _steps,
 )
 from rtlslink import ota
 from rtlslink.dialect import load_dialect
@@ -212,6 +215,7 @@ async def test_a_preset_sets_block_slots_and_slot_length(dialect, builder, hub, 
         await ext.set_param(system_id, "UWB_SLOTS_RR", 16, "uint8")
         await ext.set_param(system_id, "UWB_SLOT_RSTU", 1000, "uint16")
     assert _cell_settings(ext)["rateHz"] is None
+    start = _schedule(devices[TAG])
     writes = _record_writes(ext)
 
     await _request(ext, builder, hub, rateHz=83)
@@ -220,8 +224,10 @@ async def test_a_preset_sets_block_slots_and_slot_length(dialect, builder, hub, 
         assert _param(device, "UWB_BLOCK_MS") == 12
         assert _param(device, "UWB_SLOTS_RR") == 12
         assert _param(device, "UWB_SLOT_RSTU") == 1200
-    # a shorter block comes last: a device cut off midway still boots
-    assert writes[TAG] == ["UWB_SLOTS_RR", "UWB_SLOT_RSTU", "UWB_BLOCK_MS"]
+    # the shorter block comes after the round shrinks: a device cut off
+    # midway still boots
+    assert writes[TAG][0] == ("UWB_SLOTS_RR", 12)
+    assert all(map(_boots, _steps(start, writes[TAG])))
 
 
 async def test_a_longer_block_is_written_first(dialect, builder, hub, resets):
@@ -233,7 +239,7 @@ async def test_a_longer_block_is_written_first(dialect, builder, hub, resets):
 
     await _request(ext, builder, hub, rateHz=50)
 
-    assert writes[TAG] == ["UWB_BLOCK_MS", "UWB_SLOTS_RR"]
+    assert [name for name, _ in writes[TAG]] == ["UWB_BLOCK_MS", "UWB_SLOTS_RR"]
 
 
 async def test_no_online_device_refuses(dialect, builder, hub, resets):

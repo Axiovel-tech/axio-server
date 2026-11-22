@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import trio
 
-from .cell_settings import cell_warnings
+from .cell_state import cell_warnings
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension

@@ -112,8 +112,9 @@ enables it.
 - `anchor_sleep.py`: an anchor's sleep and wake and their verification.
 - `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
   and the show gate.
-- `cell_settings.py`: `X-RTLS-CELL`, the per-device cell-settings state, its
-  lock warning and Verify rule.
+- `cell_state.py`: the per-device cell-settings state, the `cellSettings`
+  summary, its lock warning and Verify rule.
+- `cell_settings.py`: `X-RTLS-CELL`, the apply that writes and reboots.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.

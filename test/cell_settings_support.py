@@ -44,6 +44,31 @@ def _param(device, name):
     return int.from_bytes(device.params[name][0], "little")
 
 
+_SCHEDULE = ("UWB_BLOCK_MS", "UWB_SLOTS_RR", "UWB_SLOT_RSTU")
+
+
+def _schedule(device):
+    """The ``{name: value}`` of the schedule ``device`` stores now."""
+    return {name: _param(device, name) for name in _SCHEDULE}
+
+
+def _steps(start, writes):
+    """The ``(block ms, slots, slot RSTU)`` stored after each schedule write of
+    ``writes``, starting from the ``start`` schedule."""
+    params, steps = dict(start), []
+    for name, value in writes:
+        if name in params:
+            params[name] = value
+            steps.append(tuple(params[name] for name in _SCHEDULE))
+    return steps
+
+
+def _boots(schedule):
+    """Whether the firmware boots ``schedule``: its round fits its block."""
+    block_ms, slots, slot_rstu = schedule
+    return slots * slot_rstu <= block_ms * 1200
+
+
 def _states(ext):
     return {
         int(sid): (entry.get("cellSettings"), entry.get("cellSettingsDetail"))
@@ -80,12 +105,12 @@ def _dropped_from_dump(name, *, answers=True):
 
 
 def _record_writes(ext):
-    """The parameter names written to each device, in order."""
+    """The ``(name, value)`` written to each device, in order."""
     writes, write = {}, ext.set_param
 
-    async def set_param(system_id, name, *args, **kwargs):
-        writes.setdefault(system_id, []).append(name)
-        return await write(system_id, name, *args, **kwargs)
+    async def set_param(system_id, name, value, *args, **kwargs):
+        writes.setdefault(system_id, []).append((name, value))
+        return await write(system_id, name, value, *args, **kwargs)
 
     ext.set_param = set_param
     return writes
