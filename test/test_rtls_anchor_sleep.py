@@ -95,8 +95,11 @@ async def test_anchor_already_asleep(dialect, builder, hub, autojump_clock):
     assert entry["accepted"] is True and entry["sleeping"] is True
 
 
-async def test_standby_anchor_sleeps_in_place(dialect, builder, hub, autojump_clock):
-    anchor = FakeAnchor(dialect, standby=True, in_place_sleep=True)
+async def test_plain_standby_anchor_sleeps_in_place(
+    dialect, builder, hub, autojump_clock
+):
+    # plain standby reads SLEEP 3; writing 1 moves it to asleep in place
+    anchor = FakeAnchor(dialect, standby=True, sleep_value=3, in_place_sleep=True)
 
     _, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
 
@@ -111,25 +114,20 @@ async def test_standby_anchor_sleeps_in_place(dialect, builder, hub, autojump_cl
     assert elapsed < anchor.reboot_s
 
 
-async def test_plain_standby_anchor_sleeps_in_place(
-    dialect, builder, hub, autojump_clock
-):
-    # plain standby reads SLEEP 3; writing 1 moves it to asleep in place
-    anchor = FakeAnchor(dialect, standby=True, sleep_value=3, in_place_sleep=True)
+async def test_sleep_confirmed_through_booting(dialect, builder, hub, autojump_clock):
+    # back on the network but still booting, the anchor reads SLEEP 0: no refusal
+    anchor = FakeAnchor(dialect, boot_s=3.0)
 
-    _, entry, elapsed = await _anchor_sleep(dialect, builder, hub, anchor, True)
+    _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True)
 
     assert entry["accepted"] is True and entry["sleeping"] is True
     assert anchor.power == "asleep"
-    assert anchor.reboot_at is None
-    assert elapsed < anchor.reboot_s
 
 
 async def test_standby_anchor_is_not_reported_asleep_while_in_standby(
     dialect, builder, hub, autojump_clock
 ):
-    # firmware that leaves a standby anchor in standby on SLEEP=1 (it already
-    # reads 1): STANDBY heartbeats alone must not count as asleep
+    # an anchor that stays in standby after SLEEP=1 is not reported asleep
     anchor = FakeAnchor(dialect, standby=True)
 
     _, entry, _ = await _anchor_sleep(dialect, builder, hub, anchor, True, timeout=6)

@@ -147,18 +147,21 @@ async def _await_outcome(
     deadline of its own) until one shows the target ``powerState`` (returns
     None) or SLEEP reads back another value (returns it: a refusal). SLEEP is
     read every ANCHOR_SLEEP_POLL seconds, starting ANCHOR_SLEEP_SETTLE
-    seconds after the write, until one read is answered."""
+    seconds after the write, until one read is answered or the anchor
+    reboots."""
     target = "asleep" if sleeping else "operating"
     read_at = trio.current_time() + ANCHOR_SLEEP_SETTLE
     while True:
-        with trio.move_on_at(read_at):
+        with trio.move_on_at(read_at) as scope:
             async for event in events:
-                if (
-                    event.kind == "stats"
-                    and event.system_id == system_id
-                    and ext._power_state(system_id) == target
-                ):
+                if event.system_id != system_id:
+                    continue
+                if event.kind == "stats" and ext._power_state(system_id) == target:
                     return None
+                if event.kind in ("lost", "discovered"):
+                    # it reboots, so it took the write (a refusal never
+                    # reboots), and while booting it reads SLEEP 0
+                    scope.deadline = read_at = math.inf
         read_at = trio.current_time() + ANCHOR_SLEEP_POLL
         value = await _read_sleep(ext, system_id)
         if value is not None:

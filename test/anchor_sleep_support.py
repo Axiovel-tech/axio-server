@@ -26,7 +26,8 @@ class FakeAnchor(FakeDevice):
     reboots into the requested state, off the network for ``reboot_s``
     seconds, like rtls-link-zephyr's anchor (docs/reference/
     anchor-power-path.md). ``refuse_with`` makes it refuse instead,
-    reading back as that SLEEP value; ``hang`` accepts and never reboots.
+    reading back as that SLEEP value; ``hang`` accepts and never reboots;
+    ``boot_s`` keeps it ``booting`` (SLEEP 0) that long after the reboot.
     With ``in_place_sleep`` a sleep request in plain standby moves it to
     asleep without a reboot; it streams ``pwrst`` unless
     ``reports_power_state`` is off."""
@@ -41,6 +42,7 @@ class FakeAnchor(FakeDevice):
         in_place_sleep=False,
         reports_power_state=True,
         sleep_value=None,
+        boot_s=0.0,
     ):
         super().__init__(dialect)
         set_fake_param(self, "UWB_ROLE", 3, "uint8")
@@ -51,6 +53,8 @@ class FakeAnchor(FakeDevice):
         self.in_place_sleep = in_place_sleep
         self.reports_power_state = reports_power_state
         self.reboot_s = reboot_s
+        self.boot_s = boot_s
+        self.booted_at = None
         self.reboot_at = None
         self.target = None
         self.refuse_with = None
@@ -88,10 +92,16 @@ class FakeAnchor(FakeDevice):
                     self.expired = True
                     extension._expire_devices(time.monotonic() + 1000.0)
                 if now >= self.reboot_at + self.reboot_s:
-                    self.power = self.target
+                    self.power = "booting" if self.boot_s else self.target
+                    self.booted_at = now
                     self.reboot_at = None
-                    if self.power == "off":
+                    if self.power == "booting":
+                        # until the retained intent applies (firmware sleep_value)
+                        self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
+                    elif self.power == "off":
                         self.params["SLEEP"] = (bytes([2]), PARAM_TYPE_UINT8)
+            elif self.power == "booting" and now >= self.booted_at + self.boot_s:
+                self.power = self.target
             if not self.down:
                 await extension._process_datagram(
                     self.heartbeat(), self.address, time.monotonic()
