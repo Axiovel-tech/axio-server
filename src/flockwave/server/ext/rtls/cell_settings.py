@@ -23,8 +23,9 @@ a time. It:
    authorization now applies; otherwise reboots over SMP every running device
    that stores the target and the reference's channel and session but runs
    something else, A0 last. Asleep and standby devices apply it at their wake.
-   A written device whose run state is not known is not rebooted and leaves
-   the result ``incomplete`` ("restart needed").
+   A written device whose run state is not known ("restart needed") and a
+   device storing another channel or session than A0 are not rebooted and
+   leave the result ``incomplete``.
 """
 
 from __future__ import annotations
@@ -334,6 +335,10 @@ async def _restart_written(
     for sid, entry in results.items():
         if entry["written"] == "changed" and plan.get(int(sid)) is None:
             entry["detail"], unconfirmed = "restart needed", True
+    for sid, member in fresh.items():
+        if any(member.params.get(k) != v for k, v in session.items()):
+            detail = "different channel or session than A0"
+            results[str(sid)]["detail"], unconfirmed = detail, True
     to_reset = [fresh[sid] for sid, needed in plan.items() if needed]
     if not await _restart(ext, to_reset, results) or unconfirmed:
         return "incomplete", "Not every device restarted", results

@@ -213,6 +213,7 @@ async def test_resets_follow_the_state_after_the_writes(dialect, builder, hub, r
     )
     assert body["results"]["201"]["detail"] == "restart needed"
     assert "detail" not in body["results"][str(TAG)]
+    assert body["results"]["202"]["detail"] == "different channel or session than A0"
 
 
 async def test_an_awake_device_that_does_not_report_is_not_called_applied(
