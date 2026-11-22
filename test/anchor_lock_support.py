@@ -15,15 +15,17 @@ def _inf_broadcasts(extension):
     ]
 
 
-async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2))):
+async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2)), prepare=None):
     """An extension that discovered a tag (42) and the anchors given as
     (system id, UWB_ROLE, UWB_MAC), routed by address; returns it and the
-    devices by system id."""
+    devices by system id. ``prepare`` sees the devices before discovery."""
     tag = FakeDevice(dialect)
     set_fake_param(tag, "UWB_ROLE", 1, "uint8")
     devices = {tag.system_id: tag}
     for system_id, role, mac in anchors:
         devices[system_id] = _anchor(dialect, system_id, role, mac)
+    if prepare is not None:
+        prepare(devices)
     ext = RtlsExtension()
     ext._protocol = RtlsProtocol(dialect, targets=[])
     ext.app = StubApp()

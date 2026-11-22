@@ -35,6 +35,8 @@ from rtlslink import (
     param_type_to_name,
     parse_address,
 )
+from rtlslink.cell_settings import CODE_PARAMS as CELL_CODE_PARAMS
+from rtlslink.cell_settings import TX_GAIN_PARAM as CELL_TX_GAIN_PARAM
 from rtlslink.dialect import load_dialect
 from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
@@ -66,6 +68,7 @@ from .anchor_sleep import (
     sleep_error,
 )
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
+from .cell_settings import cell_json, device_states, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
@@ -448,6 +451,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                         "X-RTLS-FORGET": self._handle_RTLS_FORGET,
                         "X-RTLS-LOCK": self._handle_RTLS_LOCK,
+                        "X-RTLS-CELL": self._handle_RTLS_CELL,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -1217,8 +1221,10 @@ class RtlsExtension(Extension):
             # The drone's own telemetry rides its tag's snapshot so that one
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
-        if body.get("locked") != (self._stats.get(system_id) or {}).get("locked"):
-            self._inf_pending = True  # anchorLock follows the anchors' lock
+        previous = self._stats.get(system_id) or {}
+        if any(body.get(key) != previous.get(key) for key in ("locked", "cellConfig")):
+            # anchorLock and cellSettings follow the lock and cellcfg stats
+            self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
@@ -1521,6 +1527,7 @@ class RtlsExtension(Extension):
             "status": self._inf_status(now),
             "anchors": self._site_anchors(),
             "anchorLock": lock_json(self),
+            "cellSettings": cell_json(self),
         }
         await hub.broadcast_message(hub.create_notification(body))
 
@@ -1714,6 +1721,7 @@ class RtlsExtension(Extension):
                 "status": self._inf_status(time.monotonic()),
                 "anchors": self._site_anchors(),
                 "anchorLock": lock_json(self),
+                "cellSettings": cell_json(self),
             },
             in_response_to=message,
         )
@@ -2085,6 +2093,17 @@ class RtlsExtension(Extension):
         locked = None if accepted else locked_detail(self, system_id)
         return {} if locked is None else {"detail": locked}
 
+    async def _handle_RTLS_CELL(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        try:
+            body = await handle_cell_request(self, message.body)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        if body["results"]:
+            await self._on_inf_change(time.monotonic())
+        return hub.create_response_or_notification(body=body, in_response_to=message)
+
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
@@ -2179,6 +2198,10 @@ class RtlsExtension(Extension):
                 status[str(system_id)] = self._device_json(
                     device, now, None, None, online=False
                 )
+        for system_id, (state, detail) in device_states(self).items():
+            status[str(system_id)]["cellSettings"] = state
+            if detail is not None:
+                status[str(system_id)]["cellSettingsDetail"] = detail
         return status
 
     def _device_json(
@@ -2676,6 +2699,20 @@ def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
 def _missing_identity_param_names(
     params: dict[str, Any], role: str | None
 ) -> list[str]:
+    cell = [name for name in _cell_param_names(role) if name not in params]
+    return cell + _missing_naming_param_names(params, role)
+
+
+def _cell_param_names(role: str | None) -> tuple[str, ...]:
+    """The parameters the cell-settings state reads: the cell code's and, on an
+    anchor, its TX level. A name absent from an older registry costs the capped
+    refill rounds and is then left alone."""
+    if role in ANCHOR_ROLES:
+        return (*CELL_CODE_PARAMS, CELL_TX_GAIN_PARAM)
+    return CELL_CODE_PARAMS if role == "tag" else ()
+
+
+def _missing_naming_param_names(params: dict[str, Any], role: str | None) -> list[str]:
     """The identity params a device's snapshot must gain before its name
     (anchor A-index) or cell geometry (tag) can resolve — an empty list
     when nothing needs re-requesting.
@@ -2776,6 +2813,8 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("wdisc", "wifiDisconnects", int),
     ("wtxerr", "wifiTxErrors", int),
     ("boots", "bootCount", int),
+    # the code of the session the device runs (cell_settings.py)
+    ("cellcfg", "cellConfig", int),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),
