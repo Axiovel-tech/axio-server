@@ -9,9 +9,10 @@ is, in this order: ``unknown`` until it has reported what it runs and its
 stored settings are cached; ``restart`` while what it stores differs from what
 it runs and equals what A0 stores (with no reference: whenever the two
 differ), ``differ`` when it stores something else; ``unknown`` without a
-reference (for an anchor's TX level: without A0's); ``differ`` when it runs
-something else than A0; ``ok`` otherwise. Nothing is stored: the state is
-derived from the cached parameters and stats. One server is one cell.
+reference; ``differ`` when it runs something else than A0; an anchor
+``unknown`` while A0 reports no TX level, ``differ`` when its TX level is not
+A0's; ``ok`` otherwise. The state is derived from the cached parameters and
+stats, nothing is stored. One server is one cell.
 
 Apply refuses without a reference, writes the preset and the anchors' TX level
 to every online device that differs, rolls every write back when one fails,
@@ -69,7 +70,6 @@ _STATE_DETAILS = {
     "unknown": "cell settings not reported",
 }
 _TX_DETAIL = "different TX level"
-_NO_REFERENCE = "Cell settings: no A0 to compare"
 
 
 @dataclass(frozen=True)
@@ -211,7 +211,7 @@ def _not_ok(ext: "RtlsExtension") -> list[tuple[Optional[int], str]]:
     members = _members(ext)
     reference = _reference(members)
     if reference is None:
-        return [(None, _NO_REFERENCE)]
+        return [(None, "Cell settings: no A0 to compare")]
     found = []
     for member in members:
         state, detail = _state(member, reference)
