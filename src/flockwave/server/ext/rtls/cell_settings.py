@@ -1,21 +1,23 @@
 """Cell settings (X-RTLS-CELL): the ranging rate every device of the cell runs
 and the anchors' TX level.
 
-Every anchor and tag reads its session settings once at boot and reports the
-code of the session it runs as the ``cellcfg`` stat (anchors also their TX
-level as ``txgain``); the SDK computes the same code from a device's
-parameters (``rtlslink.cell_settings``). The cell's reference is the online
-initiator (A0): a device is ``restart`` while what it stores differs from what
-it runs, ``ok`` when it runs what A0 runs, ``differ`` otherwise and
-``unknown`` until it has reported both. Nothing is stored here: the state is
+Every anchor and tag reports the code of the session it booted with as the
+``cellcfg`` stat (anchors their TX level as ``txgain``); the SDK computes the
+same code from a device's parameters (``rtlslink.cell_settings``). The
+reference is the online initiator (A0) once it reports ``cellcfg``. A device
+is, in this order: ``unknown`` until it has reported what it runs and its
+stored settings are cached; ``restart`` while what it stores differs from what
+it runs and equals what A0 stores (with no reference: whenever the two
+differ), ``differ`` when it stores something else; ``unknown`` without a
+reference (for an anchor's TX level: without A0's); ``differ`` when it runs
+something else than A0; ``ok`` otherwise. Nothing is stored: the state is
 derived from the cached parameters and stats. One server is one cell.
 
-Apply reads what it has not cached yet, writes the preset (block, slots, slot
-length) and the anchors' TX level to every online device that differs, rolls
-every write back when one is refused or unanswered, then, from the state after
-the writes, reboots over SMP each running device that stores the target but
-runs something else, A0 last. A device asleep or in standby is written, not
-rebooted: its wake reboots it.
+Apply refuses without a reference, writes the preset and the anchors' TX level
+to every online device that differs, rolls every write back when one fails,
+then reboots over SMP each running device that stores the target but runs
+something else, A0 last. Asleep and standby devices are written, not
+rebooted; a written device whose run state is unknown leaves it incomplete.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ from rtlslink.cell_settings import (
 )
 
 from flockwave.server.ext.show.extension import authorizes_flight
+
+from .cell_compat import role_from_params
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -65,6 +69,7 @@ _STATE_DETAILS = {
     "unknown": "cell settings not reported",
 }
 _TX_DETAIL = "different TX level"
+_NO_REFERENCE = "Cell settings: no A0 to compare"
 
 
 @dataclass(frozen=True)
@@ -78,8 +83,9 @@ class _Member:
     params: dict[str, Any]
     running: Optional[int]
     running_tx: Optional[int]
-    #: an operating anchor or an awake tag: the device a reboot applies to
-    operating: bool
+    #: an operating anchor or an awake tag: the device a reboot applies to;
+    #: None for an anchor that has not reported its power state
+    operating: Optional[bool]
 
     @property
     def anchor(self) -> bool:
@@ -104,26 +110,31 @@ class _Member:
 
 
 def _members(ext: "RtlsExtension") -> list[_Member]:
+    """The online devices, each with the role its own cache reports (never one
+    retained from an earlier device with that system id)."""
     from .extension import _decoded_device_params, _device_name
 
     devices = ext._protocol.devices if ext._protocol else {}
     members = []
     for device in sorted(devices.values(), key=lambda d: d.system_id):
-        role = ext._device_role(device.system_id)
+        params = _decoded_device_params(device)
+        role = role_from_params(params)
         if role == "disabled":
             continue
-        params = _decoded_device_params(device)
         identity = {**ext._retained_params.get(device.system_id, {}), **params}
         stats = ext._fresh_stats(device.system_id) or {}
+        power = ext._power_state(device.system_id)
         if role == "tag":
             operating = not getattr(device, "sleeping", False)
         else:
-            operating = ext._power_state(device.system_id) == "operating"
+            operating = None if power is None else power == "operating"
         running, running_tx = stats.get("cellConfig"), stats.get("txGain")
         members.append(
             _Member(
                 system_id=device.system_id,
-                name=_device_name(device.system_id, identity, role)
+                name=_device_name(
+                    device.system_id, identity, ext._device_role(device.system_id)
+                )
                 or str(device.system_id),
                 role=role,
                 address=tuple(device.address),
@@ -137,12 +148,15 @@ def _members(ext: "RtlsExtension") -> list[_Member]:
 
 
 def _reference(members: list[_Member]) -> Optional[_Member]:
-    return next((m for m in members if m.role == "anchor-initiator"), None)
+    """The online A0 once it reports what it runs."""
+    return next(
+        (m for m in members if m.role == "anchor-initiator" and m.running is not None),
+        None,
+    )
 
 
 def _state(member: _Member, reference: Optional[_Member]) -> tuple[str, Optional[str]]:
-    """unknown until reported; restart while it stores A0's settings and runs
-    others; ok when it runs what A0 runs; differ otherwise."""
+    """The device's state against the reference (module docstring)."""
     reported = (member.running, member.stored)
     if member.anchor:
         reported += (member.running_tx, member.tx_gain)
@@ -156,10 +170,12 @@ def _state(member: _Member, reference: Optional[_Member]) -> tuple[str, Optional
             and (not member.anchor or member.tx_gain == reference.tx_gain)
         )
         return ("restart" if stores_reference else "differ"), None
-    if reference is None or reference.running is None:
+    if reference is None:
         return "unknown", None
     if member.running != reference.running:
         return "differ", None
+    if member.anchor and reference.running_tx is None:
+        return "unknown", None
     if member.anchor and member.running_tx != reference.running_tx:
         return "differ", _TX_DETAIL
     return "ok", None
@@ -189,13 +205,13 @@ def cell_view(
     return summary, states
 
 
-def _not_ok(ext: "RtlsExtension") -> list[tuple[int, str]]:
+def _not_ok(ext: "RtlsExtension") -> list[tuple[Optional[int], str]]:
     """``(system id, "<name>: <what>")`` of every online device that is not ok;
-    none without A0, whose absence the lock and Verify report themselves."""
+    without a reference one ``(None, why)`` for the whole cell."""
     members = _members(ext)
     reference = _reference(members)
     if reference is None:
-        return []
+        return [(None, _NO_REFERENCE)]
     found = []
     for member in members:
         state, detail = _state(member, reference)
@@ -254,18 +270,15 @@ def _request(body: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
 
 
 def _target(
-    rate: Optional[int], tx: Optional[int], reference: Optional[_Member]
+    rate: Optional[int], tx: Optional[int], reference: _Member
 ) -> dict[str, int]:
     """Every parameter value the request asks of the cell, the reference's for
-    what it leaves out. Raises ValueError without a rate or a reference."""
-    ref = reference.params if reference is not None else {}
+    what it leaves out."""
     if rate is not None:
         target = preset(rate)
-    elif reference is not None:
-        target = {name: int(ref[name]) for name in _RATE_PARAMS}
     else:
-        raise ValueError("rateHz is required while A0 is not online")
-    tx = tx if tx is not None else (reference.tx_gain if reference else None)
+        target = {name: int(reference.params[name]) for name in _RATE_PARAMS}
+    tx = tx if tx is not None else reference.tx_gain
     if tx is not None:
         target[TX_GAIN_PARAM] = tx
     return target
@@ -278,16 +291,19 @@ def _wanted(member: _Member, target: dict[str, int]) -> dict[str, int]:
 
 def _needs_reset(
     member: _Member, target: dict[str, int], session: dict[str, Any]
-) -> bool:
+) -> Optional[bool]:
     """Whether a reboot makes ``member`` run the target: it is running, stores
-    the target and the cell's channel and session, and runs something else."""
+    the target and the cell's channel and session, and runs something else.
+    None when it stores them but whether it runs is not known."""
     stores = {**session, **_wanted(member, target)}
-    if not member.operating or any(
+    if member.operating is False or any(
         member.params.get(k) != v for k, v in stores.items()
     ):
         return False
+    if member.operating is None or member.running is None:
+        return None
     stale_tx = member.anchor and member.running_tx not in (None, member.tx_gain)
-    return member.running not in (None, member.stored) or stale_tx
+    return member.running != member.stored or stale_tx
 
 
 async def _write(
@@ -299,8 +315,8 @@ async def _write(
         ack = await ext.set_param(member.system_id, name, value, _PARAM_TYPES[name])
     except trio.TooSlowError:
         return f"{member.name}: no answer to {name}={value}", False
-    except (KeyError, ValueError) as ex:
-        return f"{member.name}: {ex or 'offline'}", True
+    except KeyError:
+        return f"{member.name}: offline", True
     if not ack["accepted"]:
         return f"{member.name} refused {name}={value}", True
     if int(ack["value"]) != value:
@@ -357,9 +373,7 @@ async def _restart(
 
     async def restart(member: _Member) -> None:
         nonlocal failed
-        entry = results.setdefault(
-            str(member.system_id), {"written": "unchanged", "restarted": False}
-        )
+        entry = results[str(member.system_id)]
         port = ext._smp_ports.get(member.address, ota.SMP_PORT)
         try:
             await trio.to_thread.run_sync(
@@ -381,22 +395,36 @@ async def _restart(
     return not failed
 
 
+def _preflight(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
+    """Why nothing may be written to ``members`` now, if anything."""
+    if not members:
+        return "No online devices"
+    reason = _refusal(ext, members)
+    if reason is not None:
+        return reason
+    unread = [m.name for m in members if m.missing]
+    if unread:
+        return f"{', '.join(unread)}: settings not read yet"
+    if _reference(members) is None:
+        return "A0 is offline"
+    return None
+
+
 async def _apply(
     ext: "RtlsExtension", rate: Optional[int], tx: Optional[int]
 ) -> tuple[str, Optional[str], dict[str, dict[str, Any]]]:
     members = _members(ext)
-    if not members:
-        return "refused", "No online devices", {}
-    reason = _refusal(ext, members)
+    for _ in range(2):  # a role read in the first pass names what the second reads
+        incomplete = [m for m in members if m.missing]
+        if not incomplete:
+            break
+        await _read_missing(ext, incomplete)
+        members = _members(ext)
+    reason = _preflight(ext, members)
     if reason is not None:
         return "refused", reason, {}
-    for _ in range(2):  # a role read in the first pass names what the second reads
-        await _read_missing(ext, members)
-        members = _members(ext)
-    unread = [m.name for m in members if m.missing]
-    if unread:
-        return "refused", f"{', '.join(unread)}: settings not read yet", {}
     reference = _reference(members)
+    assert reference is not None
     target = _target(rate, tx, reference)
 
     results = {
@@ -405,11 +433,13 @@ async def _apply(
     undo: dict[int, list[tuple[str, Any]]] = {}
 
     async def write(member: _Member) -> None:
-        entry, writes = (
-            results[str(member.system_id)],
-            undo.setdefault(member.system_id, []),
-        )
-        for name, value in _wanted(member, target).items():
+        entry = results[str(member.system_id)]
+        writes = undo.setdefault(member.system_id, [])
+        wanted = _wanted(member, target)
+        if wanted["UWB_BLOCK_MS"] < member.params["UWB_BLOCK_MS"]:
+            # the round shrinks before the block does, so each step stays valid
+            wanted["UWB_BLOCK_MS"] = wanted.pop("UWB_BLOCK_MS")
+        for name, value in wanted.items():
             if member.params[name] == value:
                 continue
             writes.append((name, member.params[name]))
@@ -427,21 +457,21 @@ async def _apply(
             nursery.start_soon(write, member)
     if any(entry["written"] == "failed" for entry in results.values()):
         await _roll_back(ext, members, undo, results)
-        return (
-            "incomplete",
-            "Not every device took the change; nothing was restarted",
-            results,
-        )
+        reason = "Not every device took the change; nothing was restarted"
+        return "incomplete", reason, results
 
-    fresh = _members(ext)
-    reason = _refusal(ext, fresh)
+    fresh = {m.system_id: m for m in _members(ext) if str(m.system_id) in results}
+    reason = _refusal(ext, list(fresh.values()))
     if reason is not None:
         return "incomplete", f"{reason}; nothing was restarted", results
-    session = (
-        {name: reference.params[name] for name in _SESSION_PARAMS} if reference else {}
-    )
-    to_reset = [m for m in fresh if _needs_reset(m, target, session)]
-    if not await _restart(ext, to_reset, results):
+    session = {name: reference.params[name] for name in _SESSION_PARAMS}
+    plan = {sid: _needs_reset(m, target, session) for sid, m in fresh.items()}
+    unconfirmed = False
+    for sid, entry in results.items():
+        if entry["written"] == "changed" and plan.get(int(sid)) is None:
+            entry["detail"], unconfirmed = "restart needed", True
+    to_reset = [fresh[sid] for sid, needed in plan.items() if needed]
+    if not await _restart(ext, to_reset, results) or unconfirmed:
         return "incomplete", "Not every device restarted", results
     return "applied", None, results
 
@@ -451,23 +481,17 @@ async def handle_cell_request(
 ) -> dict[str, Any]:
     """The X-RTLS-CELL response body. Raises ValueError for an invalid
     request."""
-    action = body.get("action", "status")
-    if action not in ("status", "apply"):
-        raise ValueError(f"Invalid action: {action!r} (expected status or apply)")
-    result, reason, results = action, None, {}
-    if action == "apply":
-        rate, tx = _request(body)
-        if ext._cell_applying:
-            result, reason = "refused", "An apply is running"
-        else:
-            ext._cell_applying = True
-            try:
-                result, reason, results = await _apply(ext, rate, tx)
-            finally:
-                ext._cell_applying = False
+    rate, tx = _request(body)
+    if ext._cell_applying:
+        result, reason, results = "refused", "An apply is running", {}
+    else:
+        ext._cell_applying = True
+        try:
+            result, reason, results = await _apply(ext, rate, tx)
+        finally:
+            ext._cell_applying = False
     return {
         "type": "X-RTLS-CELL",
-        "action": action,
         "result": result,
         "reason": reason,
         "results": results,

@@ -111,7 +111,7 @@ async def test_lock_with_warnings_needs_acknowledgement(dialect, builder, hub):
 async def test_lock_warnings(dialect, builder, hub):
     ext, _ = await _cell(dialect, anchors=())
     body = await _lock(ext, builder, hub, action="status")
-    assert [w["code"] for w in body["warnings"]] == ["no-anchors"]
+    assert [w["code"] for w in body["warnings"]] == ["no-anchors", "cell-settings"]
 
     ext, _ = await _cell(dialect)
     await ext._on_stats(201, HEALTHY_A0, time.monotonic())
@@ -123,7 +123,7 @@ async def test_lock_warnings(dialect, builder, hub):
     ]
     ext._expire_devices(time.monotonic() + 1000)
     body = await _lock(ext, builder, hub, action="status")
-    assert {w["code"] for w in body["warnings"]} == {"offline"}
+    assert {w["code"] for w in body["warnings"]} == {"offline", "cell-settings"}
 
 
 async def test_a_refused_write_is_reported(dialect, builder, hub):
