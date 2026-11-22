@@ -89,10 +89,11 @@ enables it.
   answers the show extension (`show_start_refusal()`) before it authorizes a
   flight.
 - **Cell settings are derived, never stored.** Each board reports the code
-  of the session it booted with (`cellcfg`); the server compares it with the
-  code of its cached parameters and with A0's, and `X-RTLS-CELL` writes the
-  ranging rate and the anchors' TX level, then reboots the running boards
-  (A0 last). One server is one cell.
+  of the session it booted with (`cellcfg`, anchors also `txgain`); the
+  server compares it with the code of its cached parameters and with what A0
+  runs, and `X-RTLS-CELL` writes the ranging rate and the anchors' TX level,
+  then reboots the running boards the state after the writes calls for (A0
+  last). One apply at a time; one server is one cell.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.

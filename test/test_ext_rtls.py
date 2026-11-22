@@ -2891,7 +2891,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
     extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
     a0 = add_anchor_device(extension, 200, role=2, uwb_mac=1)
     add_session_params(a0, anchor=True, setter=set_cached_param)
-    extension._stats[200] = {"id": 200, "cellConfig": SESSION_CODE}
+    extension._stats[200] = {"id": 200, "cellConfig": SESSION_CODE, "txGain": 47}
     extension._stats_at[200] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
         extension._stats[sysid] = {

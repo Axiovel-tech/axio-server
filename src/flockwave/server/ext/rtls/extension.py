@@ -68,7 +68,7 @@ from .anchor_sleep import (
     sleep_error,
 )
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .cell_settings import cell_json, device_states, handle_cell_request
+from .cell_settings import cell_view, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
@@ -279,6 +279,8 @@ class RtlsExtension(Extension):
         #: publish their own port in the sim manifest, which the generated
         #: config forwards (rtlslink.sim.gcs_config_from_manifest).
         self._smp_ports: dict[tuple[str, int], int] = {}
+        #: an X-RTLS-CELL apply is running (cell_settings.py: one at a time)
+        self._cell_applying = False
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
@@ -1222,8 +1224,11 @@ class RtlsExtension(Extension):
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
         previous = self._stats.get(system_id) or {}
-        if any(body.get(key) != previous.get(key) for key in ("locked", "cellConfig")):
-            # anchorLock and cellSettings follow the lock and cellcfg stats
+        if any(
+            body.get(key) != previous.get(key)
+            for key in ("locked", "cellConfig", "txGain")
+        ):
+            # anchorLock and cellSettings follow the lock, cellcfg and txgain stats
             self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
@@ -1522,14 +1527,7 @@ class RtlsExtension(Extension):
             self._warn_no_app()
             return
         hub = self.app.message_hub
-        body = {
-            "type": "X-RTLS-INF",
-            "status": self._inf_status(now),
-            "anchors": self._site_anchors(),
-            "anchorLock": lock_json(self),
-            "cellSettings": cell_json(self),
-        }
-        await hub.broadcast_message(hub.create_notification(body))
+        await hub.broadcast_message(hub.create_notification(self._inf_body(now)))
 
     # ---- tag<->drone association ----
 
@@ -1716,14 +1714,7 @@ class RtlsExtension(Extension):
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
         return hub.create_response_or_notification(
-            body={
-                "type": "X-RTLS-INF",
-                "status": self._inf_status(time.monotonic()),
-                "anchors": self._site_anchors(),
-                "anchorLock": lock_json(self),
-                "cellSettings": cell_json(self),
-            },
-            in_response_to=message,
+            body=self._inf_body(time.monotonic()), in_response_to=message
         )
 
     async def _handle_RTLS_PARAM_LIST(
@@ -2181,10 +2172,26 @@ class RtlsExtension(Extension):
         ):
             del self._retained_params[system_id]
 
-    def _inf_status(self, now: float) -> dict[str, dict[str, Any]]:
+    def _inf_body(self, now: float) -> dict[str, Any]:
+        """The X-RTLS-INF body of the query response and the broadcast."""
+        cell, cell_states = cell_view(self)
+        return {
+            "type": "X-RTLS-INF",
+            "status": self._inf_status(now, cell_states),
+            "anchors": self._site_anchors(),
+            "anchorLock": lock_json(self),
+            "cellSettings": cell,
+        }
+
+    def _inf_status(
+        self,
+        now: float,
+        cell_states: dict[int, tuple[str, str | None]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """The full X-RTLS-INF status map: one entry per live or lost
-        device, keyed by system id (as string). Shared by the query response
-        and the gained/lost broadcast so both carry the same body shape."""
+        device, keyed by system id (as string), with each live device's cell
+        settings state (``cell_states``, from :func:`cell_view` unless
+        given)."""
         devices = self._protocol.devices if self._protocol else {}
         claims, uav_ids = self._associations()
         status = {
@@ -2198,7 +2205,9 @@ class RtlsExtension(Extension):
                 status[str(system_id)] = self._device_json(
                     device, now, None, None, online=False
                 )
-        for system_id, (state, detail) in device_states(self).items():
+        if cell_states is None:
+            cell_states = cell_view(self)[1]
+        for system_id, (state, detail) in cell_states.items():
             status[str(system_id)]["cellSettings"] = state
             if detail is not None:
                 status[str(system_id)]["cellSettingsDetail"] = detail
@@ -2813,8 +2822,9 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("wdisc", "wifiDisconnects", int),
     ("wtxerr", "wifiTxErrors", int),
     ("boots", "bootCount", int),
-    # the code of the session the device runs (cell_settings.py)
+    # the code and TX level of the session the device runs (cell_settings.py)
     ("cellcfg", "cellConfig", int),
+    ("txgain", "txGain", int),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),

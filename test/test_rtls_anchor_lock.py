@@ -9,6 +9,7 @@ import pytest
 import trio
 import trio.testing
 from anchor_lock_support import (
+    CODE_50,
     HEALTHY_A0,
     HEALTHY_A1,
     _anchor,
@@ -269,9 +270,10 @@ async def test_a_board_without_a_power_path_locks(dialect, builder, hub):
     # such a board reports only pwrst 5 (operating); that is enough
     ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
     anchor = devices[201]
-    await ext._process_datagram(
-        anchor.named_value_float("pwrst", 5.0), anchor.address, time.monotonic()
-    )
+    for name, value in (("pwrst", 5.0), ("cellcfg", CODE_50), ("txgain", 47.0)):
+        await ext._process_datagram(
+            anchor.named_value_float(name, value), anchor.address, time.monotonic()
+        )
 
     body = await _lock(ext, builder, hub)
 

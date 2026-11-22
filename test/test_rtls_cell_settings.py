@@ -5,25 +5,19 @@ writes, rolls back on a refusal and reboots the running devices with A0 last."""
 import time
 
 import pytest
-from anchor_lock_support import HEALTHY_A0, HEALTHY_A1, _cell, _lock
-from rtls_support import make_message, set_fake_param
+import trio.testing
+from anchor_lock_support import CODE_50, HEALTHY_A0, HEALTHY_A1, SESSION, _cell, _lock
+from rtls_support import make_message
+from rtlslink import ota
 from rtlslink.cell_settings import code
 from rtlslink.dialect import load_dialect
 
-from flockwave.server.ext.rtls import cell_settings
 from flockwave.server.ext.rtls.verify import run_verify
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
-SESSION = {
-    "UWB_CHANNEL": 9,
-    "UWB_SESSION_ID": 0x11223344,
-    "UWB_SLOT_RSTU": 1200,
-    "UWB_SLOTS_RR": 12,
-}
-CODE_50 = code({**SESSION, "UWB_BLOCK_MS": 20})
-CODE_83 = code({**SESSION, "UWB_BLOCK_MS": 12})
+CODE_83 = code({**{k: v for k, (v, _) in SESSION.items()}, "UWB_BLOCK_MS": 12})
 TAG = 42
 
 
@@ -46,36 +40,28 @@ def builder():
 def resets(monkeypatch):
     """The SMP resets the apply sends, in order, as (host, port)."""
     sent = []
-
-    async def reset(host, port):
-        sent.append((host, port))
-
-    monkeypatch.setattr(cell_settings, "_reset_device", reset)
+    monkeypatch.setattr(ota, "reset", lambda host, port: sent.append((host, port)))
     return sent
 
 
-def _session_params(devices, block_ms=20):
-    for system_id, device in devices.items():
-        set_fake_param(device, "UWB_CHANNEL", 9, "uint8")
-        set_fake_param(device, "UWB_SESSION_ID", 0x11223344, "uint32")
-        set_fake_param(device, "UWB_BLOCK_MS", block_ms, "uint16")
-        set_fake_param(device, "UWB_SLOT_RSTU", 1200, "uint16")
-        set_fake_param(device, "UWB_SLOTS_RR", 12, "uint8")
-        if system_id != TAG:
-            set_fake_param(device, "UWB_TX_GAIN", 47, "uint8")
+@pytest.fixture
+def autojump_clock():
+    return trio.testing.MockClock(autojump_threshold=0)
 
 
-async def _running(ext, codes):
-    """Each device reports the code it runs (anchors operating)."""
+async def _running(ext, codes, tx=47, **stats):
+    """Each device reports the code (anchors also the TX level) it runs;
+    anchors operating unless ``stats`` say otherwise."""
     for system_id, running in codes.items():
-        stats = {"cellcfg": float(running)}
+        body = {"cellcfg": float(running)}
         if system_id != TAG:
-            stats.update(HEALTHY_A0 if system_id == 201 else HEALTHY_A1)
-        await ext._on_stats(system_id, stats, time.monotonic())
+            healthy = HEALTHY_A0 if system_id == 201 else HEALTHY_A1
+            body = {**healthy, **stats, **body, "txgain": float(tx)}
+        await ext._on_stats(system_id, body, time.monotonic())
 
 
 async def _converged_cell(dialect, running=CODE_50):
-    ext, devices = await _cell(dialect, prepare=_session_params)
+    ext, devices = await _cell(dialect)
     await _running(ext, {TAG: running, 201: running, 202: running})
     return ext, devices
 
@@ -113,20 +99,32 @@ async def test_a_converged_cell_reads_ok(dialect, builder, hub):
     assert _states(ext) == {TAG: ("ok", None), 201: ("ok", None), 202: ("ok", None)}
 
 
-async def test_states_follow_stored_and_running_codes(dialect):
-    ext, _ = await _cell(dialect, prepare=_session_params)
+async def test_states_compare_what_runs_with_what_a0_runs(dialect):
+    ext, _ = await _cell(dialect)
+    ext._stats.pop(TAG)
     await _running(ext, {201: CODE_50, 202: CODE_83})
     # 202 stores A0's settings but runs others; the tag has not reported
     assert _states(ext)[202] == ("restart", None)
     assert _states(ext)[TAG] == ("unknown", None)
 
-    await ext.set_param(202, "UWB_BLOCK_MS", 30, "uint16")
-    await ext.set_param(201, "UWB_TX_GAIN", 20, "uint8")
+    # A0 stores 83 Hz but still runs 50 Hz: a peer running 83 Hz is not with it
+    await ext.set_param(201, "UWB_BLOCK_MS", 12, "uint16")
+    await ext.set_param(202, "UWB_BLOCK_MS", 12, "uint16")
+    await _running(ext, {TAG: CODE_50})
     states = _states(ext)
+    assert states[201] == ("restart", None)
     assert states[202] == ("differ", None)
-    # TX is not in the code: A0 stays ok, 202 now differs from its level
-    assert states[201] == ("ok", None)
-    await ext.set_param(202, "UWB_BLOCK_MS", 20, "uint16")
+    assert states[TAG] == ("ok", None)
+    # storing what A0 does not store: a reboot would not bring it in
+    await ext.set_param(202, "UWB_BLOCK_MS", 30, "uint16")
+    assert _states(ext)[202] == ("differ", None)
+
+
+async def test_a_different_tx_level_differs(dialect):
+    ext, _ = await _converged_cell(dialect)
+    await ext.set_param(202, "UWB_TX_GAIN", 20, "uint8")
+    assert _states(ext)[202] == ("differ", None)
+    await _running(ext, {202: CODE_50}, tx=20)
     assert _states(ext)[202] == ("differ", "different TX level")
 
 
@@ -178,9 +176,7 @@ async def test_a_refused_write_rolls_every_write_back(dialect, builder, hub, res
 
 async def test_an_asleep_device_is_written_not_restarted(dialect, builder, hub, resets):
     ext, devices = await _converged_cell(dialect)
-    await ext._on_stats(
-        202, {**HEALTHY_A1, "pwrst": 3.0, "cellcfg": float(CODE_50)}, 0.0
-    )
+    await _running(ext, {202: CODE_50}, pwrst=3.0)
 
     body = await _request(ext, builder, hub, action="apply", rateHz=33)
 
@@ -207,13 +203,11 @@ async def test_apply_is_refused_while_locked_or_a_show_is_authorized(
     dialect, builder, hub, resets
 ):
     ext, devices = await _converged_cell(dialect)
-    await ext._on_stats(
-        202, {**HEALTHY_A1, "lock": 1.0, "cellcfg": float(CODE_50)}, 0.0
-    )
+    await _running(ext, {202: CODE_50}, lock=1.0)
     body = await _request(ext, builder, hub, action="apply", rateHz=83)
     assert (body["result"], body["reason"]) == ("refused", "Unlock the anchors first")
 
-    await ext._on_stats(202, {**HEALTHY_A1, "cellcfg": float(CODE_50)}, 0.0)
+    await _running(ext, {202: CODE_50})
 
     class Show:
         authorized_to_start = True
@@ -254,3 +248,182 @@ async def test_lock_warns_and_verify_fails_on_a_device_that_differs(
     rule = next(rule for rule in verify["rules"] if rule["id"] == "cell")
     assert (rule["status"], rule["severity"]) == ("fail", "error")
     assert rule["detail"] == "RTLS anchor 202: different cell settings"
+
+
+def _lose_acks(device, dialect, name, *, after=0):
+    """``device`` stores every write of ``name`` but the acks after the first
+    ``after`` are lost."""
+    handle, parser, acked = device.handle, dialect.MAVLink(None), [0]
+
+    def lossy(data):
+        out = []
+        for reply in handle(data):
+            message = (parser.parse_buffer(reply) or [None])[0]
+            if message is not None and message.get_type() == "PARAM_EXT_ACK":
+                if message.param_id == name:
+                    acked[0] += 1
+                    if acked[0] > after:
+                        continue
+            out.append(reply)
+        return out
+
+    device.handle = lossy
+
+
+async def test_an_unanswered_write_is_rolled_back_too(
+    dialect, builder, hub, resets, autojump_clock
+):
+    ext, devices = await _converged_cell(dialect)
+    _lose_acks(devices[202], dialect, "UWB_BLOCK_MS")
+
+    body = await _request(ext, builder, hub, action="apply", rateHz=83)
+
+    assert body["result"] == "incomplete"
+    assert body["results"]["202"]["written"] == "failed"
+    # 202 stored 12 ms though its ack was lost: the rollback restores it
+    assert all(_param(device, "UWB_BLOCK_MS") == 20 for device in devices.values())
+    assert resets == []
+
+
+async def test_rollback_attempts_every_restore(
+    dialect, builder, hub, resets, autojump_clock
+):
+    ext, devices = await _converged_cell(dialect)
+    devices[TAG].set_result = 2  # an armed tag refuses
+    _lose_acks(devices[202], dialect, "UWB_TX_GAIN", after=1)
+
+    body = await _request(ext, builder, hub, action="apply", rateHz=83, txGain=60)
+
+    # the TX restore's ack is lost; the block is restored all the same
+    assert _param(devices[202], "UWB_BLOCK_MS") == 20
+    assert _param(devices[202], "UWB_TX_GAIN") == 47
+    assert body["results"]["202"]["detail"].startswith("rollback failed: ")
+    assert _param(devices[201], "UWB_BLOCK_MS") == 20 and resets == []
+
+
+async def test_one_apply_at_a_time(dialect, builder, hub, resets):
+    ext, devices = await _converged_cell(dialect)
+    ext._cell_applying = True
+    body = await _request(ext, builder, hub, action="apply", rateHz=83)
+    assert (body["result"], body["reason"]) == ("refused", "An apply is running")
+    assert _param(devices[201], "UWB_BLOCK_MS") == 20 and resets == []
+
+
+def _dropped_from_dump(name, *, answers=True):
+    def prepare(devices):
+        devices[202].drop_from_list = {name}
+        devices[202].respond_to_read = answers
+
+    return prepare
+
+
+async def test_a_setting_missing_from_the_dump_is_read_before_writing(
+    dialect, builder, hub, resets
+):
+    ext, devices = await _cell(dialect, prepare=_dropped_from_dump("UWB_TX_GAIN"))
+    await _running(ext, {TAG: CODE_50, 201: CODE_50, 202: CODE_50})
+
+    body = await _request(ext, builder, hub, action="apply", txGain=60)
+
+    assert body["result"] == "applied"
+    assert _param(devices[202], "UWB_TX_GAIN") == 60
+
+
+async def test_a_setting_that_cannot_be_read_refuses_the_whole_apply(
+    dialect, builder, hub, resets, autojump_clock
+):
+    for name in ("UWB_ROLE", "UWB_BLOCK_MS"):
+        prepare = _dropped_from_dump(name, answers=False)
+        ext, devices = await _cell(dialect, prepare=prepare)
+        await _running(ext, {TAG: CODE_50, 201: CODE_50, 202: CODE_50})
+
+        body = await _request(ext, builder, hub, action="apply", rateHz=83)
+
+        assert body["result"] == "refused", name
+        assert body["reason"].endswith("202: settings not read yet"), name
+        assert _param(devices[201], "UWB_BLOCK_MS") == 20 and resets == []
+
+
+async def test_a_preset_sets_block_slots_and_slot_length(dialect, builder, hub, resets):
+    ext, devices = await _cell(dialect)
+    for system_id in devices:
+        await ext.set_param(system_id, "UWB_SLOTS_RR", 16, "uint8")
+        await ext.set_param(system_id, "UWB_SLOT_RSTU", 1000, "uint16")
+    assert (await _request(ext, builder, hub))["cellSettings"]["rateHz"] is None
+
+    await _request(ext, builder, hub, action="apply", rateHz=83)
+
+    for device in devices.values():
+        assert _param(device, "UWB_BLOCK_MS") == 12
+        assert _param(device, "UWB_SLOTS_RR") == 12
+        assert _param(device, "UWB_SLOT_RSTU") == 1200
+
+
+async def test_a_show_authorized_during_the_writes_stops_the_resets(
+    dialect, builder, hub, resets
+):
+    ext, _ = await _converged_cell(dialect)
+    authorized = []
+
+    class Api:
+        def get_configuration(self):
+            class Show:
+                authorized_to_start = bool(authorized)
+                authorization_scope = AuthorizationScope.REHEARSAL
+
+            return Show()
+
+    ext.app.import_api = lambda name: Api()
+    write = ext.set_param
+
+    async def set_param(*args, **kwargs):
+        authorized.append(True)  # another client authorizes rehearsal meanwhile
+        return await write(*args, **kwargs)
+
+    ext.set_param = set_param
+    body = await _request(ext, builder, hub, action="apply", rateHz=83)
+
+    assert body["result"] == "incomplete"
+    assert body["reason"] == "A show is authorized; nothing was restarted"
+    assert resets == []
+    assert body["cellSettings"]["restart"] == [TAG, 201, 202]
+
+
+async def test_resets_follow_the_state_after_the_writes(dialect, builder, hub, resets):
+    ext, devices = await _converged_cell(dialect)
+    # 202 stores another channel; A0's power state is unknown
+    await ext.set_param(202, "UWB_CHANNEL", 5, "uint8")
+    await ext._on_stats(201, {"cellcfg": float(CODE_50), "txgain": 47.0}, 0.0)
+    write = ext.set_param
+
+    async def set_param(system_id, *args, **kwargs):
+        ack = await write(system_id, *args, **kwargs)
+        if system_id == TAG:  # the tag rebooted on its own right after its write
+            await _running(ext, {TAG: CODE_83})
+        return ack
+
+    ext.set_param = set_param
+    body = await _request(ext, builder, hub, action="apply", rateHz=83)
+
+    assert body["result"] == "applied"
+    assert resets == []
+    assert _states(ext)[202] == ("differ", None)
+
+
+async def test_no_online_device_refuses(dialect, builder, hub, resets):
+    ext, _ = await _converged_cell(dialect)
+    ext._protocol.devices.clear()
+    body = await _request(ext, builder, hub, action="apply", rateHz=83)
+    assert (body["result"], body["reason"]) == ("refused", "No online devices")
+
+
+async def test_lock_warns_on_a_device_that_has_not_reported(dialect, builder, hub):
+    ext, _ = await _cell(dialect)
+    ext._stats.pop(TAG)
+    await _running(ext, {201: CODE_50, 202: CODE_50})
+
+    body = await _lock(ext, builder, hub)
+
+    assert [(w["code"], w["detail"]) for w in body["warnings"]] == [
+        ("cell-settings", f"RTLS tag {TAG}: cell settings not reported")
+    ]

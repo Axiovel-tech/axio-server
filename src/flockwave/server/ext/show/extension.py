@@ -23,10 +23,10 @@ from .config import (
 )
 from .logging import ShowUploadLoggingMiddleware
 
-__all__ = ("construct", "dependencies", "description")
+__all__ = ("authorizes_flight", "construct", "dependencies", "description")
 
 
-def _authorizes_flight(config: DroneShowConfiguration) -> bool:
+def authorizes_flight(config: DroneShowConfiguration) -> bool:
     """Whether a configuration lets the drones fly the show (live or
     rehearsal; lights-only authorizations do not take off)."""
     return config.authorized_to_start and config.authorization_scope in (
@@ -314,10 +314,10 @@ class DroneShowExtension(Extension):
         locked). An abort is never refused: revoking, and clearing an
         existing start whatever else the update changes; nor is a
         lights-only authorization or removing drones."""
-        if updated is None or not _authorizes_flight(updated):
+        if updated is None or not authorizes_flight(updated):
             return
         current = self._config
-        if _authorizes_flight(current):
+        if authorizes_flight(current):
             if (
                 updated.start_time_on_clock is None
                 and current.start_time_on_clock is not None
