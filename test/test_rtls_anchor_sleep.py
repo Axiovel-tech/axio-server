@@ -125,9 +125,30 @@ async def test_an_accepted_write_answers_from_the_ack(
         (
             "asleep",
             False,
-            {"vbat": 3.25},
+            {"pwrin": 1, "vbat": 3.25, "lowbat": 1},
             "wake refused by the anchor: its pack is low or has no fresh "
             "voltage reading (last 3.25 V)",
+        ),
+        (
+            "asleep",
+            False,
+            {"pwrin": 1},
+            "wake refused by the anchor: its pack is low or has no fresh "
+            "voltage reading",
+        ),
+        # the pack cannot be the reason: on PoE (a second wake while the
+        # first one's reboot is pending), or a healthy pack
+        (
+            "standby",
+            False,
+            {"pwrin": 5, "vbat": 4.10},
+            "wake refused by the anchor in its standby state",
+        ),
+        (
+            "asleep",
+            False,
+            {"pwrin": 1, "vbat": 4.10, "lowbat": 0},
+            "wake refused by the anchor in its asleep state",
         ),
         (
             "off",
@@ -203,6 +224,50 @@ async def test_inf_sleeping_comes_from_the_power_state(dialect, power, asleep):
     ext = await _extension(dialect, anchor)
 
     assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is asleep
+
+
+async def test_falling_asleep_in_place_pushes_inf(dialect):
+    """Standby and asleep heartbeat the same STANDBY: the powerState change
+    alone must push X-RTLS-INF, not the 10 s refresh."""
+    anchor = FakeAnchor(dialect, "standby")
+    ext = await _extension(dialect, anchor)
+    ext._inf_pending = False
+    await anchor.report(ext)
+    assert ext._inf_pending is False
+
+    anchor.power = "asleep"
+    await anchor.report(ext)
+
+    assert ext._inf_pending is True
+    assert ext._inf_status(time.monotonic())[str(DEVICE_SYSID)]["sleeping"] is True
+
+
+async def test_an_expired_write_is_never_sent(dialect, builder, hub):
+    """A second request queued behind the first one's parameter write lock
+    for longer than its timeout times out without sending its write."""
+    anchor = FakeAnchor(dialect, "standby")
+    ext = await _extension(dialect, anchor)
+    lock = ext._param_write_locks.setdefault((DEVICE_SYSID, "SLEEP"), trio.Lock())
+    writes = []
+    parser = dialect.MAVLink(None)
+    handle = anchor.handle
+
+    def recording(payload):
+        writes.extend(
+            m
+            for m in parser.parse_buffer(payload) or []
+            if m.get_type() == "PARAM_EXT_SET"
+        )
+        return handle(payload)
+
+    anchor.handle = recording
+    with trio.fail_after(1):
+        async with lock:
+            entry = await _sleep(ext, builder, hub, False, timeout=0.05)
+
+    assert entry["accepted"] is False
+    assert entry["detail"] == f"Timeout while waiting for device {DEVICE_SYSID}"
+    assert writes == []
 
 
 async def test_inf_anchor_without_power_state_is_not_asleep(dialect):

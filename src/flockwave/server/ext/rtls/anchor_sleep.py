@@ -84,13 +84,21 @@ async def set_anchor_sleep(
 
 
 def _refusal(ext: "RtlsExtension", system_id: int, sleeping: bool) -> str:
-    """Why an anchor refused a sleep/wake request, from its last stats."""
-    stats = ext._stats.get(system_id, {})
+    """Why an anchor refused a sleep/wake request, from its fresh stats. The
+    ack carries no reason: the pack is named only when it can be the reason,
+    a wake of an anchor running from it with a low or missing voltage."""
+    stats = ext._fresh_stats(system_id) or {}
     state = stats.get("powerState")
     if state == "off":
         return "refused: the anchor is off; only its button starts it again"
-    if not sleeping and state in ("asleep", "standby"):
-        voltage = stats.get("batteryVoltage")
+    voltage = stats.get("batteryVoltage")
+    pack_low = voltage is None or stats.get("lowBattery") or stats.get("batteryWarning")
+    if (
+        not sleeping
+        and state in ("asleep", "standby")
+        and stats.get("powerInput") == "battery"
+        and pack_low
+    ):
         return (
             "wake refused by the anchor: its pack is low or has no fresh voltage reading"
             + (f" (last {voltage:.2f} V)" if voltage is not None else "")
