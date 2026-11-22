@@ -116,8 +116,6 @@ class FakeDevice:
                 )
                 if name == "SLEEP" and self.set_result == 0:
                     self.after_sleep_write(previous[:1], value[:1])
-            elif kind == "TIMESYNC" and message.tc1 == 0:
-                out.append(self._timesync(message.ts1))
         return out
 
     def after_sleep_write(self, previous: bytes, value: bytes) -> None:
@@ -125,15 +123,6 @@ class FakeDevice:
         if self.refuse_sleep and self.sleeping:
             # the arming gate runs after the ack on the firmware
             self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
-
-    def uptime_ms(self) -> int:
-        return 100_000
-
-    def _timesync(self, token: int) -> bytes:
-        message = self.dialect.MAVLink_timesync_message(
-            tc1=self.uptime_ms() * 1_000_000, ts1=token
-        )
-        return bytes(message.pack(self._mav))
 
     def _param_value(self, name: str, index: int) -> bytes:
         value, param_type = self.params[name]

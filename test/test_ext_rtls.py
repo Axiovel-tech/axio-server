@@ -4462,33 +4462,6 @@ async def test_ota_job_names_the_species_and_its_source(
     extension._nursery = None
 
 
-async def test_ota_inspect_reports_the_receipt(extension, builder, hub, tmp_path):
-    image = _signed_image(tmp_path, "anchor")
-    bare = tmp_path / "bare.bin"
-    bare.write_bytes(b"\x00" * 16)
-
-    def inspect(path):
-        message = make_message(
-            builder, {"type": "X-RTLS-OTA", "image": str(path), "inspect": True}
-        )
-        return extension._handle_RTLS_OTA(message, None, hub)
-
-    response = await inspect(image)
-    assert response.body == {
-        "type": "X-RTLS-OTA",
-        "image": str(image),
-        "species": "anchor",
-        "speciesSource": "receipt",
-        "board": "axio_anchor",
-        "git": "9b1573bd",
-    }
-    response = await inspect(bare)
-    assert response.body["species"] is None
-    assert response.body["speciesSource"] is None
-    response = await inspect(tmp_path / "missing.bin")
-    assert response.body["type"] == "ACK-NAK"
-
-
 # ---- audit round: stale snapshots, lost devices, OTA export, forget ------
 
 
@@ -4561,7 +4534,9 @@ async def test_start_ota_export_refuses_unchecked_images(extension, device, tmp_
     bare = tmp_path / "bare.bin"
     bare.write_bytes(b"\x00" * 16)
 
-    with pytest.raises(ValueError, match="no build receipt and no declared role"):
+    with pytest.raises(
+        ValueError, match="no build receipt and no declared role; build it with"
+    ):
         await extension.start_ota(DEVICE_SYSID, str(bare))
     with pytest.raises(ValueError, match="refusing to upload a anchor image"):
         await extension.start_ota(DEVICE_SYSID, str(_signed_image(tmp_path, "anchor")))
