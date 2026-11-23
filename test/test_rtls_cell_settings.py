@@ -19,7 +19,9 @@ from cell_settings_support import (
     _request,
     _states,
 )
+from rtls_support import set_fake_param
 from rtlslink.dialect import load_dialect
+from rtlslink.protocol import raw_field_bytes
 
 from flockwave.server.ext.rtls.verify import run_verify
 from flockwave.server.ext.show.config import AuthorizationScope
@@ -100,7 +102,7 @@ async def test_without_a0_running_nothing_compares_or_applies(dialect, builder, 
     assert set(_states(ext).values()) == {("unknown", None)}
 
     body = await _request(ext, builder, hub, rateHz=83)
-    assert (body["result"], body["reason"]) == ("refused", "A0 is offline")
+    assert (body["result"], body["reason"]) == ("refused", "A0 is not ranging")
     assert _param(devices[202], "UWB_BLOCK_MS") == 20
 
     lock = await _lock(ext, builder, hub)
@@ -112,6 +114,10 @@ async def test_without_a0_running_nothing_compares_or_applies(dialect, builder, 
         "fail",
         "Cell settings: no A0 to compare",
     )
+
+    ext._protocol.devices.pop(201)
+    body = await _request(ext, builder, hub, rateHz=83)
+    assert (body["result"], body["reason"]) == ("refused", "A0 is offline")
 
 
 async def test_lock_warns_and_verify_fails_on_a_device_not_ok(dialect, builder, hub):
@@ -222,9 +228,8 @@ async def test_tx_level_goes_to_anchors_only(dialect, builder, hub):
     body = await _request(ext, builder, hub, txGain=60)
 
     assert body["result"] == "applied"
-    assert body["results"][str(TAG)] == {"written": "unchanged"}
-    assert TAG not in writes
-    assert writes[202] == [("UWB_TX_GAIN", 60)]
+    assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
+    assert writes[202] == [("UWB_BLOCK_MS", 20), ("UWB_TX_GAIN", 60)]
     assert "UWB_TX_GAIN" not in devices[TAG].params
     await _report(ext, devices)
     assert _cell_settings(ext)["txGain"] == 60
@@ -243,9 +248,50 @@ async def test_an_empty_request_brings_in_a_device_left_behind(dialect, builder,
     body = await _request(ext, builder, hub)
 
     assert body["result"] == "applied"
-    assert writes == {202: [("UWB_BLOCK_MS", 12), ("UWB_TX_GAIN", 60)]}
+    assert writes[202] == [("UWB_BLOCK_MS", 12), ("UWB_TX_GAIN", 60)]
     await _report(ext, devices)
     assert _cell_settings(ext)["differ"] == []
+
+
+async def test_a_device_changed_elsewhere_is_written_again(dialect, builder, hub):
+    # 202 was set to 12 ms by another client: the server's cache still
+    # holds A0's 20 ms, so only the write itself can bring it back
+    ext, devices = await _live_cell(dialect)
+    set_fake_param(devices[202], "UWB_BLOCK_MS", 12, "uint16")
+    await _report(ext, devices, [202])
+    assert _states(ext)[202] == ("differ", None)
+
+    body = await _request(ext, builder, hub)
+
+    assert body["results"]["202"] == {"written": "changed"}
+    await _report(ext, devices)
+    assert _states(ext)[202] == ("ok", None)
+
+
+async def test_an_earlier_writes_ack_does_not_count(dialect, builder, hub):
+    # the tag's 12 ms write is lost; what comes back is the ack of an
+    # earlier 30 ms write, which must not start the anchor phase
+    ext, devices = await _live_cell(dialect)
+    tag, handle = devices[TAG], devices[TAG].handle
+    parser = dialect.MAVLink(None)
+
+    def stale(data):
+        message = (parser.parse_buffer(data) or [None])[0]
+        if message is not None and message.get_type() == "PARAM_EXT_SET":
+            value = raw_field_bytes(message, "param_value") or b""
+            old = (30).to_bytes(2, "little") + value[2:]
+            return [tag._param_ack(message.param_id, old, message.param_type, 0)]
+        return handle(data)
+
+    tag.handle = stale
+
+    body = await _request(ext, builder, hub, rateHz=83)
+
+    assert body["result"] == "incomplete"
+    assert body["results"][str(TAG)]["detail"] == (
+        f"RTLS tag {TAG}: no answer to UWB_BLOCK_MS=12"
+    )
+    assert all(_param(devices[sid], "UWB_BLOCK_MS") == 20 for sid in ANCHORS)
 
 
 async def test_an_asleep_anchor_is_written_and_runs_it_at_its_start(
@@ -287,7 +333,15 @@ async def test_refusals_write_nothing(dialect, builder, hub):
 
 async def test_invalid_requests_are_rejected(dialect, builder, hub):
     ext, _ = await _live_cell(dialect)
-    for body in ({"rateHz": 100}, {"txGain": 128}, {"txGain": -1}):
+    invalid = (
+        {"rateHz": 100},
+        {"rateHz": []},
+        {"rateHz": 83.0},
+        {"txGain": 128},
+        {"txGain": -1},
+        {"txGain": True},
+    )
+    for body in invalid:
         response = await _request(ext, builder, hub, **body)
         assert response["type"] == "ACK-NAK", body
 
@@ -315,6 +369,44 @@ async def test_a_role_not_cached_is_read_once(dialect, builder, hub, autojump_cl
         "202: role not read yet",
     )
     assert _param(devices[201], "UWB_BLOCK_MS") == 20
+
+
+async def test_a_device_whose_role_is_not_read_is_unknown(dialect):
+    prepare = _role_lost_from_dump(answers=False)
+    ext, devices = await _live_cell(dialect, prepare=prepare)
+    await _report(ext, devices, [202], txgain=20.0)
+    assert _states(ext)[202] == ("unknown", "role not read yet")
+    assert 202 in _cell_settings(ext)["unknown"]
+
+
+def _block_lost_from_a0_dump(*, answers):
+    def prepare(devices):
+        devices[201].drop_from_list = {"UWB_BLOCK_MS"}
+        devices[201].respond_to_read = answers
+
+    return prepare
+
+
+async def test_a_left_out_rate_needs_a0s_block(dialect, builder, hub, autojump_clock):
+    prepare = _block_lost_from_a0_dump(answers=True)
+    ext, devices = await _live_cell(dialect, prepare=prepare)
+    writes = _record_writes(ext)
+    body = await _request(ext, builder, hub, txGain=60)
+    assert body["result"] == "applied"
+    assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
+
+    prepare = _block_lost_from_a0_dump(answers=False)
+    ext, devices = await _live_cell(dialect, prepare=prepare)
+    body = await _request(ext, builder, hub, txGain=60)
+    assert (body["result"], body["reason"]) == (
+        "refused",
+        "A0's settings not read yet",
+    )
+    assert _param(devices[202], "UWB_TX_GAIN") == 47
+
+    # a request that names the rate needs no read
+    body = await _request(ext, builder, hub, rateHz=83)
+    assert body["result"] == "applied"
 
 
 async def test_a_cached_cell_reads_nothing(dialect, builder, hub):

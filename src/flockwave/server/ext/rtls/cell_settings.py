@@ -93,6 +93,8 @@ def _reference(members: list[_Member]) -> Optional[_Member]:
 
 
 def _state(member: _Member, reference: Optional[_Member]) -> _State:
+    if member.role is None:
+        return "unknown", "role not read yet"
     tx_missing = member.anchor and member.running_tx is None
     if reference is None or member.running is None or tx_missing:
         return "unknown", None
@@ -162,6 +164,10 @@ def cell_rule(ext: "RtlsExtension") -> dict[str, Any]:
     }
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _request(body: dict[str, Any]) -> dict[str, int]:
     """What the request names: the preset's block, the TX level.
 
@@ -171,12 +177,12 @@ def _request(body: dict[str, Any]) -> dict[str, int]:
     rate, tx = body.get("rateHz"), body.get("txGain")
     named = {}
     if rate is not None:
-        if rate not in RATE_PRESETS:
+        if not _is_int(rate) or rate not in RATE_PRESETS:
             raise ValueError(f"Unknown ranging rate: {rate!r}")
         named[_BLOCK_PARAM] = RATE_PRESETS[rate]
     if tx is not None:
         low, high, _ = tx_gain_range()
-        if not isinstance(tx, int) or not low <= tx <= high:
+        if not _is_int(tx) or not low <= tx <= high:
             raise ValueError(f"TX level out of range: {tx!r}")
         named[TX_GAIN_PARAM] = tx
     return named
@@ -196,7 +202,8 @@ def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
             if authorizes_flight(ext.app.import_api("show").get_configuration()):
                 return "A show is authorized"
     if _reference(members) is None:
-        return "A0 is offline"
+        a0_online = any(m.role == "anchor-initiator" for m in members)
+        return "A0 is not ranging" if a0_online else "A0 is offline"
     unknown = [m.name for m in members if m.role is None]
     return f"{', '.join(unknown)}: role not read yet" if unknown else None
 
@@ -204,13 +211,11 @@ def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
 async def _write(
     ext: "RtlsExtension", member: _Member, target: dict[str, int]
 ) -> dict[str, Any]:
-    """Writes what ``member`` takes of ``target`` (a tag: no TX level) and
-    does not store yet, stopping at the first failure; returns its
-    ``results`` entry."""
-    written = "unchanged"
+    """Writes what ``member`` takes of ``target`` (a tag: no TX level),
+    stopping at the first failure; returns its ``results`` entry. Every
+    value is written: the firmware ignores a write of the value it has."""
     for name, value in target.items():
-        tag_tx = name == TX_GAIN_PARAM and not member.anchor
-        if tag_tx or member.params.get(name) == value:
+        if name == TX_GAIN_PARAM and not member.anchor:
             continue
         try:
             ack = await ext.set_param(member.system_id, name, value, _PARAM_TYPES[name])
@@ -219,13 +224,14 @@ async def _write(
         except KeyError:
             failure = f"{member.name}: offline"
         else:
-            failure = (
-                None if ack["accepted"] else f"{member.name} refused {name}={value}"
-            )
+            failure = None
+            if not ack["accepted"]:
+                failure = f"{member.name} refused {name}={value}"
+            elif ack["value"] != value:  # the ack of an earlier write
+                failure = f"{member.name}: no answer to {name}={value}"
         if failure is not None:
             return {"written": "failed", "detail": failure}
-        written = "changed"
-    return {"written": written}
+    return {"written": "changed"}
 
 
 async def _write_all(
@@ -249,15 +255,18 @@ async def _apply(
 ) -> tuple[str, Optional[str], dict[str, dict[str, Any]]]:
     """One apply; ``(result, reason, results)``."""
 
-    async def read_role(member: _Member) -> None:
+    async def read(member: _Member, name: str) -> None:
         with suppress(KeyError, trio.TooSlowError):
-            await ext.get_param(member.system_id, "UWB_ROLE", timeout=_READ_TIMEOUT)
+            await ext.get_param(member.system_id, name, timeout=_READ_TIMEOUT)
 
-    members = _members(ext)
     async with trio.open_nursery() as nursery:
-        for member in members:
+        for member in _members(ext):
             if member.role is None:
-                nursery.start_soon(read_role, member)
+                nursery.start_soon(read, member, "UWB_ROLE")
+            elif member.role == "anchor-initiator" and not (
+                _BLOCK_PARAM in named or _BLOCK_PARAM in member.params
+            ):
+                nursery.start_soon(read, member, _BLOCK_PARAM)
     members = _members(ext)
     reason = _refusal(ext, members)
     if reason is not None:
@@ -265,9 +274,11 @@ async def _apply(
     reference = _reference(members)
     assert reference is not None and reference.running_tx is not None
     # what the request leaves out is A0's
-    block = reference.params.get(_BLOCK_PARAM)
-    target = {} if block is None else {_BLOCK_PARAM: int(block)}
-    target = {**target, TX_GAIN_PARAM: reference.running_tx, **named}
+    block = named.get(_BLOCK_PARAM, reference.params.get(_BLOCK_PARAM))
+    if block is None:
+        return "refused", "A0's settings not read yet", {}
+    tx = named.get(TX_GAIN_PARAM, reference.running_tx)
+    target = {_BLOCK_PARAM: int(block), TX_GAIN_PARAM: tx}
     results, ok = await _write_all(ext, [m for m in members if not m.anchor], target)
     if not ok:
         reason = "Not every tag took the change; no anchor was written"
