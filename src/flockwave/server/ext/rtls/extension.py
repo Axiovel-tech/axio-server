@@ -791,8 +791,11 @@ class RtlsExtension(Extension):
         param_type: Any = None,
         *,
         timeout: float = DEFAULT_PARAM_TIMEOUT,
+        exact: bool = False,
     ) -> dict[str, Any]:
         """Writes a single parameter and waits for the device-side ack.
+        With ``exact``, an accepted ack of another value is taken for a late
+        ack of an earlier write and skipped.
         Returns ``{"value", "type", "result", "accepted"}`` where
         ``value`` is the value *acknowledged by the device* (decoded) and
         ``result`` is the raw PARAM_ACK code.
@@ -829,6 +832,12 @@ class RtlsExtension(Extension):
                     continue
                 if event.data["result"] == PARAM_ACK_IN_PROGRESS:
                     continue  # final ack still to come
+                if (
+                    exact
+                    and event.data["result"] == PARAM_ACK_ACCEPTED
+                    and decode_param_value(event.data["value"], param_type) != value
+                ):
+                    continue  # an earlier write's late ack
                 return event
 
         # Serialize writes of the same parameter of the same device:

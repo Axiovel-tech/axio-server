@@ -268,7 +268,9 @@ async def test_a_device_changed_elsewhere_is_written_again(dialect, builder, hub
     assert _states(ext)[202] == ("ok", None)
 
 
-async def test_an_earlier_writes_ack_does_not_count(dialect, builder, hub):
+async def test_an_earlier_writes_ack_does_not_count(
+    dialect, builder, hub, autojump_clock
+):
     # the tag's 12 ms write is lost; what comes back is the ack of an
     # earlier 30 ms write, which must not start the anchor phase
     ext, devices = await _live_cell(dialect)
@@ -292,6 +294,32 @@ async def test_an_earlier_writes_ack_does_not_count(dialect, builder, hub):
         f"RTLS tag {TAG}: no answer to UWB_BLOCK_MS=12"
     )
     assert all(_param(devices[sid], "UWB_BLOCK_MS") == 20 for sid in ANCHORS)
+
+
+async def test_an_earlier_writes_ack_before_the_right_one_is_skipped(
+    dialect, builder, hub
+):
+    # a late ack of an earlier 30 ms write arrives first, then the 12 ms ack
+    ext, devices = await _live_cell(dialect)
+    tag, handle = devices[TAG], devices[TAG].handle
+    parser = dialect.MAVLink(None)
+
+    def late_then_right(data):
+        message = (parser.parse_buffer(data) or [None])[0]
+        replies = handle(data)
+        if message is not None and message.get_type() == "PARAM_EXT_SET":
+            value = raw_field_bytes(message, "param_value") or b""
+            old = (30).to_bytes(2, "little") + value[2:]
+            replies = [tag._param_ack(message.param_id, old, message.param_type, 0)]
+            replies += handle(data)
+        return replies
+
+    tag.handle = late_then_right
+
+    body = await _request(ext, builder, hub, rateHz=83)
+
+    assert body["result"] == "applied"
+    assert all(_param(devices[sid], "UWB_BLOCK_MS") == 12 for sid in ANCHORS)
 
 
 async def test_an_asleep_anchor_is_written_and_runs_it_at_its_start(
@@ -340,6 +368,8 @@ async def test_invalid_requests_are_rejected(dialect, builder, hub):
         {"txGain": 128},
         {"txGain": -1},
         {"txGain": True},
+        {"rateHz": None},
+        {"txGain": None},
     )
     for body in invalid:
         response = await _request(ext, builder, hub, **body)
@@ -407,6 +437,19 @@ async def test_a_left_out_rate_needs_a0s_block(dialect, builder, hub, autojump_c
     # a request that names the rate needs no read
     body = await _request(ext, builder, hub, rateHz=83)
     assert body["result"] == "applied"
+
+
+async def test_a0s_role_and_block_lost_are_both_read(
+    dialect, builder, hub, autojump_clock
+):
+    def prepare(devices):
+        devices[201].drop_from_list = {"UWB_ROLE", "UWB_BLOCK_MS"}
+
+    ext, devices = await _live_cell(dialect, prepare=prepare)
+    writes = _record_writes(ext)
+    body = await _request(ext, builder, hub, txGain=60)
+    assert body["result"] == "applied"
+    assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
 
 
 async def test_a_cached_cell_reads_nothing(dialect, builder, hub):

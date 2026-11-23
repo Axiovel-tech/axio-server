@@ -174,13 +174,14 @@ def _request(body: dict[str, Any]) -> dict[str, int]:
     Raises:
         ValueError: for a rate that is not a preset or a TX level out of range.
     """
-    rate, tx = body.get("rateHz"), body.get("txGain")
     named = {}
-    if rate is not None:
+    if "rateHz" in body:
+        rate = body["rateHz"]
         if not _is_int(rate) or rate not in RATE_PRESETS:
             raise ValueError(f"Unknown ranging rate: {rate!r}")
         named[_BLOCK_PARAM] = RATE_PRESETS[rate]
-    if tx is not None:
+    if "txGain" in body:
+        tx = body["txGain"]
         low, high, _ = tx_gain_range()
         if not _is_int(tx) or not low <= tx <= high:
             raise ValueError(f"TX level out of range: {tx!r}")
@@ -218,7 +219,9 @@ async def _write(
         if name == TX_GAIN_PARAM and not member.anchor:
             continue
         try:
-            ack = await ext.set_param(member.system_id, name, value, _PARAM_TYPES[name])
+            ack = await ext.set_param(
+                member.system_id, name, value, _PARAM_TYPES[name], exact=True
+            )
         except trio.TooSlowError:
             failure = f"{member.name}: no answer to {name}={value}"
         except KeyError:
@@ -227,8 +230,6 @@ async def _write(
             failure = None
             if not ack["accepted"]:
                 failure = f"{member.name} refused {name}={value}"
-            elif ack["value"] != value:  # the ack of an earlier write
-                failure = f"{member.name}: no answer to {name}={value}"
         if failure is not None:
             return {"written": "failed", "detail": failure}
     return {"written": "changed"}
@@ -255,18 +256,26 @@ async def _apply(
 ) -> tuple[str, Optional[str], dict[str, dict[str, Any]]]:
     """One apply; ``(result, reason, results)``."""
 
-    async def read(member: _Member, name: str) -> None:
+    async def read(system_id: int, name: str) -> None:
         with suppress(KeyError, trio.TooSlowError):
-            await ext.get_param(member.system_id, name, timeout=_READ_TIMEOUT)
+            await ext.get_param(system_id, name, timeout=_READ_TIMEOUT)
+
+    async def prepare(member: _Member) -> None:
+        """Reads the role if it is missing, then A0's block if the request
+        leaves the rate out and it is not cached."""
+        if member.role is None:
+            await read(member.system_id, "UWB_ROLE")
+            member = next(
+                (m for m in _members(ext) if m.system_id == member.system_id), member
+            )
+        if member.role == "anchor-initiator" and not (
+            _BLOCK_PARAM in named or _BLOCK_PARAM in member.params
+        ):
+            await read(member.system_id, _BLOCK_PARAM)
 
     async with trio.open_nursery() as nursery:
         for member in _members(ext):
-            if member.role is None:
-                nursery.start_soon(read, member, "UWB_ROLE")
-            elif member.role == "anchor-initiator" and not (
-                _BLOCK_PARAM in named or _BLOCK_PARAM in member.params
-            ):
-                nursery.start_soon(read, member, _BLOCK_PARAM)
+            nursery.start_soon(prepare, member)
     members = _members(ext)
     reason = _refusal(ext, members)
     if reason is not None:
