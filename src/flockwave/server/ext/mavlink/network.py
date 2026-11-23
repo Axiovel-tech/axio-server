@@ -507,6 +507,54 @@ class MAVLinkNetwork:
         """
         await self.manager.broadcast_packet(spec, destination=channel)
 
+    async def broadcast_packet_and_collect_replies(
+        self,
+        spec: MAVLinkMessageSpecification,
+        uavs: Iterable[MAVLinkUAV],
+        reply: tuple[str, MAVLinkMessageMatcher],
+        *,
+        timeout: float,
+        channel: str | None = None,
+    ) -> dict[MAVLinkUAV, MAVLinkMessage]:
+        """Broadcasts a message to all UAVs in the network and collects the
+        replies of the given UAVs.
+
+        The replies are expected before the broadcast leaves, so a reply that
+        arrives before this method gets to wait for it is not lost.
+
+        Args:
+            spec: the specification of the MAVLink message to send
+            uavs: the UAVs of this network whose replies to collect
+            reply: the type of the reply and a matcher that examines it
+                further, as in `send_packet()`; the reply must come from the
+                system ID of the UAV
+            timeout: number of seconds to wait for the replies after the
+                broadcast
+            channel: specifies the channel that the packet should be sent on;
+                defaults to the primary channel of the network
+
+        Returns:
+            the reply of each UAV that replied in time; UAVs that did not
+            reply are missing
+
+        Raises:
+            Exception: what the broadcast raised; no reply is collected then
+        """
+        reply_type, matcher = reply
+        replies: dict[MAVLinkUAV, MAVLinkMessage] = {}
+        with ExitStack() as stack:
+            futures = {
+                uav: stack.enter_context(
+                    self.expect_packet(reply_type, matcher, system_id=uav.system_id)
+                )
+                for uav in uavs
+            }
+            await self.broadcast_packet(spec, channel)
+            with move_on_after(timeout):
+                for uav, future in futures.items():
+                    replies[uav] = await future.wait()
+        return replies
+
     def enqueue_rc_override_packet(self, spec: MAVLinkMessageSpecification) -> None:
         """Enqueues a message containing a MAVLink RC override packet to the network,
         handling failures gracefully.
@@ -541,6 +589,22 @@ class MAVLinkNetwork:
         configuration of each drone.
         """
         self._led_light_configuration_manager.notify_config_changed(config)
+
+    def use_start_gate(
+        self,
+        refuse_start: Callable[[str], None],
+        find_uav: Callable[[str], object | None],
+    ) -> None:
+        """Lets the network cancel a scheduled start that a drone of the show
+        is not ready for, before the drones commit to it.
+
+        Args:
+            refuse_start: cancels the scheduled start for the given reason
+            find_uav: returns the UAV with the given ID from any network or
+                driver, ``None`` if the server does not know it
+        """
+        self._scheduled_takeoff_manager.refuse_start = refuse_start
+        self._scheduled_takeoff_manager.find_uav = find_uav
 
     def notify_scheduled_takeoff_config_changed(self, config: DroneShowConfiguration):
         """Notifies the network that the automatic start configuration of the

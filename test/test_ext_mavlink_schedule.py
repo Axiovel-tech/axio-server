@@ -270,35 +270,20 @@ def make_uav(status=None, start=None):
     )
 
 
-async def test_drones_echoing_the_schedule_get_it_unicast_never_as_parameters(
-    schedule, monkeypatch
-):
+def test_the_start_reaches_the_drones_by_broadcast_only(schedule, monkeypatch):
     monkeypatch.setattr(takeoff, "time", lambda: EPOCH)
     manager, sent = make_manager(schedule)
-    start = EPOCH + 60
-    config = auto(start)
+    config = auto(EPOCH + 60)
     schedule.update(config)
 
-    in_sync = make_uav(echo(schedule.id, schedule.start_cluster_us))
+    # Not even a drone that is behind, or one without a schedule echo, is
+    # configured on its own: it stays unauthorized and the checks report it
     behind = make_uav(echo(schedule.id - 1, 0))
-    assert not manager.uav_needs_update(in_sync, config)
-    assert manager.uav_needs_update(behind, config)
-
-    await manager.update_uav(behind, config)
-    assert behind.writes == []
-    [(kind, target, spec, channel)] = sent
-    assert (kind, target, channel) == ("unicast", "1", Channel.SHOW_CONTROL)
-    assert spec == schedule.packet(EPOCH)
-
-    # With the RC start the RC holder owns the start
-    schedule.update(RC_AUTHORIZED)
-    assert not manager.uav_needs_update(behind, RC_AUTHORIZED)
-
-    # Without an echo the start still goes by parameters
     legacy = make_uav()
-    assert manager.uav_needs_update(legacy, config)
-    await manager.update_uav(legacy, config)
-    assert legacy.writes == [int(start)]
+    behind.scheduled_takeoff_authorization_scope = AuthorizationScope.NONE
+    for uav in (behind, legacy):
+        assert not manager.uav_needs_update(uav, config)
+    assert sent == []
 
 
 async def test_schedule_broadcast_pace(schedule, monkeypatch, autojump_clock, nursery):
@@ -325,7 +310,7 @@ async def test_schedule_broadcast_pace(schedule, monkeypatch, autojump_clock, nu
     assert times[15:] == [round(25.7 + 0.2 * step, 1) for step in range(72)]
 
 
-async def test_schedule_also_goes_to_every_drone_on_its_own_address(
+async def test_schedule_goes_by_broadcast_only(
     schedule, monkeypatch, autojump_clock, nursery
 ):
     monkeypatch.setattr(takeoff, "time", lambda: EPOCH + trio.current_time())
@@ -339,12 +324,9 @@ async def test_schedule_also_goes_to_every_drone_on_its_own_address(
 
     nursery.start_soon(manager._broadcast_show_schedule)
     await trio.sleep(0.5)
-    assert [(kind, target) for kind, target, _, _ in sent] == [
-        ("broadcast", 0.0),
-        ("unicast", "0"),
-        ("unicast", "1"),
+    assert [(kind, at, spec) for kind, at, spec, _ in sent] == [
+        ("broadcast", 0.0, schedule.packet(EPOCH))
     ]
-    assert all(spec == schedule.packet(EPOCH) for _, _, spec, _ in sent)
 
 
 async def test_a_change_during_a_slow_broadcast_goes_out_at_once(

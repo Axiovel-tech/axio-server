@@ -15,7 +15,12 @@ from flockwave.server.model.log import Severity
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
-from .config import DroneShowConfiguration, LightConfiguration, StartMethod
+from .config import (
+    AuthorizationScope,
+    DroneShowConfiguration,
+    LightConfiguration,
+    StartMethod,
+)
 from .logging import ShowUploadLoggingMiddleware
 
 __all__ = ("construct", "dependencies", "description")
@@ -63,6 +68,7 @@ class DroneShowExtension(Extension):
 
     def exports(self) -> dict[str, Any]:
         return {
+            "cancel_start": self._cancel_start,
             "get_clock": self._get_clock,
             "get_configuration": self._get_configuration,
             "get_last_uploaded_show_metadata": self._get_last_uploaded_show_metadata,
@@ -238,6 +244,30 @@ class DroneShowExtension(Extension):
         ):
             self.app.request_to_send_SYS_MSG_message(message, severity=Severity.WARNING)
 
+    def _cancel_start(self, reason: str) -> None:
+        """Cancels the scheduled start and revokes the authorization through
+        the regular configuration-update path, exactly as if a client had
+        cleared them (all change signals fire, so the drones stand down, and
+        the clients learn the new settings), and tells the operator why.
+
+        Args:
+            reason: why the start is cancelled, for the operator
+        """
+        self._config.update_from_json(
+            {
+                "start": {
+                    "time": None,
+                    "authorized": False,
+                    "authorizationScope": AuthorizationScope.NONE.value,
+                }
+            }
+        )
+        self.log.error(f"Start cancelled: {reason}")
+        if self.app is not None:
+            self.app.request_to_send_SYS_MSG_message(
+                f"Start cancelled: {reason}", severity=Severity.ERROR
+            )
+
     def _get_clock(self) -> ShowClock | None:
         """Returns a reference to the show clock."""
         return self._clock
@@ -335,6 +365,15 @@ class DroneShowExtension(Extension):
         assert self.app is not None
         updated_signal = self.app.import_api("signals").get("show:config_updated")
         updated_signal.send(self, config=self._config.clone())
+
+        # Clients read the settings again: a start the server cancelled, or
+        # one that another client set, would not reach them otherwise
+        hub = self.app.message_hub
+        hub.enqueue_broadcast_message(
+            hub.create_notification(
+                {"type": "X-SHOW-CFG", "configuration": self._config.json}
+            )
+        )
 
     def _on_lights_updated(self, sender) -> None:
         """Handler that is called when the configuration of the LED lights was

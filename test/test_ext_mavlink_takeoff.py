@@ -25,28 +25,9 @@ def make_uav(seconds, msec, *, echo=None, **kwds):
         scheduled_takeoff_time_msec=msec,
         show_schedule_status=echo,
         messages=[],
+        is_connected=kwds.get("connected", True),
+        supports_scheduled_takeoff=True,
     )
-
-
-def test_uav_needs_update_compares_the_milliseconds_too():
-    needs_update = MAVLinkScheduledTakeoffManager.uav_needs_update
-    assert not needs_update(None, make_uav(1_760_000_012, 750), CONFIG)  # type: ignore[arg-type]
-    assert needs_update(None, make_uav(1_760_000_011, 750), CONFIG)  # type: ignore[arg-type]
-    assert needs_update(None, make_uav(1_760_000_012, 500), CONFIG)  # type: ignore[arg-type]
-
-
-async def test_update_uav_writes_the_milliseconds_of_the_start():
-    calls = []
-
-    async def set_scheduled_takeoff_time(seconds, msec=0):
-        calls.append((seconds, msec))
-
-    uav = make_uav(1_760_000_012, 500)
-    uav.set_scheduled_takeoff_time = set_scheduled_takeoff_time
-
-    await MAVLinkScheduledTakeoffManager.update_uav(None, uav, CONFIG)  # type: ignore[arg-type]
-
-    assert calls == [(1_760_000_012, 750)]
 
 
 SENT_START_US = 10_000_000_000
@@ -60,7 +41,13 @@ def make_echo(schedule_id, start_offset_us=0, *, flags=0x01 | 0x04, age=0.5):
     return ShowScheduleStatus.from_mavlink_message(message, time() - age)
 
 
-def check_start_agreement(uavs, lead, schedule_id=5):
+def check_start_agreement(
+    uavs, lead, schedule_id=5, *, show=None, network_uavs=None, elsewhere=()
+):
+    """Runs the start agreement check on the given connected drones; returns
+    the reasons the start was cancelled for. `show` lists the IDs of the
+    drones of the show, `network_uavs` every drone of the network,
+    `elsewhere` the IDs the server knows from other networks."""
     schedule = ShowSchedule()
     schedule.id = schedule_id
     schedule.start_cluster_us = SENT_START_US
@@ -73,7 +60,13 @@ def check_start_agreement(uavs, lead, schedule_id=5):
     manager._log = logging.getLogger("test_ext_mavlink_takeoff")
     manager._network = SimpleNamespace(driver=SimpleNamespace(show_schedule=schedule))
     manager.iter_uavs_to_schedule = lambda: iter(uavs)  # type: ignore[method-assign]
+    manager._network.uavs = lambda: list(network_uavs or uavs)
+    manager._config = SimpleNamespace(uav_ids=show or [])  # type: ignore[assignment]
+    refused = []
+    manager.refuse_start = refused.append
+    manager.find_uav = lambda id: object() if id in elsewhere else None
     manager.check_start_agreement(CONFIG, lead)
+    return refused
 
 
 def test_start_agreement_before_the_drones_commit():
@@ -136,6 +129,57 @@ def test_start_agreement_after_the_drones_commit(caplog):
     ]
     assert "Start offset at T-5 s: -3.00 ms" in offsets
     assert len(offsets) == 4
+
+
+def test_the_start_is_cancelled_unless_every_drone_of_the_show_is_ready():
+    ready = make_uav(None, 0, echo=make_echo(5), id="1")
+    stale = make_uav(None, 0, echo=make_echo(5, age=4), id="2")
+    offline = make_uav(None, 0, id="3", connected=False)
+    spare = make_uav(None, 0, echo=make_echo(4), id="9")
+    connected = [ready, stale, spare]
+
+    [reason] = check_start_agreement(
+        connected,
+        15,
+        show=["1", "2", "3", "4", "5", None],
+        network_uavs=[ready, stale, offline, spare],
+        elsewhere={"5"},
+    )
+    assert reason.startswith("not every drone of the show is ready at T-15 s: ")
+    assert "2: its show schedule echo is 4 s old" in reason
+    assert "3: it is not connected" in reason
+    assert "4: the server does not know it" in reason
+    # Ready, checked by its own network, or not in the show
+    for id in ("1:", "5:", "9:"):
+        assert id not in reason
+
+
+def test_a_ready_show_starts_even_with_a_spare_drone_out_of_sync():
+    ready = make_uav(None, 0, echo=make_echo(5), id="1")
+    spare = make_uav(None, 0, echo=make_echo(4), id="9")
+    assert check_start_agreement([ready, spare], 15, show=["1"]) == []
+    assert spare.messages  # still warned about
+
+
+def test_without_an_assignment_every_drone_has_to_be_ready():
+    ready = make_uav(None, 0, echo=make_echo(5), id="1")
+    behind = make_uav(None, 0, echo=make_echo(4), id="2")
+    [reason] = check_start_agreement([ready, behind], 15)
+    assert "2: it holds schedule 4, not 5" in reason
+
+
+def test_after_the_drones_commit_the_check_only_warns():
+    behind = make_uav(None, 0, echo=make_echo(4, flags=0x01 | 0x02 | 0x04), id="1")
+    assert check_start_agreement([behind], 5, show=["1"]) == []
+    assert behind.messages
+
+
+def test_many_drones_that_are_not_ready_are_summed_up():
+    drones = [make_uav(None, 0, id=str(n), connected=False) for n in range(1, 9)]
+    [reason] = check_start_agreement(
+        [], 15, show=[d.id for d in drones], network_uavs=drones
+    )
+    assert reason.endswith("; and 3 more")
 
 
 async def test_fallback_writes_show_start_msec_with_every_start():

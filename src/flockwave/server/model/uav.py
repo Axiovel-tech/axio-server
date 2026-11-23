@@ -1078,7 +1078,9 @@ class UAVDriver(Generic[TUAV], ABC):
         function assumes that there is a dedicated _handler_ function (either
         sync or async) that can perform the operation for a _single_ UAV, and
         optionally another, _broadcaster_ function that can perform the operation
-        by broadcasting a message to all affected UAVs. The results from the
+        by broadcasting a message to all affected UAVs. The broadcaster is
+        called with the list of UAVs first, and may return a single result for
+        all of them or a dictionary with the result of each UAV. The results from the
         individual handlers are then merged into a dictionary consisting of
         results (for UAVs with sync handlers) and awaitables (for UAVs with
         async handlers).
@@ -1090,11 +1092,13 @@ class UAVDriver(Generic[TUAV], ABC):
             handler: the handler function that can perform the operation for a
                 single UAV
             broadcaster: the broadcaster function that can perform the operation
-                by broadcasting a message
+                by broadcasting a message; called with the list of UAVs and the
+                keyword arguments of the request
 
         Returns:
             dictionary mapping UAVs to the corresponding result objects or
-            awaitables, or a single result object if broadacsting was used
+            awaitables, or what the broadcaster returned if broadcasting was
+            used
         """
         result = {}
 
@@ -1109,7 +1113,7 @@ class UAVDriver(Generic[TUAV], ABC):
             # We need to broadcast. Do we have a separate function for broadcasting?
             if broadcaster is not None:
                 try:
-                    outcome = broadcaster(**kwds)
+                    outcome = broadcaster(uavs, **kwds)
                 except NotImplementedError:
                     outcome = NotImplementedError(
                         f"Broadcasting {request_name} not implemented yet"

@@ -34,6 +34,7 @@ __all__ = (
     "MAVLinkMessageRoutingTable",
     "MAVLinkMessageSpecification",
     "MAVLinkNetworkSpecification",
+    "PacketBroadcastCollectorFn",
     "PacketBroadcasterFn",
     "PacketSenderFn",
     "UAVBoundPacketSenderFn",
@@ -84,6 +85,10 @@ pairs. These are used to construct new MAVLink messages.
 
 PacketBroadcasterFn: TypeAlias = Callable[..., Awaitable[None]]
 """Type specification for the broadcast_packet() function of a MAVLinkNetwork object."""
+
+PacketBroadcastCollectorFn: TypeAlias = Callable[..., Awaitable[dict[Any, Any]]]
+"""Type specification for the broadcast_packet_and_collect_replies() function
+of a MAVLinkNetwork object."""
 
 
 class PacketSenderFn(Protocol):

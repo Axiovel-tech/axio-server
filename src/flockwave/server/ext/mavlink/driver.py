@@ -120,7 +120,13 @@ from .show_slot import (
     check_show_slot_version,
     write_show_slot,
 )
-from .types import MAVLinkMessage, PacketBroadcasterFn, PacketSenderFn, spec
+from .types import (
+    MAVLinkMessage,
+    PacketBroadcastCollectorFn,
+    PacketBroadcasterFn,
+    PacketSenderFn,
+    spec,
+)
 from .utils import (
     can_communicate_infer_from_heartbeat,
     log_id_for_uav,
@@ -204,9 +210,19 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     have thousands of drones and you know which autopilot they are using.
     """
 
+    broadcast_ack_timeout: float = 0.5
+    """Number of seconds to wait for the acknowledgments of a broadcast command
+    before sending it to each UAV that did not acknowledge it on its own
+    address."""
+
     broadcast_packet: PacketBroadcasterFn
     """A function that should be called by the driver whenever it wants to
     broadcast a packet. The function must be called with the packet to send.
+    """
+
+    broadcast_packet_and_collect_replies: PacketBroadcastCollectorFn
+    """A function that should be called by the driver whenever it wants to
+    broadcast a packet and collect the replies of some UAVs to it.
     """
 
     create_device_tree_mutator: Callable[[], DeviceTreeMutator]
@@ -252,6 +268,7 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         self.autopilot_factory = None
         self.broadcast_packet = None  # type: ignore
+        self.broadcast_packet_and_collect_replies = None  # type: ignore
         self.create_device_tree_mutator = None  # type: ignore
         self.log = None  # type: ignore
         self.mandatory_custom_mode = None
@@ -261,10 +278,10 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         self._default_timeout = 2
         self._default_retries = 10
-        self._default_delay = 0.1
 
-    async def broadcast_command_long_with_retries(
+    async def broadcast_command_long(
         self,
+        uavs: Sequence[MAVLinkUAV],
         command_id: int,
         param1: float = 0,
         param2: float = 0,
@@ -274,21 +291,15 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         param6: float = 0,
         param7: float = 0,
         *,
-        timeout: float | None = None,
-        retries: int | None = None,
-        delay: float | None = None,
         channel: str = Channel.PRIMARY,
-    ) -> None:
-        """Broadcasts a MAVLink command to all UAVs reachable on a given
-        communication channel a given number of times, without waiting for an
-        acknowledgment.
+    ) -> dict[MAVLinkUAV, int]:
+        """Broadcasts a MAVLink command once to all UAVs reachable on a given
+        communication channel and collects the acknowledgments of the given
+        UAVs.
 
-        Due to the broadcasting nature of this command, we cannot wait for
-        acknowledgments as we do not know how many acknowledgments we are
-        expecting.
-
-        Parameters:
-            target: the UAV to send the command to
+        Args:
+            uavs: the UAVs whose acknowledgments to collect
+            command_id: the command to send
             param1: the first parameter of the command
             param2: the second parameter of the command
             param3: the third parameter of the command
@@ -296,75 +307,93 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             param5: the fifth parameter of the command
             param6: the sixth parameter of the command
             param7: the seventh parameter of the command
-            timeout: timeout in seconds for _sending_ the command; `None` means
-                to use the default timeout for the driver
-            retries: number of times the command will be sent, no matter whether
-                a response is received or not; `None` means to use the default
-                retry count for the driver
-            delay: number of seconds to wait between sending attempts; `None`
-                means to use the default setting for the driver
             channel: the channel to send the command on
+
+        Returns:
+            the result (a ``MAV_RESULT``) that each UAV acknowledged the command
+            with within `broadcast_ack_timeout` seconds; UAVs that did not
+            acknowledge it are missing
 
         Raises:
             NotSupportedError: if the driver does not support broadcasting
         """
-        if self.broadcast_packet is None:
+        if self.broadcast_packet_and_collect_replies is None:
             raise NotSupportedError("This driver does not support broadcasting")
 
-        if timeout is None or timeout <= 0:
-            timeout = self._default_timeout
+        message = spec.command_long(
+            command=command_id,
+            param1=param1,
+            param2=param2,
+            param3=param3,
+            param4=param4,
+            param5=param5,
+            param6=param6,
+            param7=param7,
+            confirmation=0,
+            target_system=0,
+            target_component=0,
+        )
+        acks = await self.broadcast_packet_and_collect_replies(
+            message,
+            uavs,
+            ("COMMAND_ACK", {"command": command_id}),
+            timeout=self.broadcast_ack_timeout,
+            channel=channel,
+        )
+        return {uav: ack.result for uav, ack in acks.items()}
 
-        if retries is None or retries <= 0:
-            retries = self._default_retries
+    def _results_of_broadcast(
+        self,
+        uavs: Sequence[MAVLinkUAV],
+        acks: dict[MAVLinkUAV, int],
+        description: str,
+        send_single: Callable[[MAVLinkUAV], Awaitable[Any]],
+    ) -> dict[MAVLinkUAV, Any]:
+        """Turns the acknowledgments of a broadcast command into the result
+        of each UAV, and sends the command to each UAV that did not acknowledge
+        it on its own address, waiting for its acknowledgment there as for any
+        command sent to a single UAV.
 
-        if delay is None or delay < 0:
-            delay = self._default_delay
+        Args:
+            uavs: the UAVs that the command was meant for
+            acks: the result that each UAV acknowledged the broadcast with
+            description: what the command does, for messages
+            send_single: sends the command to a single UAV and waits for its
+                acknowledgment
 
-        tried, sent = 0, 0
-
-        while tried < retries:
-            try:
-                with fail_after(timeout):
-                    message = spec.command_long(
-                        command=command_id,
-                        param1=param1,
-                        param2=param2,
-                        param3=param3,
-                        param4=param4,
-                        param5=param5,
-                        param6=param6,
-                        param7=param7,
-                        confirmation=0,
-                        target_system=0,
-                        target_component=0,
-                    )
-                    tried += 1
-                    await self.broadcast_packet(message, channel=channel)
-                    sent += 1
-            except TooSlowError:
-                pass
-
-            if delay > 0:
-                await sleep(delay)
-
-        if sent < tried:
-            if sent > 1:
-                self.log.warning(
-                    f"Tried to send broadcast command {tried} times but only "
-                    f"{sent} were successful"
-                )
-            elif sent > 0:
-                self.log.warning(
-                    f"Tried to send broadcast command {tried} times but only "
-                    f"one was successful"
-                )
-            elif tried > 1:
-                self.log.warning(
-                    f"Tried to send broadcast command {tried} times but none "
-                    f"were successful"
+        Returns:
+            dictionary mapping each UAV to ``None`` if it accepted the command,
+            to an error if it refused it, and to an awaitable for the command
+            sent to it on its own address if it did not acknowledge the
+            broadcast
+        """
+        results: dict[MAVLinkUAV, Any] = {}
+        silent: list[MAVLinkUAV] = []
+        for uav in uavs:
+            result = acks.get(uav)
+            if result is None:
+                silent.append(uav)
+                results[uav] = send_single(uav)
+            elif result == MAVResult.ACCEPTED:
+                results[uav] = None
+            elif result == MAVResult.UNSUPPORTED:
+                results[uav] = NotSupportedError(
+                    f"The drone does not support the {description} command"
                 )
             else:
-                self.log.warning("Failed to send broadcast command")
+                results[uav] = RuntimeError(
+                    f"The drone refused the {description} command "
+                    f"({_mav_result_name(result)})"
+                )
+
+        if silent:
+            self.log.warning(
+                f"{len(silent)} of {len(uavs)} drones did not acknowledge the "
+                f"broadcast {description} command, sending it to them on their "
+                f"own addresses: {', '.join(uav.id for uav in silent)}"
+            )
+
+        return results
 
     def create_uav(self, id: str) -> "MAVLinkUAV":
         """Creates a new UAV that is to be managed by this driver.
@@ -858,13 +887,23 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         return response
 
     async def _enter_low_power_mode_broadcast(
-        self, *, transport: TransportOptions | None = None
-    ) -> None:
+        self,
+        uavs: list[MAVLinkUAV],
+        *,
+        transport: TransportOptions | None = None,
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
+        acks = await self.broadcast_command_long(
+            uavs,
             MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
             param1=126,  # request low power mode
             channel=channel,
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "low-power mode",
+            partial(self._enter_low_power_mode_single, transport=transport),
         )
 
     async def _enter_low_power_mode_single(
@@ -908,15 +947,25 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         return await uav.get_version_info()
 
     async def _resume_from_low_power_mode_broadcast(
-        self, *, transport: TransportOptions | None = None
-    ) -> None:
+        self,
+        uavs: list[MAVLinkUAV],
+        *,
+        transport: TransportOptions | None = None,
+    ) -> dict[MAVLinkUAV, Any]:
         # This is not supported by standard MAVLink so it relies on a custom
         # protocol extension
         channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
+        acks = await self.broadcast_command_long(
+            uavs,
             MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
             param1=127,  # resume autopilot
             channel=channel,
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "wake-up",
+            partial(self._resume_from_low_power_mode_single, transport=transport),
         )
         # TODO(ntamas): shall we notify all the UAVs that they are about to
         # be resumed (i.e. _notify_rebooted_by_us())?
@@ -941,7 +990,9 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
     ) -> None:
         await uav.fly_to(target)
 
-    async def _send_hover_signal_broadcast(self, *, transport=None) -> None:
+    async def _send_hover_signal_broadcast(
+        self, uavs: list[MAVLinkUAV], *, transport=None
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
 
         # TODO(ntamas): HACK HACK HACK This won't work for a PixHawk as we are
@@ -950,12 +1001,19 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         # may have different autopilots and the mode numbers might be different.
         base_mode, mode, submode = MAVModeFlag.CUSTOM_MODE_ENABLED, 16, 0
 
-        await self.broadcast_command_long_with_retries(
+        acks = await self.broadcast_command_long(
+            uavs,
             MAVCommand.DO_SET_MODE,
             param1=float(base_mode),
             param2=float(mode),
             param3=float(submode),
             channel=channel,
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "hold position",
+            partial(self._send_hover_signal_single, transport=transport),
         )
 
     async def _send_hover_signal_single(
@@ -964,10 +1022,18 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         channel = transport_options_to_channel(transport)
         await uav.set_mode("pos hold", channel=channel)
 
-    async def _send_landing_signal_broadcast(self, *, transport=None) -> None:
+    async def _send_landing_signal_broadcast(
+        self, uavs: list[MAVLinkUAV], *, transport=None
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
-            MAVCommand.NAV_LAND, channel=channel
+        acks = await self.broadcast_command_long(
+            uavs, MAVCommand.NAV_LAND, channel=channel
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "land",
+            partial(self._send_landing_signal_single, transport=transport),
         )
 
     async def _send_landing_signal_single(
@@ -981,7 +1047,12 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             raise RuntimeError("Landing command failed")
 
     async def _send_light_or_sound_emission_signal_broadcast(
-        self, signals: list[str], duration: int, *, transport=None
+        self,
+        uavs: list[MAVLinkUAV],
+        signals: list[str],
+        duration: int,
+        *,
+        transport=None,
     ) -> None:
         channel = transport_options_to_channel(transport)
 
@@ -999,14 +1070,31 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             await self.send_packet(message, uav, channel=channel)
 
     async def _send_motor_start_stop_signal_broadcast(
-        self, start: bool, force: bool = False, *, transport=None
-    ) -> None:
+        self,
+        uavs: list[MAVLinkUAV],
+        start: bool,
+        force: bool = False,
+        *,
+        transport=None,
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
+        acks = await self.broadcast_command_long(
+            uavs,
             MAVCommand.COMPONENT_ARM_DISARM,
             1 if start else 0,
             FORCE_MAGIC if force else 0,
             channel=channel,
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "arm" if start else "disarm",
+            partial(
+                self._send_motor_start_stop_signal_single,
+                start=start,
+                force=force,
+                transport=transport,
+            ),
         )
 
     async def _send_motor_start_stop_signal_single(
@@ -1018,18 +1106,31 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         else:
             await uav.disarm(force=force, channel=channel)
 
-    async def _send_reset_signal_broadcast(self, component, *, transport=None) -> None:
+    async def _send_reset_signal_broadcast(
+        self, uavs: list[MAVLinkUAV], component, *, transport=None
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
 
         if not component:
             # Resetting all the UAVs, this is supported
-            await self.broadcast_command_long_with_retries(
+            acks = await self.broadcast_command_long(
+                uavs,
                 MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
                 1,  # reboot autopilot
                 channel=channel,
             )
             # TODO(ntamas): shall we notify all the UAVs that they are about to
             # be rebooted (i.e. _notify_rebooted_by_us())?
+            return self._results_of_broadcast(
+                uavs,
+                acks,
+                "reboot",
+                partial(
+                    self._send_reset_signal_single,
+                    component=component,
+                    transport=transport,
+                ),
+            )
         else:
             # No per-component resets are implemented yet
             raise RuntimeError(f"Resetting {component!r} is not supported")
@@ -1046,10 +1147,18 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
             # No per-component resets are implemented on this UAV yet
             raise RuntimeError(f"Resetting {component!r} is not supported")
 
-    async def _send_return_to_home_signal_broadcast(self, *, transport=None) -> None:
+    async def _send_return_to_home_signal_broadcast(
+        self, uavs: list[MAVLinkUAV], *, transport=None
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
-        await self.broadcast_command_long_with_retries(
-            MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
+        acks = await self.broadcast_command_long(
+            uavs, MAVCommand.NAV_RETURN_TO_LAUNCH, channel=channel
+        )
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "return to home",
+            partial(self._send_return_to_home_signal_single, transport=transport),
         )
 
     async def _send_return_to_home_signal_single(
@@ -1064,16 +1173,38 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         if not success:
             raise RuntimeError("Return to home command failed")
 
-    async def _send_shutdown_signal_broadcast(self, *, transport=None) -> None:
+    async def _send_shutdown_signal_broadcast(
+        self, uavs: list[MAVLinkUAV], *, transport=None
+    ) -> dict[MAVLinkUAV, Any]:
         channel = transport_options_to_channel(transport)
-        await self._send_motor_start_stop_signal_broadcast(
-            start=False, force=True, transport=transport
+        disarm_acks = await self.broadcast_command_long(
+            uavs,
+            MAVCommand.COMPONENT_ARM_DISARM,
+            0,
+            FORCE_MAGIC,
+            channel=channel,
         )
-        await self.broadcast_command_long_with_retries(
+        shutdown_acks = await self.broadcast_command_long(
+            uavs,
             MAVCommand.PREFLIGHT_REBOOT_SHUTDOWN,
             2,  # shutdown autopilot
             param6=RebootShutdownConditions.FORCE,
             channel=channel,
+        )
+
+        # A drone that missed either broadcast gets both on its own address
+        acks = {
+            uav: shutdown_acks[uav]
+            if disarm_acks[uav] == MAVResult.ACCEPTED
+            else disarm_acks[uav]
+            for uav in uavs
+            if uav in disarm_acks and uav in shutdown_acks
+        }
+        return self._results_of_broadcast(
+            uavs,
+            acks,
+            "shutdown",
+            partial(self._send_shutdown_signal_single, transport=transport),
         )
 
     async def _send_shutdown_signal_single(
@@ -1158,6 +1289,14 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 def _require_finite(name: str, value: float) -> None:
     if not isfinite(value):
         raise RuntimeError(f"Value of parameter {name!r} must be finite")
+
+
+def _mav_result_name(result: int) -> str:
+    """Returns the name of a ``MAV_RESULT`` value for messages."""
+    try:
+        return MAVResult(result).name
+    except ValueError:
+        return f"result {result}"
 
 
 def _require_float32(name: str, value: float) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from logging import Logger
 from time import time
@@ -52,6 +52,14 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
     _network: MAVLinkNetwork
     """The MAVLink network that owns this scheduled takeoff manager."""
 
+    refuse_start: Callable[[str], None] | None = None
+    """Cancels the scheduled start for the given reason; ``None`` to only warn
+    about the drones that are not ready for it."""
+
+    find_uav: Callable[[str], object | None] = staticmethod(lambda _id: None)
+    """Returns the UAV with the given ID from any network or driver, ``None``
+    if the server does not know it."""
+
     def __init__(self, network: MAVLinkNetwork):
         """Constructor.
 
@@ -72,11 +80,10 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         return self._network.driver.show_schedule
 
     async def _broadcast_show_schedule(self) -> None:
-        """Sends the show schedule next to the start configuration, more often
-        shortly before the start and at once when it changes: broadcast, and to
-        every drone on its own address, because a wireless bridge (such as the
-        positioning tags' bridge to their autopilots) may not forward
-        broadcasts.
+        """Broadcasts the show schedule next to the start configuration, more
+        often shortly before the start and at once when it changes. Broadcast
+        is the only path: a drone that misses it reports a schedule that
+        differs from the server's, and the start agreement checks report it.
         """
         schedule = self._schedule
         while True:
@@ -90,15 +97,8 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
                         spec, channel=Channel.SHOW_CONTROL
                     )
                 except Exception:
+                    # A drone that misses one gets the next
                     pass
-                for uav in list(self.iter_uavs_to_schedule()):
-                    try:
-                        await self._network.send_packet(
-                            schedule.packet(now), uav, channel=Channel.SHOW_CONTROL
-                        )
-                    except Exception:
-                        # A drone that misses one gets the next
-                        pass
             with move_on_after(schedule.period(now)):
                 await changed.wait()
 
@@ -115,12 +115,8 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         await self._network.broadcast_packet(spec, channel=Channel.SHOW_CONTROL)
 
     def iter_uavs_to_schedule(self) -> Iterator[MAVLinkUAV]:
-        """Returns an iterator over the UAVs managed by this object that are
-        to be updated on an individual basis if they do not receive the
-        broadcast configuration packet or do not respond to it.
-
-        May return an empty iterator if you do not want to support individual
-        configuration for the UAVs.
+        """Returns an iterator over the UAVs managed by this object whose
+        agreement with the scheduled start is checked before the start.
         """
         return (
             uav
@@ -129,91 +125,102 @@ class MAVLinkScheduledTakeoffManager(ScheduledTakeoffManager["MAVLinkUAV"]):
         )
 
     def check_start_agreement(self, config: TakeoffConfiguration, lead: float) -> None:
+        """Warns about each drone whose start differs from the server's and,
+        before the drones commit to the start, cancels it unless every drone
+        of the show is ready: a drone that is not would stay on its pad while
+        the others take off around it.
+        """
         schedule = self._schedule
         now = time()
+        problems: dict[str, str] = {}
         for uav in self.iter_uavs_to_schedule():
-            echo = uav.show_schedule_status
-            if echo is None:
-                problem = (
-                    "its start time or authorization differs from the server's"
-                    if _start_differs(uav, config)
-                    else None
-                )
-            elif (
-                config.authorization_scope != uav.scheduled_takeoff_authorization_scope
-            ):
-                problem = "its authorization differs from the server's"
-            elif lead > DRONE_COMMIT_LEAD:
-                problem = _problem_before_commit(echo, schedule, now)
-            else:
-                problem = _problem_after_commit(echo, schedule)
-                if echo.has_start and self._log:
-                    offset = (echo.start_cluster_us - schedule.start_cluster_us) / 1000
-                    self._log.info(
-                        f"Start offset at T-{lead:.0f} s: {offset:+.2f} ms",
-                        extra={"id": uav.id},
-                    )
+            problem = self._start_problem(uav, config, lead, schedule, now)
             if problem is None:
                 continue
+            problems[uav.id] = problem
             message = f"Not in sync for the scheduled start: {problem}"
             if self._log:
                 self._log.warning(message, extra={"id": uav.id})
             uav.send_log_message_to_gcs(message, severity=Severity.WARNING)
 
-    def uav_needs_update(self, uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
-        """Returns whether the given UAV needs to be updated if the desired
-        takeoff configuration is the one provided as `config`.
+        if lead > DRONE_COMMIT_LEAD and self.refuse_start is not None:
+            not_ready = self._show_drones_not_ready(problems)
+            if not_ready:
+                self.refuse_start(
+                    f"not every drone of the show is ready at T-{lead:.0f} s: "
+                    + _format_not_ready(not_ready)
+                )
 
-        May return False unconditionally if you do not want to support individual
-        configuration for the UAVs.
+    def _start_problem(
+        self,
+        uav: MAVLinkUAV,
+        config: TakeoffConfiguration,
+        lead: float,
+        schedule: ShowSchedule,
+        now: float,
+    ) -> str | None:
+        """Returns why the given drone is not in agreement with the scheduled
+        start, ``None`` if it is."""
+        echo = uav.show_schedule_status
+        if echo is None:
+            return (
+                "its start time or authorization differs from the server's"
+                if _start_differs(uav, config)
+                else None
+            )
+        if config.authorization_scope != uav.scheduled_takeoff_authorization_scope:
+            return "its authorization differs from the server's"
+        if lead > DRONE_COMMIT_LEAD:
+            return _problem_before_commit(echo, schedule, now)
+        problem = _problem_after_commit(echo, schedule)
+        if echo.has_start and self._log:
+            offset = (echo.start_cluster_us - schedule.start_cluster_us) / 1000
+            self._log.info(
+                f"Start offset at T-{lead:.0f} s: {offset:+.2f} ms",
+                extra={"id": uav.id},
+            )
+        return problem
+
+    def _show_drones_not_ready(self, problems: dict[str, str]) -> list[tuple[str, str]]:
+        """Returns the ID of each drone of the show that is not ready for the
+        start in this network, with the reason; the drones of other networks
+        are checked by their own network.
 
         Args:
-            uav: the UAV to check
-            config: the desired takeoff configuration to check against
+            problems: why each drone in this network disagrees with the start,
+                by ID
         """
-        if config.authorization_scope != uav.scheduled_takeoff_authorization_scope:
-            # Auth scope is different so we definitely need an update
-            return True
+        show_ids = [id for id in (self._config.uav_ids if self._config else ()) if id]
+        if not show_ids:
+            # No assignment: every drone that takes part has to be ready
+            return list(problems.items())
 
-        echo = uav.show_schedule_status
-        if echo is not None:
-            return self._schedule.packet(time()) is not None and (
-                self._schedule.disagrees_with(echo)
-            )
+        ours = {uav.id: uav for uav in self._network.uavs()}
+        not_ready: list[tuple[str, str]] = []
+        for id in show_ids:
+            uav = ours.get(id)
+            if uav is None:
+                if self.find_uav(id) is None:
+                    not_ready.append((id, "the server does not know it"))
+            elif not uav.is_connected:
+                not_ready.append((id, "it is not connected"))
+            elif not uav.supports_scheduled_takeoff:
+                not_ready.append((id, "it does not support a scheduled start"))
+            elif id in problems:
+                not_ready.append((id, problems[id]))
+        return not_ready
 
-        if config.should_update_takeoff_time:
-            # Takeoff time must be cleared (None) or set to a specific
-            # value; we need an update if it is different from what
-            # we have on the UAV
-            return (
-                uav.scheduled_takeoff_time != config.takeoff_time_in_whole_seconds
-                or uav.scheduled_takeoff_time_msec != config.takeoff_time_msec
-            )
-
-        # Auth scope is the same and the takeoff time does not
-        # need to change
+    def uav_needs_update(self, uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:
+        """Returns ``False``: the start configuration and the show schedule
+        reach the drones by broadcast only, so that a drone shows up as
+        authorized only if the broadcast reached it. The broadcast is the path
+        of the stop commands of the show page too, so an authorized fleet has
+        proven that path.
+        """
         return False
 
     async def update_uav(self, uav: MAVLinkUAV, config: TakeoffConfiguration) -> None:
-        desired_auth_scope = config.authorization_scope
-        desired_takeoff_time = config.takeoff_time_in_legacy_format
-
-        echo = uav.show_schedule_status
-        desired_msec = config.takeoff_time_msec
-        if echo is not None:
-            spec = self._schedule.packet(time())
-            if spec is not None and self._schedule.disagrees_with(echo):
-                await self._network.send_packet(spec, uav, channel=Channel.SHOW_CONTROL)
-        elif (desired_takeoff_time is None or desired_takeoff_time >= 0) and (
-            desired_takeoff_time != uav.scheduled_takeoff_time
-            or desired_msec != uav.scheduled_takeoff_time_msec
-        ):
-            await uav.set_scheduled_takeoff_time(
-                seconds=desired_takeoff_time, msec=desired_msec
-            )
-
-        if desired_auth_scope != uav.scheduled_takeoff_authorization_scope:
-            await uav.set_authorization_scope(desired_auth_scope)
+        """Never called, see `uav_needs_update()`."""
 
 
 class ScheduledTakeoffSignalDispatcher(SimpleScheduledTakeoffManagerBase):
@@ -262,6 +269,17 @@ START_AGREEMENT_TOLERANCE = 0.02
 the start agreement check: the start may move by a few milliseconds shortly
 before it (e.g. when the timecode clock is re-anchored), and the drones follow
 it at the next broadcast."""
+
+
+NOT_READY_LISTED = 5
+"""Number of drones that are not ready for the start that are named one by one
+when the start is cancelled."""
+
+
+def _format_not_ready(not_ready: list[tuple[str, str]]) -> str:
+    listed = "; ".join(f"{id}: {reason}" for id, reason in not_ready[:NOT_READY_LISTED])
+    more = len(not_ready) - NOT_READY_LISTED
+    return listed + (f"; and {more} more" if more > 0 else "")
 
 
 def _start_differs(uav: MAVLinkUAV, config: TakeoffConfiguration) -> bool:

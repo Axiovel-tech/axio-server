@@ -5,7 +5,7 @@ MAVLink protocol.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from functools import partial
 from typing import TYPE_CHECKING, Any, overload
@@ -154,6 +154,9 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         driver.assume_data_streams_configured = assume_data_streams_configured
         driver.autopilot_factory = autopilot_factory
         driver.broadcast_packet = self._broadcast_packet
+        driver.broadcast_packet_and_collect_replies = (
+            self._broadcast_packet_and_collect_replies
+        )
         driver.create_device_tree_mutator = self.create_device_tree_mutation_context
         driver.log = self.log
         driver.mandatory_custom_mode = optional_int(configuration.get("custom_mode"))
@@ -235,6 +238,16 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
         )
         show = app.import_api("show", ShowExtensionAPI)
         schedule.is_locked = lambda: show.is_start_locked()
+
+        # A show starts only if every drone of it is ready before the drones
+        # commit to the start
+        registry = app.object_registry
+
+        def find_uav(uav_id: str) -> object | None:
+            return registry.find_by_id(uav_id) if uav_id in registry else None
+
+        for network in networks.values():
+            network.use_start_gate(show.cancel_start, find_uav)
 
         # Create self._uavs only here and not in the constructor; this is to
         # ensure that we cannot accidentally register a UAV when the extension
@@ -377,6 +390,63 @@ class MAVLinkDronesExtension(UAVExtension[MAVLinkDriver]):
 
         for network in self._networks.values():
             await network.broadcast_packet(spec, channel)
+
+    async def _broadcast_packet_and_collect_replies(
+        self,
+        spec: MAVLinkMessageSpecification,
+        uavs: Iterable[MAVLinkUAV],
+        reply: tuple[str, MAVLinkMessageMatcher],
+        *,
+        timeout: float,
+        channel: str | None = None,
+    ) -> dict[MAVLinkUAV, MAVLinkMessage]:
+        """Broadcasts a message to all the UAVs on all the networks managed by
+        this extension and collects the replies of the given UAVs.
+
+        Args:
+            spec: the specification of the MAVLink message to send
+            uavs: the UAVs whose replies to collect
+            reply: the type of the reply and a matcher that examines it further
+            timeout: number of seconds to wait for the replies after the
+                broadcast
+            channel: specifies the channel that the packet should be sent on;
+                defaults to the preferred channel of the network
+
+        Returns:
+            the reply of each UAV that replied in time; UAVs that did not reply,
+            and the UAVs of a network whose broadcast failed, are missing
+        """
+        if not self._networks:
+            raise RuntimeError("Cannot send packet; extension is not running")
+
+        uavs_by_network: dict[str, list[MAVLinkUAV]] = {}
+        for uav in uavs:
+            uavs_by_network.setdefault(uav.network_id, []).append(uav)
+
+        replies: dict[MAVLinkUAV, MAVLinkMessage] = {}
+
+        async def collect(network_id: str, network: MAVLinkNetwork) -> None:
+            try:
+                replies.update(
+                    await network.broadcast_packet_and_collect_replies(
+                        spec,
+                        uavs_by_network.get(network_id, ()),
+                        reply,
+                        timeout=timeout,
+                        channel=channel,
+                    )
+                )
+            except Exception:
+                assert self.log is not None
+                self.log.exception(
+                    "Failed to broadcast packet", extra={"id": network_id}
+                )
+
+        async with trio.open_nursery() as nursery:
+            for network_id, network in self._networks.items():
+                nursery.start_soon(collect, network_id, network)
+
+        return replies
 
     def _get_network_specifications_from_configuration(
         self, configuration
