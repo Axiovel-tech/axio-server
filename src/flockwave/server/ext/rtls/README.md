@@ -89,11 +89,10 @@ enables it.
   answers the show extension (`show_start_refusal()`) before it authorizes a
   flight.
 - **Cell settings are derived, never stored.** Each board reports the code
-  of the session it booted with (`cellcfg`, anchors also `txgain`); the
-  server compares it with the code of its cached parameters and with what A0
-  runs, and `X-RTLS-CELL` writes the ranging rate and the anchors' TX level,
-  then reboots the running boards the state after the writes calls for (A0
-  last). One apply at a time; one server is one cell.
+  of the session it runs (`cellcfg`, anchors also `txgain`) and the server
+  compares it with what A0 runs. A write applies on the board at once, so
+  `X-RTLS-CELL` only writes: the tags first, the anchors only when every tag
+  took it. One apply at a time; one server is one cell.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -112,9 +111,8 @@ enables it.
 - `anchor_sleep.py`: an anchor's sleep and wake and their verification.
 - `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
   and the show gate.
-- `cell_state.py`: the per-device cell-settings state, the `cellSettings`
-  summary, its lock warning and Verify rule.
-- `cell_settings.py`: `X-RTLS-CELL`, the apply that writes and reboots.
+- `cell_settings.py`: `X-RTLS-CELL`, the per-device cell-settings state,
+  the `cellSettings` summary, its lock warning and Verify rule.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.

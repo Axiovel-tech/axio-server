@@ -32,7 +32,6 @@ from rtls_support import (
     make_message,
     set_fake_param,
 )
-from rtlslink.cell_settings import code as cell_code
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
@@ -115,31 +114,13 @@ def set_cached_param(device, name, value, param_type_name):
     device.param_types[name] = param_type
 
 
-#: the session parameters every device of the test cell stores
-SESSION_PARAMS = (
-    ("UWB_CHANNEL", 9, "uint8"),
-    ("UWB_SESSION_ID", 0x11223344, "uint32"),
-    ("UWB_BLOCK_MS", 20, "uint16"),
-    ("UWB_SLOT_RSTU", 1200, "uint16"),
-    ("UWB_SLOTS_RR", 12, "uint8"),
-)
-SESSION_CODE = cell_code({name: value for name, value, _ in SESSION_PARAMS})
-
-
-def add_session_params(device, *, anchor=False, setter=None):
-    """The cell-settings parameters (the anchors' TX level too), so the
-    identity refill finds nothing missing."""
-    setter = setter or set_fake_param
-    for name, value, param_type in SESSION_PARAMS:
-        setter(device, name, value, param_type)
-    if anchor:
-        setter(device, "UWB_TX_GAIN", 47, "uint8")
+#: the cell code every device of the verify fleet runs
+SESSION_CODE = 0x123456
 
 
 def add_rtls_cell_params(device, *, role=1, uwb_mac=254):
     """Give a FakeDevice a full RTLS cell: a role, its own MAC, the cell
     origin and a two-anchor NED table (A1 carries a survey bias)."""
-    add_session_params(device, anchor=role != 1)
     for name, value, param_type in (
         ("UWB_ROLE", role, "uint8"),
         ("UWB_MAC", uwb_mac, "uint16"),
@@ -206,7 +187,6 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
             "txGain": None,
             "reference": None,
             "differ": [],
-            "restart": [],
             "unknown": [],
         },
     }
@@ -459,7 +439,6 @@ async def test_anchor_beacon_refreshes_after_param_set(extension, device):
 def add_anchor_identity_params(device, *, uwb_mac=2):
     """Give a FakeDevice an anchor identity: responder role, its own MAC
     and a two-entry anchor MAC table (MAC 2 -> index A1)."""
-    add_session_params(device, anchor=True)
     for name, value, param_type in (
         ("UWB_ROLE", 3, "uint8"),
         ("UWB_MAC", uwb_mac, "uint16"),
@@ -2889,8 +2868,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
         ids_by_type=lambda _type: list(uavs)
     )
     extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
-    a0 = add_anchor_device(extension, 200, role=2, uwb_mac=1)
-    add_session_params(a0, anchor=True, setter=set_cached_param)
+    add_anchor_device(extension, 200, role=2, uwb_mac=1)
     extension._stats[200] = {"id": 200, "cellConfig": SESSION_CODE, "txGain": 47}
     extension._stats_at[200] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):

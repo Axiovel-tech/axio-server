@@ -35,8 +35,6 @@ from rtlslink import (
     param_type_to_name,
     parse_address,
 )
-from rtlslink.cell_settings import CODE_PARAMS as CELL_CODE_PARAMS
-from rtlslink.cell_settings import TX_GAIN_PARAM as CELL_TX_GAIN_PARAM
 from rtlslink.dialect import load_dialect
 from rtlslink.flash import read_receipt
 from rtlslink.protocol import (
@@ -68,8 +66,7 @@ from .anchor_sleep import (
     sleep_error,
 )
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
-from .cell_settings import handle_cell_request
-from .cell_state import cell_view
+from .cell_settings import cell_view, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
@@ -2709,17 +2706,10 @@ def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
 def _missing_identity_param_names(
     params: dict[str, Any], role: str | None
 ) -> list[str]:
-    cell = [name for name in _cell_param_names(role) if name not in params]
-    return cell + _missing_naming_param_names(params, role)
-
-
-def _cell_param_names(role: str | None) -> tuple[str, ...]:
-    """The parameters the cell-settings state reads: the cell code's and, on an
-    anchor, its TX level. A name absent from an older registry costs the capped
-    refill rounds and is then left alone."""
-    if role in ANCHOR_ROLES:
-        return (*CELL_CODE_PARAMS, CELL_TX_GAIN_PARAM)
-    return CELL_CODE_PARAMS if role == "tag" else ()
+    # A0's block, slots and slot length make the cell's rate (cell_settings.py)
+    rate = A0_RATE_PARAMS if role == "anchor-initiator" else ()
+    missing = [name for name in rate if name not in params]
+    return missing + _missing_naming_param_names(params, role)
 
 
 def _missing_naming_param_names(params: dict[str, Any], role: str | None) -> list[str]:
@@ -2794,6 +2784,14 @@ def _code_name(names: dict[int, str]) -> Callable[[float], str]:
     return convert
 
 
+A0_RATE_PARAMS = ("UWB_BLOCK_MS", "UWB_SLOTS_RR", "UWB_SLOT_RSTU")
+
+
+def _running_or_none(value: float) -> int | None:
+    """``cellcfg`` and ``txgain``: -1 while the device runs no session."""
+    return None if value < 0 else int(value)
+
+
 #: stats (wire name) carried 1:1 into the X-RTLS-STATS body (key, converter),
 #: each present only while its stat is. Non-finite values are dropped.
 STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
@@ -2823,9 +2821,9 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("wdisc", "wifiDisconnects", int),
     ("wtxerr", "wifiTxErrors", int),
     ("boots", "bootCount", int),
-    # the code and TX level of the session the device runs (cell_state.py)
-    ("cellcfg", "cellConfig", int),
-    ("txgain", "txGain", int),
+    # the code and TX level of the session the device runs (cell_settings.py)
+    ("cellcfg", "cellConfig", _running_or_none),
+    ("txgain", "txGain", _running_or_none),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),
