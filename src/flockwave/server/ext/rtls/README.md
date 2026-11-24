@@ -55,7 +55,9 @@ keeps streaming to that client until someone else speaks to it.
   "port": 3333,               // management port of the boards in "devices"
   "register_beacons": true,   // anchors as map beacons
   "heartbeat_interval": 2,    // s
-  "device_timeout": 6         // s without a heartbeat before a board is lost
+  "device_timeout": 6,        // s without a heartbeat before a board is lost
+  "lock_required_for_show": true  // SHOW-SETCFG authorizes a flight only
+                                  // with anchors online, all locked
 }
 ```
 
@@ -81,6 +83,11 @@ enables it.
   the network) and falls asleep in place from standby; `anchor_sleep.py`
   verifies the outcome from the `powerState` it reports after the write and
   does not command an anchor that reports none. A woken board reboots.
+- **The anchor lock lives in the firmware.** A locked anchor (`LOCK=1`,
+  reported as its `lock` stat) refuses every remote change itself. The
+  server only writes `LOCK`, derives the cell's lock from the stats, and
+  answers the show extension (`show_start_refusal()`) before it authorizes a
+  flight.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -97,6 +104,8 @@ enables it.
   `set_param()`, `set_sleep()`, `start_ota()`, `cluster_clock`, …) are the
   entry points for other extensions.
 - `anchor_sleep.py`: an anchor's sleep and wake and their verification.
+- `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
+  and the show gate.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.
@@ -115,4 +124,5 @@ uv run pytest test/test_ext_rtls.py test/test_rtls_*.py
 The tests drive the handlers against the SDK's sans-IO protocol core with a
 scripted fake device, without sockets. Protocol tests belong to the SDK, in
 rtls-link-zephyr `py/tests/`. `test/rtls_support.py` and
-`test/anchor_sleep_support.py` hold the fakes.
+`test/anchor_sleep_support.py` and `test/anchor_lock_support.py` hold the
+fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.

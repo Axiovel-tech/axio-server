@@ -162,7 +162,22 @@ def add_anchor_device(extension, system_id, *, role, uwb_mac):
 async def test_inf_empty_before_discovery(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body == {"type": "X-RTLS-INF", "status": {}, "anchors": []}
+    assert response.body == {
+        "type": "X-RTLS-INF",
+        "status": {},
+        "anchors": [],
+        "anchorLock": {
+            "locked": False,
+            "lockedCount": 0,
+            "anchorCount": 0,
+            "unlocked": [],
+            "showGate": {
+                "required": True,
+                "refused": True,
+                "reason": "no anchors locked; lock them in Control first",
+            },
+        },
+    }
 
 
 async def test_unlisted_board_is_found_from_its_stream(dialect, device):

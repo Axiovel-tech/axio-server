@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
+from .anchor_lock import handle_lock_request, lock_json, locked_detail, show_gate
 from .anchor_sleep import (
     ANCHOR_SLEEP_TIMEOUT,
     lacks_param,
@@ -359,6 +360,8 @@ class RtlsExtension(Extension):
         #: :meth:`_poll_uav_map` -- never persisted
         self._fc_claims: dict[int, FlightController] = {}
         self._uav_map: dict[int, str] = {}
+        #: whether a flight may be authorized only with the anchors locked
+        self._lock_required_for_show = True
 
     async def run(self, app, configuration, logger):
         # Fail fast on the classic standalone-harness mistake: the server
@@ -379,6 +382,9 @@ class RtlsExtension(Extension):
         )
         listen_port = int(configuration.get("listen_port", DEFAULT_LISTEN_PORT))
         register_beacons = bool(configuration.get("register_beacons", True))
+        self._lock_required_for_show = bool(
+            configuration.get("lock_required_for_show", True)
+        )
         self._cluster_clock.log = self.log
         self._beacon_api = app.import_api("beacon") if register_beacons else None
 
@@ -441,23 +447,28 @@ class RtlsExtension(Extension):
                         "X-RTLS-GEOM": self._handle_RTLS_GEOM,
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                         "X-RTLS-FORGET": self._handle_RTLS_FORGET,
+                        "X-RTLS-LOCK": self._handle_RTLS_LOCK,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
         finally:
-            self._nursery = None
             sock.close()
-            self._sock = None
-            self._uptime_ms.clear()
-            self._lost.clear()
-            self._retained_params.clear()
-            self._sleeping.clear()
-            self._sleep_pins.clear()
-            self._mavlink_api = None
-            self._fc_claims.clear()
-            self._uav_map.clear()
-            self._beacon_api = None
-            self._clear_anchor_beacons()
+            self._forget_run_state()
+
+    def _forget_run_state(self) -> None:
+        """What a stopped extension keeps of no device."""
+        self._nursery = None
+        self._sock = None
+        self._uptime_ms.clear()
+        self._lost.clear()
+        self._retained_params.clear()
+        self._sleeping.clear()
+        self._sleep_pins.clear()
+        self._mavlink_api = None
+        self._fc_claims.clear()
+        self._uav_map.clear()
+        self._beacon_api = None
+        self._clear_anchor_beacons()
 
     async def _run_protocol_loop(self, protocol, sock, logger) -> None:
         while True:
@@ -918,12 +929,13 @@ class RtlsExtension(Extension):
                 f"Device {system_id}: role unknown (UWB_ROLE not read); not commanded",
             )
         if role in ANCHOR_ROLES:
-            return await set_anchor_sleep(
+            result = await set_anchor_sleep(
                 self,
                 system_id,
                 sleeping,
                 timeout=ANCHOR_SLEEP_TIMEOUT if timeout is None else timeout,
             )
+            return {**result, **self._refusal_detail(system_id, result["accepted"])}
         return await self._set_tag_sleep(
             system_id,
             sleeping,
@@ -1156,8 +1168,9 @@ class RtlsExtension(Extension):
                 nursery.cancel_scope.cancel()
 
         if error is not None:
+            locked = locked_detail(self, job["id"])
             job["status"] = "error"
-            job["error"] = error
+            job["error"] = error if locked is None else f"{locked} ({error})"
             if self.log:
                 self.log.warning(f"rtls: OTA for sysid {job['id']} failed: {error}")
         else:
@@ -1204,6 +1217,8 @@ class RtlsExtension(Extension):
             # The drone's own telemetry rides its tag's snapshot so that one
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
+        if body.get("locked") != (self._stats.get(system_id) or {}).get("locked"):
+            self._inf_pending = True  # anchorLock follows the anchors' lock
         self._stats[system_id] = body
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
@@ -1505,6 +1520,7 @@ class RtlsExtension(Extension):
             "type": "X-RTLS-INF",
             "status": self._inf_status(now),
             "anchors": self._site_anchors(),
+            "anchorLock": lock_json(self),
         }
         await hub.broadcast_message(hub.create_notification(body))
 
@@ -1697,6 +1713,7 @@ class RtlsExtension(Extension):
                 "type": "X-RTLS-INF",
                 "status": self._inf_status(time.monotonic()),
                 "anchors": self._site_anchors(),
+                "anchorLock": lock_json(self),
             },
             in_response_to=message,
         )
@@ -1808,6 +1825,7 @@ class RtlsExtension(Extension):
                 "paramType": result["type"],
                 "result": result["result"],
                 "accepted": result["accepted"],
+                **self._refusal_detail(system_id, result["accepted"]),
             },
             in_response_to=message,
         )
@@ -2044,6 +2062,28 @@ class RtlsExtension(Extension):
         self._prune_stats(system_id)
         self._sleep_pins.pop(system_id, None)
         return {"forgotten": True}
+
+    async def _handle_RTLS_LOCK(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        try:
+            body = await handle_lock_request(self, message.body)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        if body["results"]:
+            await self._on_inf_change(time.monotonic())
+        return hub.create_response_or_notification(body=body, in_response_to=message)
+
+    def show_start_refusal(self) -> str | None:
+        """Why a flight may not be authorized or scheduled now, or None (see
+        :func:`.anchor_lock.show_gate`). Exported to the show extension."""
+        return show_gate(self)["reason"]
+
+    def _refusal_detail(self, system_id: int, accepted: bool) -> dict[str, str]:
+        """``{"detail": "RTLS anchor A3 is locked"}`` for a write a locked
+        anchor refused, else nothing."""
+        locked = None if accepted else locked_detail(self, system_id)
+        return {} if locked is None else {"detail": locked}
 
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
@@ -2489,6 +2529,7 @@ class RtlsExtension(Extension):
             "set_param": self.set_param,
             "set_sleep": self.set_sleep,
             "forget_device": self.forget_device,
+            "show_start_refusal": self.show_start_refusal,
             "start_ota": self.start_ota,
             "verify_species": self.verify_species,
         }
@@ -2724,6 +2765,8 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("rnghz", "rangingRateHz", _rounded(2)),
     ("urst", "radioRestarts", int),
     ("moved", "moved", bool),
+    # the anchor's LOCK: it refuses every remote change while set
+    ("lock", "locked", bool),
     ("tilt", "tiltDeg", _rounded(1)),
     ("knocks", "knocks", int),
     ("elink", "ethernetLink", bool),
@@ -2967,6 +3010,12 @@ schema = {
         "register_beacons": {
             "type": "boolean",
             "title": "Register configured RTLS anchors as map beacons",
+            "default": True,
+        },
+        "lock_required_for_show": {
+            "type": "boolean",
+            "title": "Authorize or schedule a flight only while every online "
+            "anchor reports its lock",
             "default": True,
         },
     }

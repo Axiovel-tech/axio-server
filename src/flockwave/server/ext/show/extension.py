@@ -15,10 +15,24 @@ from flockwave.server.model.log import Severity
 from flockwave.server.tasks import wait_for_dict_items, wait_until
 
 from .clock import ClockSynchronizationHandler, ShowClock, ShowEndClock
-from .config import DroneShowConfiguration, LightConfiguration, StartMethod
+from .config import (
+    AuthorizationScope,
+    DroneShowConfiguration,
+    LightConfiguration,
+    StartMethod,
+)
 from .logging import ShowUploadLoggingMiddleware
 
 __all__ = ("construct", "dependencies", "description")
+
+
+def _authorizes_flight(config: DroneShowConfiguration) -> bool:
+    """Whether a configuration lets the drones fly the show (live or
+    rehearsal; lights-only authorizations do not take off)."""
+    return config.authorized_to_start and config.authorization_scope in (
+        AuthorizationScope.LIVE,
+        AuthorizationScope.REHEARSAL,
+    )
 
 
 class DroneShowExtension(Extension):
@@ -115,7 +129,9 @@ class DroneShowExtension(Extension):
                         "live" if authorized else "none"
                     )
 
-            self._ensure_start_not_moved(config)
+            candidate = self._candidate(config)
+            self._ensure_start_not_moved(candidate)
+            self._ensure_anchors_allow_start(candidate)
             self._config.update_from_json(config)
             return hub.acknowledge(message)
         except Exception as ex:
@@ -258,17 +274,26 @@ class DroneShowExtension(Extension):
                 "authorizationScope": self._config.authorization_scope.value,
             }
         }
-        self._ensure_start_not_moved(config)
+        candidate = self._candidate(config)
+        self._ensure_start_not_moved(candidate)
+        self._ensure_anchors_allow_start(candidate)
         self._config.update_from_json(config)
 
-    def _ensure_start_not_moved(self, config: Any) -> None:
-        """Raises an error if the given configuration update moves a locked
-        start. Clearing a locked start (aborting the show) is allowed.
-        """
-        if not self._is_start_locked() or not isinstance(config, dict):
-            return
+    def _candidate(self, config: Any) -> DroneShowConfiguration | None:
+        """The configuration a SHOW-SETCFG update would produce, for the
+        start guards to judge; None for an update that is not a dict."""
+        if not isinstance(config, dict):
+            return None
         updated = self._config.clone()
         updated.update_from_json(config)
+        return updated
+
+    def _ensure_start_not_moved(self, updated: DroneShowConfiguration | None) -> None:
+        """Raises an error if the updated configuration moves a locked
+        start. Clearing a locked start (aborting the show) is allowed.
+        """
+        if updated is None or not self._is_start_locked():
+            return
         if updated.start_time_on_clock is not None and (
             updated.clock != self._config.clock
             or updated.start_time_on_clock != self._config.start_time_on_clock
@@ -279,6 +304,52 @@ class DroneShowExtension(Extension):
                 f"The start is locked from T{point_of_no_return:.0f} s; only "
                 "abort (clear the start) is possible"
             )
+
+    def _ensure_anchors_allow_start(
+        self, updated: DroneShowConfiguration | None
+    ) -> None:
+        """Raises an error if the updated configuration authorizes a flight
+        (live or rehearsal), or gives an authorized one a new start or more
+        drones, while the rtls extension refuses it (the anchors are not
+        locked). An abort is never refused: revoking, and clearing an
+        existing start whatever else the update changes; nor is a
+        lights-only authorization or removing drones."""
+        if updated is None or not _authorizes_flight(updated):
+            return
+        current = self._config
+        if _authorizes_flight(current):
+            if (
+                updated.start_time_on_clock is None
+                and current.start_time_on_clock is not None
+            ):
+                return
+            added = {i for i in updated.uav_ids if i} - set(current.uav_ids)
+            if not added and (
+                updated.start_time_on_clock,
+                updated.clock,
+                updated.start_method,
+            ) == (
+                current.start_time_on_clock,
+                current.clock,
+                current.start_method,
+            ):
+                return
+        refusal = self._anchor_start_refusal()
+        if refusal is not None:
+            raise RuntimeError(f"Show start refused: {refusal}")
+
+    def _anchor_start_refusal(self) -> str | None:
+        """The rtls extension's reason to refuse a show start, None when it
+        has none or is not loaded (no RTLS cell, no requirement)."""
+        if self.app is None:
+            return None
+        try:
+            rtls = self.app.import_api("rtls")
+            if not rtls.loaded:
+                return None
+            return rtls.show_start_refusal()
+        except (AttributeError, KeyError, RuntimeError):
+            return None
 
     def _is_start_locked(self) -> bool:
         """Returns whether the show start is final: from the point of no
