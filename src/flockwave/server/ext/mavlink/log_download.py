@@ -30,6 +30,17 @@ from .utils import ChunkAssembler
 __all__ = ("MAVLinkLogDownloader",)
 
 
+LOG_DATA_GAP_TIMEOUT = 0.5
+"""Seconds without a LOG_DATA message after which the downloader stops waiting
+for the rest of the requested range and requests the missing part again.
+
+LOG_DATA messages lost on the way (for instance over Wi-Fi) are never re-sent
+by the drone on its own, so every loss costs this long. ArduPilot sends the
+requested range without pauses, so half a second without data means the rest
+of it is not coming.
+"""
+
+
 def create_log_metadata_from_mavlink_message(
     message: MAVLinkMessage,
 ) -> FlightLogMetadata:
@@ -176,7 +187,12 @@ class MAVLinkLogDownloader:
                 )
 
                 # Process the response, and start processing any other LOG_DATA messages
-                # that we receive via the channel
+                # that we receive via the channel. The drone sends the range in
+                # order, so once its last message has arrived, any part still
+                # missing was lost and is requested again straight away instead
+                # of after a timeout.
+                range_end = next_range.offset + next_range.size
+                end_of_range_received = False
                 while response is not None:
                     if response.get_type() == "LOG_DATA":
                         if response.id != log_id:
@@ -189,9 +205,15 @@ class MAVLinkLogDownloader:
                         if to_flush:
                             log_data.append(to_flush)
 
+                        message_end = response.ofs + response.count
+                        if response.id == log_id and (
+                            response.ofs < range_end <= message_end
+                        ):
+                            end_of_range_received = True
+
                     response = None
-                    if not chunks.done_with(next_range):
-                        with move_on_after(3):
+                    if not chunks.done_with(next_range) and not end_of_range_received:
+                        with move_on_after(LOG_DATA_GAP_TIMEOUT):
                             response = await rx.receive()
 
                     now = current_time()
