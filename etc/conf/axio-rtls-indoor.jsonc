@@ -5,10 +5,10 @@
 // 14550 is also the only port a tag listens on, so fleet-wide messages
 // (broadcast-mode commands, lights, the start configuration, the time axis
 // and the show schedule) are broadcast to 14550 too. The access point must
-// pass broadcast from the wired side to its wireless stations, and the board
-// subnet must hold one server only: every drone in it obeys every broadcast
-// it hears. A second team on the same network uses its own /24 (its tags'
-// NET_PREFIX) and binds that one below.
+// pass broadcast from the wired side to its wireless stations. Every drone on
+// a port obeys every server on it, so each person runs their stack on their
+// own ports (MAVLink, telemetry and Control, in AxioStack
+// repos/ops/axio-fleet/network.md); this file has the defaults.
 {
   "EXTENSIONS": {
     // Listen on all interfaces so Axio Control can connect from anywhere
@@ -38,9 +38,7 @@
             // replaces the former per-drone localhost ports, which never saw
             // the board-network traffic. Binding to the subnet makes every
             // broadcast go to the subnet's broadcast address from the start,
-            // so none leaves through another interface (e.g. office Wi-Fi)
-            // and drones in another team's subnet ignore it. The subnet is
-            // this team's: the /24 of its tags' NET_PREFIX.
+            // so none leaves through another interface (e.g. office Wi-Fi).
             // Broadcasts go to the tags' bridge port; the outdoor configs
             // keep 14555.
             "udp-listen://:14550?subnet=192.168.0.0/24&broadcast_port=14550"

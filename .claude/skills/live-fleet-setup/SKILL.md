@@ -1,6 +1,6 @@
 ---
 name: live-fleet-setup
-description: How the live indoor fleet reaches this server - one shared MAVLink listener on UDP 14550, the RTLS management stream, the tag bridge parameters, broadcast, sysids, launch and checks. Read before touching mavlink connection config, assigning ports, or configuring rtls-link boards for a bench or show session. Per-instance port layouts belong to the simulator only.
+description: How the live indoor fleet reaches this server - one shared MAVLink listener on the person's port (14550 by default), ports per person, the RTLS management stream, the tag bridge parameters, broadcast, sysids, launch and checks. Read before touching mavlink connection config, assigning ports, or configuring rtls-link boards for a bench or show session. Per-instance port layouts belong to the simulator only.
 ---
 
 # Live fleet setup
@@ -25,44 +25,48 @@ rtls-link-zephyr `docs/guidance/bench.md` ("Network") and
   AxioStack) and the boards the server has found (`X-RTLS-INF`, Control's
   RTLS panels).
 
-## MAVLink: one listener on UDP 14550
+## MAVLink: one listener, on your port
 
 Every tag bridges its autopilot's MAVLink to `WIFI_UART_HOST:WIFI_UART_PORT`,
-and every tag sends to the same place: the server host, port 14550. Drones
-are told apart by MAVLink system id, not by port. The server needs exactly
-one connection, as in `etc/conf/axio-rtls-indoor.jsonc`:
-`udp-listen://:14550?subnet=<board /24>&broadcast_port=14550`.
+and all of a server's tags send to the same place: the server host, on the
+MAVLink port of the person running it (14550 by default; each person's ports
+are in AxioStack `repos/ops/axio-fleet/network.md`). Drones are told apart by
+MAVLink system id. The server needs exactly one connection, as in
+`etc/conf/axio-rtls-indoor.jsonc`:
+`udp-listen://:<port>?subnet=192.168.0.0/24&broadcast_port=<port>`.
 
-- Bind the board subnet: `subnet=` is the /24 of the tags' `NET_PREFIX`,
-  and the listener binds the host's address in it. Bound to the subnet,
+- Bind the board subnet: `subnet=` is the board network's /24, and the
+  listener binds the host's address in it. Bound to the subnet,
   every broadcast goes to the subnet's broadcast address from the start;
   bound to all interfaces it would go to `255.255.255.255` out of the
   default route (an office Wi-Fi, say) until the first drone is heard. A
   `127.0.0.1` listener receives nothing from the board network; four
   per-drone localhost listeners once showed zero drones for that reason.
-- Keep `broadcast_port=14550`, the tags' bridge port (next section); a bare
-  `udp-listen` crashes the mavlink extension on broadcast-address updates.
+- Keep `broadcast_port` equal to the listener's port, the tags' bridge port
+  (next section); a bare `udp-listen` crashes the mavlink extension on
+  broadcast-address updates.
   The outdoor configs keep 14555.
 - Never add per-drone connections or ports. A new drone appears with no
-  server change once its tag bridges to 14550.
+  server change once its tag bridges to your port.
 
 Tag parameters for a drone to appear:
 
 | Parameter | Value |
 |---|---|
 | `WIFI_UART_EN` | 1 |
-| `WIFI_UART_PORT` | 14550 |
+| `WIFI_UART_PORT` | your MAVLink port (14550 by default) |
 | `WIFI_UART_HOST` | the server host's board-network address (= `MGMT_HOST`) |
+| `MGMT_PORT` | your telemetry port (3343 by default) |
 
 They apply at the tag's next boot: set, read back, reboot the tag (the
 autopilot keeps power). An empty or non-IPv4 `WIFI_UART_HOST` makes the tag
 wait for the ground to speak first, so a drone missing while the others
 stream usually has a wrong `WIFI_UART_HOST`.
 
-## Broadcast: the access point and one server per subnet
+## Broadcast: the access point and ports per person
 
-Fleet-wide messages go out once, as a broadcast to the board subnet on
-14550: commands in broadcast mode (Control switches to it when a show start
+Fleet-wide messages go out once, as a broadcast to the board subnet on the
+server's MAVLink port: commands in broadcast mode (Control switches to it when a show start
 is authorized, so the show page's stop buttons use it), lights, the start
 configuration and authorization, the time axis and the show schedule. Each
 tag's bridge hands them to ArduPilot. Each drone acknowledges a broadcast
@@ -80,17 +84,16 @@ So the network has to carry broadcast, at the bench and at every venue:
 - DTIM 1, and no 802.11b rates on 2.4 GHz (Grandstream: radio → "Allow
   Legacy Devices (802.11b)" off; TP-Link: mode 802.11g/n mixed), so
   broadcasts go out at 6 Mbps or more instead of 1 Mbps.
-- **One ground server per board subnet.** Every drone obeys every
-  broadcast to its subnet: a second server on the same subnet commands your
-  drones, and each server's start configuration (sent every second)
-  overrides the other's. Teams sharing the access point and the wired
-  network each take their own /24: the tags' `NET_PREFIX`, `WIFI_UART_HOST`
-  and `MGMT_HOST` set to the team's server address in it, that address
-  added to the server host's board interface, and `subnet=` set to it. A tag
-  ignores another subnet's broadcast (measured 2026-11-23); only
-  `255.255.255.255` reaches every subnet, and the `subnet=` binding never
-  sends it. The subnets still share the radio, which costs nothing at these
-  rates.
+- **Ports per person.** A tag listens only on its `WIFI_UART_PORT`, so a
+  server's broadcasts and commands reach only the tags set to its port, and
+  every drone on a port obeys every server sending to it: two servers on one
+  port command each other's drones, and each one's start configuration (sent
+  every second) overrides the other's. Each person has one set of ports
+  (MAVLink, telemetry, Control) for every session on any computer; the table
+  and the rules for starting a stack are in axio-fleet `network.md`. Two
+  people can run servers on one computer that way. Measured 2026-11-24: a
+  tag moved to another port acknowledged commands only there, and a drone on
+  another port ignored its server's lights and start authorization.
 - Keep the server host quiet on its board interface (no mDNS or other
   chatter): every broadcast on the air costs every tag CPU time.
 
@@ -102,7 +105,8 @@ round trip 9–42 ms.
 ## RTLS management
 
 Boards stream their management telemetry to `MGMT_HOST:MGMT_PORT` (3343 by
-default) from boot; the `rtls` extension listens there and finds them
+default, or the person's telemetry port) from boot; the `rtls` extension
+listens there (`listen_port`) and finds them
 without a device list. See `src/flockwave/server/ext/rtls/README.md`.
 
 ## Sysids
@@ -123,16 +127,17 @@ without a device list. See `src/flockwave/server/ext/rtls/README.md`.
 uv run skybrushd -c etc/conf/axio-rtls-indoor.jsonc
 ```
 
-- Before starting, check nothing stale holds the HTTP ports
-  (`ss -tlnp | grep -E ':500[01]'`); a stale `skybrushd` makes the new one
-  fail its bind.
-- Ingest: `ss -ulnp | grep 14550` must show the host's board address on
-  14550. If
-  `sudo tcpdump -ni <board interface> udp port 14550` sees packets but no
+- Before starting, check nothing holds your ports (`ss -ulpn`, `ss -tlpn`;
+  Control 5000–5003 by default); a stale `skybrushd` makes the new one fail
+  its bind, and a stack already on your ports is a second stack of yours
+  (axio-fleet `network.md`).
+- Ingest: `ss -ulnp` must show the host's board address on your MAVLink
+  port. If `sudo tcpdump -ni <board interface> udp port <port>` sees packets
+  but no
   drone appears, the listener is wrong, not the drones.
 - A board-initiated flow that seems dead: check the host firewall first
   (firmware `docs/guidance/bench.md`). The server needs UDP from the board
-  subnet allowed to `MGMT_PORT` and 14550.
+  subnet allowed to your telemetry and MAVLink ports.
 
 ## Simulation is different on purpose
 
@@ -145,4 +150,4 @@ The simulator's broker stands in for the broadcast domain: it relays the
 server's loopback broadcasts to every sim tag (rtls-link-zephyr
 `docs/reference/simulation.md`). Never
 copy these ports into a live config, and never fix a live problem with fresh
-ports: align the tags to 14550.
+ports: align the tags to the person's ports.
