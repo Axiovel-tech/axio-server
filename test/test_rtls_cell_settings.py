@@ -225,21 +225,21 @@ async def test_tx_level_goes_to_anchors_only(dialect, builder, hub):
     ext, devices = await _live_cell(dialect)
     writes = _record_writes(ext)
 
-    body = await _request(ext, builder, hub, txGain=60)
+    body = await _request(ext, builder, hub, txGain=30)
 
     assert body["result"] == "applied"
     assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
-    assert writes[202] == [("UWB_BLOCK_MS", 20), ("UWB_TX_GAIN", 60)]
+    assert writes[202] == [("UWB_BLOCK_MS", 20), ("UWB_TX_GAIN", 30)]
     assert "UWB_TX_GAIN" not in devices[TAG].params
     await _report(ext, devices)
-    assert _cell_settings(ext)["txGain"] == 60
+    assert _cell_settings(ext)["txGain"] == 30
     assert _states(ext)[202] == ("ok", None)
 
 
 async def test_an_empty_request_brings_in_a_device_left_behind(dialect, builder, hub):
     ext, devices = await _live_cell(dialect)
     devices[202].set_result = 2
-    await _request(ext, builder, hub, rateHz=83, txGain=60)
+    await _request(ext, builder, hub, rateHz=83, txGain=30)
     devices[202].set_result = 0
     await _report(ext, devices)
     assert _cell_settings(ext)["differ"] == [202]
@@ -248,7 +248,7 @@ async def test_an_empty_request_brings_in_a_device_left_behind(dialect, builder,
     body = await _request(ext, builder, hub)
 
     assert body["result"] == "applied"
-    assert writes[202] == [("UWB_BLOCK_MS", 12), ("UWB_TX_GAIN", 60)]
+    assert writes[202] == [("UWB_BLOCK_MS", 12), ("UWB_TX_GAIN", 30)]
     await _report(ext, devices)
     assert _cell_settings(ext)["differ"] == []
 
@@ -387,9 +387,9 @@ def _role_lost_from_dump(*, answers):
 async def test_a_role_not_cached_is_read_once(dialect, builder, hub, autojump_clock):
     prepare = _role_lost_from_dump(answers=True)
     ext, devices = await _live_cell(dialect, prepare=prepare)
-    body = await _request(ext, builder, hub, txGain=60)
+    body = await _request(ext, builder, hub, txGain=30)
     assert body["result"] == "applied"
-    assert _param(devices[202], "UWB_TX_GAIN") == 60
+    assert _param(devices[202], "UWB_TX_GAIN") == 30
 
     prepare = _role_lost_from_dump(answers=False)
     ext, devices = await _live_cell(dialect, prepare=prepare)
@@ -421,13 +421,13 @@ async def test_a_left_out_rate_needs_a0s_block(dialect, builder, hub, autojump_c
     prepare = _block_lost_from_a0_dump(answers=True)
     ext, devices = await _live_cell(dialect, prepare=prepare)
     writes = _record_writes(ext)
-    body = await _request(ext, builder, hub, txGain=60)
+    body = await _request(ext, builder, hub, txGain=30)
     assert body["result"] == "applied"
     assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
 
     prepare = _block_lost_from_a0_dump(answers=False)
     ext, devices = await _live_cell(dialect, prepare=prepare)
-    body = await _request(ext, builder, hub, txGain=60)
+    body = await _request(ext, builder, hub, txGain=30)
     assert (body["result"], body["reason"]) == (
         "refused",
         "A0's settings not read yet",
@@ -447,7 +447,7 @@ async def test_a0s_role_and_block_lost_are_both_read(
 
     ext, devices = await _live_cell(dialect, prepare=prepare)
     writes = _record_writes(ext)
-    body = await _request(ext, builder, hub, txGain=60)
+    body = await _request(ext, builder, hub, txGain=30)
     assert body["result"] == "applied"
     assert writes[TAG] == [("UWB_BLOCK_MS", 20)]
 
