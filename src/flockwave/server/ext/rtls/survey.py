@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
-from rtlslink import ProtocolEvent
+from rtlslink.survey import ROLE_RESPONDER, SurveyAnchor, hold_for, time_limit
 
 from .anchor_lock import anchor_views
 from .cell_settings import write_refusal
@@ -58,17 +58,7 @@ from .survey_request import (
     parse_start,
     placement_json,
 )
-from .survey_step import (
-    ROLE_RESPONDER,
-    Member,
-    ReportScanner,
-    StepResult,
-    end_survey,
-    hold_for,
-    next_step_id,
-    run_step,
-    time_limit,
-)
+from .survey_step import StepResult, end_survey, next_step_id, run_step
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -84,6 +74,9 @@ RUNNING_STATES = ("measuring", "returning", "committing")
 INCOMPLETE = "Not every anchor took the survey"
 CANCELLED = "cancelled"
 _INTERNAL_ERROR = "The survey stopped on an internal error"
+
+#: what an anchor reports of the session it runs: -1 (here None) while none
+_SESSION_STATS = ("cellConfig", "txGain", "surveyId")
 
 _Answer = tuple[str, Optional[str]]
 
@@ -147,7 +140,6 @@ class Survey:
         self._changed = _Pulse()
         self._dirty = False
         self._pushed_at: Optional[float] = None
-        self._reports = ReportScanner()
 
     @property
     def running(self) -> bool:
@@ -193,9 +185,18 @@ class Survey:
 
     # ---- what the extension tells the survey ----
 
-    def reports_in(self, data: bytes) -> list[ProtocolEvent]:
-        """The survey reports a management datagram carries, as events."""
-        return self._reports.events(data)
+    def keep_session(
+        self, system_id: int, stats: dict[str, Any], previous: dict[str, Any]
+    ) -> None:
+        """A step, the end of a survey and a commit each restart an anchor's
+        ranging, and for about 0.3 s it reports no session. While the survey
+        runs, its anchors keep the session they reported last in ``stats``,
+        so that a restart reads neither as cell settings that differ nor as
+        an anchor without a survey."""
+        if self.involves(system_id):
+            for key in _SESSION_STATS:
+                if stats.get(key) is None and previous.get(key) is not None:
+                    stats[key] = previous[key]
 
     def on_stats(self, system_id: int, stats: dict[str, Any]) -> None:
         run = self._run
@@ -407,12 +408,12 @@ class Survey:
         """Every anchor initiates one step; returns why the run cannot go
         on, if it cannot. A step that ends without every report is run once
         more, then what is missing stays missing: the gate decides."""
-        group = [Member(anchor.system_id, anchor.mac) for anchor in run.order]
+        group = [SurveyAnchor(anchor.system_id, anchor.mac) for anchor in run.order]
         limit = time_limit(run.rounds, run.block_ms)
         hold = hold_for(run.rounds, run.block_ms)
         step_id = random.randint(1, 0xFFFF)
 
-        async def step(initiator: Member) -> StepResult:
+        async def step(initiator: SurveyAnchor) -> StepResult:
             nonlocal step_id
             current, step_id = step_id, next_step_id(step_id)
             return await run_step(
@@ -436,7 +437,8 @@ class Survey:
             if result.ends_survey:
                 return self._step_failure(run, result)
             for system_id, report in result.reports.items():
-                if report.role == ROLE_RESPONDER and report.peer_mac == initiator.mac:
+                ranged = report.role == ROLE_RESPONDER and report.samples
+                if ranged and report.peer_mac == initiator.mac:
                     run.measurements[initiator.system_id, system_id] = DirectedRange(
                         range_m=report.range_m or 0.0,
                         mad_m=report.mad_m or 0.0,
@@ -470,7 +472,7 @@ class Survey:
         returns by itself, so the wait is then the hold time."""
         self.state = "returning"
         await self._notify()
-        group = [Member(anchor.system_id, anchor.mac) for anchor in run.order]
+        group = [SurveyAnchor(anchor.system_id, anchor.mac) for anchor in run.order]
         waiting = {a.system_id for a in run.order if a.boot_responder}
         deadline = trio.current_time() + hold_for(run.rounds, run.block_ms)
         unanswered = await end_survey(self._ext, group)

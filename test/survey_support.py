@@ -66,6 +66,7 @@ class SurveyCell:
         #: of, counted from 1
         self.lost_reports = {}
         self._steps_seen = {}
+        self._reports_sent = 0
         #: how long an anchor's answer to a step command takes, in seconds
         self.late = {}
         #: how long an anchor takes to collect a step, in seconds
@@ -205,8 +206,10 @@ class SurveyCell:
                 "svn": valid,
                 "svok": valid,
             }
+        # the SDK takes the frames of one time_boot_ms for one report, once
+        self._reports_sent += 1
         return b"".join(
-            device.named_value_float(name, float(value), time_boot_ms=step_id)
+            device.named_value_float(name, float(value), self._reports_sent)
             for name, value in frames.items()
         )
 

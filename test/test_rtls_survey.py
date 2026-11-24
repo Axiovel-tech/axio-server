@@ -5,14 +5,17 @@ import math
 
 import pytest
 import trio
-from anchor_lock_support import _lock
+from anchor_lock_support import CODE_50, _lock
 from cell_settings_support import _request as cell_request
+from cell_settings_support import _states as cell_states
 from rtls_support import make_message
 from rtlslink.dialect import load_dialect
+from rtlslink.survey import SurveyAnchor, encode_step
 from survey_support import (
     FLAT,
     TWO_TIERS,
     authorize_show,
+    commit,
     measure,
     request,
     survey_cell,
@@ -20,13 +23,7 @@ from survey_support import (
 )
 
 from flockwave.server.ext.rtls import survey as survey_module
-from flockwave.server.ext.rtls.survey_step import (
-    Member,
-    StepProblem,
-    encode_step,
-    end_survey,
-    run_step,
-)
+from flockwave.server.ext.rtls.survey_step import StepProblem, end_survey, run_step
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -273,6 +270,99 @@ async def test_a_range_to_another_peer_than_the_initiator_is_not_taken(
             assert pair["ab"] and pair["ba"]
 
 
+async def test_a_responder_that_heard_nothing_measured_no_range(
+    cell, builder, hub, autojump_clock
+):
+    cell.share[201, 203] = 0.0
+
+    survey = await measure(cell, builder, hub)
+
+    # its report says zero samples and a range of zero: a missing direction
+    pair = next(p for p in survey["pairs"] if (p["a"], p["b"]) == (201, 203))
+    assert pair["ab"] is None and pair["ba"]["n"] == 98
+    assert pair["rangeM"] == pair["ba"]["rangeM"]
+    assert survey["gate"] == {"blocked": [], "warnings": []}
+
+
+async def test_a_radio_lost_after_the_report_does_not_take_the_range_back(
+    cell, autojump_clock
+):
+    group = [SurveyAnchor(system_id, cell.mac[system_id]) for system_id in IDS]
+    cell.late[204] = 0.5
+    lost = {"svid": 5, "svrole": 3, "svst": 3, "svrnd": 100}
+
+    async def lose_the_radio():
+        await trio.sleep(0.4)
+        device = cell.devices[203]
+        datagram = b"".join(
+            device.named_value_float(name, float(value), 9999)
+            for name, value in lost.items()
+        )
+        await cell.ext._process_datagram(datagram, device.address, 0.0)
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(lose_the_radio)
+        result = await run_step(cell.ext, group, group[0], 5, 100, HOLD, timeout=2.0)
+
+    assert result.complete
+    assert result.reports[203].samples == 98
+
+
+async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
+    cell, builder, hub, autojump_clock
+):
+    ext = cell.ext
+    restarting = {"cellcfg": -1.0, "txgain": -1.0, "sid": -1.0}
+    cell.collect_s = 1.2
+    await _start(cell, builder, hub, anchors=[201, 202, 203])
+    await trio.sleep(0.5)
+    ext._inf_pending = False
+
+    # 201 is the cell's reference: without it every device reads unknown
+    await cell.report([201, 204], **restarting)
+
+    kept = {"cellConfig": CODE_50, "txGain": 47, "surveyId": None}
+    assert {key: ext._stats[201][key] for key in kept} == kept
+    # an anchor outside the survey is believed
+    assert ext._stats[204]["cellConfig"] is None
+    assert cell_states(ext)[201] == cell_states(ext)[202] == ("ok", None)
+    assert cell_states(ext)[204] == ("unknown", None)
+    warned = {
+        w["device"] for w in (await _lock(ext, builder, hub, "status"))["warnings"]
+    }
+    assert warned == {204}
+
+    # once the survey is over, an anchor without a session reads as one
+    await until(cell, "returning")
+    await cell.report([202, 203])
+    await until(cell, "ready")
+    await cell.report([201], **restarting)
+    assert ext._stats[201]["cellConfig"] is None
+
+
+async def test_a_restart_in_a_commit_keeps_the_survey_id_until_the_new_one(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+    await commit(cell, builder, hub)
+    await measure(cell, builder, hub)
+    cell.location_silent.add(204)
+    task = {}
+
+    async def ask():
+        task["answer"] = await request(cell, builder, hub, "commit")
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(ask)
+        await trio.sleep(0.1)
+        await cell.report([201], sid=-1.0)
+        assert cell.ext._stats[201]["surveyId"] == 1
+        await cell.report()
+
+    assert task["answer"]["survey"]["commit"]["running"] == [201, 202, 203]
+    assert cell.ext._stats[201]["surveyId"] == 2
+
+
 async def test_an_anchor_whose_radio_fails_the_steps_loses_its_pairs(
     cell, builder, hub, autojump_clock
 ):
@@ -455,7 +545,7 @@ async def test_cancel_while_the_anchors_return_drops_the_measurement(
 
 
 async def test_a_step_names_an_anchor_that_is_not_live(cell, autojump_clock):
-    group = [Member(system_id, cell.mac[system_id]) for system_id in IDS]
+    group = [SurveyAnchor(system_id, cell.mac[system_id]) for system_id in IDS]
     cell.lose(203)
 
     result = await run_step(cell.ext, group, group[0], 5, 100, HOLD, timeout=1.0)
@@ -469,7 +559,7 @@ async def test_a_step_names_an_anchor_that_is_not_live(cell, autojump_clock):
 async def test_a_report_of_another_step_or_anchor_is_not_this_steps(
     cell, autojump_clock
 ):
-    group = [Member(system_id, cell.mac[system_id]) for system_id in IDS[:3]]
+    group = [SurveyAnchor(system_id, cell.mac[system_id]) for system_id in IDS[:3]]
     cell.lost_reports = {201: {1}, 202: {1}, 203: {1}}
     stale = cell._report(cell.devices[202], encode_step(4, 100, HOLD, 1, [2, 3]))
     foreign = cell._report(cell.devices[204], encode_step(5, 100, HOLD, 1, [2, 4]))

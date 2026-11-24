@@ -8,7 +8,6 @@ from collections.abc import Sequence
 from typing import Any, Optional
 
 from .survey_fit import Frame
-from .survey_step import ROUNDS
 
 __all__ = (
     "DEFAULT_ROUNDS",
@@ -21,6 +20,8 @@ __all__ = (
 )
 
 DEFAULT_ROUNDS = 100
+#: what a step command carries
+ROUNDS = range(20, 1001)
 
 #: rough ``(x, y)`` or ``(x, y, z)`` per anchor, metres in the declared frame
 Placement = dict[int, tuple[float, ...]]

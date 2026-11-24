@@ -130,9 +130,9 @@ enables it.
   commit; `survey_group.py` who takes part and in which order,
   `survey_request.py` the request's frame and placement,
   `survey_commit.py` the survey ID and the `UWB_LOC` values and write.
-- `survey_step.py`: one survey step on the anchors (the `UWB_SURVEY`
-  command, the report frames, the write-and-wait). It stands in for the
-  SDK's `rtlslink.survey` and `survey_report` event until the pin has them.
+- `survey_step.py`: one survey step on the anchors, over the extension's
+  own socket: the command and the report are the SDK's (`rtlslink.survey`),
+  the write-and-wait is done here because the SDK's needs its own client.
 - `survey_fit.py`: anchor positions fitted to the ranges of an anchor
   survey, and the gate on committing them. Pure, numpy only.
 - `verify.py`: `X-RTLS-VERIFY`.

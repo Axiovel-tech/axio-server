@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 from rtlslink.cell_settings import RATE_PRESETS
+from rtlslink.survey import MAX_GROUP
 
 from .anchor_lock import anchor_views, lock_refusal
-from .survey_step import MAX_GROUP
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension

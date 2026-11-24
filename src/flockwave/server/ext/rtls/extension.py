@@ -535,10 +535,7 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        events = [
-            *self._protocol.feed(data, address, now),
-            *self._survey.reports_in(data),
-        ]
+        events = self._protocol.feed(data, address, now)
         # A device's whole health report arrives as one datagram, one
         # NAMED_VALUE_FLOAT per stat, and every stats event carries the SDK's
         # accumulated snapshot: the device's last one is the full report, so
@@ -1259,6 +1256,7 @@ class RtlsExtension(Extension):
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
         previous = self._stats.get(system_id) or {}
+        self._survey.keep_session(system_id, body, previous)
         # anchorLock and cellSettings follow the lock, cellcfg and txgain stats;
         # an anchor's INF sleeping follows its powerState (standby <-> asleep
         # keeps the same heartbeat)
