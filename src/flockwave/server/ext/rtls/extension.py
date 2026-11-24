@@ -66,6 +66,7 @@ from .anchor_sleep import (
     sleep_error,
 )
 from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
+from .cell_settings import cell_view, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
@@ -276,6 +277,8 @@ class RtlsExtension(Extension):
         #: publish their own port in the sim manifest, which the generated
         #: config forwards (rtlslink.sim.gcs_config_from_manifest).
         self._smp_ports: dict[tuple[str, int], int] = {}
+        #: an X-RTLS-CELL apply is running (cell_settings.py: one at a time)
+        self._cell_applying = False
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
@@ -448,6 +451,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                         "X-RTLS-FORGET": self._handle_RTLS_FORGET,
                         "X-RTLS-LOCK": self._handle_RTLS_LOCK,
+                        "X-RTLS-CELL": self._handle_RTLS_CELL,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -787,8 +791,11 @@ class RtlsExtension(Extension):
         param_type: Any = None,
         *,
         timeout: float = DEFAULT_PARAM_TIMEOUT,
+        exact: bool = False,
     ) -> dict[str, Any]:
         """Writes a single parameter and waits for the device-side ack.
+        With ``exact``, an accepted ack of another value is taken for a late
+        ack of an earlier write and skipped.
         Returns ``{"value", "type", "result", "accepted"}`` where
         ``value`` is the value *acknowledged by the device* (decoded) and
         ``result`` is the raw PARAM_ACK code.
@@ -828,6 +835,12 @@ class RtlsExtension(Extension):
                     continue
                 if event.data["result"] == PARAM_ACK_IN_PROGRESS:
                     continue  # final ack still to come
+                if (
+                    exact
+                    and event.data["result"] == PARAM_ACK_ACCEPTED
+                    and decode_param_value(event.data["value"], param_type) != value
+                ):
+                    continue  # an earlier write's late ack
                 return event
 
         # Serialize writes of the same parameter of the same device:
@@ -1225,11 +1238,15 @@ class RtlsExtension(Extension):
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
         previous = self._stats.get(system_id) or {}
-        # anchorLock follows the anchors' lock and an anchor's INF sleeping
-        # its powerState (standby <-> asleep keeps the same heartbeat)
-        if body.get("locked") != previous.get("locked") or (
-            body.get("powerState") == "asleep"
-        ) != (previous.get("powerState") == "asleep"):
+        # anchorLock and cellSettings follow the lock, cellcfg and txgain stats;
+        # an anchor's INF sleeping follows its powerState (standby <-> asleep
+        # keeps the same heartbeat)
+        if any(
+            body.get(key) != previous.get(key)
+            for key in ("locked", "cellConfig", "txGain")
+        ) or (body.get("powerState") == "asleep") != (
+            previous.get("powerState") == "asleep"
+        ):
             self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
@@ -1528,13 +1545,7 @@ class RtlsExtension(Extension):
             self._warn_no_app()
             return
         hub = self.app.message_hub
-        body = {
-            "type": "X-RTLS-INF",
-            "status": self._inf_status(now),
-            "anchors": self._site_anchors(),
-            "anchorLock": lock_json(self),
-        }
-        await hub.broadcast_message(hub.create_notification(body))
+        await hub.broadcast_message(hub.create_notification(self._inf_body(now)))
 
     # ---- tag<->drone association ----
 
@@ -1721,13 +1732,7 @@ class RtlsExtension(Extension):
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
         return hub.create_response_or_notification(
-            body={
-                "type": "X-RTLS-INF",
-                "status": self._inf_status(time.monotonic()),
-                "anchors": self._site_anchors(),
-                "anchorLock": lock_json(self),
-            },
-            in_response_to=message,
+            body=self._inf_body(time.monotonic()), in_response_to=message
         )
 
     async def _handle_RTLS_PARAM_LIST(
@@ -2097,6 +2102,17 @@ class RtlsExtension(Extension):
         locked = None if accepted else locked_detail(self, system_id)
         return {} if locked is None else {"detail": locked}
 
+    async def _handle_RTLS_CELL(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        try:
+            body = await handle_cell_request(self, message.body)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
+        if body["results"]:
+            await self._on_inf_change(time.monotonic())
+        return hub.create_response_or_notification(body=body, in_response_to=message)
+
     async def _handle_RTLS_VERIFY(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
@@ -2174,10 +2190,26 @@ class RtlsExtension(Extension):
         ):
             del self._retained_params[system_id]
 
-    def _inf_status(self, now: float) -> dict[str, dict[str, Any]]:
+    def _inf_body(self, now: float) -> dict[str, Any]:
+        """The X-RTLS-INF body of the query response and the broadcast."""
+        cell, cell_states = cell_view(self)
+        return {
+            "type": "X-RTLS-INF",
+            "status": self._inf_status(now, cell_states),
+            "anchors": self._site_anchors(),
+            "anchorLock": lock_json(self),
+            "cellSettings": cell,
+        }
+
+    def _inf_status(
+        self,
+        now: float,
+        cell_states: dict[int, tuple[str, str | None]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """The full X-RTLS-INF status map: one entry per live or lost
-        device, keyed by system id (as string). Shared by the query response
-        and the gained/lost broadcast so both carry the same body shape."""
+        device, keyed by system id (as string), with each live device's cell
+        settings state (``cell_states``, from :func:`cell_view` unless
+        given)."""
         devices = self._protocol.devices if self._protocol else {}
         claims, uav_ids = self._associations()
         status = {
@@ -2191,6 +2223,12 @@ class RtlsExtension(Extension):
                 status[str(system_id)] = self._device_json(
                     device, now, None, None, online=False
                 )
+        if cell_states is None:
+            cell_states = cell_view(self)[1]
+        for system_id, (state, detail) in cell_states.items():
+            status[str(system_id)]["cellSettings"] = state
+            if detail is not None:
+                status[str(system_id)]["cellSettingsDetail"] = detail
         return status
 
     def _device_json(
@@ -2688,6 +2726,13 @@ def _anchor_index_for_device(params: dict[str, Any]) -> int | None:
 def _missing_identity_param_names(
     params: dict[str, Any], role: str | None
 ) -> list[str]:
+    # A0's block, slots and slot length make the cell's rate (cell_settings.py)
+    rate = A0_RATE_PARAMS if role == "anchor-initiator" else ()
+    missing = [name for name in rate if name not in params]
+    return missing + _missing_naming_param_names(params, role)
+
+
+def _missing_naming_param_names(params: dict[str, Any], role: str | None) -> list[str]:
     """The identity params a device's snapshot must gain before its name
     (anchor A-index) or cell geometry (tag) can resolve — an empty list
     when nothing needs re-requesting.
@@ -2759,6 +2804,14 @@ def _code_name(names: dict[int, str]) -> Callable[[float], str]:
     return convert
 
 
+A0_RATE_PARAMS = ("UWB_BLOCK_MS", "UWB_SLOTS_RR", "UWB_SLOT_RSTU")
+
+
+def _running_or_none(value: float) -> int | None:
+    """``cellcfg`` and ``txgain``: -1 while the device runs no session."""
+    return None if value < 0 else int(value)
+
+
 #: stats (wire name) carried 1:1 into the X-RTLS-STATS body (key, converter),
 #: each present only while its stat is. Non-finite values are dropped.
 STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
@@ -2788,6 +2841,9 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("wdisc", "wifiDisconnects", int),
     ("wtxerr", "wifiTxErrors", int),
     ("boots", "bootCount", int),
+    # the code and TX level of the session the device runs (cell_settings.py)
+    ("cellcfg", "cellConfig", _running_or_none),
+    ("txgain", "txGain", _running_or_none),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),

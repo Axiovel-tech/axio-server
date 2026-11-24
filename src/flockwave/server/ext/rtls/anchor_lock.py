@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import trio
 
+from .cell_settings import cell_warnings
+
 if TYPE_CHECKING:
     from .extension import RtlsExtension
 
@@ -163,7 +165,7 @@ async def handle_lock_request(
             f"Invalid action: {action!r} (expected status, lock or unlock)"
         )
     views = anchor_views(ext)
-    warnings = lock_warnings(views)
+    warnings = lock_warnings(views) + cell_warnings(ext)
     reason = lock_refusal(views)
     result, results = action, None
     if action == "lock":

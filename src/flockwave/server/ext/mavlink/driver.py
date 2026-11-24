@@ -153,6 +153,11 @@ IMU_TEMPERATURE_MAX_AGE = 5.0
 """Seconds after which an IMU temperature is stale. AVCopter's show telemetry
 streams SCALED_IMU and SCALED_IMU2 at 1 Hz from boot; the server never asks."""
 
+ARMED_HEARTBEAT_MAX_AGE = 3.0
+"""Seconds after which the last heartbeat no longer tells whether the
+autopilot is armed: three missed 1 Hz ArduPilot heartbeats, Control's default
+"no telemetry" threshold."""
+
 nan = float("nan")
 """"Not a number" constant, used in some MAVLink messages to indicate a default
 value."""
@@ -1549,6 +1554,27 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             force: whether to force the arming even if the UAV thinks it is not safe
         """
         return await self._set_armed_state(False, force=force, channel=channel)
+
+    def get_armed_state(self, now: float | None = None) -> bool | None:
+        """Returns whether the autopilot reports itself armed in its last
+        heartbeat (``MAV_MODE_FLAG_SAFETY_ARMED``), or ``None`` when that is
+        not known: no heartbeat yet, the last one is older than
+        `ARMED_HEARTBEAT_MAX_AGE`, or it says the flight controller cannot
+        communicate (asleep, booting).
+
+        Only the autopilot component's heartbeats reach the UAV. This is not
+        ``DISARMED``, which tells whether the motor outputs are enabled (the
+        hardware safety switch).
+        """
+        heartbeat = self.get_last_message(MAVMessageType.HEARTBEAT)
+        if (
+            heartbeat is None
+            or self.get_age_of_message(MAVMessageType.HEARTBEAT, now)
+            > ARMED_HEARTBEAT_MAX_AGE
+            or not can_communicate_infer_from_heartbeat(heartbeat)
+        ):
+            return None
+        return bool(heartbeat.base_mode & MAVModeFlag.SAFETY_ARMED.value)
 
     def get_age_of_message(self, type: int, now: float | None = None) -> float:
         """Returns the number of seconds elapsed since we have last seen a
@@ -3409,6 +3435,10 @@ class MAVLinkUAV(UAVBase[MAVLinkDriver]):
             raise RuntimeError(
                 "Failed to arm the motors" if armed else "Failed to disarm the motors"
             )
+
+    def _update_status_timestamp(self) -> None:
+        self._status.armed = self.get_armed_state()
+        super()._update_status_timestamp()
 
     def _set_connection_state(
         self, value: ConnectionState, heartbeat: MAVLinkMessage | None

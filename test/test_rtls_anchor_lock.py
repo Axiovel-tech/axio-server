@@ -9,6 +9,7 @@ import pytest
 import trio
 import trio.testing
 from anchor_lock_support import (
+    CODE_50,
     HEALTHY_A0,
     HEALTHY_A1,
     _anchor,
@@ -110,7 +111,7 @@ async def test_lock_with_warnings_needs_acknowledgement(dialect, builder, hub):
 async def test_lock_warnings(dialect, builder, hub):
     ext, _ = await _cell(dialect, anchors=())
     body = await _lock(ext, builder, hub, action="status")
-    assert [w["code"] for w in body["warnings"]] == ["no-anchors"]
+    assert [w["code"] for w in body["warnings"]] == ["no-anchors", "cell-settings"]
 
     ext, _ = await _cell(dialect)
     await ext._on_stats(201, HEALTHY_A0, time.monotonic())
@@ -122,7 +123,7 @@ async def test_lock_warnings(dialect, builder, hub):
     ]
     ext._expire_devices(time.monotonic() + 1000)
     body = await _lock(ext, builder, hub, action="status")
-    assert {w["code"] for w in body["warnings"]} == {"offline"}
+    assert {w["code"] for w in body["warnings"]} == {"offline", "cell-settings"}
 
 
 async def test_a_refused_write_is_reported(dialect, builder, hub):
@@ -269,9 +270,10 @@ async def test_a_board_without_a_power_path_locks(dialect, builder, hub):
     # such a board reports only pwrst 5 (operating); that is enough
     ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
     anchor = devices[201]
-    await ext._process_datagram(
-        anchor.named_value_float("pwrst", 5.0), anchor.address, time.monotonic()
-    )
+    for name, value in (("pwrst", 5.0), ("cellcfg", CODE_50), ("txgain", 47.0)):
+        await ext._process_datagram(
+            anchor.named_value_float(name, value), anchor.address, time.monotonic()
+        )
 
     body = await _lock(ext, builder, hub)
 

@@ -114,6 +114,10 @@ def set_cached_param(device, name, value, param_type_name):
     device.param_types[name] = param_type
 
 
+#: the cell code every device of the verify fleet runs
+SESSION_CODE = 0x123456
+
+
 def add_rtls_cell_params(device, *, role=1, uwb_mac=254):
     """Give a FakeDevice a full RTLS cell: a role, its own MAC, the cell
     origin and a two-anchor NED table (A1 carries a survey bias)."""
@@ -176,6 +180,14 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
                 "refused": True,
                 "reason": "no anchors locked; lock them in Control first",
             },
+        },
+        "cellSettings": {
+            "rateHz": None,
+            "blockMs": None,
+            "txGain": None,
+            "reference": None,
+            "differ": [],
+            "unknown": [],
         },
     }
 
@@ -2856,9 +2868,13 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
         ids_by_type=lambda _type: list(uavs)
     )
     extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
+    add_anchor_device(extension, 200, role=2, uwb_mac=1)
+    extension._stats[200] = {"id": 200, "cellConfig": SESSION_CODE, "txGain": 47}
+    extension._stats_at[200] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
         extension._stats[sysid] = {
             "id": sysid,
+            "cellConfig": SESSION_CODE,
             "solveRateHz": 12.5,
             "solvePct": 97.0,
             "fixAgeMs": 80,
@@ -2914,6 +2930,7 @@ async def test_verify_passes_on_a_healthy_fleet(
         "pairing": "pass",
         "yaw-source": "pass",
         "uwb": "pass",
+        "cell": "pass",
         "params": "skipped",
     }
 
