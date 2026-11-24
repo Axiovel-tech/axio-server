@@ -48,7 +48,9 @@ def parse_start(body: dict[str, Any]) -> tuple[Optional[list[int]], int, Any]:
     if anchors is not None and len(set(_ids(anchors, "anchors"))) != len(anchors):
         raise ValueError("Invalid anchors: an anchor is listed twice")
     rounds = body.get("rounds", DEFAULT_ROUNDS)
-    if isinstance(rounds, bool) or rounds not in ROUNDS:
+    if isinstance(rounds, float) and rounds.is_integer():
+        rounds = int(rounds)
+    if type(rounds) is not int or rounds not in ROUNDS:
         raise ValueError(f"Invalid rounds: {rounds!r} (expected 20 to 1000)")
     return anchors, rounds, body.get("frame")
 

@@ -594,6 +594,15 @@ async def test_commit_is_refused_while_the_cell_may_not_be_written(
     assert await _commit_refusal(cell, builder, hub) == "Unlock the anchors first"
 
 
+async def test_commit_is_refused_by_a_lock_of_a_device_of_unknown_role(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub, anchors=[201, 202, 203])
+    del cell.ext._protocol.devices[204].params["UWB_ROLE"]
+    await cell.report([204], lock=1.0)
+    assert await _commit_refusal(cell, builder, hub) == "Unlock the anchors first"
+
+
 async def test_a_commit_runs_alone_and_tells_its_clients(
     cell, builder, hub, nursery, autojump_clock
 ):

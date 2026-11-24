@@ -218,6 +218,14 @@ async def test_a_step_is_timed_by_the_longest_block_the_group_stores(
     assert cell.steps()[0][8:10] == "25"
 
 
+async def test_a_whole_number_of_rounds_is_taken_as_that_integer(
+    cell, builder, hub, autojump_clock
+):
+    survey = await measure(cell, builder, hub, rounds=100.0)
+    assert survey["state"] == "ready"
+    assert cell.steps()[0][4:8] == "0064"
+
+
 async def test_rounds_set_the_command_and_how_long_a_step_is_held(
     cell, builder, hub, autojump_clock
 ):
@@ -242,6 +250,24 @@ async def test_a_step_with_a_report_missing_is_run_once_more(
     assert len(cell.sent(201, first)) == 1
     assert survey["state"] == "ready"
     assert all(pair["ab"] and pair["ba"] for pair in survey["pairs"])
+
+
+async def test_a_refusal_of_the_second_attempt_ends_the_run(
+    cell, builder, hub, autojump_clock
+):
+    # 203 completed the first attempt of step 1; 204 did not, so the step is
+    # run once more, and that command 203 refuses
+    cell.lost_reports[204] = {1}
+    cell.refused_steps[203] = {2}
+
+    survey = await measure(cell, builder, hub)
+
+    assert (survey["state"], survey["reason"]) == (
+        "failed",
+        "RTLS anchor A2 refused the survey step: its radio is not running,"
+        " or the step does not fit its slots",
+    )
+    assert _initiators(cell) == [1, 1]
 
 
 async def test_a_report_still_missing_leaves_its_range_out(
@@ -657,6 +683,17 @@ async def test_start_is_refused_while_the_anchors_are_locked(
     assert await _refusal(cell, builder, hub) == "Unlock the anchors first"
 
 
+async def test_a_lock_counts_before_the_devices_role_is_known(
+    cell, builder, hub, autojump_clock
+):
+    # 204 was lost and is back: it reports its lock, its role is not read yet
+    del cell.ext._protocol.devices[204].params["UWB_ROLE"]
+    await cell.report([204], lock=1.0)
+
+    reason = await _refusal(cell, builder, hub, anchors=[201, 202, 203])
+    assert reason == "Unlock the anchors first"
+
+
 async def test_start_is_refused_while_a_show_is_authorized(
     cell, builder, hub, autojump_clock
 ):
@@ -752,6 +789,10 @@ async def test_a_second_start_is_refused_while_a_survey_runs(
         {"action": "start", "anchors": IDS},
         {"action": "start", "anchors": IDS, "frame": {"preset": "ring"}},
         {"action": "start", "anchors": IDS, "frame": TWO_TIERS, "rounds": 10},
+        {"action": "start", "anchors": IDS, "frame": TWO_TIERS, "rounds": 100.5},
+        {"action": "start", "anchors": IDS, "frame": TWO_TIERS, "rounds": "100"},
+        {"action": "start", "anchors": IDS, "frame": TWO_TIERS, "rounds": True},
+        {"action": "start", "anchors": IDS, "frame": TWO_TIERS, "rounds": float("nan")},
         {"action": "start", "anchors": [201, 201, 202], "frame": TWO_TIERS},
         {"action": "start", "anchors": "all", "frame": TWO_TIERS},
         {"action": "start", "anchors": IDS, "frame": {"origin": 201, "xAxis": "A1"}},

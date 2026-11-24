@@ -195,15 +195,13 @@ def _request(body: dict[str, Any]) -> dict[str, int]:
     return named
 
 
-def write_refusal(
-    ext: "RtlsExtension", members: Optional[list[_Member]] = None
-) -> Optional[str]:
-    """Why neither cell settings nor a survey may be written now: an online
-    anchor reports its lock, or a show is authorized."""
-    if any(
-        m.anchor and (ext._fresh_stats(m.system_id) or {}).get("locked")
-        for m in (_members(ext) if members is None else members)
-    ):
+def write_refusal(ext: "RtlsExtension") -> Optional[str]:
+    """Why neither cell settings nor a survey may be written now: a live
+    device reports its lock, or a show is authorized. The lock counts
+    whatever else is known of the device: an anchor that was lost reports it
+    again before its role is read."""
+    devices = ext._protocol.devices if ext._protocol else {}
+    if any((ext._fresh_stats(sid) or {}).get("locked") for sid in devices):
         return "Unlock the anchors first"
     if ext.app is not None:
         with suppress(AttributeError, KeyError, RuntimeError):
@@ -216,7 +214,7 @@ def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
     """Why nothing may be written now, if anything."""
     if not members:
         return "No online devices"
-    reason = write_refusal(ext, members)
+    reason = write_refusal(ext)
     if reason is not None:
         return reason
     if _reference(members) is None:

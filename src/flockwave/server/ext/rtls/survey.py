@@ -129,6 +129,19 @@ class _Pulse:
         await self._event.wait()
 
 
+def _merged(first: StepResult, again: StepResult) -> StepResult:
+    """What two attempts at a step measured, neither of which ended the
+    survey: the reports of both, and a problem for each anchor that
+    completed neither."""
+    reports = first.reports | again.reports
+    missing = {
+        system_id: problem
+        for system_id, problem in again.problems.items()
+        if system_id not in reports
+    }
+    return StepResult(reports, missing)
+
+
 class Survey:
     """The extension's one survey: its state, the run and the commit."""
 
@@ -427,13 +440,7 @@ class Survey:
             result = await step(initiator)
             if not (result.complete or result.ends_survey):
                 again = await step(initiator)
-                reports = result.reports | again.reports
-                missing = {
-                    system_id: problem
-                    for system_id, problem in again.problems.items()
-                    if system_id not in reports
-                }
-                result = StepResult(reports, missing)
+                result = again if again.ends_survey else _merged(result, again)
             if result.ends_survey:
                 return self._step_failure(run, result)
             for system_id, report in result.reports.items():

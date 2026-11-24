@@ -56,6 +56,8 @@ class SurveyCell:
         #: anchors that refuse, or do not answer, a step command
         self.refusing = set()
         self.silent = set()
+        #: which of the steps an anchor is commanded it refuses, from 1
+        self.refused_steps = {}
         #: anchors whose radio does not start a step
         self.failing = set()
         #: anchors that report a range to another peer than the initiator
@@ -145,16 +147,17 @@ class SurveyCell:
         if system_id in self.silent or self.unheard.get(system_id, 0) > 0:
             self.unheard[system_id] = self.unheard.get(system_id, 0) - 1
             return []
-        if system_id in self.refusing:
+        seen = self._steps_seen.setdefault(system_id, [])
+        if value != "0000" and value[:4] not in seen:
+            seen.append(value[:4])
+        step = seen.index(value[:4]) + 1 if value != "0000" else 0
+        if system_id in self.refusing or step in self.refused_steps.get(system_id, ()):
             return [
                 device._param_ack(STEP_PARAM, b"", PARAM_TYPE_CUSTOM, PARAM_ACK_FAILED)
             ]
         replies = [device._param_ack(STEP_PARAM, value.encode(), PARAM_TYPE_CUSTOM, 0)]
-        seen = self._steps_seen.setdefault(system_id, [])
         if value != "0000":
-            if value[:4] not in seen:
-                seen.append(value[:4])
-            if seen.index(value[:4]) + 1 in self.lost_reports.get(system_id, ()):
+            if step in self.lost_reports.get(system_id, ()):
                 pass
             elif self.collect_s:
                 self._later(
