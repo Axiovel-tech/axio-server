@@ -60,7 +60,7 @@ from flockwave.server.registries.errors import RegistryFull
 
 from .anchor_lock import handle_lock_request, lock_json, locked_detail, show_gate
 from .anchor_sleep import (
-    ANCHOR_SLEEP_TIMEOUT,
+    ANCHOR_WRITE_TIMEOUT,
     lacks_param,
     set_anchor_sleep,
     sleep_error,
@@ -796,7 +796,10 @@ class RtlsExtension(Extension):
         The parameter type may be omitted if it is already known from an
         earlier parameter listing (devices are listed automatically on
         discovery). Raises KeyError for unknown devices, ValueError if
-        the type cannot be determined and trio.TooSlowError on timeout."""
+        the type cannot be determined and trio.TooSlowError on timeout,
+        which also bounds the wait behind an earlier write of the same
+        parameter: a write still queued when it expires is never sent."""
+        deadline = trio.current_time() + timeout
         protocol = self._require_protocol()
         device = protocol.devices.get(system_id)
         if device is None:
@@ -836,7 +839,9 @@ class RtlsExtension(Extension):
         key = (system_id, name)
         lock = self._param_write_locks.setdefault(key, trio.Lock())
         try:
-            async with lock:
+            with trio.fail_at(deadline):
+                await lock.acquire()
+            try:
                 # re-resolve the device: while this write queued behind
                 # the lock, the device may have been lost and
                 # rediscovered under the same system id — mirroring the
@@ -852,7 +857,7 @@ class RtlsExtension(Extension):
                     await self._send(*request)
 
                     try:
-                        with trio.fail_after(timeout):
+                        with trio.fail_at(deadline):
                             event = await wait_for_final_ack(events)
                     except trio.TooSlowError:
                         # keep holding the lock through a short drain:
@@ -889,6 +894,8 @@ class RtlsExtension(Extension):
                         "result": result,
                         "accepted": result == PARAM_ACK_ACCEPTED,
                     }
+            finally:
+                lock.release()
         finally:
             # prune the lock once nobody holds or awaits it: parameter
             # names are client-supplied, so keeping every (device, name)
@@ -912,11 +919,11 @@ class RtlsExtension(Extension):
         settle: float = DEFAULT_SLEEP_SETTLE,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Puts a device to sleep (``sleeping=True``) or wakes it, and
-        verifies the outcome through the ``SLEEP`` parameter: a tag as
-        :meth:`_set_tag_sleep` describes, an anchor as
-        :func:`.anchor_sleep.set_anchor_sleep` does. ``timeout`` defaults
-        per role. A device whose role cannot be established is not
+        """Puts a device to sleep (``sleeping=True``) or wakes it through
+        the ``SLEEP`` parameter: a tag as :meth:`_set_tag_sleep` describes,
+        verified; an anchor as :func:`.anchor_sleep.set_anchor_sleep` does,
+        answered by the write's acknowledgement. ``timeout`` defaults per
+        role. A device whose role cannot be established is not
         commanded.
 
         Returns ``{"requested", "accepted", "sleeping", "detail"}``.
@@ -933,7 +940,7 @@ class RtlsExtension(Extension):
                 self,
                 system_id,
                 sleeping,
-                timeout=ANCHOR_SLEEP_TIMEOUT if timeout is None else timeout,
+                timeout=ANCHOR_WRITE_TIMEOUT if timeout is None else timeout,
             )
             return {**result, **self._refusal_detail(system_id, result["accepted"])}
         return await self._set_tag_sleep(
@@ -1217,8 +1224,13 @@ class RtlsExtension(Extension):
             # The drone's own telemetry rides its tag's snapshot so that one
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
-        if body.get("locked") != (self._stats.get(system_id) or {}).get("locked"):
-            self._inf_pending = True  # anchorLock follows the anchors' lock
+        previous = self._stats.get(system_id) or {}
+        # anchorLock follows the anchors' lock and an anchor's INF sleeping
+        # its powerState (standby <-> asleep keeps the same heartbeat)
+        if body.get("locked") != previous.get("locked") or (
+            body.get("powerState") == "asleep"
+        ) != (previous.get("powerState") == "asleep"):
+            self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
         self._cluster_clock.on_stats(system_id, data)
@@ -1794,8 +1806,8 @@ class RtlsExtension(Extension):
         value = message.body["value"]
         param_type = message.body.get("paramType")
         if name == SLEEP_PARAM and (isinstance(value, bool) or value not in (0, 1)):
-            # 2 is an anchor's "off", which only its button ends: not a
-            # remote command (wake and sleep are 0 and 1)
+            # an anchor reads 2 in a standby it is not asleep in: a state,
+            # not a remote command (wake and sleep are 0 and 1)
             return hub.reject(
                 message,
                 reason=f"{SLEEP_PARAM} accepts 0 (awake) or 1 (asleep) remotely",
@@ -1858,8 +1870,8 @@ class RtlsExtension(Extension):
         if not isinstance(sleeping, bool):
             return hub.reject(message, reason="Missing 'sleeping' boolean")
         try:
-            # without one, the deadline is the role's: an anchor's transition
-            # is a reboot, a tag's a parameter write and readback
+            # without one, the deadline is the role's: an anchor's is the
+            # write's ack, a tag's a parameter write and readback
             timeout = (
                 _get_timeout(message, DEFAULT_SLEEP_TIMEOUT)
                 if "timeout" in body
@@ -2203,10 +2215,10 @@ class RtlsExtension(Extension):
             "paramCount": device.param_count,
             "otaStatus": job["status"] if job is not None else None,
         }
-        # an anchor in standby or off heartbeats STANDBY too: its power
-        # state, when reported, says whether it is asleep
-        power_state = self._power_state(device.system_id) if online else None
-        if role in ANCHOR_ROLES and power_state is not None:
+        # an anchor in standby or off heartbeats STANDBY too: only its
+        # power state says whether it is asleep
+        if role in ANCHOR_ROLES:
+            power_state = self._power_state(device.system_id) if online else None
             body["sleeping"] = power_state == "asleep"
         else:
             # getattr: tolerate an SDK that predates sleep mode
