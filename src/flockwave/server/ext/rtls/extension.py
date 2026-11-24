@@ -70,6 +70,7 @@ from .cell_settings import cell_view, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
 from .fitted_cell import fitted_anchor_positions
+from .survey import Survey, handle_survey_request
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -279,6 +280,8 @@ class RtlsExtension(Extension):
         self._smp_ports: dict[tuple[str, int], int] = {}
         #: an X-RTLS-CELL apply is running (cell_settings.py: one at a time)
         self._cell_applying = False
+        #: the anchor survey (survey.py: one at a time)
+        self._survey = Survey(self)
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
@@ -452,6 +455,7 @@ class RtlsExtension(Extension):
                         "X-RTLS-FORGET": self._handle_RTLS_FORGET,
                         "X-RTLS-LOCK": self._handle_RTLS_LOCK,
                         "X-RTLS-CELL": self._handle_RTLS_CELL,
+                        "X-RTLS-SURVEY": self._handle_RTLS_SURVEY,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -463,6 +467,7 @@ class RtlsExtension(Extension):
         """What a stopped extension keeps of no device."""
         self._nursery = None
         self._sock = None
+        self._survey = Survey(self)
         self._uptime_ms.clear()
         self._lost.clear()
         self._retained_params.clear()
@@ -501,6 +506,7 @@ class RtlsExtension(Extension):
             # pushed once their throttle window elapses, and the list is
             # rebroadcast on a slow heartbeat so client-side ages refresh.
             await self._flush_pending_inf(now)
+            await self._survey.flush()
 
             with trio.move_on_after(0.25):
                 try:
@@ -529,7 +535,10 @@ class RtlsExtension(Extension):
         if self._protocol is None:
             return
         self._scan_pos_debug(data, now)
-        events = self._protocol.feed(data, address, now)
+        events = [
+            *self._protocol.feed(data, address, now),
+            *self._survey.reports_in(data),
+        ]
         # A device's whole health report arrives as one datagram, one
         # NAMED_VALUE_FLOAT per stat, and every stats event carries the SDK's
         # accumulated snapshot: the device's last one is the full report, so
@@ -792,10 +801,13 @@ class RtlsExtension(Extension):
         *,
         timeout: float = DEFAULT_PARAM_TIMEOUT,
         exact: bool = False,
+        resend_after: float | None = None,
     ) -> dict[str, Any]:
         """Writes a single parameter and waits for the device-side ack.
         With ``exact``, an accepted ack of another value is taken for a late
-        ack of an earlier write and skipped.
+        ack of an earlier write and skipped. With ``resend_after``, the write
+        is sent again every so many seconds while no ack comes, which only a
+        write that may arrive twice allows.
         Returns ``{"value", "type", "result", "accepted"}`` where
         ``value`` is the value *acknowledged by the device* (decoded) and
         ``result`` is the raw PARAM_ACK code.
@@ -867,11 +879,16 @@ class RtlsExtension(Extension):
                     request = protocol.set_param(system_id, name, encoded, param_type)
                     if request is None:
                         raise KeyError(system_id)
-                    await self._send(*request)
+
+                    async def send_until_acked():
+                        while True:
+                            await self._send(*request)
+                            with trio.move_on_after(resend_after or math.inf):
+                                return await wait_for_final_ack(events)
 
                     try:
                         with trio.fail_at(deadline):
-                            event = await wait_for_final_ack(events)
+                            event = await send_until_acked()
                     except trio.TooSlowError:
                         # keep holding the lock through a short drain:
                         # a LATE final ack caught here is adopted as
@@ -942,6 +959,8 @@ class RtlsExtension(Extension):
         Returns ``{"requested", "accepted", "sleeping", "detail"}``.
         Raises KeyError for unknown devices and trio.TooSlowError on
         timeout."""
+        if self._survey.involves(system_id):
+            return sleep_error(sleeping, "A survey is running")
         role = await self._command_role(system_id, timeout)
         if role is None:
             return sleep_error(
@@ -1117,6 +1136,8 @@ class RtlsExtension(Extension):
         not running."""
         if system_id not in self._require_protocol().devices:
             raise KeyError(system_id)
+        if self._survey.involves(system_id):
+            raise RuntimeError("A survey is running")
         species, source = _image_species(image_path, role)
         if species is None:
             raise ValueError(
@@ -1250,6 +1271,7 @@ class RtlsExtension(Extension):
             self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
+        self._survey.on_stats(system_id, body)
         self._cluster_clock.on_stats(system_id, data)
         await self._follow_fitted_cell(system_id, now)
         # STATS_FIELDS is the SDK's required legacy set of a tag; newer stats
@@ -1468,6 +1490,7 @@ class RtlsExtension(Extension):
         if stats is not None:
             self._stats[event.system_id] = {**stats, "stale": True}
         self._fitted_cells.pop(event.system_id, None)
+        self._survey.on_lost(event.system_id)
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
@@ -2111,6 +2134,15 @@ class RtlsExtension(Extension):
             return hub.reject(message, reason=str(ex))
         if body["results"]:
             await self._on_inf_change(time.monotonic())
+        return hub.create_response_or_notification(body=body, in_response_to=message)
+
+    async def _handle_RTLS_SURVEY(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        try:
+            body = await handle_survey_request(self, message.body)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
         return hub.create_response_or_notification(body=body, in_response_to=message)
 
     async def _handle_RTLS_VERIFY(
@@ -2812,6 +2844,12 @@ def _running_or_none(value: float) -> int | None:
     return None if value < 0 else int(value)
 
 
+def _survey_id_or_none(value: float) -> int | None:
+    """``sid``: 0 while the session advertises no location, -1 while no
+    session runs."""
+    return None if value <= 0 else int(value)
+
+
 #: stats (wire name) carried 1:1 into the X-RTLS-STATS body (key, converter),
 #: each present only while its stat is. Non-finite values are dropped.
 STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
@@ -2844,6 +2882,8 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     # the code and TX level of the session the device runs (cell_settings.py)
     ("cellcfg", "cellConfig", _running_or_none),
     ("txgain", "txGain", _running_or_none),
+    # the survey ID of the position the device's session advertises
+    ("sid", "surveyId", _survey_id_or_none),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),

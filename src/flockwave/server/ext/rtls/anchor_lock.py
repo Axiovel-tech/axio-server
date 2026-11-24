@@ -166,7 +166,7 @@ async def handle_lock_request(
         )
     views = anchor_views(ext)
     warnings = lock_warnings(views) + cell_warnings(ext)
-    reason = lock_refusal(views)
+    reason = "A survey is running" if ext._survey.running else lock_refusal(views)
     result, results = action, None
     if action == "lock":
         if reason:

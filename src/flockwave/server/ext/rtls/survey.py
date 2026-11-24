@@ -1,0 +1,519 @@
+"""The anchor survey as the operator runs it (X-RTLS-SURVEY).
+
+A survey ranges every pair of a group of anchors (``survey_step.py``), fits
+their positions in the cell frame (``survey_fit.py``) and, when the operator
+commits, writes every anchor its own position (``survey_commit.py``). One
+survey at a time::
+
+    idle -> measuring -> returning -> ready -> committing -> committed
+
+A run that fails or is cancelled still returns the anchors to their stored
+session, then ends in ``failed`` or ``idle``, and so does a measurement the
+fit cannot start from; a commit an anchor misses falls back to ``ready``. The measurement and the fit are kept in memory for the
+page only: after a restart the positions come from the anchors. A server
+that dies mid-run leaves anchors that return by themselves when the hold
+time of their last step is over.
+
+The message, its state object and the refusals: AxioStack
+``contracts/rtls-client-api.md``, ``X-RTLS-SURVEY``.
+"""
+
+from __future__ import annotations
+
+import copy
+import random
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Optional
+
+import trio
+from rtlslink import ProtocolEvent
+
+from .anchor_lock import anchor_views
+from .cell_settings import write_refusal
+from .survey_commit import (
+    CONFIRM_TIMEOUT,
+    commit_refusal,
+    known_survey_ids,
+    location_values,
+    next_survey_id,
+    read_params,
+    running_ids,
+    stored_positions,
+    write_locations,
+)
+from .survey_fit import (
+    DirectedRange,
+    Frame,
+    SurveyFit,
+    SurveyFitError,
+    fit_survey,
+    frame_refusal,
+)
+from .survey_group import Anchor, block_ms, select_group, step_order
+from .survey_request import (
+    Placement,
+    frame_json,
+    parse_frame,
+    parse_placement,
+    parse_start,
+    placement_json,
+)
+from .survey_step import (
+    ROLE_RESPONDER,
+    Member,
+    ReportScanner,
+    StepResult,
+    end_survey,
+    hold_for,
+    next_step_id,
+    run_step,
+    time_limit,
+)
+
+if TYPE_CHECKING:
+    from .extension import RtlsExtension
+
+__all__ = ("Survey", "handle_survey_request")
+
+#: the state is pushed at most this often, in seconds; the last change of a
+#: burst is pushed when the interval is over
+NOTIFY_INTERVAL = 0.5
+
+RUNNING_STATES = ("measuring", "returning", "committing")
+
+INCOMPLETE = "Not every anchor took the survey"
+CANCELLED = "cancelled"
+_INTERNAL_ERROR = "The survey stopped on an internal error"
+
+_Answer = tuple[str, Optional[str]]
+
+
+@dataclass
+class _Run:
+    """One survey: its group, what it measured and what was made of it."""
+
+    #: the group as the request listed it, and in the order of its steps
+    anchors: list[Anchor]
+    order: list[Anchor]
+    rounds: int
+    block_ms: int
+    frame: Frame
+    placement: Optional[Placement]
+    #: each anchor's ``moved`` latch when the run started
+    moved: dict[int, bool]
+    #: by ``(initiator, responder)`` system ID
+    measurements: dict[tuple[int, int], DirectedRange] = field(default_factory=dict)
+    step: int = 1
+    fit: Optional[SurveyFit] = None
+    #: the ``commit`` member of the state
+    commit: Optional[dict[str, Any]] = None
+    #: the survey ID and ``UWB_LOC`` values of the commit of this fit, kept
+    #: so that a commit an anchor missed is sent again unchanged
+    plan: Optional[tuple[int, dict[int, str]]] = None
+    #: an anchor went offline or moved since the run started
+    stale: bool = False
+    cancelled: bool = False
+    scope: trio.CancelScope = field(default_factory=trio.CancelScope)
+    #: the anchors that reported ranging since the end command was answered
+    returned: set[int] = field(default_factory=set)
+
+    @property
+    def ids(self) -> list[int]:
+        return [anchor.system_id for anchor in self.anchors]
+
+
+class _Pulse:
+    """Wakes every task that waits for the next change."""
+
+    def __init__(self) -> None:
+        self._event = trio.Event()
+
+    def set(self) -> None:
+        self._event.set()
+        self._event = trio.Event()
+
+    async def wait(self) -> None:
+        await self._event.wait()
+
+
+class Survey:
+    """The extension's one survey: its state, the run and the commit."""
+
+    def __init__(self, ext: "RtlsExtension"):
+        self._ext = ext
+        self.state = "idle"
+        self.reason: Optional[str] = None
+        self._run: Optional[_Run] = None
+        self._changed = _Pulse()
+        self._dirty = False
+        self._pushed_at: Optional[float] = None
+        self._reports = ReportScanner()
+
+    @property
+    def running(self) -> bool:
+        return self.state in RUNNING_STATES
+
+    def involves(self, system_id: int) -> bool:
+        """Whether a running survey has this anchor in its group."""
+        return self.running and self._run is not None and system_id in self._run.ids
+
+    @property
+    def json(self) -> dict[str, Any]:
+        """The state object."""
+        state: dict[str, Any] = {
+            "state": self.state,
+            "reason": self.reason,
+            "anchors": [],
+            "step": 0,
+            "steps": 0,
+            "initiator": None,
+            "pairs": [],
+            "fit": None,
+            "gate": {"blocked": [], "warnings": []},
+            "commit": None,
+            "frame": None,
+            "placement": None,
+        }
+        run = self._run
+        if run is None:
+            return state
+        state |= {
+            "anchors": run.ids,
+            "step": run.step,
+            "steps": len(run.order),
+            "commit": copy.deepcopy(run.commit),
+            "frame": frame_json(run.frame),
+            "placement": placement_json(run.placement),
+        }
+        if self.state == "measuring":
+            state["initiator"] = run.order[run.step - 1].system_id
+        if run.fit is not None:
+            state |= run.fit.json
+        return state
+
+    # ---- what the extension tells the survey ----
+
+    def reports_in(self, data: bytes) -> list[ProtocolEvent]:
+        """The survey reports a management datagram carries, as events."""
+        return self._reports.events(data)
+
+    def on_stats(self, system_id: int, stats: dict[str, Any]) -> None:
+        run = self._run
+        if run is not None and system_id in run.moved:
+            if stats.get("moved") and not run.moved[system_id]:
+                run.stale = True
+            if (stats.get("rangingRateHz") or 0) > 0:
+                run.returned.add(system_id)
+        self._changed.set()
+
+    def on_lost(self, system_id: int) -> None:
+        if self._run is not None and system_id in self._run.moved:
+            self._run.stale = True
+
+    async def flush(self) -> None:
+        """Pushes the state when it changed since the last push and the
+        limit of two pushes a second allows one. The protocol loop calls this
+        too, which delivers the last change of a burst."""
+        now = trio.current_time()
+        limited = (
+            self._pushed_at is not None and now - self._pushed_at < NOTIFY_INTERVAL
+        )
+        if limited or not self._dirty:
+            return
+        self._dirty, self._pushed_at = False, now
+        if self._ext.app is None:
+            self._ext._warn_no_app()
+            return
+        hub = self._ext.app.message_hub
+        body = {"type": "X-RTLS-SURVEY", "survey": self.json}
+        await hub.broadcast_message(hub.create_notification(body))
+
+    async def _notify(self) -> None:
+        self._dirty = True
+        await self.flush()
+
+    # ---- the actions ----
+
+    async def status(self, body: dict[str, Any]) -> _Answer:
+        return "status", None
+
+    async def start(self, body: dict[str, Any]) -> _Answer:
+        requested, rounds, raw_frame = parse_start(body)
+        placement = parse_placement(body.get("placement"))
+        ext = self._ext
+        nursery = ext._nursery
+        if self.running:
+            return "refused", "A survey is running"
+        if ext._cell_applying:
+            return "refused", "An apply is running"
+        if nursery is None:
+            return "refused", "RTLS is not running"
+        anchors: list[Anchor] = []
+        reason = write_refusal(ext)
+        if reason is None:
+            anchors, reason = select_group(ext, requested)
+        if reason is not None:
+            return "refused", reason
+        ids = [anchor.system_id for anchor in anchors]
+        try:
+            frame = parse_frame(raw_frame, ids)
+        except SurveyFitError as ex:
+            return "refused", str(ex)
+        reason = frame_refusal(frame, ids)
+        if reason is not None:
+            return "refused", reason
+        run = self._run = _Run(
+            anchors=anchors,
+            order=step_order(ext, anchors),
+            rounds=rounds,
+            block_ms=block_ms(ext, anchors),
+            frame=frame,
+            placement=placement,
+            moved={
+                system_id: bool((ext._fresh_stats(system_id) or {}).get("moved"))
+                for system_id in ids
+            },
+        )
+        self.state, self.reason = "measuring", None
+        nursery.start_soon(self._survey, run)
+        await self._notify()
+        return "started", None
+
+    async def cancel(self, body: dict[str, Any]) -> _Answer:
+        run = self._run
+        if self.state == "committing":
+            return "refused", "A commit cannot be cancelled"
+        if run is None or not self.running:
+            return "refused", "No survey is running"
+        run.cancelled = True
+        run.scope.cancel()
+        self.state = "returning"
+        await self._notify()
+        return "cancelled", None
+
+    async def fit(self, body: dict[str, Any]) -> _Answer:
+        run = self._run
+        if self.running:
+            return "refused", "A survey is running"
+        if run is None or self.state != "ready":
+            return "refused", "There is no measurement to fit"
+        placement = parse_placement(body.get("placement"))
+        try:
+            frame = run.frame
+            if body.get("frame") is not None:
+                frame = parse_frame(body["frame"], run.ids)
+            fit = self._fitted(run, frame, placement)
+        except SurveyFitError as ex:
+            return "refused", str(ex)
+        run.frame, run.placement, run.fit = frame, placement, fit
+        run.commit = run.plan = self.reason = None
+        await self._notify()
+        return "fitted", None
+
+    async def commit(self, body: dict[str, Any]) -> _Answer:
+        run = self._run
+        if self.running:
+            return "refused", "A survey is running"
+        if run is None or self.state != "ready" or run.fit is None:
+            return "refused", "There is no fit to commit"
+        fit = run.fit
+        reason = commit_refusal(self._ext, run.anchors, fit, run.stale)
+        if reason is not None:
+            return "refused", reason
+        if fit.blocked:
+            return "blocked", None
+        if fit.warnings and body.get("acknowledgeWarnings") is not True:
+            return "warnings", None
+        self.state, self.reason = "committing", None
+        committed = False
+        try:
+            await self._notify()
+            committed = await self._write_and_confirm(run, fit)
+        finally:
+            self.state = "committed" if committed else "ready"
+            self.reason = None if committed else INCOMPLETE
+        await self._notify()
+        return ("committed", None) if committed else ("incomplete", INCOMPLETE)
+
+    async def _write_and_confirm(self, run: _Run, fit: SurveyFit) -> bool:
+        """Writes every anchor of the group its position and waits until
+        each reports the new survey ID; whether every anchor did both. The
+        ID is the one an anchor reports, never the -1 of a restart, which a
+        simulated anchor does not show."""
+        ext = self._ext
+        if run.plan is None:
+            online = [view["systemId"] for view in anchor_views(ext) if view["online"]]
+            await read_params(ext, online, fresh=True)
+            survey_id = next_survey_id(known_survey_ids(ext))
+            values = location_values(ext, run.anchors, fit, run.measurements, survey_id)
+            run.plan = survey_id, values
+        survey_id, values = run.plan
+        running: list[int] = []
+        commit = run.commit = {"surveyId": survey_id, "results": {}, "running": running}
+        results = commit["results"] = await write_locations(ext, run.anchors, values)
+        await self._notify()
+        written = {
+            anchor.system_id
+            for anchor in run.anchors
+            if results[str(anchor.system_id)]["written"] == "changed"
+        }
+        with trio.move_on_after(CONFIRM_TIMEOUT):
+            while True:
+                reporting = running_ids(ext, run.anchors, survey_id)
+                if reporting != running:
+                    running = commit["running"] = reporting
+                    await self._notify()
+                if written <= set(running):
+                    break
+                await self._changed.wait()
+        return written == set(run.ids) == set(running)
+
+    # ---- the run ----
+
+    async def _survey(self, run: _Run) -> None:
+        """The run's task: the steps, the return and the fit. Nothing it
+        meets may end the extension's nursery, so a defect ends the survey
+        in ``failed`` instead."""
+        failure: Optional[str] = None
+        try:
+            with run.scope:
+                failure = await self._measure(run)
+        except Exception as ex:
+            failure = self._defect(ex)
+        try:
+            await self._return(run)
+            if failure is None and not run.cancelled:
+                await read_params(self._ext, run.ids, fresh=False)
+                try:
+                    run.fit = self._fitted(run, run.frame, run.placement)
+                except SurveyFitError as ex:
+                    failure = str(ex)
+        except Exception as ex:
+            failure = self._defect(ex)
+        if run.cancelled:
+            self._run, self.state, self.reason = None, "idle", CANCELLED
+        elif failure is not None:
+            self.state, self.reason = "failed", failure
+        else:
+            self.state = "ready"
+        await self._notify()
+
+    def _defect(self, error: Exception) -> str:
+        if self._ext.log:
+            self._ext.log.warning(f"rtls: the survey stopped: {error!r}")
+        return _INTERNAL_ERROR
+
+    async def _measure(self, run: _Run) -> Optional[str]:
+        """Every anchor initiates one step; returns why the run cannot go
+        on, if it cannot. A step that ends without every report is run once
+        more, then what is missing stays missing: the gate decides."""
+        group = [Member(anchor.system_id, anchor.mac) for anchor in run.order]
+        limit = time_limit(run.rounds, run.block_ms)
+        hold = hold_for(run.rounds, run.block_ms)
+        step_id = random.randint(1, 0xFFFF)
+
+        async def step(initiator: Member) -> StepResult:
+            nonlocal step_id
+            current, step_id = step_id, next_step_id(step_id)
+            return await run_step(
+                self._ext, group, initiator, current, run.rounds, hold, timeout=limit
+            )
+
+        for index, initiator in enumerate(group, start=1):
+            if index > 1:
+                run.step = index
+                await self._notify()
+            result = await step(initiator)
+            if not (result.complete or result.ends_survey):
+                again = await step(initiator)
+                reports = result.reports | again.reports
+                missing = {
+                    system_id: problem
+                    for system_id, problem in again.problems.items()
+                    if system_id not in reports
+                }
+                result = StepResult(reports, missing)
+            if result.ends_survey:
+                return self._step_failure(run, result)
+            for system_id, report in result.reports.items():
+                if report.role == ROLE_RESPONDER and report.peer_mac == initiator.mac:
+                    run.measurements[initiator.system_id, system_id] = DirectedRange(
+                        range_m=report.range_m or 0.0,
+                        mad_m=report.mad_m or 0.0,
+                        inliers=report.samples or 0,
+                        share=min(1.0, (report.valid or 0) / run.rounds),
+                    )
+        return None
+
+    def _step_failure(self, run: _Run, result: StepResult) -> str:
+        """Names the first anchor that ended the run, and why."""
+        system_id = min(s for s, p in result.problems.items() if p.ends_survey)
+        problem = result.problems[system_id]
+        name = next(a.name for a in run.anchors if a.system_id == system_id)
+        if problem.kind != "refused":
+            return f"{name} {problem.detail}"
+        return f"{name} refused the survey step: {self._why(system_id)}"
+
+    def _why(self, system_id: int) -> str:
+        """The ack of a refused step carries no reason: the anchor's stats
+        name the likely one."""
+        stats = self._ext._fresh_stats(system_id) or {}
+        if stats.get("locked"):
+            return "locked"
+        if stats.get("powerState") not in (None, "operating"):
+            return "not operating"
+        return "its radio is not running, or the step does not fit its slots"
+
+    async def _return(self, run: _Run) -> None:
+        """Ends the survey on every anchor and waits until every boot
+        responder reports ranging again. An anchor that did not take the end
+        returns by itself, so the wait is then the hold time."""
+        self.state = "returning"
+        await self._notify()
+        group = [Member(anchor.system_id, anchor.mac) for anchor in run.order]
+        waiting = {a.system_id for a in run.order if a.boot_responder}
+        deadline = trio.current_time() + hold_for(run.rounds, run.block_ms)
+        unanswered = await end_survey(self._ext, group)
+        run.returned.clear()
+        with trio.move_on_at(deadline):
+            while unanswered or not waiting <= run.returned:
+                await self._changed.wait()
+
+    def _fitted(
+        self, run: _Run, frame: Frame, placement: Optional[Placement]
+    ) -> SurveyFit:
+        return fit_survey(
+            run.ids,
+            run.measurements,
+            frame,
+            placement=placement,
+            stored=stored_positions(self._ext, run.ids),
+        )
+
+
+_ACTIONS = ("status", "start", "cancel", "fit", "commit")
+
+
+async def handle_survey_request(
+    ext: "RtlsExtension", body: dict[str, Any]
+) -> dict[str, Any]:
+    """The X-RTLS-SURVEY response body: the action's result, its reason and
+    the state object after it.
+
+    Raises:
+        ValueError: for an unknown action or a malformed member.
+    """
+    action = body.get("action", "status")
+    if action not in _ACTIONS:
+        raise ValueError(
+            f"Invalid action: {action!r} (expected one of {', '.join(_ACTIONS)})"
+        )
+    survey = ext._survey
+    result, reason = await getattr(survey, action)(body)
+    return {
+        "type": "X-RTLS-SURVEY",
+        "action": action,
+        "result": result,
+        "reason": reason,
+        "survey": survey.json,
+    }

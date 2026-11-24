@@ -93,6 +93,16 @@ enables it.
   compares it with what A0 runs. A write applies on the board at once, so
   `X-RTLS-CELL` only writes: the tags first, the anchors only when every tag
   took it. One apply at a time; one server is one cell.
+- **A survey gives every anchor its own position.** `X-RTLS-SURVEY` makes
+  each anchor of a group the ranging initiator in turn (`UWB_SURVEY`, held
+  in the anchors' RAM: an anchor returns to its stored session by itself
+  when the server goes away), fits the positions to the ranges, and on the
+  operator's commit writes each anchor its `UWB_LOC`: position, survey ID
+  and its own measured range to the stored initiator. The anchors are the
+  only store: the survey ID continues from what they hold, a missed write
+  is not rolled back, and the commit does not lock (Control locks after
+  it). While a survey runs, the cell settings, the lock, and sleep and OTA
+  of its anchors are refused. Tags do not use these positions yet.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -116,6 +126,13 @@ enables it.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.
+- `survey.py`: `X-RTLS-SURVEY`, the survey run as a state machine and its
+  commit; `survey_group.py` who takes part and in which order,
+  `survey_request.py` the request's frame and placement,
+  `survey_commit.py` the survey ID and the `UWB_LOC` values and write.
+- `survey_step.py`: one survey step on the anchors (the `UWB_SURVEY`
+  command, the report frames, the write-and-wait). It stands in for the
+  SDK's `rtlslink.survey` and `survey_report` event until the pin has them.
 - `survey_fit.py`: anchor positions fitted to the ranges of an anchor
   survey, and the gate on committing them. Pure, numpy only.
 - `verify.py`: `X-RTLS-VERIFY`.
@@ -132,5 +149,6 @@ uv run pytest test/test_ext_rtls.py test/test_rtls_*.py
 
 The tests drive the handlers against the SDK's sans-IO protocol core with a
 scripted fake device, without sockets. Protocol tests belong to the SDK, in
-rtls-link-zephyr `py/tests/`. `test/rtls_support.py` and
-`test/anchor_lock_support.py` hold the fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.
+rtls-link-zephyr `py/tests/`. `test/rtls_support.py`,
+`test/anchor_lock_support.py` and `test/survey_support.py` (anchors that
+take survey steps and store positions) hold the fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.

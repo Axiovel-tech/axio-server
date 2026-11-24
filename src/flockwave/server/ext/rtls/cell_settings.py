@@ -31,7 +31,13 @@ from .cell_compat import role_from_params
 if TYPE_CHECKING:
     from .extension import RtlsExtension
 
-__all__ = ("cell_rule", "cell_view", "cell_warnings", "handle_cell_request")
+__all__ = (
+    "cell_rule",
+    "cell_view",
+    "cell_warnings",
+    "handle_cell_request",
+    "write_refusal",
+)
 
 _BLOCK_PARAM = "UWB_BLOCK_MS"
 _PARAM_TYPES = {_BLOCK_PARAM: "uint16", TX_GAIN_PARAM: "uint8"}
@@ -189,19 +195,30 @@ def _request(body: dict[str, Any]) -> dict[str, int]:
     return named
 
 
-def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
-    """Why nothing may be written now, if anything."""
-    if not members:
-        return "No online devices"
+def write_refusal(
+    ext: "RtlsExtension", members: Optional[list[_Member]] = None
+) -> Optional[str]:
+    """Why neither cell settings nor a survey may be written now: an online
+    anchor reports its lock, or a show is authorized."""
     if any(
         m.anchor and (ext._fresh_stats(m.system_id) or {}).get("locked")
-        for m in members
+        for m in (_members(ext) if members is None else members)
     ):
         return "Unlock the anchors first"
     if ext.app is not None:
         with suppress(AttributeError, KeyError, RuntimeError):
             if authorizes_flight(ext.app.import_api("show").get_configuration()):
                 return "A show is authorized"
+    return None
+
+
+def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
+    """Why nothing may be written now, if anything."""
+    if not members:
+        return "No online devices"
+    reason = write_refusal(ext, members)
+    if reason is not None:
+        return reason
     if _reference(members) is None:
         a0_online = any(m.role == "anchor-initiator" for m in members)
         return "A0 is not ranging" if a0_online else "A0 is offline"
@@ -310,6 +327,8 @@ async def handle_cell_request(
     named = _request(body)
     if ext._cell_applying:
         result, reason, results = "refused", "An apply is running", {}
+    elif ext._survey.running:
+        result, reason, results = "refused", "A survey is running", {}
     else:
         ext._cell_applying = True
         try:
