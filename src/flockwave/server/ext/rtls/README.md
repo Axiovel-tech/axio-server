@@ -76,13 +76,13 @@ enables it.
   `.receipt.json` that rtls-link-zephyr `scripts/build.sh` writes beside it
   (the declared `role` only without one) and checks it against `UWB_ROLE`;
   `UWB_ROLE` itself cannot be changed by parameter.
-- **Sleep is a parameter write the firmware may undo.** On a tag, `SLEEP` is
-  written back to `0` while the drone's autopilot is armed or not confirmed
-  disarmed; the server reads it back after a settle delay to report the
-  refusal. An anchor reboots when it enters or leaves operating (8-15 s off
-  the network) and falls asleep in place from standby; `anchor_sleep.py`
-  verifies the outcome from the `powerState` it reports after the write and
-  does not command an anchor that reports none. A woken board reboots.
+- **Sleep is a parameter write.** On a tag the firmware may undo it: `SLEEP`
+  is written back to `0` while the drone's autopilot is armed or not
+  confirmed disarmed, and the server reads it back after a settle delay to
+  report the refusal. An anchor answers in the write's acknowledgement
+  (`PARAM_ACK_FAILED` for a request it would not act on now); the server
+  returns that answer without waiting, and the anchor's `powerState` shows
+  the transition and whether it is asleep. A woken board reboots.
 - **The anchor lock lives in the firmware.** A locked anchor (`LOCK=1`,
   reported as its `lock` stat) refuses every remote change itself. The
   server only writes `LOCK`, derives the cell's lock from the stats, and
@@ -108,7 +108,7 @@ enables it.
   the message handlers. Its exports (`devices()`, `get_param()`,
   `set_param()`, `set_sleep()`, `start_ota()`, `cluster_clock`, …) are the
   entry points for other extensions.
-- `anchor_sleep.py`: an anchor's sleep and wake and their verification.
+- `anchor_sleep.py`: an anchor's sleep and wake, answered by the ack.
 - `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
   and the show gate.
 - `cell_settings.py`: `X-RTLS-CELL`, the per-device cell-settings state,
@@ -131,5 +131,4 @@ uv run pytest test/test_ext_rtls.py test/test_rtls_*.py
 The tests drive the handlers against the SDK's sans-IO protocol core with a
 scripted fake device, without sockets. Protocol tests belong to the SDK, in
 rtls-link-zephyr `py/tests/`. `test/rtls_support.py` and
-`test/anchor_sleep_support.py` and `test/anchor_lock_support.py` hold the
-fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.
+`test/anchor_lock_support.py` hold the fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.
