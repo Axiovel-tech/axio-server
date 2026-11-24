@@ -222,6 +222,7 @@ class VirtualUAV(UAVBase):
     @armed.setter
     def armed(self, value: bool) -> None:
         self._armed = value
+        self._status.armed = value
         self.ensure_error(FlockwaveErrorCode.DISARMED, present=not self._armed)
 
     def arm_if_on_ground(self) -> bool:

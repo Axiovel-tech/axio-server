@@ -102,6 +102,9 @@ class UAVStatusInfo(TimestampMixin, metaclass=ModelMeta):
     battery: BatteryInfo
     rssi: list[int]
 
+    _json: dict[str, Any]
+    """The wire representation, kept by ``ModelMeta``."""
+
     def __init__(self, id: str | None = None, timestamp: TimestampLike | None = None):
         """Constructor.
 
@@ -127,6 +130,25 @@ class UAVStatusInfo(TimestampMixin, metaclass=ModelMeta):
         self.velocityXYZ = None
         self.battery = BatteryInfo()
         self.rssi = []
+
+    @property
+    def armed(self) -> bool | None:
+        """Whether the autopilot reports itself armed; ``None`` when the
+        driver does not know.
+
+        Published as the ``armed`` key of the status, an Axiovel addition to
+        UAV-INF. The key is left out while the value is unknown, so a client
+        must treat a missing key as unknown, never as disarmed.
+        """
+        value = self._json.get("armed")
+        return value if isinstance(value, bool) else None
+
+    @armed.setter
+    def armed(self, value: bool | None) -> None:
+        if value is None:
+            self._json.pop("armed", None)
+        else:
+            self._json["armed"] = bool(value)
 
     @property
     def position_xyz(self) -> PositionXYZ | None:
@@ -324,7 +346,7 @@ class UAVBase(UAV, Generic[TDriver]):
         equivalent to a previous message but we want to remember that the UAV is
         alive.
         """
-        self._status.update_timestamp()
+        self._update_status_timestamp()
 
     def update_rssi(self, *, index: int, value: int | None = None) -> None:
         """Updates the RSSI value of the UAV for the channel with the given
@@ -340,7 +362,7 @@ class UAVBase(UAV, Generic[TDriver]):
         if len(rssi) <= index:
             rssi.extend([-1] * (index - len(rssi) + 1))
         rssi[index] = value
-        self._status.update_timestamp()
+        self._update_status_timestamp()
 
     def update_status(
         self,
@@ -435,6 +457,16 @@ class UAVBase(UAV, Generic[TDriver]):
             self._status.gps.update_from(gps)
         if debug is not None:
             self._status.debug = debug
+        self._update_status_timestamp()
+
+    def _update_status_timestamp(self) -> None:
+        """Marks the status information as current.
+
+        A subclass that publishes a status field with a freshness of its own
+        (such as ``armed``, which comes from one message type) overrides this
+        to refresh that field first, so a newer timestamp never vouches for
+        an older value.
+        """
         self._status.update_timestamp()
 
 
