@@ -51,17 +51,26 @@ SHARE_WARNING = 0.9
 #: an anchor with a larger predicted uncertainty is not located, metres
 SIGMA_BLOCK_M = 0.20
 
-#: ranges are quantised to 1 cm, so no fit is trusted below this, metres
-NOISE_FLOOR_M = 0.01
+#: the least range error a fit is taken to have, metres. Real links carry
+#: biases of a few centimetres (25 mm rms of residual on the bench cell), and
+#: a fit with few spare ranges absorbs them instead of showing them, so a
+#: smaller residual does not mean a better survey.
+NOISE_FLOOR_M = 0.025
 #: range noise assumed when the fit has no spare measurement to estimate it
 NOISE_PRIOR_M = 0.03
 
 #: two layouts closer than this at every anchor are one solution, metres
 SAME_SOLUTION_M = 0.01
 
-#: where a height nobody gave starts, above the origin's group, metres. A
-#: start exactly level with the group has no height gradient to descend along.
+#: the least an anchor outside the origin's height group starts off that
+#: group's plane, metres. A start level with it has no height gradient to
+#: descend along, and the fit would never leave the plane.
 START_HEIGHT_M = 1.0
+
+#: an anchor the frame puts on one side of a mirror image (``upper``,
+#: ``y_positive``) settles that image only when it is this far on a side,
+#: and three of its predicted sigmas, metres
+SIDE_MARGIN_M = 0.3
 
 MAX_ITERATIONS = 200
 STEP_TOLERANCE_M = 1e-10
@@ -385,10 +394,22 @@ class _Problem:
         group."""
         return [i for i in sorted(self.upper) if positions[i, 2] >= 0]
 
-    def frame_violations(self, positions: np.ndarray) -> int:
-        """How many anchors contradict ``upper`` or ``y_positive``."""
-        wrong_side = self.y_positive is not None and positions[self.y_positive, 1] <= 0
-        return len(self.not_above(positions)) + int(wrong_side)
+    def frame_sides(self, positions: np.ndarray) -> tuple[int, bool, bool]:
+        """How many anchors are clearly on the wrong side of the mirror image
+        the frame puts them on, and whether the ``y_positive`` anchor, or an
+        ``upper`` one, is too near its mirror plane to say which side."""
+        sigma, _ = self.uncertainty(positions)
+        declared = [(i, -positions[i, 2], False) for i in sorted(self.upper)]
+        if self.y_positive is not None:
+            i = self.y_positive
+            declared.append((i, positions[i, 1], True))
+        wrong, in_line, level = 0, False, False
+        for i, side, horizontal in declared:
+            if abs(side) <= max(SIDE_MARGIN_M, 3.0 * sigma[i]):
+                in_line, level = in_line or horizontal, level or not horizontal
+            elif side < 0:
+                wrong += 1
+        return wrong, in_line, level
 
     def scaled_start(self) -> np.ndarray | None:
         """Classical multidimensional scaling of the ranges, turned so that
@@ -416,14 +437,18 @@ class _Problem:
         return shape @ np.column_stack([across, np.cross(up, across), up])
 
     def with_heights(self, rough: np.ndarray) -> np.ndarray:
-        """A placement with the heights it does not give filled in."""
+        """A placement with a start height for every anchor outside the
+        origin's height group. The height the placement gives is only a hint:
+        the start is always off the group's plane, above it for ``upper``
+        anchors and where no height says otherwise."""
         start = rough.copy()
         start[self.level, 2] = 0.0
         for members in self.free_heights:
             given = start[members, 2]
-            start[members, 2] = (
-                -START_HEIGHT_M if np.isnan(given).all() else np.nanmean(given)
-            )
+            hint = 0.0 if np.isnan(given).all() else float(np.nanmean(given))
+            height = max(abs(hint), START_HEIGHT_M)
+            above = hint <= 0 or bool(self.upper & set(members))
+            start[members, 2] = -height if above else height
         return start
 
     def variants(self, start: np.ndarray) -> Iterator[np.ndarray]:
@@ -564,15 +589,16 @@ def _match(
 
 def _choose(
     problem: _Problem, solutions: list[_Solution], reference: np.ndarray | None
-) -> tuple[_Solution, np.ndarray]:
-    """The winning layout, and per anchor whether another layout fits the
-    ranges as well and neither the frame nor the reference tells them
-    apart. A layout is a rival unless its rms is twice the best one's.
-    Among rivals the frame decides first, then the nearest to the
-    reference, then the one that needs no exchange to be that near."""
+) -> tuple[_Solution, dict[int, str]]:
+    """The winning layout, and for each anchor (by index) that another
+    layout places elsewhere while fitting the ranges as well, why nothing
+    tells the two apart. A layout is a rival unless its rms is twice the
+    best one's. Among rivals the frame decides first, as far as its anchors
+    are clearly on a side, then the nearest to the reference, then the one
+    that needs no exchange to be that near."""
     limit = 2.0 * max(solutions[0].rms, NOISE_FLOOR_M)
     rivals = [s for s in solutions if max(s.rms, NOISE_FLOOR_M) < limit]
-    rivals = _closest(rivals, lambda s: problem.frame_violations(s.positions), 0.0)
+    rivals = _closest(rivals, lambda s: problem.frame_sides(s.positions)[0], 0.0)
     if reference is not None:
         rivals = _closest(
             rivals, lambda s: _match(s.positions, reference)[0], SAME_SOLUTION_M
@@ -580,9 +606,19 @@ def _choose(
         rivals = _closest(
             rivals, lambda s: _match(s.positions, reference)[1] is not None, 0.0
         )
-    undecided = np.zeros(problem.count, dtype=bool)
+    _, in_line, level = problem.frame_sides(rivals[0].positions)
+    why = "neither the placement nor the frame tells them apart"
+    if in_line:
+        why = "the frame's reference anchors are too nearly in line to tell them apart"
+    elif level:
+        why = (
+            "the upper anchors are too nearly level with the origin's group to"
+            " tell them apart"
+        )
+    undecided = {}
     for other in rivals[1:]:
-        undecided |= _differing(rivals[0], other)
+        for i in np.flatnonzero(_differing(rivals[0], other)):
+            undecided[int(i)] = f"another layout fits the ranges as well, and {why}"
     return rivals[0], undecided
 
 
@@ -761,12 +797,8 @@ def fit_survey(
         for k, (a, b) in enumerate(problem.pairs)
     )
     reports, reasons = _anchor_fits(problem, anchors, positions, residual, stored)
-    for i in np.flatnonzero(undecided):
-        reasons.setdefault(
-            anchors[i],
-            "another layout fits the ranges as well, and neither the placement"
-            " nor the frame tells them apart",
-        )
+    for i, why in undecided.items():
+        reasons.setdefault(anchors[i], why)
     blocked, warnings = _gate(
         anchors, measurements, pairs, reports, reasons, winner.rms
     )

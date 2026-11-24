@@ -3,6 +3,7 @@
 import json
 import re
 from itertools import combinations
+from math import dist
 
 import numpy as np
 import pytest
@@ -12,8 +13,10 @@ from flockwave.server.ext.rtls.survey_fit import (
     DirectedRange,
     Frame,
     SurveyFitError,
+    _distinct,
     _pair_ranges,
     _Problem,
+    _Solution,
     fit_survey,
     frame_refusal,
 )
@@ -88,6 +91,19 @@ def survey(layout, seed=0, noise=NOISE_M, drop=()):
                 share=0.96,
             )
     return measurements
+
+
+def read_to_the_centimetre(rows):
+    """Anchors 1, 2, ... at the rows, every pair ranged both ways without
+    noise, as the centimetres an anchor reports."""
+    layout = dict(enumerate(rows, 1))
+    measurements = {
+        (a, b): DirectedRange(round(dist(layout[a], layout[b]), 2), 0.01, 95, 0.95)
+        for a in layout
+        for b in layout
+        if a != b
+    }
+    return layout, measurements
 
 
 def rough(layout, seed=0, spread=0.5):
@@ -288,6 +304,95 @@ def test_square_cell_follows_its_sketch():
         assert fit.notes == () and fit.blocked == ()
 
 
+def test_sketch_drawn_flat_at_zero_height_still_finds_the_tiers():
+    layout, measurements = read_to_the_centimetre(
+        [(x, y, z) for z in (0.0, -2.0) for y in (0.0, 5.0) for x in (0.0, 6.0)]
+    )
+    flat = {a: (x, y, 0.0) for a, (x, y, _) in layout.items()}
+
+    fit = fit_survey(
+        list(layout), measurements, Frame.two_tiers(list(layout)), placement=flat
+    )
+
+    assert worst_error(fit, layout) < 0.02
+    assert fit.rms_m < 0.01
+    assert fit.blocked == ()
+
+
+def test_flat_sketch_finds_a_height_group_the_frame_does_not_call_upper():
+    two_heights = Frame(
+        origin=301, x_axis=302, height_groups=((301, 302, 303), (304, 305))
+    )
+    flat = {a: (x, y, 0.0) for a, (x, y, _) in FIVE.items()}
+
+    fit = fit_survey(list(FIVE), survey(FIVE, noise=0.005), two_heights, placement=flat)
+
+    assert fit.rms_m < 0.02
+    assert abs(fit.anchors[304].position[2]) == pytest.approx(2.2, abs=0.1)
+    assert codes(fit.blocked) == [
+        ("not-located", 304, None),
+        ("not-located", 305, None),
+    ]
+    assert "neither the placement nor the frame" in fit.blocked[0].detail
+
+
+def test_reference_anchor_nearly_on_the_x_axis_leaves_the_mirror_open():
+    layout, measurements = read_to_the_centimetre(
+        [(0.0, 0.0), (8.0, 0.0), (4.0, 0.01), (0.0, 6.0)]
+    )
+    measurements[3, 4] = measurements[4, 3] = DirectedRange(7.22, 0.01, 95, 0.95)
+    frame = Frame.two_tiers(list(layout))
+
+    fit = fit_survey(list(layout), measurements, frame)
+
+    assert ("not-located", 4, None) in codes(fit.blocked)
+    assert {code for code, _, _ in codes(fit.blocked)} == {"not-located"}
+    assert "nearly in line" in fit.blocked[-1].detail
+    assert abs(fit.anchors[4].position[1]) == pytest.approx(6.0, abs=0.05)
+
+    sketched = fit_survey(list(layout), measurements, frame, placement=dict(layout))
+
+    assert sketched.anchors[4].position[1] == pytest.approx(6.0, abs=0.05)
+    assert sketched.blocked == ()
+
+
+def test_reference_anchor_within_three_sigmas_of_the_x_axis_leaves_the_mirror_open():
+    thin = {1: (0.0, 0.0, 0.0), 2: (6.0, 0.0, 0.0), 3: (3.0, 0.45, 0.0)}
+
+    fit = fit_survey(list(thin), survey(thin, noise=0.0), Frame.two_tiers(list(thin)))
+
+    assert 0.45 / 3 < sigma_of(fit, 3) < 0.20
+    assert codes(fit.blocked) == [("not-located", 3, None)]
+    assert "nearly in line" in fit.blocked[0].detail
+
+
+def test_upper_tier_barely_above_the_lower_leaves_the_mirror_open():
+    layout, measurements = read_to_the_centimetre(
+        [(x, y, z) for z in (0.0, -0.25) for y in (0.0, 5.0) for x in (0.0, 6.0)]
+    )
+    frame = Frame.two_tiers(list(layout))
+
+    fit = fit_survey(list(layout), measurements, frame)
+
+    assert codes(fit.blocked) == [("not-located", a, None) for a in (5, 6, 7, 8)]
+    assert "nearly level" in fit.blocked[0].detail
+    assert abs(fit.anchors[5].position[2]) == pytest.approx(0.25, abs=0.03)
+
+    stored = fit_survey(list(layout), measurements, frame, stored=layout)
+
+    assert worst_error(stored, layout) < 0.03
+    assert stored.blocked == ()
+
+
+def test_triangle_of_a_few_metres_is_settled_by_the_preset():
+    fit = fit_survey(
+        list(TRIANGLE), survey(TRIANGLE, noise=0.0), Frame.two_tiers(list(TRIANGLE))
+    )
+
+    assert worst_error(fit, TRIANGLE) < 1e-6
+    assert fit.blocked == ()
+
+
 def test_top_down_sketch_cannot_tell_above_from_below():
     undeclared = Frame(origin=301, x_axis=302, height_groups=((301, 302, 303),))
     flat_sketch = {a: (x, y) for a, (x, y, _) in FIVE.items()}
@@ -443,11 +548,21 @@ def test_one_spare_range_is_enough_to_estimate_the_noise():
         4: (5.0, 5.0, 0.0),
     }
     frame = Frame(origin=1, x_axis=2, height_groups=((1, 2, 3, 4),), y_positive=3)
+    exact = survey(square, noise=0.0)
+    off = dict(exact)
+    off[1, 4] = off[4, 1] = DirectedRange(exact[1, 4].range_m + 0.2, 0.005, 96, 0.96)
 
-    fit = fit_survey(list(square), survey(square, noise=0.0), frame)
+    clean = fit_survey(list(square), exact, frame)
+    strained = fit_survey(list(square), off, frame)
 
-    assert worst_error(fit, square) < 1e-6
-    assert 0.005 < sigma_of(fit, 2) < 0.011
+    # Six ranges for five unknowns: the one spare range carries all of the
+    # residual, and a clean fit is held at the 2.5 cm floor.
+    assert clean.rms_m < 1e-6
+    noise = strained.rms_m * np.sqrt(6)
+    assert noise > 0.05
+    assert sigma_of(strained, 2) / sigma_of(clean, 2) == pytest.approx(
+        noise / 0.025, rel=0.1
+    )
 
 
 def test_square_cell_surveyed_again_keeps_its_side():
@@ -498,6 +613,11 @@ def test_stored_positions_in_another_frame_start_the_fit():
     assert moved_of(fit, 101) == pytest.approx(np.sqrt(14.0), abs=0.01)
 
 
+# Above the 2.5 cm floor of the prediction, which would otherwise be what is
+# compared with the spread.
+MONTE_CARLO_NOISE_M = 0.04
+
+
 def test_predicted_sigma_matches_the_monte_carlo_spread():
     runs = 100
     positions = np.empty((runs, len(TWO_TIERS), 3))
@@ -505,7 +625,7 @@ def test_predicted_sigma_matches_the_monte_carlo_spread():
     for run in range(runs):
         fit = fit_survey(
             list(TWO_TIERS),
-            survey(TWO_TIERS, seed=run),
+            survey(TWO_TIERS, seed=run, noise=MONTE_CARLO_NOISE_M),
             TWO_TIERS_FRAME,
             placement=TWO_TIERS,
         )
@@ -522,12 +642,12 @@ def test_predicted_sigma_matches_the_monte_carlo_spread():
     assert spread[1] < 0.7 * spread[2:].min()
 
 
-def test_ranges_that_agree_exactly_keep_the_centimetre_they_are_read_to():
+def test_ranges_that_agree_exactly_are_not_taken_for_a_perfect_survey():
     fit = fit_survey(list(TWO_TIERS), survey(TWO_TIERS, noise=0.0), TWO_TIERS_FRAME)
 
     assert fit.rms_m < 1e-6
     sigmas = [report.sigma_m for report in fit.anchors.values()][1:]
-    assert 0.005 < min(sigmas) and max(sigmas) < 0.02
+    assert 0.015 < min(sigmas) and max(sigmas) < 0.04
 
 
 def test_stored_positions_start_the_fit_and_give_the_move():
@@ -874,6 +994,42 @@ def test_heights_the_placement_leaves_out_start_above_the_origin_group():
     assert list(problem.with_heights(sketch)[:, 2]) == [0.0] * 4 + [-3.0] * 4
 
 
+@pytest.mark.parametrize(
+    ("drawn", "started"),
+    [
+        (0.0, -START_HEIGHT_M),
+        (0.2, -START_HEIGHT_M),
+        (3.0, -3.0),
+        (-0.2, -START_HEIGHT_M),
+    ],
+)
+def test_upper_anchors_start_above_the_origin_group_whatever_the_sketch_says(
+    drawn, started
+):
+    problem = problem_of(TWO_TIERS, TWO_TIERS_FRAME)
+    sketch = rows(TWO_TIERS)
+    sketch[:, 2] = drawn
+
+    assert list(problem.with_heights(sketch)[:, 2]) == [0.0] * 4 + [started] * 4
+
+
+@pytest.mark.parametrize(
+    ("drawn", "started"),
+    [(0.0, -START_HEIGHT_M), (0.2, START_HEIGHT_M), (3.0, 3.0), (-3.0, -3.0)],
+)
+def test_height_the_frame_does_not_call_upper_starts_on_the_side_it_was_drawn(
+    drawn, started
+):
+    two_heights = Frame(
+        origin=301, x_axis=302, height_groups=((301, 302, 303), (304, 305))
+    )
+    problem = problem_of(FIVE, two_heights)
+    sketch = rows(FIVE)
+    sketch[:, 2] = drawn
+
+    assert list(problem.with_heights(sketch)[:, 2]) == [0.0] * 3 + [started] * 2
+
+
 def test_variants_exchange_every_pair_and_reflect_through_the_nearest_ranged():
     problem = problem_of(FIVE, FIVE_FREE_HEIGHTS)
     start = rows(FIVE)
@@ -895,3 +1051,13 @@ def test_variants_exchange_every_pair_and_reflect_through_the_nearest_ranged():
         ranges_from_305(start)[[0, 2, 3]]
     )
     assert abs(ranges_from_305(reflected)[1] - ranges_from_305(start)[1]) > 0.5
+
+
+def test_every_solution_comes_with_its_mirror_images():
+    in_space = _distinct([_Solution(rows(FIVE), 0.01)])
+    in_a_plane = _distinct([_Solution(rows(L_SHAPE), 0.01)])
+
+    sides_of_304 = {tuple(np.sign(layout.positions[3, 1:])) for layout in in_space}
+    assert sides_of_304 == {(1.0, -1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)}
+    assert len(in_space) == 4
+    assert [layout.positions[2, 1] for layout in in_a_plane] == [3.0, -3.0]
