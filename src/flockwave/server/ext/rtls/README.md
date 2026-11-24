@@ -68,14 +68,22 @@ enables it.
   at boot. `X-RTLS-GEOM` only compares the fits across the fleet, and a tag
   refits on `UWB_GEOM_RECAL=1`.
 - **OTA has no bootloader revert.** MCUboot on the ESP32-S3 is
-  overwrite-only, so a bad image is recovered by uploading the previous one.
-  Tag and anchor images are different artifacts. Pass `role` with
-  `X-RTLS-OTA` so the server checks `UWB_ROLE` first; `UWB_ROLE` itself
-  cannot be changed by parameter.
-- **Sleep is a parameter write the firmware may undo.** `SLEEP` is written
-  back to `0` while the drone's autopilot is armed or not confirmed disarmed.
-  The server reads it back after a settle delay to report the refusal. A
-  woken board reboots and is off the network for a few seconds.
+  overwrite-only, and the SDK confirms every uploaded image, so a bad image
+  is recovered by uploading the previous one. Tag and anchor images are
+  different artifacts: the server takes the image's species from the
+  `.receipt.json` that rtls-link-zephyr `scripts/build.sh` writes beside it
+  (the declared `role` only without one) and checks it against `UWB_ROLE`;
+  `UWB_ROLE` itself cannot be changed by parameter.
+- **Sleep is a parameter write the firmware may undo.** On a tag, `SLEEP` is
+  written back to `0` while the drone's autopilot is armed or not confirmed
+  disarmed; the server reads it back after a settle delay to report the
+  refusal. An anchor reboots when it enters or leaves operating (8-15 s off
+  the network) and falls asleep in place from standby; `anchor_sleep.py`
+  verifies the outcome from the `powerState` it reports after the write and
+  does not command an anchor that reports none. A woken board reboots.
+- **Lost boards stay listed.** A board that misses `device_timeout` stays in
+  `X-RTLS-INF` offline, with its last stats marked stale, until an operator
+  forgets it or the server restarts; nothing treats it as live.
 - **Drone pairing comes from the tag.** A tag reports its autopilot's system
   id (`FC_SYS_ID` / `FC_STATE`) and keeps reporting it while asleep; the
   server pairs the tag with the drone of that system id.
@@ -88,6 +96,7 @@ enables it.
   the message handlers. Its exports (`devices()`, `get_param()`,
   `set_param()`, `set_sleep()`, `start_ota()`, `cluster_clock`, …) are the
   entry points for other extensions.
+- `anchor_sleep.py`: an anchor's sleep and wake and their verification.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.
@@ -100,9 +109,10 @@ enables it.
 ## Tests
 
 ```sh
-uv run pytest test/test_ext_rtls.py
+uv run pytest test/test_ext_rtls.py test/test_rtls_*.py
 ```
 
 The tests drive the handlers against the SDK's sans-IO protocol core with a
 scripted fake device, without sockets. Protocol tests belong to the SDK, in
-rtls-link-zephyr `py/tests/`.
+rtls-link-zephyr `py/tests/`. `test/rtls_support.py` and
+`test/anchor_sleep_support.py` hold the fakes.

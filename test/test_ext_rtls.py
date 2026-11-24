@@ -21,218 +21,40 @@ import pytest
 import rtlslink as rtlslink_module
 import trio
 import trio.testing
+from rtls_support import (
+    DEVICE_ADDRESS,
+    DEVICE_SYSID,
+    FakeDevice,
+    StubApp,
+    StubBeaconAPI,
+    StubMessageHub,
+    discover,
+    make_message,
+    set_fake_param,
+)
 from rtlslink.dialect import load_dialect
 from rtlslink.protocol import (
     PARAM_ACK_FAILED,
     PARAM_ACK_VALUE_UNSUPPORTED,
-    PARAM_TYPE_CUSTOM,
-    PARAM_TYPE_INT32,
-    PARAM_TYPE_REAL32,
     PARAM_TYPE_UINT8,
-    RTLS_COMPONENT_ID,
     ProtocolEvent,
     RtlsProtocol,
     encode_param_value,
     param_type_from_name,
-    raw_field_bytes,
 )
 
 from flockwave.server.ext.rtls.extension import (
+    DEFAULT_DEVICE_TIMEOUT,
     REFILL_INITIAL_DELAY,
     REFILL_MAX_ATTEMPTS,
     REFILL_READ_SPACING,
     SLEEP_PIN_TIMEOUT,
+    STATS_STALE_AFTER,
     RtlsExtension,
     _stats_json,
 )
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
-
-DEVICE_SYSID = 42
-DEVICE_ADDRESS = ("192.168.4.42", 3333)
-
-
-class FakeDevice:
-    """Scripted rtls-link device: parses the datagrams the server sends
-    and produces the MAVLink replies a real firmware would."""
-
-    def __init__(self, dialect, system_id: int = DEVICE_SYSID):
-        self.dialect = dialect
-        self.system_id = system_id
-        self.address = DEVICE_ADDRESS
-        self._mav = dialect.MAVLink(
-            None, srcSystem=system_id, srcComponent=RTLS_COMPONENT_ID
-        )
-        self._parser = dialect.MAVLink(None)
-        self._parser.robust_parsing = True
-
-        # name -> (raw value bytes, MAV_PARAM_EXT_TYPE code)
-        self.params: dict[str, tuple[bytes, int]] = {
-            "MAV_SYS_ID": (bytes([system_id]), PARAM_TYPE_UINT8),
-            "UWB_CH": (struct.pack("<i", 5), PARAM_TYPE_INT32),
-            "POS_X": (struct.pack("<f", 1.5), PARAM_TYPE_REAL32),
-            "FW_VERSION": (b"1.2.3", PARAM_TYPE_CUSTOM),
-            "SLEEP": (bytes([0]), PARAM_TYPE_UINT8),
-        }
-
-        self.respond_to_list = True
-        self.respond_to_read = True
-        #: parameter names omitted from full-list responses, simulating
-        #: the datagrams a real dump loses to UDP under the startup burst
-        self.drop_from_list: set[str] = set()
-        #: every parameter name the server asked for with a targeted
-        #: PARAM_EXT_REQUEST_READ, in arrival order (recorded even while
-        #: ``respond_to_read`` is off)
-        self.read_requests: list[str] = []
-        self.respond_to_set = True
-        self.set_result = 0  # PARAM_ACK_ACCEPTED
-        #: emulate the firmware's arming gate: a SLEEP=1 write is acked
-        #: but flipped back to 0, as the real device does while armed
-        self.refuse_sleep = False
-
-    @property
-    def sleeping(self) -> bool:
-        return self.params["SLEEP"][0][:1] == b"\x01"
-
-    def heartbeat(self) -> bytes:
-        d = self.dialect
-        # a sleeping device advertises STANDBY, like the firmware
-        status = d.MAV_STATE_STANDBY if self.sleeping else d.MAV_STATE_ACTIVE
-        message = d.MAVLink_heartbeat_message(
-            type=d.MAV_TYPE_GENERIC,
-            autopilot=d.MAV_AUTOPILOT_INVALID,
-            base_mode=0,
-            custom_mode=0,
-            system_status=status,
-            mavlink_version=3,
-        )
-        return bytes(message.pack(self._mav))
-
-    def named_value_float(
-        self, name: str, value: float, time_boot_ms: int = 0
-    ) -> bytes:
-        """One NAMED_VALUE_FLOAT, as the firmware emits per health stat."""
-        message = self.dialect.MAVLink_named_value_float_message(
-            time_boot_ms=time_boot_ms,
-            name=name.encode(),
-            value=value,
-        )
-        return bytes(message.pack(self._mav))
-
-    def handle(self, data: bytes) -> list[bytes]:
-        out: list[bytes] = []
-        for message in self._parser.parse_buffer(data) or []:
-            kind = message.get_type()
-            if kind == "PARAM_EXT_REQUEST_LIST" and self.respond_to_list:
-                for index, name in enumerate(self.params):
-                    if name in self.drop_from_list:
-                        continue
-                    out.append(self._param_value(name, index))
-            elif kind == "PARAM_EXT_REQUEST_READ":
-                name = message.param_id
-                self.read_requests.append(name)
-                if self.respond_to_read and name in self.params:
-                    index = list(self.params).index(name)
-                    out.append(self._param_value(name, index))
-            elif kind == "PARAM_EXT_SET" and self.respond_to_set:
-                name = message.param_id
-                value = raw_field_bytes(message, "param_value") or b""
-                if self.set_result == 0 and name in self.params:
-                    width = len(self.params[name][0])
-                    self.params[name] = (value[:width], message.param_type)
-                out.append(
-                    self._param_ack(name, value, message.param_type, self.set_result)
-                )
-                if name == "SLEEP" and self.refuse_sleep and self.sleeping:
-                    # the arming gate runs after the ack on the firmware
-                    self.params["SLEEP"] = (bytes([0]), PARAM_TYPE_UINT8)
-        return out
-
-    def _param_value(self, name: str, index: int) -> bytes:
-        value, param_type = self.params[name]
-        message = self.dialect.MAVLink_param_ext_value_message(
-            param_id=name.encode(),
-            param_value=value,
-            param_type=param_type,
-            param_count=len(self.params),
-            param_index=index,
-        )
-        return bytes(message.pack(self._mav))
-
-    def _param_ack(
-        self, name: str, value: bytes, param_type: int, result: int
-    ) -> bytes:
-        message = self.dialect.MAVLink_param_ext_ack_message(
-            param_id=name.encode(),
-            param_value=value,
-            param_type=param_type,
-            param_result=result,
-        )
-        return bytes(message.pack(self._mav))
-
-
-class StubMessageHub:
-    """Captures the notifications that the extension broadcasts."""
-
-    def __init__(self):
-        self.broadcasts = []
-        #: when set, enqueue_broadcast_message emulates a full TX queue by
-        #: dropping the notification, like the real hub does on overflow
-        self.full = False
-
-    def create_notification(self, body=None):
-        return body
-
-    async def broadcast_message(self, message):
-        self.broadcasts.append(message)
-
-    def enqueue_broadcast_message(self, message):
-        # the real hub's send_nowait drops the message when the queue is
-        # full instead of blocking the caller
-        if not self.full:
-            self.broadcasts.append(message)
-
-
-class StubApp:
-    def __init__(self):
-        self.message_hub = StubMessageHub()
-
-
-class StubBeaconBasicProperties:
-    def __init__(self, name=""):
-        self.name = name
-
-
-class StubBeacon:
-    def __init__(self, id):
-        self.id = id
-        self.basic_properties = StubBeaconBasicProperties()
-        self.position = None
-        self.active = False
-
-    def update_status(self, position=None, heading=None, active=None):
-        if position is not None:
-            self.position = position
-        if active is not None:
-            self.active = bool(active)
-
-
-class StubBeaconAPI:
-    """Stands in for the beacon-registry API the extension imports: ``use``
-    yields a beacon and removes it again when its context exits, mirroring the
-    real registry-backed context manager."""
-
-    def __init__(self):
-        self.beacons = {}
-
-    @contextmanager
-    def use(self, beacon_id):
-        beacon = StubBeacon(beacon_id)
-        self.beacons[beacon_id] = beacon
-        try:
-            yield beacon
-        finally:
-            self.beacons.pop(beacon_id, None)
 
 
 @pytest.fixture(scope="module")
@@ -269,21 +91,9 @@ def extension(dialect, device):
     return ext
 
 
-async def discover(extension, device):
-    """Feeds a device heartbeat into the extension; the extension then
-    auto-fetches the parameter list, exactly as the run loop would."""
-    await extension._process_datagram(
-        device.heartbeat(), device.address, time.monotonic()
-    )
-
-
 @pytest.fixture
 def autojump_clock():
     return trio.testing.MockClock(autojump_threshold=0)
-
-
-def make_message(builder, body):
-    return builder.create_message(body)
 
 
 async def test_run_without_app_fails_fast(dialect):
@@ -294,12 +104,6 @@ async def test_run_without_app_fails_fast(dialect):
     assert ext.app is None
     with pytest.raises(RuntimeError, match="without an app"):
         await ext.run(None, {}, None)
-
-
-def set_fake_param(device, name, value, param_type_name):
-    """Write a parameter into a FakeDevice's wire store (raw bytes + type)."""
-    param_type = param_type_from_name(param_type_name)
-    device.params[name] = (encode_param_value(value, param_type), param_type)
 
 
 def set_cached_param(device, name, value, param_type_name):
@@ -1378,6 +1182,7 @@ async def test_sleep_rejects_malformed_requests(extension, device, builder, hub)
 
 
 async def test_ota_full_flow(extension, device, builder, hub, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag
     await discover(extension, device)
 
     image = tmp_path / "firmware.bin"
@@ -1398,7 +1203,13 @@ async def test_ota_full_flow(extension, device, builder, hub, tmp_path):
         extension._nursery = nursery
 
         start = make_message(
-            builder, {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)}
+            builder,
+            {
+                "type": "X-RTLS-OTA",
+                "id": DEVICE_SYSID,
+                "image": str(image),
+                "role": "tag",
+            },
         )
         response = await extension._handle_RTLS_OTA(start, None, hub)
 
@@ -1515,6 +1326,7 @@ async def test_ota_role_guardrail_rejects_invalid_role(
 
 
 async def test_ota_rejects_concurrent_jobs(extension, device, builder, hub, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag
     await discover(extension, device)
 
     image = tmp_path / "firmware.bin"
@@ -1533,13 +1345,25 @@ async def test_ota_rejects_concurrent_jobs(extension, device, builder, hub, tmp_
             extension._nursery = nursery
 
             start = make_message(
-                builder, {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)}
+                builder,
+                {
+                    "type": "X-RTLS-OTA",
+                    "id": DEVICE_SYSID,
+                    "image": str(image),
+                    "role": "tag",
+                },
             )
             response = await extension._handle_RTLS_OTA(start, None, hub)
             assert response.body["job"]["status"] == "running"
 
             again = make_message(
-                builder, {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)}
+                builder,
+                {
+                    "type": "X-RTLS-OTA",
+                    "id": DEVICE_SYSID,
+                    "image": str(image),
+                    "role": "tag",
+                },
             )
             response = await extension._handle_RTLS_OTA(again, None, hub)
             assert response.body["type"] == "ACK-NAK"
@@ -1554,6 +1378,7 @@ async def test_ota_rejects_concurrent_jobs(extension, device, builder, hub, tmp_
 
 
 async def test_ota_failure_is_reported(extension, device, builder, hub, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag
     await discover(extension, device)
 
     image = tmp_path / "firmware.bin"
@@ -1567,7 +1392,13 @@ async def test_ota_failure_is_reported(extension, device, builder, hub, tmp_path
     async with trio.open_nursery() as nursery:
         extension._nursery = nursery
         start = make_message(
-            builder, {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)}
+            builder,
+            {
+                "type": "X-RTLS-OTA",
+                "id": DEVICE_SYSID,
+                "image": str(image),
+                "role": "tag",
+            },
         )
         await extension._handle_RTLS_OTA(start, None, hub)
         with trio.fail_after(5):
@@ -1601,17 +1432,38 @@ async def test_ota_status_query_without_job(extension, device, builder, hub):
 # ---- device loss --------------------------------------------------------
 
 
-async def test_lost_device_disappears_from_inf(extension, device, builder, hub):
-    await discover(extension, device)
-    protocol = extension._protocol
-
-    # simulate the device going silent past its timeout
-    events = protocol.expire(time.monotonic() + 1000)
-    assert [event.kind for event in events] == ["lost"]
-
+async def _inf_status(extension, builder, hub):
     message = make_message(builder, {"type": "X-RTLS-INF"})
     response = await extension._handle_RTLS_INF(message, None, hub)
-    assert response.body["status"] == {}
+    return response.body["status"]
+
+
+async def test_lost_device_stays_listed_offline(extension, device, builder, hub):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is True
+    assert entry["age"] >= 0.0
+
+    # the device goes silent past its timeout
+    events = extension._expire_devices(time.monotonic() + 1000)
+    assert [event.kind for event in events] == ["lost"]
+
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is False
+    later = extension._inf_status(time.monotonic() + 1000)[str(DEVICE_SYSID)]
+    assert later["age"] >= 999.0
+    assert entry["role"] == "anchor-responder"
+    assert entry["address"] == list(DEVICE_ADDRESS)
+    # ...but nothing treats it as live
+    assert DEVICE_SYSID not in extension._protocol.devices
+
+    # it comes back as the same entry, live again
+    await discover(extension, device)
+    status = await _inf_status(extension, builder, hub)
+    assert list(status) == [str(DEVICE_SYSID)]
+    assert status[str(DEVICE_SYSID)]["online"] is True
+    assert DEVICE_SYSID not in extension._lost
 
 
 # ---- X-RTLS-INF push notifications --------------------------------------
@@ -1659,16 +1511,14 @@ async def test_inf_broadcast_on_loss(extension, device):
 
     # the device goes silent past its timeout; the protocol loop handles the
     # lost event (which only marks the list dirty -- the handler is sync) and
-    # then runs the periodic flush, which broadcasts the now-empty list
-    events = extension._protocol.expire(1000.0)
+    # then runs the periodic flush, which broadcasts the device offline
+    events = extension._expire_devices(1000.0)
     assert [event.kind for event in events] == ["lost"]
-    for event in events:
-        extension._handle_lost(event)
     await extension._flush_pending_inf(now=1000.0)
 
     broadcasts = _inf_broadcasts(extension)
     assert len(broadcasts) == 2
-    assert broadcasts[-1]["status"] == {}
+    assert broadcasts[-1]["status"][str(DEVICE_SYSID)]["online"] is False
 
 
 async def test_inf_broadcast_coalesces_bursts(extension, device, dialect):
@@ -2044,31 +1894,44 @@ async def test_stats_trailing_flush_delivers_latest_within_interval(extension, d
     assert len(stats_broadcasts) == 2
 
 
-async def test_lost_device_stats_pruned_from_query(extension, device, builder, hub):
+async def test_lost_device_stats_kept_stale_until_forgotten(
+    extension, device, builder, hub
+):
     await discover(extension, device)
     await _feed_stats(extension, device, FULL_STATS, now=0.0)
 
     # the snapshot is reported before the device is lost
     message = make_message(builder, {"type": "X-RTLS-STATS"})
     response = await extension._handle_RTLS_STATS(message, None, hub)
-    assert str(DEVICE_SYSID) in response.body["stats"]
+    assert "stale" not in response.body["stats"][str(DEVICE_SYSID)]
 
-    # drive the protocol loop's expiry path: the device times out, the
-    # extension handles the lost event and prunes its cached stats
-    protocol = extension._protocol
-    events = protocol.expire(time.monotonic() + 1000)
-    assert [event.kind for event in events] == ["lost"]
-    for event in events:
-        extension._handle_lost(event)
+    # drive the protocol loop's expiry path: the device times out and its
+    # last snapshot stays answerable, marked stale
+    extension._expire_devices(time.monotonic() + 1000)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    entry = response.body["stats"][str(DEVICE_SYSID)]
+    assert entry["stale"] is True
+    assert entry["solveRateHz"] == 8.0
 
-    # the X-RTLS-STATS query no longer reports the timed-out device
-    message = make_message(builder, {"type": "X-RTLS-STATS"})
+    # ...and is pushed once, so listening clients learn it went stale
+    await extension._flush_pending_stats(now=10.0)
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)]["stale"] is True
+
+    # forgetting the device drops the snapshot and its bookkeeping
+    assert extension.forget_device(DEVICE_SYSID) == {"forgotten": True}
     response = await extension._handle_RTLS_STATS(message, None, hub)
     assert response.body["stats"] == {}
-    # internal throttle bookkeeping was cleaned up too
-    assert DEVICE_SYSID not in extension._stats
     assert DEVICE_SYSID not in extension._last_stats_broadcast
     assert DEVICE_SYSID not in extension._last_stats_sent
+
+    # a fresh report after the device returns is no longer stale
+    await discover(extension, device)
+    await _feed_stats(extension, device, FULL_STATS, now=20.0)
+    response = await extension._handle_RTLS_STATS(message, None, hub)
+    assert "stale" not in response.body["stats"][str(DEVICE_SYSID)]
 
 
 # ---- cluster clock estimate ----
@@ -4047,3 +3910,717 @@ async def test_watchers_get_one_stats_event_per_report(extension, device):
                 break
 
     assert kinds.count("stats") == 1
+
+
+# ---- anchor health stats ------------------------------------------------
+
+ANCHOR_STATS = {
+    "vbat": 7.9123,
+    "soc": 81.25,
+    "ibat": 0.4321,
+    "btemp": 24.56,
+    "lowbat": 0.0,
+    "pwrst": 5.0,
+    "pwrin": 5.0,
+    "chg": 3.0,
+    "chgblk": 0.0,
+    "uwbst": 2.0,
+    "rnghz": 49.876,
+    "urst": 1.0,
+    "moved": 1.0,
+    "tilt": 3.21,
+    "knocks": 4.0,
+    "elink": 1.0,
+    "edrop": 2.0,
+    "rssi": -61.0,
+    "wdisc": 3.0,
+    "wtxerr": 7.0,
+    "boots": 12.0,
+    "rstc": 1.0,
+}
+
+
+def test_stats_json_anchor_fields():
+    body = _stats_json(7, ANCHOR_STATS, "anchor-responder")
+
+    assert body == {
+        "id": 7,
+        "batteryVoltage": 7.912,
+        "batteryPercent": 81.2,
+        "batteryCurrentA": 0.432,
+        "batteryTemperatureC": 24.6,
+        "lowBattery": False,
+        "batteryWarning": False,
+        "powerState": "operating",
+        "powerInput": "poe",
+        "charging": "cv",
+        "chargeBlock": "none",
+        "uwbStatus": 2,
+        "rangingRateHz": 49.88,
+        "radioRestarts": 1,
+        "moved": True,
+        "tiltDeg": 3.2,
+        "knocks": 4,
+        "ethernetLink": True,
+        "ethernetDrops": 2,
+        "wifiRssiDbm": -61,
+        "wifiDisconnects": 3,
+        "wifiTxErrors": 7,
+        "bootCount": 12,
+        "resetCause": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "key", "names"),
+    [
+        (
+            "pwrst",
+            "powerState",
+            [
+                "booting",
+                "preview",
+                "standby",
+                "asleep",
+                "off",
+                "operating",
+                "stopping",
+                "shutdown",
+                "fault",
+            ],
+        ),
+        (
+            "pwrin",
+            "powerInput",
+            ["unknown", "battery", "usb", "usb-1.5a", "usb-3a", "poe"],
+        ),
+        ("chg", "charging", ["off", "idle", "cc", "cv", "topoff"]),
+        (
+            "chgblk",
+            "chargeBlock",
+            [
+                "none",
+                "no-profile",
+                "no-input",
+                "charger",
+                "gauge",
+                "temperature",
+                "gauge-inhibit",
+                "pack-voltage",
+                "charger-fault",
+                "overcurrent",
+                "stopping",
+            ],
+        ),
+    ],
+)
+def test_stats_json_maps_state_codes(name, key, names):
+    for code, expected in enumerate(names):
+        assert _stats_json(7, {name: float(code)}, "anchor-initiator")[key] == expected
+    # a code the server does not know, or not an exact integer, is unknown
+    for value in (float(len(names)), -1.0, 1.5):
+        assert _stats_json(7, {name: value}, "anchor-initiator")[key] == "unknown"
+    # a non-finite value is dropped like every other stat
+    assert key not in _stats_json(7, {name: math.nan}, "anchor-initiator")
+
+
+def test_stats_json_anchor_omits_absent_fields():
+    # every field is present only while its stat is: omitted means unknown
+    assert _stats_json(7, {"vbat": 8.0}, "anchor-initiator") == {
+        "id": 7,
+        "batteryVoltage": 8.0,
+    }
+
+
+def test_stats_json_unknown_role_is_tag_shaped():
+    # a tag's 10 s status report carries no solver stats either: only
+    # UWB_ROLE switches a device to the anchor shape
+    assert _stats_json(7, {"boots": 3.0, "rstc": 1.0})["solveRateHz"] == 0.0
+
+
+async def test_stats_take_the_anchor_shape_once_the_role_says_anchor(
+    extension, device, builder, hub
+):
+    device.respond_to_list = False  # the dump has not delivered UWB_ROLE
+    await discover(extension, device)
+    await extension._on_stats(DEVICE_SYSID, {"boots": 3.0}, 0.0)
+    assert extension._stats[DEVICE_SYSID]["solveRateHz"] == 0.0
+
+    set_fake_param(device, "UWB_ROLE", 3, "uint8")
+    await extension._process_datagram(
+        device._param_value("UWB_ROLE", 0), device.address, 1.0
+    )
+    await extension._on_stats(DEVICE_SYSID, {"boots": 3.0}, 2.0)
+    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID, "bootCount": 3}
+
+
+def test_stats_json_tag_keeps_its_solver_defaults():
+    body = _stats_json(7, {"vbat": 8.0, "uwbst": 2.0, "boots": 3.0}, "tag")
+
+    assert body["solveRateHz"] == 0.0
+    assert body["anchorMask"] == 0
+    assert body["uwbStatus"] == 2
+    assert body["bootCount"] == 3
+
+
+async def test_anchor_stats_broadcast_without_the_tag_stat_set(extension, device):
+    add_rtls_cell_params(device, role=2, uwb_mac=1)
+    await discover(extension, device)
+
+    # stats the pinned SDK already accepts (pwrst, rnghz... need its bump)
+    await extension._process_datagram(
+        _bundle(device, {"vbat": 7.9, "soc": 80.0, "uwbst": 2.0}),
+        device.address,
+        0.0,
+    )
+
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)] == {
+        "id": DEVICE_SYSID,
+        "batteryVoltage": 7.9,
+        "batteryPercent": 80.0,
+        "uwbStatus": 2,
+    }
+
+
+# ---- TWR summary spread -------------------------------------------------
+
+
+def _twr_generation(device, time_boot_ms, *, distance=14.0, mad=0.0234, count=40):
+    """One responder TWR summary generation in one datagram, as the
+    firmware sends it (docs/reference/twr-summary.md)."""
+    frames = (
+        ("trcap", 1.0),
+        ("trseq", 7.0),
+        ("trmask", 1.0),
+        ("twr0001", distance),
+        ("twm0001", mad),
+        ("twn0001", float(count)),
+    )
+    return b"".join(
+        device.named_value_float(name, value, time_boot_ms) for name, value in frames
+    )
+
+
+async def test_twr_rows_carry_the_summary_spread(extension, device):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+
+    await extension._process_datagram(
+        _twr_generation(device, 1000), device.address, 10.0
+    )
+    row = extension._inf_status(10.5)[str(DEVICE_SYSID)]["twr"][0]
+    assert row == {
+        "peerMac": 0x0001,
+        "distanceM": 14.0,
+        "ageMs": 500,
+        "madM": 0.0234,
+        "count": 40,
+    }
+
+    # a later distance without its complete generation (a lost frame) is
+    # not paired with the previous generation's spread
+    await extension._process_datagram(
+        device.named_value_float("twr0001", 14.2, 2000), device.address, 11.0
+    )
+    row = extension._inf_status(11.0)[str(DEVICE_SYSID)]["twr"][0]
+    assert row["distanceM"] == 14.2
+    assert "madM" not in row and "count" not in row
+
+    # loss drops the summary with the rows
+    extension._expire_devices(time.monotonic() + 1000.0)
+    assert DEVICE_SYSID not in extension._twr_summary
+
+
+# ---- lost devices and X-RTLS-FORGET -------------------------------------
+
+
+async def test_forget_drops_a_lost_device(extension, device, builder, hub):
+    await discover(extension, device)
+    await _feed_stats(extension, device, FULL_STATS, now=0.0)
+    extension._expire_devices(time.monotonic() + 1000)
+    pushes = len(_inf_broadcasts(extension))
+
+    response = await extension._handle_RTLS_FORGET(
+        make_message(builder, {"type": "X-RTLS-FORGET", "ids": [DEVICE_SYSID, 99]}),
+        None,
+        hub,
+    )
+
+    assert response.body == {
+        "type": "X-RTLS-FORGET",
+        "result": {
+            str(DEVICE_SYSID): {"forgotten": True},
+            "99": {"forgotten": False, "detail": "No such device: 99"},
+        },
+    }
+    assert await _inf_status(extension, builder, hub) == {}
+    assert DEVICE_SYSID not in extension._stats
+    # the device list is pushed without the forgotten device
+    await extension._flush_pending_inf(now=time.monotonic() + 10.0)
+    broadcasts = _inf_broadcasts(extension)
+    assert len(broadcasts) == pushes + 1
+    assert broadcasts[-1]["status"] == {}
+
+
+async def test_forget_refuses_a_live_device(extension, device, builder, hub):
+    await discover(extension, device)
+
+    response = await extension._handle_RTLS_FORGET(
+        make_message(builder, {"type": "X-RTLS-FORGET", "id": DEVICE_SYSID}),
+        None,
+        hub,
+    )
+
+    assert response.body["result"] == {
+        str(DEVICE_SYSID): {
+            "forgotten": False,
+            "detail": f"Device {DEVICE_SYSID} is online",
+        }
+    }
+    assert str(DEVICE_SYSID) in await _inf_status(extension, builder, hub)
+
+
+async def test_forget_rejects_malformed_requests(extension, builder, hub):
+    for body in (
+        {"type": "X-RTLS-FORGET"},
+        {"type": "X-RTLS-FORGET", "ids": []},
+        {"type": "X-RTLS-FORGET", "ids": [True]},
+        {"type": "X-RTLS-FORGET", "id": "x"},
+    ):
+        response = await extension._handle_RTLS_FORGET(
+            make_message(builder, body), None, hub
+        )
+        assert response.body.get("type") == "ACK-NAK", body
+
+
+async def test_lost_anchor_is_not_active_anywhere(extension, device, dialect):
+    """A lost anchor stays listed, but no consumer counts it as live: the
+    site anchor list, the map beacons and command targets."""
+    extension._beacon_api = StubBeaconAPI()
+    add_rtls_cell_params(device)
+    await discover(extension, device)
+    anchor = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
+    anchor.address = ("192.168.4.43", 3333)
+    set_fake_param(anchor, "UWB_ROLE", 3, "uint8")
+    set_fake_param(anchor, "UWB_MAC", 2, "uint16")
+    await extension._process_datagram(anchor.heartbeat(), anchor.address, 0.0)
+    extension._send = lambda payload, address: _noop()  # the tag stays quiet
+    await extension._process_datagram(
+        anchor._param_value("UWB_ROLE", 0), anchor.address, 0.0
+    )
+    await extension._process_datagram(
+        anchor._param_value("UWB_MAC", 1), anchor.address, 0.0
+    )
+    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
+    assert slot["active"] is True
+
+    # only the anchor times out (the tag was seen at the real clock)
+    extension._expire_devices(5.0 + DEFAULT_DEVICE_TIMEOUT)
+
+    assert str(anchor.system_id) in extension._inf_status(10.0)
+    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
+    assert slot["active"] is False
+    assert slot["systemId"] is None
+    beacon = extension._beacon_api.beacons["rtls::default::anchor_1"]
+    assert beacon.active is False
+    with pytest.raises(KeyError):
+        await extension.set_param(anchor.system_id, "SLEEP", 1, "uint8")
+
+
+async def _noop():
+    return None
+
+
+async def test_sleep_on_an_offline_device_says_so(
+    extension, device, builder, hub, autojump_clock
+):
+    await discover(extension, device)
+    extension._expire_devices(time.monotonic() + 1000)
+
+    response = await extension._handle_RTLS_SLEEP(
+        make_message(
+            builder, {"type": "X-RTLS-SLEEP", "ids": [DEVICE_SYSID], "sleeping": True}
+        ),
+        None,
+        hub,
+    )
+
+    entry = response.body["result"][str(DEVICE_SYSID)]
+    assert entry["accepted"] is False
+    assert entry["detail"] == f"Device {DEVICE_SYSID} is offline"
+
+
+async def test_param_set_refuses_remote_off(extension, device, builder, hub):
+    await discover(extension, device)
+    for value in (2, True, "1"):
+        response = await extension._handle_RTLS_PARAM_SET(
+            make_message(
+                builder,
+                {
+                    "type": "X-RTLS-PARAM-SET",
+                    "id": DEVICE_SYSID,
+                    "name": "SLEEP",
+                    "value": value,
+                },
+            ),
+            None,
+            hub,
+        )
+        assert response.body.get("type") == "ACK-NAK", value
+    assert device.params["SLEEP"][0] == bytes([0])
+
+
+# ---- retained identity across loss --------------------------------------
+
+
+async def test_a_returning_anchor_keeps_its_name(extension, device, builder, hub):
+    add_anchor_identity_params(device, uwb_mac=2)
+    await discover(extension, device)
+    assert (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)][
+        "name"
+    ] == "RTLS anchor A1"
+
+    extension._expire_devices(time.monotonic() + 1000)
+    # it returns, but its parameter dump has not landed (lost or slow)
+    device.respond_to_list = False
+    await discover(extension, device)
+
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["online"] is True
+    assert entry["name"] == "RTLS anchor A1"
+    assert entry["role"] == "anchor-responder"
+    # live checks read only the new cache
+    assert extension._protocol.devices[DEVICE_SYSID].params == {}
+
+    # once the new snapshot is complete, the retained copy is dropped
+    device.respond_to_list = True
+    request = extension._protocol.request_param_list(DEVICE_SYSID)
+    await extension._send(*request)
+    assert DEVICE_SYSID not in extension._retained_params
+    entry = (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)]
+    assert entry["name"] == "RTLS anchor A1"
+
+
+# ---- stats freshness ----------------------------------------------------
+
+
+async def test_a_stat_the_device_stopped_sending_leaves_the_body(extension, device):
+    add_anchor_identity_params(device)
+    await discover(extension, device)
+
+    # the SDK ages out a stat the device stops sending (PoE pulled: no
+    # chargeBlock; gauge profile removed: no soc); the body follows it
+    await extension._on_stats(
+        DEVICE_SYSID, {"vbat": 7.9, "soc": 80.0, "chgblk": 0.0}, 0.0
+    )
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.9}, 1.0)
+
+    assert extension._stats[DEVICE_SYSID] == {"id": DEVICE_SYSID, "batteryVoltage": 7.9}
+
+
+async def test_a_silent_stats_stream_goes_stale(extension, device):
+    add_anchor_identity_params(device)
+    await discover(extension, device)
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.9}, 0.0)
+
+    await extension._flush_pending_stats(now=STATS_STALE_AFTER)
+    assert "stale" not in extension._stats[DEVICE_SYSID]
+
+    # no report for longer than three periods of the slowest one
+    await extension._flush_pending_stats(now=STATS_STALE_AFTER + 1.0)
+    assert extension._stats[DEVICE_SYSID]["stale"] is True
+    pushed = [
+        b for b in extension.app.message_hub.broadcasts if b["type"] == "X-RTLS-STATS"
+    ]
+    assert pushed[-1]["stats"][str(DEVICE_SYSID)]["stale"] is True
+
+    # the next report is fresh again
+    await extension._on_stats(DEVICE_SYSID, {"vbat": 7.8}, STATS_STALE_AFTER + 2.0)
+    assert "stale" not in extension._stats[DEVICE_SYSID]
+
+
+# ---- OTA species from the image's build receipt -------------------------
+
+
+def _signed_image(tmp_path, app, *, stale=False):
+    """An image with the receipt rtls-link-zephyr's scripts/build.sh writes
+    beside it."""
+    import hashlib
+    import json
+
+    image = tmp_path / "zephyr.signed.bin"
+    image.write_bytes(b"\x3d\xb8\xf3\x96" + b"\x00" * 60)
+    digest = hashlib.sha256(b"other build" if stale else image.read_bytes())
+    (tmp_path / "zephyr.signed.bin.receipt.json").write_text(
+        json.dumps(
+            {
+                "app": app,
+                "board": "axio_anchor" if app == "anchor" else "axiolight_esp32s3",
+                "git": "9b1573bd",
+                "sha256": digest.hexdigest(),
+                "mcuboot_digest": "00" * 32,
+            }
+        )
+    )
+    return image
+
+
+async def _start_ota(extension, builder, hub, image, **body):
+    message = make_message(
+        builder,
+        {"type": "X-RTLS-OTA", "id": DEVICE_SYSID, "image": str(image)} | body,
+    )
+    return await extension._handle_RTLS_OTA(message, None, hub)
+
+
+@pytest.mark.parametrize("declared", [None, "anchor"])
+async def test_ota_refuses_an_image_whose_receipt_names_another_species(
+    extension, device, builder, hub, tmp_path, declared
+):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)  # a tag
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "anchor")
+
+    body = {} if declared is None else {"role": declared}
+    response = await _start_ota(extension, builder, hub, image, **body)
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "refusing to upload a anchor image" in response.body["reason"]
+    assert DEVICE_SYSID not in extension._ota_jobs
+
+
+async def test_ota_receipt_overrides_a_contradicting_declared_role(
+    extension, device, builder, hub, tmp_path
+):
+    # the operator flipped the declared role to match the device: the
+    # receipt still says anchor
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "anchor")
+
+    response = await _start_ota(extension, builder, hub, image, role="tag")
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "its build receipt" in response.body["reason"]
+
+
+async def test_ota_refuses_a_stale_receipt(extension, device, builder, hub, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    image = _signed_image(tmp_path, "tag", stale=True)
+
+    response = await _start_ota(extension, builder, hub, image)
+
+    assert response.body["type"] == "ACK-NAK"
+    assert "stale receipt" in response.body["reason"]
+
+
+async def test_ota_job_names_the_species_and_its_source(
+    extension, device, builder, hub, tmp_path
+):
+    device.params["UWB_ROLE"] = (bytes([3]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    extension._ota_upgrade = (
+        lambda address, image_path, *, timeout=10.0, on_progress=None: "9.9.9"
+    )
+    receipted = _signed_image(tmp_path, "anchor")
+    bare = tmp_path / "bare.bin"
+    bare.write_bytes(b"\x00" * 16)
+
+    async with trio.open_nursery() as nursery:
+        extension._nursery = nursery
+        response = await _start_ota(extension, builder, hub, receipted)
+        assert response.body["job"]["species"] == "anchor"
+        assert response.body["job"]["speciesSource"] == "receipt"
+        with trio.fail_after(5):
+            while extension._ota_jobs[DEVICE_SYSID]["status"] == "running":
+                await trio.sleep(0.01)
+        # without a receipt, the declared role is the fallback
+        response = await _start_ota(extension, builder, hub, bare, role="anchor")
+        assert response.body["job"]["speciesSource"] == "declared"
+        with trio.fail_after(5):
+            while extension._ota_jobs[DEVICE_SYSID]["status"] == "running":
+                await trio.sleep(0.01)
+    extension._nursery = None
+
+
+# ---- audit round: stale snapshots, lost devices, OTA export, forget ------
+
+
+async def test_stale_snapshots_pass_neither_verify_nor_geom(
+    extension, device, builder, hub
+):
+    from flockwave.server.ext.rtls.verify import _uwb_rule
+
+    await discover(extension, device)
+    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
+    body = (await geom_message(extension, builder, hub)).body
+    assert body["devices"][str(DEVICE_SYSID)]["status"] != "unknown"
+
+    # the tag is lost and returns before it reports again: its kept snapshot
+    # is recent by harvest time, but stale
+    extension._expire_devices(time.monotonic() + 1000)
+    await discover(extension, device)
+    assert extension._stats[DEVICE_SYSID]["stale"] is True
+
+    body = (await geom_message(extension, builder, hub)).body
+    assert body["devices"][str(DEVICE_SYSID)]["status"] == "unknown"
+    rule = _uwb_rule(extension)
+    assert rule["status"] == "fail"
+    assert "no telemetry" in rule["detail"]
+
+
+async def test_a_lost_devices_late_datagram_is_ignored(extension, device):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    await extension._process_datagram(
+        _bundle(device, {"vbat": 7.9, "pwrst": 5.0}), device.address, 0.0
+    )
+    extension._expire_devices(time.monotonic() + 1000)
+    kept = dict(extension._stats[DEVICE_SYSID])
+
+    # stats and TWR frames without a heartbeat (the SDK still decodes them)
+    await extension._process_datagram(
+        _bundle(device, {"vbat": 6.0, "twr0001": 14.0}), device.address, 1.0
+    )
+
+    assert extension._stats[DEVICE_SYSID] == kept
+    assert DEVICE_SYSID not in extension._twr
+
+
+async def test_inf_sleeping_follows_an_anchors_power_state(
+    extension, device, builder, hub
+):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    device.params["SLEEP"] = (bytes([1]), PARAM_TYPE_UINT8)  # heartbeats STANDBY
+    await discover(extension, device)
+    # standby, off and asleep all heartbeat STANDBY
+    assert extension._protocol.devices[DEVICE_SYSID].sleeping is True
+
+    async def inf_sleeping(pwrst):
+        await extension._process_datagram(
+            device.named_value_float("pwrst", pwrst), device.address, 0.0
+        )
+        return (await _inf_status(extension, builder, hub))[str(DEVICE_SYSID)][
+            "sleeping"
+        ]
+
+    assert await inf_sleeping(2.0) is False  # plain standby
+    assert await inf_sleeping(4.0) is False  # off
+    assert await inf_sleeping(3.0) is True  # asleep
+
+
+async def test_start_ota_export_refuses_unchecked_images(extension, device, tmp_path):
+    device.params["UWB_ROLE"] = (bytes([1]), PARAM_TYPE_UINT8)
+    await discover(extension, device)
+    bare = tmp_path / "bare.bin"
+    bare.write_bytes(b"\x00" * 16)
+
+    with pytest.raises(
+        ValueError, match="no build receipt and no declared role; build it with"
+    ):
+        await extension.start_ota(DEVICE_SYSID, str(bare))
+    with pytest.raises(ValueError, match="refusing to upload a anchor image"):
+        await extension.start_ota(DEVICE_SYSID, str(_signed_image(tmp_path, "anchor")))
+    assert DEVICE_SYSID not in extension._ota_jobs
+
+
+async def test_forget_dedupes_ids_and_checks_a_single_id(
+    extension, device, builder, hub
+):
+    await discover(extension, device)
+    extension._expire_devices(time.monotonic() + 1000)
+
+    response = await extension._handle_RTLS_FORGET(
+        make_message(
+            builder, {"type": "X-RTLS-FORGET", "ids": [DEVICE_SYSID, DEVICE_SYSID]}
+        ),
+        None,
+        hub,
+    )
+    assert response.body["result"] == {str(DEVICE_SYSID): {"forgotten": True}}
+
+    for body in ({"id": True}, {"id": "42"}, {"id": 0}):
+        response = await extension._handle_RTLS_FORGET(
+            make_message(builder, {"type": "X-RTLS-FORGET", **body}), None, hub
+        )
+        assert response.body["type"] == "ACK-NAK", body
+
+
+async def test_a_stale_tag_fit_falls_back_to_its_table(extension, device, builder, hub):
+    add_four_anchor_cell_params(device)
+    extension._beacon_api = StubBeaconAPI()
+    await discover(extension, device)
+    d1, d2, d3 = FLEET_DISTANCES[:3]
+    fit = {**FULL_STATS, "geom": 3.0, "gd1": d1, "gd2": d2, "gd3": d3}
+    fit.update({f"gd{i}": 0.0 for i in range(4, 8)})
+    await extension._on_stats(DEVICE_SYSID, fit, 0.0)
+    beacon = extension._beacon_api.beacons["rtls::default::anchor_3"]
+    fitted = (beacon.position.lat, beacon.position.lon)
+
+    # the tag's stream goes silent: its cell renders from the provisioned
+    # table again, the beacons too
+    await extension._flush_pending_stats(now=STATS_STALE_AFTER + 1.0)
+    lat, lon, _ = ned_to_global_e7_for_test(1.0, 1.0)
+    assert (beacon.position.lat, beacon.position.lon) != fitted
+    assert beacon.position.lat == pytest.approx(lat)
+    assert beacon.position.lon == pytest.approx(lon)
+
+    # the same fit reported again renders again
+    await extension._on_stats(DEVICE_SYSID, fit, STATS_STALE_AFTER + 2.0)
+    assert (beacon.position.lat, beacon.position.lon) == fitted
+
+
+async def test_commands_ignore_the_role_retained_from_before_a_loss(
+    extension, device, autojump_clock
+):
+    add_anchor_identity_params(device, uwb_mac=2)
+    await discover(extension, device)
+    extension._expire_devices(time.monotonic() + 1000)
+    device.respond_to_list = False
+    device.respond_to_read = False
+    await discover(extension, device)
+
+    # displayed as the anchor it was...
+    assert extension._device_role(DEVICE_SYSID) == "anchor-responder"
+    # ...but not commanded on that memory
+    assert await extension._command_role(DEVICE_SYSID, 1.0) is None
+
+
+async def test_a_stat_ages_out_on_the_next_frame_and_a_lost_anchor_keeps_its_last(
+    extension, device
+):
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    t = time.monotonic()
+    report = {"vbat": 7.9, "lowbat": 1.0, "pwrst": 5.0, "chgblk": 2.0}
+    await extension._process_datagram(_bundle(device, report), device.address, t)
+    assert extension._stats[DEVICE_SYSID]["chargeBlock"] == "no-input"
+
+    # PoE is pulled: the next reports carry no chgblk, which ages out once
+    # a frame arrives after three report periods
+    later = {"vbat": 7.8, "lowbat": 1.0, "pwrst": 5.0}
+    await extension._process_datagram(_bundle(device, later), device.address, t + 4.0)
+    assert "chargeBlock" not in extension._stats[DEVICE_SYSID]
+
+    # the anchor goes silent and is lost: its stale snapshot still has the
+    # last battery and power state (a silent device's stats do not age)
+    await extension._process_expiry(t + 1000.0, logging.getLogger("test"))
+    kept = extension._stats[DEVICE_SYSID]
+    assert kept["stale"] is True
+    assert kept["batteryVoltage"] == 7.8
+    assert kept["batteryWarning"] is True
+    assert kept["powerState"] == "operating"
+
+
+@pytest.mark.parametrize(
+    ("lowbat", "low", "warning"),
+    [(0.0, False, False), (1.0, False, True), (2.0, True, False)],
+)
+def test_stats_json_battery_levels(lowbat, low, warning):
+    body = _stats_json(7, {"lowbat": lowbat}, "anchor-responder")
+    assert body["lowBattery"] is low
+    assert body["batteryWarning"] is warning

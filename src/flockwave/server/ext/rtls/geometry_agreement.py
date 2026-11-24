@@ -385,7 +385,7 @@ def _tag_entries(
         entry = _entry_for(
             system_id,
             _cell_id_from_params(params),
-            ext._stats.get(system_id),
+            ext._fresh_stats(system_id),
             stats_age,
         )
         if entry["status"] == "candidate" and not _cell_known(device, params):
