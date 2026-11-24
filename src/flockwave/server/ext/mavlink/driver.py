@@ -350,9 +350,15 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
         send_single: Callable[[MAVLinkUAV], Awaitable[Any]],
     ) -> dict[MAVLinkUAV, Any]:
         """Turns the acknowledgments of a broadcast command into the result
-        of each UAV, and sends the command to each UAV that did not acknowledge
-        it on its own address, waiting for its acknowledgment there as for any
-        command sent to a single UAV.
+        of each UAV, and sends the command to each connected UAV that did not
+        acknowledge it on its own address, waiting for its acknowledgment there
+        as for any command sent to a single UAV.
+
+        A UAV that did not acknowledge it and is no longer connected is not
+        sent the command again: the server keeps the last address of every UAV
+        it has heard, and a drone that went silent may since have been pointed
+        at another ground computer, whose operator now flies it from that
+        address.
 
         Args:
             uavs: the UAVs that the command was meant for
@@ -363,15 +369,22 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
 
         Returns:
             dictionary mapping each UAV to ``None`` if it accepted the command,
-            to an error if it refused it, and to an awaitable for the command
-            sent to it on its own address if it did not acknowledge the
-            broadcast
+            to an error if it refused it or is not connected, and to an
+            awaitable for the command sent to it on its own address if it did
+            not acknowledge the broadcast
         """
         results: dict[MAVLinkUAV, Any] = {}
         silent: list[MAVLinkUAV] = []
+        gone: list[MAVLinkUAV] = []
         for uav in uavs:
             result = acks.get(uav)
-            if result is None:
+            if result is None and not uav.is_connected:
+                gone.append(uav)
+                results[uav] = RuntimeError(
+                    f"The drone did not acknowledge the {description} command "
+                    "and is not connected, so it was not sent again"
+                )
+            elif result is None:
                 silent.append(uav)
                 results[uav] = send_single(uav)
             elif result == MAVResult.ACCEPTED:
@@ -391,6 +404,12 @@ class MAVLinkDriver(UAVDriver["MAVLinkUAV"]):
                 f"{len(silent)} of {len(uavs)} drones did not acknowledge the "
                 f"broadcast {description} command, sending it to them on their "
                 f"own addresses: {', '.join(uav.id for uav in silent)}"
+            )
+        if gone:
+            self.log.warning(
+                f"{len(gone)} of {len(uavs)} drones did not acknowledge the "
+                f"broadcast {description} command and are not connected, so it "
+                f"was not sent to them again: {', '.join(uav.id for uav in gone)}"
             )
 
         return results

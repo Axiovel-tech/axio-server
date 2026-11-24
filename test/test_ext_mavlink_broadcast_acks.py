@@ -17,10 +17,11 @@ from flockwave.server.model.transport import TransportOptions
 
 
 class Drone:
-    def __init__(self, system_id: int):
+    def __init__(self, system_id: int, *, connected: bool = True):
         self.system_id = system_id
         self.id = str(system_id)
         self.network_id = "mav"
+        self.is_connected = connected
 
 
 def ack(command: int, result: int = MAVResult.ACCEPTED) -> SimpleNamespace:
@@ -158,6 +159,25 @@ async def test_broadcast_land_reports_each_drone_and_unicasts_the_silent_one():
     [warning] = warnings
     assert "1 of 4 drones" in warning
     assert warning.endswith(": 4")
+
+
+async def test_a_silent_drone_that_is_not_connected_is_not_sent_the_command_again():
+    # Its last address may now be a drone that another ground computer flies
+    heard, gone = Drone(1), Drone(2, connected=False)
+    driver, _, singles, warnings = make_driver({heard: MAVResult.ACCEPTED})
+
+    results = await driver.send_landing_signal(
+        [heard, gone],  # type: ignore[list-item]
+        transport=TransportOptions.from_json({"broadcast": True}),
+    )
+
+    assert results[heard] is None
+    assert isinstance(results[gone], RuntimeError)
+    assert "not connected" in str(results[gone])
+    assert singles == []
+    [warning] = warnings
+    assert "1 of 2 drones" in warning and "not connected" in warning
+    assert warning.endswith(": 2")
 
 
 async def test_shutdown_goes_to_a_drone_on_its_own_address_if_it_missed_a_step():
