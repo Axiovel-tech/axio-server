@@ -414,7 +414,6 @@ async def test_fit_refits_the_held_measurement_without_ranging(
 ):
     await measure(cell, builder, hub)
     await trio.sleep(1)
-    await cell.ext._survey.flush()
     await trio.sleep(1)
     commands, pushed = len(cell.commands), len(cell.broadcasts)
     frame = {
@@ -433,6 +432,7 @@ async def test_fit_refits_the_held_measurement_without_ranging(
 
     answer = await request(cell, builder, hub, "fit", frame=frame, placement=placement)
 
+    await trio.sleep(0.01)
     assert (answer["action"], answer["result"], answer["reason"]) == (
         "fit",
         "fitted",
@@ -608,7 +608,6 @@ async def test_a_commit_runs_alone_and_tells_its_clients(
 ):
     await measure(cell, builder, hub)
     await trio.sleep(1)
-    await cell.ext._survey.flush()
     await trio.sleep(1)
     pushed = len(cell.broadcasts)
     cell.location_silent.add(204)
@@ -629,13 +628,28 @@ async def test_a_commit_runs_alone_and_tells_its_clients(
     await cell.report()
     await until(cell, "ready")
     await trio.sleep(0.5)
-    await cell.ext._survey.flush()
 
-    # each push says what was known then: the writes done, none confirmed
-    assert cell.broadcasts[pushed + 1]["commit"]["running"] == []
-    assert cell.broadcasts[-1]["commit"]["running"] == [201, 202, 203]
     states = [(s["state"], s["commit"] is not None) for s in cell.broadcasts[pushed:]]
-    assert states == [("committing", False), ("committing", True), ("ready", True)]
+    assert states == [("committing", False), ("ready", True)]
+
+
+async def test_each_push_of_a_commit_says_what_was_known_then(
+    cell, builder, hub, nursery, autojump_clock
+):
+    await measure(cell, builder, hub)
+    await trio.sleep(1)
+    pushed = len(cell.broadcasts)
+
+    nursery.start_soon(request, cell, builder, hub, "commit")
+    await trio.sleep(0.1)
+    await cell.report([201, 202])
+    await trio.sleep(1)
+    await cell.report()
+    await until(cell, "committed")
+    await trio.sleep(0.5)
+
+    running = [s["commit"] and s["commit"]["running"] for s in cell.broadcasts[pushed:]]
+    assert running == [None, [201, 202], IDS]
 
 
 def test_the_survey_id_stat_reads_null_without_a_survey():

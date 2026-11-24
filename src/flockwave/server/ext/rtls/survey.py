@@ -152,6 +152,7 @@ class Survey:
         self._run: Optional[_Run] = None
         self._changed = _Pulse()
         self._dirty = False
+        self._pushing = False
         self._pushed_at: Optional[float] = None
 
     @property
@@ -224,27 +225,36 @@ class Survey:
         if self._run is not None and system_id in self._run.moved:
             self._run.stale = True
 
-    async def flush(self) -> None:
-        """Pushes the state when it changed since the last push and the
-        limit of two pushes a second allows one. The protocol loop calls this
-        too, which delivers the last change of a burst."""
-        now = trio.current_time()
-        limited = (
-            self._pushed_at is not None and now - self._pushed_at < NOTIFY_INTERVAL
-        )
-        if limited or not self._dirty:
-            return
-        self._dirty, self._pushed_at = False, now
-        if self._ext.app is None:
-            self._ext._warn_no_app()
-            return
-        hub = self._ext.app.message_hub
-        body = {"type": "X-RTLS-SURVEY", "survey": self.json}
-        await hub.broadcast_message(hub.create_notification(body))
-
-    async def _notify(self) -> None:
+    def _notify(self) -> None:
+        """Marks the state as changed. A task of its own delivers it, so that
+        an outbound queue without room holds up neither the run, which has
+        anchors to return, nor an answer."""
         self._dirty = True
-        await self.flush()
+        nursery = self._ext._nursery
+        if nursery is not None and not self._pushing:
+            self._pushing = True
+            nursery.start_soon(self._push)
+
+    async def _push(self) -> None:
+        """Pushes the state while it has changed since the last push, at
+        most twice a second: the last change of a burst goes out when the
+        half second is over."""
+        try:
+            while self._dirty:
+                if self._pushed_at is not None:
+                    await trio.sleep_until(self._pushed_at + NOTIFY_INTERVAL)
+                self._dirty, self._pushed_at = False, trio.current_time()
+                if self._ext.app is None:
+                    self._ext._warn_no_app()
+                    continue
+                hub = self._ext.app.message_hub
+                body = {"type": "X-RTLS-SURVEY", "survey": self.json}
+                await hub.broadcast_message(hub.create_notification(body))
+        except Exception as ex:
+            if self._ext.log:
+                self._ext.log.warning(f"rtls: survey notification not sent: {ex!r}")
+        finally:
+            self._pushing = False
 
     # ---- the actions ----
 
@@ -290,7 +300,7 @@ class Survey:
         )
         self.state, self.reason = "measuring", None
         nursery.start_soon(self._survey, run)
-        await self._notify()
+        self._notify()
         return "started", None
 
     async def cancel(self, body: dict[str, Any]) -> _Answer:
@@ -302,7 +312,7 @@ class Survey:
         run.cancelled = True
         run.scope.cancel()
         self.state = "returning"
-        await self._notify()
+        self._notify()
         return "cancelled", None
 
     async def fit(self, body: dict[str, Any]) -> _Answer:
@@ -321,7 +331,7 @@ class Survey:
             return "refused", str(ex)
         run.frame, run.placement, run.fit = frame, placement, fit
         run.commit = run.plan = self.reason = None
-        await self._notify()
+        self._notify()
         return "fitted", None
 
     async def commit(self, body: dict[str, Any]) -> _Answer:
@@ -341,12 +351,12 @@ class Survey:
         self.state, self.reason = "committing", None
         committed = False
         try:
-            await self._notify()
+            self._notify()
             committed = await self._write_and_confirm(run, fit)
         finally:
             self.state = "committed" if committed else "ready"
             self.reason = None if committed else INCOMPLETE
-        await self._notify()
+        self._notify()
         return ("committed", None) if committed else ("incomplete", INCOMPLETE)
 
     async def _write_and_confirm(self, run: _Run, fit: SurveyFit) -> bool:
@@ -365,7 +375,7 @@ class Survey:
         running: list[int] = []
         commit = run.commit = {"surveyId": survey_id, "results": {}, "running": running}
         results = commit["results"] = await write_locations(ext, run.anchors, values)
-        await self._notify()
+        self._notify()
         written = {
             anchor.system_id
             for anchor in run.anchors
@@ -376,7 +386,7 @@ class Survey:
                 reporting = running_ids(ext, run.anchors, survey_id)
                 if reporting != running:
                     running = commit["running"] = reporting
-                    await self._notify()
+                    self._notify()
                 if written <= set(running):
                     break
                 await self._changed.wait()
@@ -410,7 +420,7 @@ class Survey:
             self.state, self.reason = "failed", failure
         else:
             self.state = "ready"
-        await self._notify()
+        self._notify()
 
     def _defect(self, error: Exception) -> str:
         if self._ext.log:
@@ -436,7 +446,7 @@ class Survey:
         for index, initiator in enumerate(group, start=1):
             if index > 1:
                 run.step = index
-                await self._notify()
+                self._notify()
             result = await step(initiator)
             if not (result.complete or result.ends_survey):
                 again = await step(initiator)
@@ -478,7 +488,7 @@ class Survey:
         responder reports ranging again. An anchor that did not take the end
         returns by itself, so the wait is then the hold time."""
         self.state = "returning"
-        await self._notify()
+        self._notify()
         group = [SurveyAnchor(anchor.system_id, anchor.mac) for anchor in run.order]
         waiting = {a.system_id for a in run.order if a.boot_responder}
         deadline = trio.current_time() + hold_for(run.rounds, run.block_ms)

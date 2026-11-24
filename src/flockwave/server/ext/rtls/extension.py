@@ -506,7 +506,6 @@ class RtlsExtension(Extension):
             # pushed once their throttle window elapses, and the list is
             # rebroadcast on a slow heartbeat so client-side ages refresh.
             await self._flush_pending_inf(now)
-            await self._survey.flush()
 
             with trio.move_on_after(0.25):
                 try:

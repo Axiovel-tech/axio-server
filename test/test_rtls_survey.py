@@ -115,7 +115,6 @@ async def test_a_run_steps_every_anchor_returns_them_and_fits(
     await cell.report()
     await until(cell, "ready")
     await trio.sleep(0.5)
-    await cell.ext._survey.flush()
 
     # step IDs count up from a random one and skip 0; the first step is the
     # session the anchors store, the last command ends the survey
@@ -869,20 +868,56 @@ async def test_the_state_is_pushed_at_most_twice_a_second(
     # the steps of this cell take no time: only the first push went out
     assert [s["state"] for s in cell.broadcasts] == ["measuring"]
     await trio.sleep(0.45)
-    await survey.flush()
     assert len(cell.broadcasts) == 1
 
     # the last change of the burst is pushed when the half second is over
     await trio.sleep(0.05)
-    await survey.flush()
     assert [s["state"] for s in cell.broadcasts] == ["measuring", "ready"]
     assert cell.ext.app.message_hub.broadcasts[-1] == {
         "type": "X-RTLS-SURVEY",
         "survey": survey.json,
     }
     await trio.sleep(1)
-    await survey.flush()
     assert len(cell.broadcasts) == 2
+
+
+async def test_a_full_notification_queue_holds_up_neither_the_run_nor_its_answers(
+    cell, builder, hub, autojump_clock
+):
+    delivered, room = [], trio.Event()
+
+    async def broadcast(message):
+        await room.wait()
+        delivered.append(message["survey"]["state"])
+
+    cell.ext.app.message_hub.broadcast_message = broadcast
+
+    with trio.fail_after(60):
+        answer = await _start(cell, builder, hub)
+        assert answer["result"] == "started"
+        await until(cell, "returning")
+        await cell.report()
+        await until(cell, "ready")
+        assert (await request(cell, builder, hub, "fit"))["result"] == "fitted"
+
+    assert {to for to, value, _ in cell.commands if value == "0000"} == set(IDS)
+    assert not cell.ext._survey.running
+    assert delivered == []
+
+    # once there is room, what is delivered ends with the state as it is
+    room.set()
+    await trio.sleep(1)
+    assert delivered == ["measuring", "ready"]
+
+
+async def test_a_notification_that_cannot_be_sent_does_not_stop_the_survey(
+    cell, builder, hub, autojump_clock
+):
+    async def broken(message):
+        raise trio.BrokenResourceError
+
+    cell.ext.app.message_hub.broadcast_message = broken
+    assert (await measure(cell, builder, hub))["state"] == "ready"
 
 
 async def test_a_stopped_extension_keeps_no_survey(cell, builder, hub, autojump_clock):
