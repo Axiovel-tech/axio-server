@@ -120,14 +120,15 @@ enables it.
   refused while an online anchor's stored value cannot be read), a missed
   write is not rolled back, and the commit does not lock (Control locks
   after it). The same commit again brings in an anchor that missed it,
-  unless something else was written to the group since. While a survey
-  runs, the cell settings, the lock, and sleep and OTA of its anchors are
-  refused, and its anchors keep the session they last reported through the
-  restarts of their ranging. An online anchor of the group's cell must be
-  in the group unless it reports another power state than operating: left
-  out while it ranges, it would lose its initiator at every step and keep
-  the old survey ID. A start that leaves one out is refused, and a start
-  that names no group takes exactly those anchors.
+  unless an anchor of the group moved or restarted since the measurement, or
+  something else was written to the group. While a survey runs, the cell
+  settings, the lock, and sleep and OTA of its anchors are refused, and its
+  anchors keep the session they last reported through the restarts of their
+  ranging. An online anchor of the group's cell must be in the group unless
+  it reports another power state than operating: left out while it ranges,
+  it would lose its initiator at every step and keep the old survey ID. A
+  start that leaves one out is refused, and a start that names no group
+  takes exactly those anchors.
 - **A commit names the survey it commits.** The survey state carries a
   `revision`, in every reply and notification, that the server raises on
   every change of what it holds (a phase, a measurement, a fit, a commit's

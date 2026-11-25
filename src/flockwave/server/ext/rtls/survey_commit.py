@@ -224,15 +224,19 @@ def commit_refusal(
     longer the cell's when an anchor ``moved`` since the measurement, or was
     ``lost`` by the server or ``rebooted`` (by name; either may have been
     carried away while off, and its motion latch starts anew). The ``retry``
-    of a commit an anchor missed only needs every anchor back."""
+    of a commit an anchor missed takes an anchor that was lost when it is
+    back and reports, which tells whether it rebooted."""
     devices = ext._require_protocol().devices
     offline = [a.name for a in anchors if a.system_id not in devices]
-    if rebooted and not retry:
+    if rebooted:
         return f"{rebooted[0]} restarted since it was surveyed; survey again"
     if moved or (not retry and (lost or offline)):
         return SURVEY_AGAIN
     if offline:
         return f"{offline[0]} is offline"
+    silent = [a.name for a in anchors if ext._fresh_stats(a.system_id) is None]
+    if retry and silent:
+        return f"Still waiting for {silent[0]} to report"
     if ext._cell_applying:
         return "An apply is running"
     if any(

@@ -1067,18 +1067,28 @@ async def test_a_reboot_shows_in_the_uptime_of_an_anchors_stats(
     assert await _commit_refusal(cell, builder, hub) == REBOOTED
 
 
-async def test_a_reboot_does_not_refuse_the_retry_of_a_commit_an_anchor_missed(
+async def test_a_reboot_refuses_the_retry_of_a_commit_an_anchor_missed(
     cell, builder, hub, autojump_clock
 ):
     await measure(cell, builder, hub)
     cell.location_silent.add(204)
     assert (await commit(cell, builder, hub))["result"] == "incomplete"
     cell.location_silent.clear()
+    cell.locations.clear()
 
-    # the anchor that missed the write was off: it is back, with one more boot
+    # the anchor that missed the write is off, moved and back
+    cell.lose(204)
+    anchor = cell.devices[204]
+    await cell.ext._process_datagram(anchor.heartbeat(), anchor.address, 0.0)
+    assert await _commit_refusal(cell, builder, hub) == (
+        "Still waiting for RTLS anchor A3 to report"
+    )
     await cell.report([204], boots=4.0)
 
-    assert (await commit(cell, builder, hub))["result"] == "committed"
+    assert await _commit_refusal(cell, builder, hub) == (
+        "RTLS anchor A3 restarted since it was surveyed; survey again"
+    )
+    assert cell.locations == []
 
 
 @pytest.mark.parametrize(
