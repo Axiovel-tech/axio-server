@@ -124,6 +124,13 @@ enables it.
   initiator at every step and keep the old survey ID. A start that names no
   group takes the online anchors that do not report another power state
   than operating.
+- **A commit names the survey it commits.** The survey state carries a
+  `revision`, in every reply and notification, that the server raises on
+  every change of what it holds (a phase, a measurement, a fit, a commit's
+  result, a cancel) and never lowers while it runs. `commit` must carry the
+  current one and `fit` may; a request with another is refused with the
+  reason `stale` and writes nothing, so a client cannot commit a fit another
+  client replaced while it was looking at the old one.
 - **A height group is "about the same height".** With one height group in
   the frame its anchors share one height exactly: ranges within one plane
   cannot tell heights apart, and the survey is `planar`. With two or more,

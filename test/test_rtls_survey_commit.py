@@ -18,6 +18,7 @@ from survey_support import (
     TWO_TIERS,
     authorize_show,
     commit,
+    held,
     measure,
     request,
     survey_cell,
@@ -392,7 +393,7 @@ async def test_a_retry_does_not_write_over_a_newer_survey(
     answer = await commit(cell, builder, hub)
 
     assert (answer["result"], answer["reason"]) == ("refused", "Survey again")
-    assert answer["survey"] == incomplete["survey"]
+    assert held(answer["survey"]) == held(incomplete["survey"])
     assert cell.locations == []
     assert {cell.stored(system_id).location.survey_id for system_id in IDS} == {2}
 
@@ -867,3 +868,98 @@ def test_the_survey_id_stat_reads_null_without_a_survey():
     assert _stats_json(201, {"sid": 0.0}, "anchor-responder")["surveyId"] is None
     assert _stats_json(201, {"sid": -1.0}, "anchor-responder")["surveyId"] is None
     assert "surveyId" not in _stats_json(201, {}, "anchor-responder")
+
+
+# ---- the revision of the held survey ---------------------------------------
+
+
+async def test_a_commit_of_a_fit_another_client_replaced_writes_nothing(
+    cell, builder, hub, autojump_clock
+):
+    shown = (await measure(cell, builder, hub)).get("revision")
+    # another client fits again, with another origin and +x anchor
+    frame = {"origin": 202, "xAxis": 201, "heightGroups": [IDS], "yPositive": 203}
+    refit = await request(cell, builder, hub, "fit", frame=frame)
+    assert refit["result"] == "fitted"
+
+    answer = await request(cell, builder, hub, "commit", revision=shown)
+
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert answer["survey"]["state"] == "ready"
+    assert cell.locations == []
+    current = answer["survey"]["revision"]
+    assert current == refit["survey"]["revision"] > shown
+
+    answer = await commit(cell, builder, hub, revision=current)
+    assert answer["result"] == "committed"
+    assert cell.stored(202).location.ned_m == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("revision", [None, True, "7", -1])
+async def test_a_commit_needs_the_current_revision(
+    cell, builder, hub, autojump_clock, revision
+):
+    await measure(cell, builder, hub)
+
+    answer = await request(cell, builder, hub, "commit", revision=revision)
+
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert cell.locations == []
+
+
+async def test_a_fit_that_carries_a_revision_needs_the_current_one(
+    cell, builder, hub, autojump_clock
+):
+    survey = await measure(cell, builder, hub)
+    frame = {"origin": 202, "xAxis": 201, "heightGroups": [IDS], "yPositive": 203}
+
+    answer = await request(
+        cell, builder, hub, "fit", frame=frame, revision=survey["revision"] - 1
+    )
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert answer["survey"]["frame"]["origin"] == 201
+    assert answer["survey"]["revision"] == survey["revision"]
+
+    answer = await request(
+        cell, builder, hub, "fit", frame=frame, revision=survey["revision"]
+    )
+    assert answer["result"] == "fitted"
+    # a fit that carries none is taken as before
+    assert (await request(cell, builder, hub, "fit"))["result"] == "fitted"
+
+
+async def test_the_revision_rises_with_every_change_and_never_falls(
+    cell, builder, hub, autojump_clock
+):
+    seen = [(await request(cell, builder, hub))["survey"]["revision"]]
+
+    async def after(action=None, **body):
+        answer = await request(cell, builder, hub, action, **body)
+        seen.append(answer["survey"]["revision"])
+        return answer
+
+    await after("start", anchors=IDS, frame=TWO_TIERS)
+    await until(cell, "returning")
+    await after()
+    await cell.report()
+    await until(cell, "ready")
+    await after()
+    await after("fit")
+    await after("commit", revision=None)
+    unchanged = len(seen)
+    seen.append((await commit(cell, builder, hub))["survey"]["revision"])
+    await after("start", anchors=IDS, frame=TWO_TIERS)
+    await after("cancel")
+    await until(cell, "idle")
+    await after()
+
+    assert seen[unchanged - 1] == seen[unchanged - 2]  # a refusal changes nothing
+    rises = [b - a for a, b in zip(seen, seen[1:])]
+    assert min(rises) >= 0 and sum(1 for rise in rises if rise) >= 8
+    # every push carries it, and in order
+    pushed = [state["revision"] for state in cell.broadcasts]
+    assert pushed == sorted(pushed) and pushed[-1] == seen[-1]
+
+    # an extension that stops and starts again goes on counting
+    cell.ext._forget_run_state()
+    assert cell.ext._survey.revision > seen[-1]

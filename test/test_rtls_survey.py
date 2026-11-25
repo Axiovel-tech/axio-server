@@ -19,6 +19,7 @@ from survey_support import (
     TWO_TIERS,
     authorize_show,
     commit,
+    held,
     measure,
     request,
     survey_cell,
@@ -90,7 +91,7 @@ async def test_an_idle_server_reports_an_empty_survey(
         "action": "status",
         "result": "status",
         "reason": None,
-        "survey": IDLE,
+        "survey": IDLE | {"revision": 0},
     }
 
 
@@ -107,7 +108,7 @@ async def test_a_run_steps_every_anchor_returns_them_and_fits(
         "started",
         None,
     )
-    assert answer["survey"] | {"frame": None} == IDLE | {
+    assert held(answer["survey"]) | {"frame": None} == IDLE | {
         "state": "measuring",
         "anchors": IDS,
         "step": 1,
@@ -591,7 +592,7 @@ async def test_cancel_returns_the_anchors_and_ends_idle(
     await trio.sleep(0.1)
     await cell.report()
     await until(cell, "idle")
-    assert cell.ext._survey.json == IDLE | {"reason": "cancelled"}
+    assert held(cell.ext._survey.json) == IDLE | {"reason": "cancelled"}
     assert _initiators(cell) == [1, 2]
     assert {to for to, value, _ in cell.commands if value == "0000"} == set(IDS)
 
@@ -609,7 +610,7 @@ async def test_cancel_while_the_anchors_return_drops_the_measurement(
     assert (answer["result"], answer["survey"]["state"]) == ("cancelled", "returning")
     await cell.report()
     await until(cell, "idle")
-    assert cell.ext._survey.json == IDLE | {"reason": "cancelled"}
+    assert held(cell.ext._survey.json) == IDLE | {"reason": "cancelled"}
 
 
 async def test_a_step_names_an_anchor_that_is_not_live(cell, autojump_clock):
@@ -713,7 +714,7 @@ async def test_a_defect_in_the_run_fails_the_survey_only(
 async def _refusal(cell, builder, hub, **body):
     answer = await _start(cell, builder, hub, **body)
     assert answer["result"] == "refused"
-    assert answer["survey"] == IDLE
+    assert held(answer["survey"]) == IDLE
     assert cell.commands == []
     return answer["reason"]
 
@@ -1020,4 +1021,4 @@ async def test_a_notification_that_cannot_be_sent_does_not_stop_the_survey(
 async def test_a_stopped_extension_keeps_no_survey(cell, builder, hub, autojump_clock):
     await measure(cell, builder, hub)
     cell.ext._forget_run_state()
-    assert cell.ext._survey.json == IDLE
+    assert held(cell.ext._survey.json) == IDLE

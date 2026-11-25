@@ -68,6 +68,9 @@ __all__ = ("Survey", "handle_survey_request")
 RUNNING_STATES = ("measuring", "returning", "committing")
 
 INCOMPLETE = "Not every anchor took the survey"
+#: why a commit or a fit is refused that does not name the held survey's
+#: revision: another client changed the survey since the request's was shown
+STALE = "stale"
 CANCELLED = "cancelled"
 _INTERNAL_ERROR = "The survey stopped on an internal error"
 
@@ -128,13 +131,24 @@ def _merged(first: StepResult, again: StepResult) -> StepResult:
 class Survey:
     """The extension's one survey: its state, the run and the commit."""
 
-    def __init__(self, ext: "RtlsExtension"):
+    def __init__(self, ext: "RtlsExtension", revision: int = 0):
         self._ext = ext
         self.state = "idle"
         self.reason: Optional[str] = None
+        #: raised on every change of what the survey holds; never lowered
+        #: while the server runs
+        self.revision = revision
         self._run: Optional[_Run] = None
         self._changed = Pulse()
-        self._notify = StatePusher(ext, self._notification).notify
+        self._push = StatePusher(ext, self._notification).notify
+
+    def _notify(self) -> None:
+        """Every change of the survey makes a new revision, which is pushed."""
+        self.revision += 1
+        self._push()
+
+    def _is_current(self, revision: Any) -> bool:
+        return type(revision) in (int, float) and revision == self.revision
 
     @property
     def running(self) -> bool:
@@ -148,6 +162,7 @@ class Survey:
     def json(self) -> dict[str, Any]:
         """The state object."""
         state: dict[str, Any] = {
+            "revision": self.revision,
             "state": self.state,
             "reason": self.reason,
             "anchors": [],
@@ -270,6 +285,8 @@ class Survey:
 
     async def fit(self, body: dict[str, Any]) -> _Answer:
         run = self._run
+        if "revision" in body and not self._is_current(body["revision"]):
+            return "refused", STALE
         if self.running:
             return "refused", "A survey is running"
         if run is None or self.state != "ready":
@@ -289,6 +306,8 @@ class Survey:
 
     async def commit(self, body: dict[str, Any]) -> _Answer:
         run = self._run
+        if not self._is_current(body.get("revision")):
+            return "refused", STALE
         if self.running:
             return "refused", "A survey is running"
         if run is None or self.state != "ready" or run.fit is None:

@@ -475,7 +475,7 @@ class RtlsExtension(Extension):
         """What a stopped extension keeps of no device."""
         self._nursery = None
         self._sock = None
-        self._survey = Survey(self)
+        self._survey = Survey(self, self._survey.revision + 1)
         self._uptime_ms.clear()
         self._lost.clear()
         self._retained_params.clear()

@@ -269,12 +269,21 @@ async def survey_cell(dialect, nursery, positions=FLAT):
 
 
 async def request(cell, builder, hub, action=None, **body):
-    """The body of the answer to an X-RTLS-SURVEY request."""
+    """The body of the answer to an X-RTLS-SURVEY request. A commit names
+    the revision the server holds, as a client that shows the last status
+    does, unless the test names one."""
     if action is not None:
         body["action"] = action
+    if action == "commit":
+        body.setdefault("revision", cell.ext._survey.revision)
     message = make_message(builder, {"type": "X-RTLS-SURVEY"} | body)
     response = await cell.ext._handle_RTLS_SURVEY(message, None, hub)
     return response.body
+
+
+def held(state):
+    """A survey state without its revision: what the survey holds."""
+    return {key: value for key, value in state.items() if key != "revision"}
 
 
 TWO_TIERS = {"preset": "two-tiers"}
