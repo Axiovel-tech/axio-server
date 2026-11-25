@@ -2,6 +2,13 @@
 // RTLS-Link UWB system. Every tag bridges its flight controller's MAVLink to
 // this host on UDP 14550 (WIFI_UART_HOST / WIFI_UART_PORT), so one shared
 // listener serves the whole fleet and drones are told apart by system id.
+// 14550 is also the only port a tag listens on, so fleet-wide messages
+// (broadcast-mode commands, lights, the start configuration, the time axis
+// and the show schedule) are broadcast to 14550 too. The access point must
+// pass broadcast from the wired side to its wireless stations. Every drone on
+// a port obeys every server on it, so each person runs their stack on their
+// own ports (MAVLink, telemetry and Control, in AxioStack
+// repos/ops/axio-fleet/network.md); this file has the defaults.
 {
   "EXTENSIONS": {
     // Listen on all interfaces so Axio Control can connect from anywhere
@@ -26,10 +33,15 @@
           "connections": [
             // The RTLS-Link tags bridge their flight controllers' MAVLink
             // to this host on UDP 14550 (matches the "rtls-link mavlink"
-            // ufw allow rule on enp2s0); one shared listener on all
-            // interfaces replaces the former per-drone localhost ports,
-            // which never saw the board-network traffic.
-            "udp-listen://:14550?broadcast_port=14555"
+            // ufw allow rule on enp2s0). One shared listener on this host's
+            // fixed address in the board network (the private AP's subnet)
+            // replaces the former per-drone localhost ports, which never saw
+            // the board-network traffic. Binding to the subnet makes every
+            // broadcast go to the subnet's broadcast address from the start,
+            // so none leaves through another interface (e.g. office Wi-Fi).
+            // Broadcasts go to the tags' bridge port; the outdoor configs
+            // keep 14555.
+            "udp-listen://:14550?subnet=192.168.0.0/24&broadcast_port=14550"
           ]
         }
       }
