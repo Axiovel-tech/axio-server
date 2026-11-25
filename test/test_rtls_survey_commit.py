@@ -94,6 +94,47 @@ def test_the_survey_id_is_one_more_than_the_newest_stored(stored, expected):
     assert next_survey_id(stored) == expected
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ([1, 0x8000, 0xFFFE], 2),
+        ([0xFFFE, 0x8000, 1], 2),
+        ([0x8000, 1, 0xFFFE], 2),
+        ([0xFFFE, 1, 2, 3], 4),
+        ([0x8000, 0xFFFE, 1, 2], 3),
+        ([5, 6, 7, 0x8006], 0x8007),
+    ],
+)
+def test_the_survey_id_is_never_one_an_anchor_still_holds(stored, expected):
+    assert next_survey_id(stored) == expected
+
+
+def test_a_survey_id_is_found_whatever_ids_the_anchors_hold():
+    stored = [1 + (step * 0x1FFF) % 0xFFFE for step in range(16)]
+
+    for turn in range(len(stored)):
+        held_ids = stored[turn:] + stored[:turn]
+        assert 1 <= next_survey_id(held_ids) <= 0xFFFE
+        assert next_survey_id(held_ids) not in held_ids
+
+
+async def test_a_commit_does_not_reuse_the_id_of_an_offline_anchor(
+    cell, builder, hub, autojump_clock
+):
+    for system_id, survey_id in ((202, 1), (203, 0x8000), (204, 0xFFFE)):
+        _store(cell, system_id, survey_id)
+        await cell.ext.get_param(system_id, LOC_PARAM)
+    cell.lose(202)
+    group = [201, 203, 204]
+    await measure(cell, builder, hub, anchors=group)
+
+    answer = await commit(cell, builder, hub, reporting=group)
+
+    assert answer["result"] == "committed"
+    assert answer["survey"]["commit"]["surveyId"] == 2
+    assert {cell.stored(system_id).location.survey_id for system_id in group} == {2}
+
+
 async def test_commit_writes_every_anchor_its_position_and_confirms(
     cell, builder, hub, autojump_clock
 ):

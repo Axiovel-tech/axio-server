@@ -64,13 +64,19 @@ Point = tuple[float, float, float]
 
 
 def next_survey_id(stored: Iterable[int]) -> int:
-    """One more than the newest of the stored IDs in 16-bit serial order,
-    skipping 0 and 0xFFFF, which no anchor advertises; 1 without any."""
-    ids = list(stored)
-    if not ids:
+    """The survey ID of a new commit: the first after the newest of the
+    stored IDs, in 16-bit serial order, that no anchor stores; 1 without
+    any. IDs spread over more than half the range have no newest one, so
+    the one after it may be taken. 0 and 0xFFFF are skipped: no anchor
+    advertises them."""
+    taken = set(stored)
+    if not taken:
         return 1
-    newest = newest_survey_id(ids)
-    return 1 if newest >= 0xFFFE else newest + 1
+    candidate = newest_survey_id(sorted(taken))
+    while True:
+        candidate = 1 if candidate >= 0xFFFE else candidate + 1
+        if candidate not in taken:
+            return candidate
 
 
 def stored_positions(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, Point]:
