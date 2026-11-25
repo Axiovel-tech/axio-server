@@ -78,9 +78,12 @@ _INTERNAL_ERROR = "The survey stopped on an internal error"
 #: what an anchor reports of the session it runs: -1 (here None) while none
 _SESSION_STATS = ("cellConfig", "txGain", "surveyId")
 
-#: a stat frame whose uptime is this far below the last one comes from an
-#: anchor that booted again, not from frames that swapped places, in ms
-_REBOOT_UPTIME_DROP_MS = 1000
+#: an uptime that falls by more than this comes from an anchor that booted
+#: again, not from frames that swapped places, in ms
+_REORDER_MS = 5000
+#: the uptime has 32 bits: a fall that is a step forward of at most this
+#: across their wrap (49.7 days) is the wrap, in ms
+_WRAP_STEP_MS = 60_000
 
 _Answer = tuple[str, Optional[str]]
 
@@ -124,6 +127,11 @@ class _Run:
     @property
     def ids(self) -> list[int]:
         return [anchor.system_id for anchor in self.anchors]
+
+
+def _restarted(before: int, now: int) -> bool:
+    """Whether an uptime that went from ``before`` to ``now`` started again."""
+    return before - now > _REORDER_MS and (now - before) % 2**32 > _WRAP_STEP_MS
 
 
 def _merged(first: StepResult, again: StepResult) -> StepResult:
@@ -235,7 +243,7 @@ class Survey:
             if (None not in (boots, now_boots) and now_boots != boots) or (
                 uptime is not None
                 and now_uptime is not None
-                and now_uptime + _REBOOT_UPTIME_DROP_MS < uptime
+                and _restarted(uptime, now_uptime)
             ):
                 run.rebooted.add(system_id)
             run.booted[system_id] = (

@@ -1041,28 +1041,28 @@ async def test_a_commit_is_refused_after_an_anchor_of_the_group_rebooted(
     assert await _commit_refusal(cell, builder, hub) == REBOOTED
 
 
+async def _health(cell, uptime_ms):
+    """A stat frame of 203 at that uptime through the SDK, then the anchor's
+    whole health as the other tests report it."""
+    anchor = cell.devices[203]
+    frame = anchor.named_value_float("rnghz", 50.0, uptime_ms)
+    await cell.ext._process_datagram(frame, anchor.address, time.monotonic())
+    await cell.report([203])
+
+
 async def test_a_reboot_shows_in_the_uptime_of_an_anchors_stats(
     cell, builder, hub, autojump_clock
 ):
-    anchor = cell.devices[203]
-
-    async def health(uptime_ms):
-        """A stat frame at that uptime through the SDK, then the anchor's
-        whole health as the other tests report it."""
-        frame = anchor.named_value_float("rnghz", 50.0, uptime_ms)
-        await cell.ext._process_datagram(frame, anchor.address, time.monotonic())
-        await cell.report([203])
-
-    await health(900_000)
+    await _health(cell, 900_000)
     await measure(cell, builder, hub)
-    await health(901_000)
+    await _health(cell, 901_000)
     assert (await commit(cell, builder, hub, acknowledgeWarnings=True))[
         "result"
     ] == "committed"
 
     cell.locations.clear()
     await measure(cell, builder, hub)
-    await health(4_000)  # the SDK forgets its stats: no boot count yet
+    await _health(cell, 4_000)  # the SDK forgets its stats: no boot count yet
 
     assert await _commit_refusal(cell, builder, hub) == REBOOTED
 
@@ -1079,6 +1079,40 @@ async def test_a_reboot_does_not_refuse_the_retry_of_a_commit_an_anchor_missed(
     await cell.report([204], boots=4.0)
 
     assert (await commit(cell, builder, hub))["result"] == "committed"
+
+
+@pytest.mark.parametrize(
+    ("measured", "since"),
+    [
+        # two frames of one boot swapped places
+        (102_000, (100_000, 103_000)),
+        # the 32-bit uptime wrapped, without and with frames that swapped
+        (2**32 - 700, (300, 1_300)),
+        (2**32 - 700, (300, 2**32 - 200, 1_300)),
+    ],
+)
+async def test_an_uptime_that_is_late_or_wraps_is_no_reboot(
+    cell, builder, hub, autojump_clock, measured, since
+):
+    await _health(cell, measured)
+    await measure(cell, builder, hub)
+
+    for uptime_ms in since:
+        await _health(cell, uptime_ms)
+
+    assert (await commit(cell, builder, hub))["result"] == "committed"
+
+
+@pytest.mark.parametrize("measured", [20_000, 2**31 + 50_000, 2**32 - 70_000])
+async def test_an_uptime_that_starts_again_is_a_reboot(
+    cell, builder, hub, autojump_clock, measured
+):
+    await _health(cell, measured)
+    await measure(cell, builder, hub)
+
+    await _health(cell, 4_000)
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
 
 
 async def test_an_anchor_outside_the_group_may_reboot(
