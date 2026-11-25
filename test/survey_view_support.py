@@ -59,10 +59,13 @@ def give_origin(device, **changed):
     set_fake_param(device, "POS_YAW_DEG", 90.0, "real32")
 
 
-async def surveyed_cell(dialect, *, anchors=ANCHORS, blank=(), prepare=None):
+async def surveyed_cell(
+    dialect, *, anchors=ANCHORS, blank=(), planar=False, prepare=None
+):
     """An extension that discovered a tag holding an origin and the anchors
     of one cell, each storing its table and, unless in ``blank``, its
-    position on survey 1; returns it and the devices by system ID."""
+    position on survey 1 (declared ``planar`` or not); returns it and the
+    devices by system ID."""
 
     def setup(devices):
         give_origin(devices[TAG])
@@ -71,7 +74,9 @@ async def surveyed_cell(dialect, *, anchors=ANCHORS, blank=(), prepare=None):
             set_fake_param(device, "UWB_AN_COUNT", len(anchors), "uint8")
             for row, (_, _, mac) in enumerate(anchors):
                 set_fake_param(device, f"UWB_AN{row}_MAC", mac, "uint16")
-            stored = "" if system_id in blank else location(*POSITIONS[system_id])
+            stored = location(*POSITIONS[system_id], planar=planar)
+            if system_id in blank:
+                stored = ""
             set_fake_param(device, "UWB_LOC", stored, "custom")
         if prepare is not None:
             prepare(devices)
@@ -83,6 +88,8 @@ async def anchors_report(ext, ids=None, **stats):
     """Each anchor of ``ids`` (default: all four) sends its health report,
     advertising survey 1 unless ``stats`` say otherwise."""
     for system_id in [a[0] for a in ANCHORS] if ids is None else ids:
+        if system_id not in ext._protocol.devices:
+            continue
         healthy = HEALTHY_A0 if system_id == 201 else HEALTHY_A1
         await ext._on_stats(system_id, {**healthy, **stats}, time.monotonic())
 

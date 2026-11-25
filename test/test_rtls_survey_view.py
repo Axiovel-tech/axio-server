@@ -6,11 +6,12 @@ import time
 
 import pytest
 import trio
-from anchor_lock_support import _lock
+from anchor_lock_support import _lock, location
 from rtls_support import FakeDevice, discover, set_fake_param
 from rtlslink.dialect import load_dialect
 from survey_support import ASLEEP
 from survey_view_support import (
+    ANCHORS,
     NO_POSITION,
     OTHER_SURVEY,
     TAG,
@@ -23,6 +24,7 @@ from survey_view_support import (
     tag_reports,
 )
 
+from flockwave.server.ext.rtls.survey_view import positioned
 from flockwave.server.ext.rtls.verify import run_verify
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
@@ -348,7 +350,9 @@ async def test_verify_fails_on_an_anchor_off_the_survey(dialect):
 
     assert rule["status"] == "fail"
     assert rule["detail"] == (
-        "RTLS anchor A2 is not surveyed; RTLS anchor A3 is on survey 9, the cell on 1"
+        "RTLS anchor A2 is not surveyed; "
+        "RTLS anchor A3 is on survey 9, the cell on 1; "
+        f"tag {TAG} uses 2 anchor(s), a position needs 4"
     )
 
 
@@ -397,7 +401,7 @@ async def test_verify_fails_on_a_tag_that_leaves_anchors_out(dialect):
 
 
 async def test_verify_names_a_left_out_anchor_the_server_lost(dialect):
-    ext, _ = await _positioned(dialect)
+    ext, _ = await _positioned(dialect, planar=True)
     ext._protocol.devices[204].last_seen = -1e9
     ext._expire_devices(time.monotonic())
     await tag_reports(ext, antbl(4, state=OTHER_SURVEY), anuse=3.0, anexc=1.0)
@@ -410,7 +414,7 @@ async def test_verify_names_a_left_out_anchor_the_server_lost(dialect):
 
 
 async def test_verify_fails_on_a_tag_that_uses_fewer_anchors_than_are_surveyed(dialect):
-    ext, _ = await _positioned(dialect)
+    ext, _ = await _positioned(dialect, planar=True)
     await tag_reports(ext, anuse=3.0)
 
     rule = await _rule(ext, "survey")
@@ -418,6 +422,82 @@ async def test_verify_fails_on_a_tag_that_uses_fewer_anchors_than_are_surveyed(d
     assert (rule["status"], rule["detail"]) == (
         "fail",
         f"tag {TAG} uses 3 of 4 surveyed anchors",
+    )
+
+
+async def test_a_tag_on_three_anchors_is_positioned_only_in_a_planar_survey(dialect):
+    # three anchors are all there are: the tag uses every one of them, and
+    # still solves nothing unless the survey lets it lock its height
+    ext, _ = await _positioned(dialect, anchors=ANCHORS[:3])
+    await tag_reports(ext, anuse=3.0)
+
+    rule = await _rule(ext, "survey")
+
+    assert (rule["status"], rule["detail"]) == (
+        "fail",
+        f"tag {TAG} uses 3 anchor(s), a position needs 4",
+    )
+
+    ext, _ = await _positioned(dialect, anchors=ANCHORS[:3], planar=True)
+    await tag_reports(ext, anuse=3.0)
+    assert (await _rule(ext, "survey"))["status"] == "pass"
+    await tag_reports(ext, anuse=2.0)
+    assert (await _rule(ext, "survey"))["detail"] == (
+        f"tag {TAG} uses 2 anchor(s), a position needs 3"
+    )
+
+
+@pytest.mark.parametrize(
+    ("survey_id", "used", "planar", "is_positioned"),
+    [
+        (1, 4, False, True),
+        (1, 3, False, False),
+        (1, 3, True, True),
+        (1, 2, True, False),
+        (2, 8, False, False),
+        (None, 4, False, False),
+    ],
+)
+def test_positioned_is_the_survey_and_enough_anchors(
+    survey_id, used, planar, is_positioned
+):
+    stats = {"surveyId": survey_id, "anchorsUsed": used}
+
+    assert positioned(stats, 1, planar) is is_positioned
+    assert positioned(stats, None, planar) is False
+
+
+async def test_a_tag_is_expected_to_use_the_anchors_that_advertise_now(dialect):
+    ext, _ = await _positioned(dialect, planar=True)
+
+    # one anchor sleeps: it stores the survey and transmits nothing
+    await anchors_report(ext, [204], **ASLEEP)
+    await tag_reports(ext, anuse=3.0)
+
+    rule = await _rule(ext, "survey")
+    assert (rule["status"], rule["detail"]) == (
+        "pass",
+        "every anchor is on survey 1 and every tag uses all of them",
+    )
+    # what a tag misses of the anchors on air is still a fault
+    await tag_reports(ext, anuse=2.0)
+    assert (await _rule(ext, "survey"))["status"] == "fail"
+
+
+async def test_a_sleeping_anchor_with_an_old_survey_is_its_own_finding(dialect):
+    def prepare(devices):
+        stored = location(0.0, 3.0, -2.5, 9, planar=True)
+        set_fake_param(devices[204], "UWB_LOC", stored, "custom")
+
+    ext, _ = await _positioned(dialect, planar=True, prepare=prepare)
+    await anchors_report(ext, [204], **ASLEEP)
+    await tag_reports(ext, anuse=3.0)
+
+    rule = await _rule(ext, "survey")
+
+    assert (rule["status"], rule["detail"]) == (
+        "fail",
+        "RTLS anchor A3 is on survey 9, the cell on 1",
     )
 
 

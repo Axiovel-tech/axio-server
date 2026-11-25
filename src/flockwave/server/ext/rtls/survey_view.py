@@ -34,6 +34,7 @@ __all__ = (
     "SURVEY_DRIFT_WARNING_M",
     "anchors_rule",
     "location_from_params",
+    "positioned",
     "newest_survey_id",
     "stored_location",
     "survey_inputs",
@@ -84,6 +85,22 @@ def newest_survey_id(ids: Sequence[int]) -> int:
     )
 
 
+def positioned(stats: Mapping[str, Any], cell: Optional[int], planar: bool) -> bool:
+    """Whether a tag solves a position on the cell's survey: it follows the
+    survey ID and uses four anchors, or three when every surveyed anchor is
+    ``planar``. The firmware's own minimum (rtls-link-zephyr
+    ``docs/reference/anchor-geometry.md``, "Enough"): a tag that keeps its
+    survey ID with fewer solves nothing."""
+    used = stats.get("anchorsUsed") or 0
+    return (
+        cell is not None and stats.get("surveyId") == cell and used >= _ENOUGH[planar]
+    )
+
+
+#: the anchors a position needs, by whether the survey is planar
+_ENOUGH = {True: 3, False: 4}
+
+
 @dataclass(frozen=True)
 class _Anchor:
     """An online anchor and the survey it is on."""
@@ -91,6 +108,11 @@ class _Anchor:
     system_id: int
     name: str
     survey_id: Optional[int]
+    #: its session advertises ``survey_id`` now: a tag can hear it. Without
+    #: a session the ID is only the one it stores.
+    on_air: bool
+    #: the flag of the position it stores
+    planar: bool
     range_deviation_m: Optional[float]
     moved: bool
 
@@ -123,15 +145,18 @@ def _anchors(ext: "RtlsExtension", views: Sequence["AnchorView"]) -> list[_Ancho
         if not view["online"] or device is None:
             continue
         stats = view["stats"]
-        survey_id = stats.get("surveyId")
-        if survey_id is None and stats.get("cellConfig") is None:
-            stored = stored_location(device)
-            survey_id = None if stored is None else stored.location.survey_id
+        stored = stored_location(device)
+        advertised = stats.get("surveyId")
+        survey_id = advertised
+        if advertised is None and stats.get("cellConfig") is None and stored:
+            survey_id = stored.location.survey_id
         anchors.append(
             _Anchor(
                 view["systemId"],
                 view["name"],
                 survey_id,
+                advertised is not None,
+                stored is not None and stored.location.planar,
                 stats.get("rangeDeviationM"),
                 bool(stats.get("moved")),
             )
@@ -252,10 +277,11 @@ def survey_warnings(
 
 
 def _tag_problems(
-    tag: _Tag, cell: int, surveyed: int, names: Mapping[int, str]
+    tag: _Tag, cell: int, on_air: Sequence[_Anchor], names: Mapping[int, str]
 ) -> list[str]:
-    """Why a tag does not position on the cell's survey with every anchor;
-    an anchor it leaves out by the name of the device that has its MAC."""
+    """Why a tag does not position on the cell's survey with every anchor
+    that advertises it (``on_air``); an anchor it leaves out by the name of
+    the device that has its MAC."""
     name = f"tag {tag.system_id}"
     stats = tag.stats
     if stats is None:
@@ -271,10 +297,13 @@ def _tag_problems(
         problems.append(
             f"{name} leaves out {excluded} anchor(s)" + (f": {named}" if named else "")
         )
-    if stats["anchorsUsed"] != surveyed:
+    used, planar = stats["anchorsUsed"], all(anchor.planar for anchor in on_air)
+    if not positioned(stats, cell, planar):
         problems.append(
-            f"{name} uses {stats['anchorsUsed']} of {surveyed} surveyed anchors"
+            f"{name} uses {used} anchor(s), a position needs {_ENOUGH[planar]}"
         )
+    elif used != len(on_air):
+        problems.append(f"{name} uses {used} of {len(on_air)} surveyed anchors")
     return problems
 
 
@@ -299,8 +328,10 @@ def survey_rule(
     ext: "RtlsExtension", views: Sequence["AnchorView"], now: float
 ) -> dict[str, Any]:
     """The X-RTLS-VERIFY ``survey`` rule: an error unless every online
-    anchor is on one survey and every online, awake tag follows it, leaves
-    out no anchor and uses as many anchors as are on it."""
+    anchor is on one survey and every online, awake tag is positioned on it
+    (:func:`positioned`), leaves out no anchor and uses as many anchors as
+    advertise it now. An anchor without a session is judged by the survey
+    it stores, and no tag is expected to use it."""
     anchors = _anchors(ext, views)
     cell = _cell_survey_id(anchors)
     problems: list[str] = []
@@ -309,11 +340,11 @@ def survey_rule(
     elif cell is None:
         problems.append("no anchor is surveyed")
     else:
-        surveyed = sum(1 for anchor in anchors if anchor.survey_id == cell)
+        on_air = [a for a in anchors if a.on_air and a.survey_id == cell]
         problems += [off for a in anchors if (off := _off_survey(a, cell)) is not None]
         names = {view["systemId"]: view["name"] for view in views}
         for tag in _tags(ext, now):
-            problems += _tag_problems(tag, cell, surveyed, names)
+            problems += _tag_problems(tag, cell, on_air, names)
     ok = f"every anchor is on survey {cell} and every tag uses all of them"
     return _rule("survey", "Anchor survey", "error", problems, ok)
 

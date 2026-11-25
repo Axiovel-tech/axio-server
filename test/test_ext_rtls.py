@@ -113,10 +113,11 @@ def set_cached_param(device, name, value, param_type_name):
     device.param_types[name] = param_type
 
 
-#: the cell code every device of the verify fleet runs, and the survey its
-#: one anchor is on
+#: the cell code every device of the verify fleet runs, its anchors and the
+#: survey they are on: four, which a position takes
 SESSION_CODE = 0x123456
 SURVEY_ID = 4
+VERIFY_ANCHORS = (200, 201, 202, 203)
 
 
 def add_rtls_cell_params(device, *, role=1, uwb_mac=254):
@@ -2613,14 +2614,17 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
         ids_by_type=lambda _type: list(uavs)
     )
     extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
-    add_anchor_device(extension, 200, role=2, uwb_mac=1)
-    extension._stats[200] = {
-        "id": 200,
-        "cellConfig": SESSION_CODE,
-        "txGain": 47,
-        "surveyId": SURVEY_ID,
-    }
-    extension._stats_at[200] = time.monotonic()
+    for anchor in VERIFY_ANCHORS:
+        add_anchor_device(
+            extension, anchor, role=2 if anchor == 200 else 3, uwb_mac=anchor
+        )
+        extension._stats[anchor] = {
+            "id": anchor,
+            "cellConfig": SESSION_CODE,
+            "txGain": 47,
+            "surveyId": SURVEY_ID,
+        }
+        extension._stats_at[anchor] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
         extension._stats[sysid] = {
             "id": sysid,
@@ -2632,7 +2636,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "anchorMask": 0b1111,
             "clockSyncOk": True,
             "surveyId": SURVEY_ID,
-            "anchorsUsed": 1,
+            "anchorsUsed": len(VERIFY_ANCHORS),
             "anchorsExcluded": 0,
             "surveyDriftM": 0.02,
         }

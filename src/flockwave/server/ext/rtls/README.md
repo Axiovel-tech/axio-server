@@ -76,7 +76,11 @@ enables it.
 - **The survey the cell is on is derived, never stored.** An anchor is on
   the survey ID its session advertises (`sid`), or on the one it stores
   while it runs no session; the cell is on the ID most online anchors are
-  on, the newer of two held equally. One server is one cell here too.
+  on, the newer of two held equally. One server is one cell here too. A tag
+  is positioned when it follows that ID and uses four anchors, or three when
+  every anchor that advertises it is `planar` (`survey_view.positioned`),
+  and it is expected to use the anchors that advertise the ID now: what a
+  sleeping anchor stores is that anchor's own finding.
 - **A tag's anchor table arrives one anchor per report.** `antbl` rotates
   over the anchors the tag tracks; the server assembles `anchorTable` and
   drops an anchor not named for two rotations. A rotation is counted in
