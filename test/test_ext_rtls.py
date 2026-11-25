@@ -44,7 +44,6 @@ from rtlslink.protocol import (
 )
 
 from flockwave.server.ext.rtls.extension import (
-    DEFAULT_DEVICE_TIMEOUT,
     REFILL_INITIAL_DELAY,
     REFILL_MAX_ATTEMPTS,
     REFILL_READ_SPACING,
@@ -114,31 +113,29 @@ def set_cached_param(device, name, value, param_type_name):
     device.param_types[name] = param_type
 
 
-#: the cell code every device of the verify fleet runs
+#: the cell code every device of the verify fleet runs, and the survey its
+#: one anchor is on
 SESSION_CODE = 0x123456
+SURVEY_ID = 4
 
 
 def add_rtls_cell_params(device, *, role=1, uwb_mac=254):
-    """Give a FakeDevice a full RTLS cell: a role, its own MAC, the cell
-    origin and a two-anchor NED table (A1 carries a survey bias)."""
-    for name, value, param_type in (
+    """Give a FakeDevice a role, its own MAC and the cell origin; an anchor
+    also the two-row MAC table of its stored session. A tag holds no table."""
+    params = [
         ("UWB_ROLE", role, "uint8"),
         ("UWB_MAC", uwb_mac, "uint16"),
         ("ORIGIN_LAT_E7", 413900000, "int32"),
         ("ORIGIN_LON_E7", 21500000, "int32"),
         ("ORIGIN_ALT_MM", 10000, "int32"),
-        ("UWB_AN_COUNT", 2, "uint8"),
-        ("UWB_AN0_X", -10.0, "real32"),
-        ("UWB_AN0_Y", -10.0, "real32"),
-        ("UWB_AN0_Z", 0.0, "real32"),
-        ("UWB_AN0_MAC", 1, "uint16"),
-        ("UWB_AN0_BIAS_M", 0.0, "real32"),
-        ("UWB_AN1_X", 10.0, "real32"),
-        ("UWB_AN1_Y", 10.0, "real32"),
-        ("UWB_AN1_Z", -4.8, "real32"),
-        ("UWB_AN1_MAC", 2, "uint16"),
-        ("UWB_AN1_BIAS_M", -0.3, "real32"),
-    ):
+    ]
+    if role != 1:
+        params += [
+            ("UWB_AN_COUNT", 2, "uint8"),
+            ("UWB_AN0_MAC", 1, "uint16"),
+            ("UWB_AN1_MAC", 2, "uint16"),
+        ]
+    for name, value, param_type in params:
         set_fake_param(device, name, value, param_type)
 
 
@@ -170,6 +167,14 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
         "type": "X-RTLS-INF",
         "status": {},
         "anchors": [],
+        "survey": {
+            "id": None,
+            "anchors": 0,
+            "notSurveyed": [],
+            "otherSurvey": [],
+            "excluding": {},
+            "rangeDeviation": [],
+        },
         "anchorLock": {
             "locked": False,
             "lockedCount": 0,
@@ -242,195 +247,11 @@ async def test_inf_includes_rtls_role_and_name(extension, device, builder, hub):
     assert entry["name"] == "RTLS anchor A0"
 
 
-async def test_inf_site_anchor_list(extension, device, builder, hub):
-    add_rtls_cell_params(device)  # tag, role=1
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-
-    anchors = {a["id"]: a for a in response.body["anchors"]}
-    assert set(anchors) == {
-        "rtls::default::anchor_0",
-        "rtls::default::anchor_1",
-    }
-    a1 = anchors["rtls::default::anchor_1"]
-    assert a1["cell"] == "default"
-    assert a1["index"] == 1
-    assert a1["mac"] == 2
-    # no live anchor device online yet
-    assert a1["active"] is False
-    assert a1["systemId"] is None
-    # the tag names the cell its anchor masks index
-    assert response.body["status"][str(DEVICE_SYSID)]["cell"] == "default"
-    # origin + NED projected to global
-    assert a1["position"]["lat"] == pytest.approx(41.3900898)
-    assert a1["position"]["lon"] == pytest.approx(2.1501197)
-    assert a1["position"]["amsl"] == pytest.approx(14.8)
-
-
-async def test_inf_site_anchor_list_without_beacon_registration(
-    extension, device, builder, hub
-):
-    # register_beacons:false leaves _beacon_api None, but the X-RTLS-INF site
-    # anchors list must still mirror the tag's advertised cell geometry (the
-    # flag only disables the beacon-layer publication, not the anchors list).
-    add_rtls_cell_params(device)  # tag, role=1
-    assert extension._beacon_api is None
-    await discover(extension, device)
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-
-    anchors = {a["id"]: a for a in response.body["anchors"]}
-    assert set(anchors) == {
-        "rtls::default::anchor_0",
-        "rtls::default::anchor_1",
-    }
-
-
-async def test_site_anchor_active_when_anchor_device_online(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-
-    # anchor A1's MAC (2) comes online as a live responder
-    add_anchor_device(extension, 102, role=3, uwb_mac=2)
-    extension._refresh_anchor_cells()
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-    anchors = {a["id"]: a for a in response.body["anchors"]}
-    assert anchors["rtls::default::anchor_1"]["active"] is True
-    assert anchors["rtls::default::anchor_1"]["systemId"] == 102
-    assert anchors["rtls::default::anchor_0"]["active"] is False
-    assert anchors["rtls::default::anchor_0"]["systemId"] is None
-    # only a tag carries a cell
-    assert "cell" not in response.body["status"]["102"]
-
-
-async def test_param_cache_registers_configured_anchors_as_beacons(extension, device):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-
-    api = extension._beacon_api
-    assert set(api.beacons) == {
-        "rtls::default::anchor_0",
-        "rtls::default::anchor_1",
-    }
-    anchor1 = api.beacons["rtls::default::anchor_1"]
-    assert anchor1.basic_properties.name == "RTLS A1"
-    assert anchor1.active is False
-    assert anchor1.position.lat == pytest.approx(41.3900898)
-    assert anchor1.position.lon == pytest.approx(2.1501197)
-    assert anchor1.position.amsl == pytest.approx(14.8)
-
-
-async def test_anchor_beacon_active_reflects_associated_anchor_device(
-    extension, device
-):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
-    assert anchor1.active is False
-
-    anchor_device = add_anchor_device(extension, 102, role=3, uwb_mac=2)
-    extension._refresh_anchor_cells()
-    assert anchor1.active is True
-
-    # the anchor process dies -> its beacon goes inactive again
-    extension._protocol.devices.pop(anchor_device.system_id)
-    extension._handle_lost(ProtocolEvent("lost", anchor_device.system_id))
-    assert anchor1.active is False
-
-
 async def test_invalid_role_does_not_register_anchor_beacons(extension, device):
     add_rtls_cell_params(device, role=99)
     extension._beacon_api = StubBeaconAPI()
     await discover(extension, device)
     assert extension._beacon_api.beacons == {}
-
-
-async def test_complete_cell_without_role_registers_legacy_tag_beacons(
-    extension, device
-):
-    add_rtls_cell_params(device)
-    device.params.pop("UWB_ROLE")
-    device.param_count = len(device.params)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
-
-
-async def test_source_tag_role_change_drops_anchor_beacons(extension, device):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
-
-    # the tag is re-roled into an anchor: it no longer sources the cell
-    result = await extension.set_param(DEVICE_SYSID, "UWB_ROLE", 3, "uint8")
-    assert result["accepted"] is True
-    assert extension._beacon_api.beacons == {}
-
-
-async def test_lost_source_tag_drops_anchor_beacons(extension, device):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
-
-    events = extension._protocol.expire(time.monotonic() + 1000)
-    assert [event.kind for event in events] == ["lost"]
-    for event in events:
-        extension._handle_lost(event)
-    assert extension._beacon_api.beacons == {}
-
-
-async def test_lost_source_tag_falls_back_to_another_live_tag(extension, device):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    assert extension._anchor_cell_sources["default"] == DEVICE_SYSID
-
-    # a second tag carries the same cell but a moved A1
-    other = SimpleNamespace(
-        system_id=99,
-        address=("192.168.4.99", 3333),
-        last_seen=time.monotonic(),
-        params=dict(extension._protocol.devices[DEVICE_SYSID].params),
-        param_types=dict(extension._protocol.devices[DEVICE_SYSID].param_types),
-        param_count=extension._protocol.devices[DEVICE_SYSID].param_count,
-    )
-    set_cached_param(other, "UWB_AN1_X", 20.0, "real32")
-    extension._protocol.devices[other.system_id] = other
-
-    extension._protocol.devices.pop(DEVICE_SYSID)
-    extension._handle_lost(ProtocolEvent("lost", DEVICE_SYSID))
-
-    # the cell re-homes onto the surviving tag and re-projects from its geometry
-    assert extension._anchor_cell_sources["default"] == other.system_id
-    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
-    assert anchor1.position.lat == pytest.approx(41.3901797)
-
-
-async def test_anchor_beacon_refreshes_after_param_set(extension, device):
-    add_rtls_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-
-    result = await extension.set_param(DEVICE_SYSID, "UWB_AN1_X", 20.0, "real32")
-    assert result["accepted"] is True
-
-    anchor1 = extension._beacon_api.beacons["rtls::default::anchor_1"]
-    assert anchor1.position.lat == pytest.approx(41.3901797)
-    assert anchor1.position.lon == pytest.approx(2.1501197)
-    assert anchor1.position.amsl == pytest.approx(14.8)
 
 
 # ---- identity-param snapshot refill -------------------------------------
@@ -538,7 +359,7 @@ async def test_refill_skips_complete_but_unmatched_anchor(extension, device):
 
 
 async def test_refill_ignores_lost_non_identity_params(extension, device):
-    # a lossy dump that only lost params irrelevant to naming/geometry
+    # a lossy dump that only lost params irrelevant to naming
     # must not trigger any targeted reads
     add_anchor_identity_params(device)
     device.drop_from_list = {"POS_X", "UWB_CH"}
@@ -564,34 +385,34 @@ async def test_refill_skips_count_complete_snapshot(extension, device):
     assert DEVICE_SYSID not in extension._refill
 
 
-async def test_refill_restores_tag_cell_and_beacons(extension, device):
-    add_rtls_cell_params(device)  # tag, full cell
-    extension._beacon_api = StubBeaconAPI()
-    # the lossy dump punched holes in the origin AND the per-anchor
-    # table (cell_from_params needs the NED triple of every counted
-    # anchor, and the MAC drives the beacon's active matching)
-    device.drop_from_list = {"ORIGIN_LAT_E7", "UWB_AN1_X", "UWB_AN1_MAC"}
+async def test_refill_restores_a_tags_origin(extension, device):
+    add_rtls_cell_params(device)
+    device.drop_from_list = {"ORIGIN_LAT_E7"}
     await discover(extension, device)
-    # the incomplete cell geometry renders no beacons
-    assert extension._beacon_api.beacons == {}
+    cached = extension._protocol.devices[DEVICE_SYSID]
+    assert "ORIGIN_LAT_E7" not in cached.params
 
     device.read_requests.clear()
     await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
-    # CELL_ID and POS_YAW_DEG are geometry-consistency identity params
-    # now; this fake registry has neither, so the first round requests
-    # them (fruitlessly) too — and once the answered reads make the
-    # snapshot count-complete again, absence is authoritative and the
-    # refill entry is dropped as before
-    assert sorted(device.read_requests) == [
-        "CELL_ID",
-        "ORIGIN_LAT_E7",
-        "POS_YAW_DEG",
-        "UWB_AN1_MAC",
-        "UWB_AN1_X",
-    ]
-    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+    # CELL_ID and POS_YAW_DEG are identity params too; this fake registry
+    # has neither, so the first round requests them (fruitlessly) — and
+    # once the answered reads make the snapshot count-complete again,
+    # absence is authoritative and the refill entry is dropped
+    assert sorted(device.read_requests) == ["CELL_ID", "ORIGIN_LAT_E7", "POS_YAW_DEG"]
+    assert "ORIGIN_LAT_E7" in cached.params
     assert DEVICE_SYSID not in extension._refill
+
+
+async def test_a_tag_is_not_asked_for_an_anchor_table(extension, device):
+    add_rtls_cell_params(device)
+    device.drop_from_list = {"POS_X"}
+    await discover(extension, device)
+
+    device.read_requests.clear()
+    await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
+
+    assert not [name for name in device.read_requests if name.startswith("UWB_AN")]
 
 
 async def test_refill_redumps_when_role_is_unknown(extension, device):
@@ -614,24 +435,21 @@ async def test_refill_redumps_when_role_is_unknown(extension, device):
 
 
 async def test_refill_repairs_legacy_tag_without_role_param(extension, device):
-    # a legacy tag (no UWB_ROLE param at all; the _cell_source_role
-    # compatibility bridge) is recognized only once its snapshot is
-    # count-complete — even a lost NON-identity param (POS_X) keeps it
-    # unrecognized, so the refill must re-dump rather than issue
+    # a legacy tag (no UWB_ROLE param at all) cannot be classified until its
+    # snapshot is count-complete — even a lost NON-identity param (POS_X)
+    # keeps it unclassified, so the refill must re-dump rather than issue
     # targeted reads for names it cannot know
     add_rtls_cell_params(device)
     device.params.pop("UWB_ROLE")
-    extension._beacon_api = StubBeaconAPI()
     device.drop_from_list = {"ORIGIN_LAT_E7", "POS_X"}
     await discover(extension, device)
-    assert extension._beacon_api.beacons == {}
+    cached = extension._protocol.devices[DEVICE_SYSID]
 
     device.drop_from_list = set()  # the retransmitted dump gets through
     await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
-    # snapshot count-complete -> the legacy tag inference activates and
-    # the cell renders
+
     assert device.read_requests == []
-    assert "rtls::default::anchor_1" in extension._beacon_api.beacons
+    assert "ORIGIN_LAT_E7" in cached.params
     assert DEVICE_SYSID not in extension._refill
 
 
@@ -2125,7 +1943,7 @@ def test_cluster_clock_keeps_its_timebase_across_a_torn_clock_pair(monkeypatch):
 def test_cluster_clock_keeps_its_timebase_when_a_tag_resets_its_clock(
     monkeypatch, old_clks
 ):
-    """A tag whose estimator resets (geometry recalibration) sends clkh=0,
+    """A tag whose estimator resets sends clkh=0,
     clks=0 and only then clkok=0, so two snapshots pair the zeroed halves
     with the previous clkok=1. Seen on the bench as a -5849 s restart of the
     whole estimate followed by a +5849 s one."""
@@ -2698,29 +2516,6 @@ async def test_pos_from_unknown_sysid_is_ignored(extension, device):
     assert not extension._pos_wire
 
 
-async def test_inf_site_anchor_list_carries_ned(extension, device, builder, hub):
-    # the debug position view plots anchors in the same NED frame as the
-    # X-RTLS-POS estimates, so the anchors list carries the native
-    # cell-frame coordinates beside the derived GPS position
-    add_rtls_cell_params(device)  # tag, role=1
-    await discover(extension, device)
-
-    message = make_message(builder, {"type": "X-RTLS-INF"})
-    response = await extension._handle_RTLS_INF(message, None, hub)
-
-    anchors = {a["id"]: a for a in response.body["anchors"]}
-    assert anchors["rtls::default::anchor_0"]["ned"] == {
-        "north": -10.0,
-        "east": -10.0,
-        "down": 0.0,
-    }
-    assert anchors["rtls::default::anchor_1"]["ned"] == {
-        "north": 10.0,
-        "east": 10.0,
-        "down": -4.8,
-    }
-
-
 # ---- multi-device helpers ----------------------------------------------
 
 
@@ -2759,19 +2554,6 @@ def test_configured_devices_accepts_smp_port_entries():
     assert smp_ports == {("127.0.0.1", 3433): 1437}
 
 
-async def test_cell_id_change_rehomes_the_source(extension, device):
-    add_rtls_cell_params(device)
-    set_fake_param(device, "CELL_ID", "a", "custom")
-    await discover(extension, device)
-    assert extension._anchor_cell_sources == {"a": DEVICE_SYSID}
-
-    await extension.set_param(DEVICE_SYSID, "CELL_ID", "b")
-
-    # the old cell id must not keep pointing at the re-homed device
-    # (it would render a phantom cell with the new cell's geometry)
-    assert extension._anchor_cell_sources == {"b": DEVICE_SYSID}
-
-
 async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
     await discover(extension, device)
 
@@ -2784,15 +2566,14 @@ async def test_param_write_locks_are_pruned(extension, device, autojump_clock):
     assert extension._param_write_locks == {}
 
 
-async def test_refill_repairs_geometry_consistency_params(extension, device):
-    # a dump-loss hole in an OPTIONAL geometry param (POS_YAW_DEG, CELL_ID,
-    # a bias) kept X-RTLS-GEO reporting the tag 'incomplete' forever: the
-    # knowability gate refuses to trust the omission and the refill never
-    # repaired non-identity holes. These params are identity now.
+async def test_refill_repairs_frame_params(extension, device):
+    # a dump-loss hole in an OPTIONAL frame param (POS_YAW_DEG, CELL_ID)
+    # would keep the Verify frame rule waiting for it forever: the refill
+    # repairs these too
     add_rtls_cell_params(device)
     set_fake_param(device, "POS_YAW_DEG", 30.0, "real32")
     set_fake_param(device, "CELL_ID", "default", "custom")
-    device.drop_from_list = {"POS_YAW_DEG", "UWB_AN1_BIAS_M"}
+    device.drop_from_list = {"POS_YAW_DEG"}
     await discover(extension, device)
     cached = extension._protocol.devices[DEVICE_SYSID]
     assert "POS_YAW_DEG" not in cached.params
@@ -2800,41 +2581,9 @@ async def test_refill_repairs_geometry_consistency_params(extension, device):
     device.read_requests.clear()
     await extension._poll_param_refill(time.monotonic() + REFILL_INITIAL_DELAY + 1)
 
-    assert sorted(device.read_requests) == ["POS_YAW_DEG", "UWB_AN1_BIAS_M"]
+    assert device.read_requests == ["POS_YAW_DEG"]
     assert "POS_YAW_DEG" in cached.params
-    assert "UWB_AN1_BIAS_M" in cached.params
     assert DEVICE_SYSID not in extension._refill
-
-
-def add_stub_tag(extension, system_id, *, yaw=None, cell="default", an1_x=10.0):
-    """Cache-only tag with a full, count-complete geometry registry."""
-    tag = SimpleNamespace(
-        system_id=system_id,
-        address=("192.168.4.%d" % (system_id % 250), 3333),
-        last_seen=time.monotonic(),
-        params={},
-        param_types={},
-        param_count=None,
-    )
-    entries = [
-        ("UWB_ROLE", 1, "uint8"),
-        ("ORIGIN_LAT_E7", 413900000, "int32"),
-        ("ORIGIN_LON_E7", 21500000, "int32"),
-        ("ORIGIN_ALT_MM", 10000, "int32"),
-        ("CELL_ID", cell, "custom"),
-        ("UWB_AN_COUNT", 1, "uint8"),
-        ("UWB_AN0_X", an1_x, "real32"),
-        ("UWB_AN0_Y", -10.0, "real32"),
-        ("UWB_AN0_Z", 0.0, "real32"),
-        ("UWB_AN0_MAC", 1, "uint16"),
-    ]
-    if yaw is not None:
-        entries.append(("POS_YAW_DEG", yaw, "real32"))
-    for name, value, type_name in entries:
-        set_cached_param(tag, name, value, type_name)
-    tag.param_count = len(tag.params)
-    extension._protocol.devices[system_id] = tag
-    return tag
 
 
 class StubUAV:
@@ -2845,10 +2594,6 @@ class StubUAV:
         if name not in self._params:
             raise KeyError(name)
         return self._params[name]
-
-
-#: one bench cell as the tags fit it (AN0-AN1 .. AN0-AN7), metres
-FLEET_DISTANCES = (8.587, 9.224, 12.528, 3.975, 9.435, 9.979, 13.233)
 
 
 def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
@@ -2869,7 +2614,12 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
     )
     extension._uav_map = {DEVICE_SYSID: "05", DEVICE_SYSID + 1: "06"}
     add_anchor_device(extension, 200, role=2, uwb_mac=1)
-    extension._stats[200] = {"id": 200, "cellConfig": SESSION_CODE, "txGain": 47}
+    extension._stats[200] = {
+        "id": 200,
+        "cellConfig": SESSION_CODE,
+        "txGain": 47,
+        "surveyId": SURVEY_ID,
+    }
     extension._stats_at[200] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
         extension._stats[sysid] = {
@@ -2881,10 +2631,10 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "clockPpm": 1.2,
             "anchorMask": 0b1111,
             "clockSyncOk": True,
-            "geometryState": 3,
-            "geometryResidualM": -0.02,
-            "geometryDriftM": 0.001,
-            "geometryDistancesM": list(FLEET_DISTANCES),
+            "surveyId": SURVEY_ID,
+            "anchorsUsed": 1,
+            "anchorsExcluded": 0,
+            "surveyDriftM": 0.02,
         }
         extension._stats_at[sysid] = time.monotonic()
     return second
@@ -2925,7 +2675,9 @@ async def test_verify_passes_on_a_healthy_fleet(
     assert body["passed"] is True, body["rules"]
     statuses = {rule["id"]: rule["status"] for rule in body["rules"]}
     assert statuses == {
-        "geometry": "pass",
+        "survey": "pass",
+        "frame": "pass",
+        "anchors": "pass",
         "firmware": "pass",
         "pairing": "pass",
         "yaw-source": "pass",
@@ -2972,8 +2724,8 @@ async def test_verify_flags_missing_stats(extension, device, dialect, builder, h
     body = response.body
     assert body["passed"] is False
     by_id = {rule["id"]: rule for rule in body["rules"]}
-    assert by_id["geometry"]["status"] == "fail"
-    assert "no geometry telemetry" in by_id["geometry"]["detail"]
+    assert by_id["survey"]["status"] == "fail"
+    assert f"tag {DEVICE_SYSID + 1}: no survey telemetry" in by_id["survey"]["detail"]
     assert by_id["uwb"]["status"] == "fail"
     assert "no telemetry" in by_id["uwb"]["detail"]
 
@@ -3067,102 +2819,15 @@ async def test_verify_vc_yaw_is_a_wrapped_angle(
     assert rule["status"] == "pass", rule
 
 
-async def test_verify_flags_a_deviating_fit(extension, device, dialect, builder, hub):
-    second = wire_verify_fleet(extension, device, dialect)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    drifted = list(FLEET_DISTANCES)
-    drifted[0] += 0.08  # AN1's tripod moved 8 cm for this tag only
-    extension._stats[DEVICE_SYSID + 1]["geometryDistancesM"] = drifted
-
-    response = await verify_message(extension, builder, hub)
-
-    body = response.body
-    assert body["passed"] is False
-    rule = next(r for r in body["rules"] if r["id"] == "geometry")
-    assert rule["status"] == "fail"
-    assert "AN0-AN1" in rule["detail"]
-    assert body["geometry"]["consistent"] is False
-
-
-# ---- X-RTLS-GEOM fleet geometry agreement --------------------------------
-
-
-GEOM_STATS = {
-    **FULL_STATS,
-    "geom": 3.0,
-    "gfail": 0.0,
-    "gres": -0.075,
-    "gdrift": 0.002,
-    **{f"gd{i + 1}": d for i, d in enumerate(FLEET_DISTANCES)},
-}
-
-
-def cache_frame(extension, *sysids, lat=413900000, yaw=90.0, macs=None):
-    """Caches the coordinate-frame params (origin, show yaw, slot MACs) on
-    live protocol devices, as the identity refill would after discovery."""
+def cache_frame(extension, *sysids, lat=413900000, yaw=90.0):
+    """Caches the coordinate-frame params (origin, show yaw) on live
+    protocol devices, as the identity refill would after discovery."""
     for sysid in sysids:
         cached = extension._protocol.devices[sysid]
         set_cached_param(cached, "ORIGIN_LAT_E7", lat, "int32")
         set_cached_param(cached, "ORIGIN_LON_E7", 21500000, "int32")
         set_cached_param(cached, "ORIGIN_ALT_MM", 10000, "int32")
         set_cached_param(cached, "POS_YAW_DEG", yaw, "real32")
-        set_cached_param(cached, "UWB_AN_COUNT", 8, "uint8")
-        for slot in range(8):
-            set_cached_param(
-                cached, f"UWB_AN{slot}_MAC", (macs or {}).get(slot, slot + 1), "uint16"
-            )
-            set_cached_param(cached, f"UWB_AN{slot}_BIAS_M", 0.0, "real32")
-
-
-async def geom_message(extension, builder, hub, body=None):
-    message = make_message(builder, {"type": "X-RTLS-GEOM", **(body or {})})
-    return await extension._handle_RTLS_GEOM(message, None, hub)
-
-
-async def test_stats_carry_the_fitted_geometry(extension, device, builder, hub):
-    await discover(extension, device)
-    await _feed_stats(extension, device, GEOM_STATS, now=0.0)
-
-    message = make_message(builder, {"type": "X-RTLS-STATS"})
-    response = await extension._handle_RTLS_STATS(message, None, hub)
-
-    entry = response.body["stats"][str(DEVICE_SYSID)]
-    assert entry["geometryState"] == 3
-    assert entry["geometryReason"] == 0
-    assert entry["geometryResidualM"] == -0.075
-    assert entry["geometryDriftM"] == 0.002
-    assert entry["geometryDistancesM"] == list(FLEET_DISTANCES)
-
-
-def test_stats_json_without_geometry_omits_the_fields():
-    body = _stats_json(7, dict(FULL_STATS))
-    assert "geometryState" not in body
-    assert "geometryDistancesM" not in body
-    # non-finite values are dropped rather than forwarded
-    body = _stats_json(
-        7,
-        {
-            **FULL_STATS,
-            "geom": float("nan"),
-            "gres": float("nan"),
-            "gdrift": float("inf"),
-            "gd1": float("nan"),
-            "gd2": 9.0,
-        },
-    )
-    assert "geometryState" not in body
-    assert "geometryResidualM" not in body
-    assert "geometryDriftM" not in body
-    assert body["geometryDistancesM"][:2] == [None, 9.0]
-    # a four-anchor cell reports only the bottom plane
-    body = _stats_json(
-        7, {**FULL_STATS, "geom": 3.0, "gd1": 8.0, "gd2": 9.0, "gd3": 12.0}
-    )
-    assert body["geometryDistancesM"] == [8.0, 9.0, 12.0, None, None, None, None]
 
 
 def test_stats_json_carries_link_quality_and_wifi():
@@ -3247,146 +2912,6 @@ async def test_stats_without_a_paired_drone_omit_imu_temperatures(
     assert "imuTemperaturesC" not in response.body["stats"][str(DEVICE_SYSID)]
 
 
-async def test_geom_agreeing_fleet(extension, device, dialect, builder, hub):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    # the second tag fitted the same cell 3 mm off on one distance
-    await _feed_stats(
-        extension,
-        second,
-        {**GEOM_STATS, "gd4": FLEET_DISTANCES[3] + 0.003},
-        now=time.monotonic(),
-    )
-
-    response = await geom_message(extension, builder, hub)
-
-    body = response.body
-    assert body["type"] == "X-RTLS-GEOM"
-    assert body["consistent"] is True
-    # the reference is the lower median: a value some tag really reported
-    assert body["reference"][3] == pytest.approx(FLEET_DISTANCES[3], abs=1e-4)
-    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
-        entry = body["devices"][str(sysid)]
-        assert entry["status"] == "agree"
-        assert entry["stateName"] == "calibrated"
-        assert entry["maxDeviationM"] <= 0.0031
-        assert entry["residualM"] == -0.075
-
-
-async def test_geom_flags_a_deviating_tag_and_names_the_distance(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    await _feed_stats(
-        extension,
-        second,
-        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
-        now=time.monotonic(),
-    )
-
-    response = await geom_message(extension, builder, hub)
-
-    body = response.body
-    assert body["consistent"] is False
-    deviating = body["devices"][str(DEVICE_SYSID + 1)]
-    assert deviating["status"] == "deviates"
-    assert set(deviating["deviations"]) == {"AN0-AN1"}
-    assert "AN0-AN1" in deviating["detail"]
-    assert "recalibrate" in deviating["detail"]
-    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
-
-    # a tag that fitted later than the fleet differs by the session's
-    # shift (centimetres); the default tolerance accepts it
-    await _feed_stats(
-        extension,
-        second,
-        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.03},
-        now=time.monotonic(),
-    )
-    response = await geom_message(extension, builder, hub)
-    assert response.body["consistent"] is True
-    assert response.body["tolerance"] == 0.05
-    await _feed_stats(
-        extension,
-        second,
-        {**GEOM_STATS, "gd1": FLEET_DISTANCES[0] + 0.08},
-        now=time.monotonic(),
-    )
-
-    # a wider tolerance accepts it
-    response = await geom_message(extension, builder, hub, {"tolerance": 0.1})
-    assert response.body["consistent"] is True
-
-
-async def test_geom_reports_uncalibrated_manual_stale_and_unknown_tags(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
-    wire_devices(extension, device, second, third)
-    await discover(extension, device)
-    for tag in (second, third):
-        await extension._process_datagram(
-            tag.heartbeat(), tag.address, time.monotonic()
-        )
-    now = time.monotonic()
-    await _feed_stats(extension, device, {**GEOM_STATS, "geom": 2.0}, now=now)
-    await _feed_stats(extension, second, {**FULL_STATS, "geom": 0.0}, now=now)
-    await _feed_stats(extension, third, FULL_STATS, now=now)
-
-    response = await geom_message(extension, builder, hub)
-    body = response.body
-    assert body["consistent"] is False
-    assert body["reference"] is None
-    devices = body["devices"]
-    assert devices[str(DEVICE_SYSID)]["status"] == "calibrating"
-    assert devices[str(DEVICE_SYSID + 1)]["status"] == "manual"
-    assert devices[str(DEVICE_SYSID + 2)]["status"] == "unknown"
-
-    # silence makes a fit stale
-    extension._stats[DEVICE_SYSID]["geometryState"] = 3
-    extension._stats_at[DEVICE_SYSID] = now - 60
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "stale"
-
-
-async def test_geom_names_why_a_tag_rejected_the_rig(extension, device, builder, hub):
-    """A placement outside the convention (two anchors swapped) is rejected
-    on the tag with a reason code; the verdict names it and blocks."""
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await _feed_stats(
-        extension,
-        device,
-        {**FULL_STATS, "geom": 4.0, "gfail": 4.0, "gres": -5.83, "gdrift": 0.0},
-        now=time.monotonic(),
-    )
-
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID)]
-    assert entry["status"] == "failed"
-    assert entry["reason"] == 4
-    assert entry["residualM"] == -5.83
-    assert "not a rectangle" in entry["detail"]
-    assert response.body["consistent"] is False
-
-
 @pytest.mark.parametrize(
     "code,phrase",
     [
@@ -3394,473 +2919,7 @@ async def test_geom_names_why_a_tag_rejected_the_rig(extension, device, builder,
         (5, "does not mirror the bottom one"),
     ],
 )
-async def test_geom_failure_reasons_match_the_firmware(
-    extension, device, builder, hub, code, phrase
-):
-    """The texts say what rtls-link-zephyr's auto_geometry.hpp ``Reason``
-    means: 2 is an anchor short of samples at the timeout, not one never
-    heard; 5 is a top rectangle that does not mirror the bottom one."""
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    await _feed_stats(
-        extension,
-        device,
-        {**FULL_STATS, "geom": 4.0, "gfail": float(code), "gdrift": 0.0},
-        now=time.monotonic(),
-    )
-
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID)]
-    assert entry["reason"] == code
-    assert phrase in entry["detail"]
-
-
-async def test_geom_ids_filter_and_validation(extension, device, dialect, builder, hub):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-
-    response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID]})
-    assert set(response.body["devices"]) == {str(DEVICE_SYSID)}
-    assert response.body["consistent"] is True
-
-    response = await geom_message(extension, builder, hub, {"tolerance": 0})
-    assert response.body["type"] == "ACK-NAK"
-    response = await geom_message(extension, builder, hub, {"ids": [0]})
-    assert response.body["type"] == "ACK-NAK"
-
-
-async def test_geom_anchors_are_not_graded(extension, device, builder, hub):
-    # an anchor image (role 3) carries no fit: it must not appear
-    set_fake_param(device, "UWB_ROLE", 3, "uint8")
-    await discover(extension, device)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"] == {}
-    assert response.body["consistent"] is False
-
-
-async def test_geom_flags_live_drift_as_blocking(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    # same fit, but this tag's live distances moved 12 cm since (a tripod)
-    await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.12}, now=time.monotonic()
-    )
-
-    response = await geom_message(extension, builder, hub)
-    body = response.body
-    assert body["consistent"] is False
-    assert body["driftTolerance"] == 0.08
-    drifted = body["devices"][str(DEVICE_SYSID + 1)]
-    assert drifted["status"] == "drifted"
-    assert "12.0 cm" in drifted["detail"]
-    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
-
-    # the verify rule blocks on it too
-    wire_verify_fleet(extension, device, dialect)
-    extension._stats[DEVICE_SYSID + 1]["geometryDriftM"] = 0.12
-    response = await verify_message(extension, builder, hub)
-    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
-    assert rule["status"] == "fail"
-    assert "moved" in rule["detail"]
-
-
-async def test_geom_accepts_centimetres_of_drift(
-    extension, device, dialect, builder, hub
-):
-    """Warm-up and people around the rig move the live distances by a few
-    centimetres; only a moved tripod (decimetres) blocks, whatever the
-    agreement tolerance."""
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.05}, now=time.monotonic()
-    )
-
-    for tolerance in (0.001, 0.02, 0.5):
-        response = await geom_message(extension, builder, hub, {"tolerance": tolerance})
-        assert response.body["consistent"] is True
-        assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
-
-    # the bound itself is accepted; a request tolerance does not move it
-    await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.08}, now=time.monotonic()
-    )
-    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
-    await _feed_stats(
-        extension, second, {**GEOM_STATS, "gdrift": 0.081}, now=time.monotonic()
-    )
-    response = await geom_message(extension, builder, hub, {"tolerance": 0.5})
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "drifted"
-
-
-async def test_geom_needs_the_live_drift(extension, device, builder, hub):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    cache_frame(extension, DEVICE_SYSID)
-    without_drift = {k: v for k, v in GEOM_STATS.items() if k != "gdrift"}
-    await _feed_stats(extension, device, without_drift, now=time.monotonic())
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID)]
-    assert entry["status"] == "calibrating"
-    assert "drift" in entry["detail"]
-    assert response.body["consistent"] is False
-
-
-async def test_geom_waits_for_the_cell_id_of_a_partial_listing(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    await _feed_stats(extension, second, GEOM_STATS, now=time.monotonic())
-    cached = extension._protocol.devices[DEVICE_SYSID + 1]
-    assert "CELL_ID" not in cached.params
-    # the listing is still being refilled: the tag's cell is unknown
-    cached.param_count = len(cached.params) + 1
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert entry["status"] == "incomplete"
-    assert entry["missingParams"] == ["CELL_ID"]
-    assert response.body["consistent"] is False
-    # a complete listing that lacks CELL_ID is the legacy default cell
-    cached.param_count = len(cached.params)
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "agree"
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "default"
-
-
-async def test_geom_references_are_per_cell(extension, device, dialect, builder, hub):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "CELL_ID", "other", "custom")
-    wire_devices(extension, device, second)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 1)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    # a legitimately different cell: every distance 50 cm longer
-    other = {
-        **GEOM_STATS,
-        **{f"gd{i + 1}": d + 0.5 for i, d in enumerate(FLEET_DISTANCES)},
-    }
-    await _feed_stats(extension, second, other, now=time.monotonic())
-
-    response = await geom_message(extension, builder, hub)
-    body = response.body
-    assert body["consistent"] is True
-    assert body["reference"] is None  # two cells: no single reference
-    assert set(body["references"]) == {"default", "other"}
-    assert body["references"]["other"][0] == pytest.approx(
-        FLEET_DISTANCES[0] + 0.5, abs=1e-4
-    )
-    assert (
-        body["devices"][str(DEVICE_SYSID)] | {"cell": "default"}
-        == body["devices"][str(DEVICE_SYSID)]
-    )
-    assert body["devices"][str(DEVICE_SYSID + 1)]["cell"] == "other"
-    assert all(entry["status"] == "agree" for entry in body["devices"].values())
-
-
-async def test_geom_waits_for_a_complete_distance_vector(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    # only the first distance has arrived so far
-    partial = {
-        k: val
-        for k, val in GEOM_STATS.items()
-        if k not in ("gd2", "gd3", "gd4", "gd5", "gd6", "gd7")
-    }
-    cache_frame(extension, DEVICE_SYSID)
-    await _feed_stats(extension, device, partial, now=time.monotonic())
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID)]
-    assert entry["status"] == "calibrating"
-    assert response.body["consistent"] is False
-    # a half top plane is equally incomplete
-    await _feed_stats(
-        extension, device, {"gd2": 9.2, "gd3": 12.5, "gd4": 4.0}, now=time.monotonic()
-    )
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID)]["status"] == "calibrating"
-    # a four-anchor cell reports zeros for the top plane: complete
-    await _feed_stats(
-        extension,
-        device,
-        {"gd4": 0.0, "gd5": 0.0, "gd6": 0.0, "gd7": 0.0},
-        now=time.monotonic(),
-    )
-    response = await geom_message(extension, builder, hub)
-    entry = response.body["devices"][str(DEVICE_SYSID)]
-    assert entry["status"] == "agree"
-    assert entry["distancesM"][3:] == [None, None, None, None]
-
-
-async def test_geom_flags_a_differing_coordinate_frame(
-    extension, device, dialect, builder, hub
-):
-    add_rtls_cell_params(device)
-    second = make_second_tag(dialect)
-    set_fake_param(second, "ORIGIN_LAT_E7", 413900100, "int32")  # 1.1 m north
-    third = make_second_tag(dialect, system_id=DEVICE_SYSID + 2)
-    wire_devices(extension, device, second, third)
-    await discover(extension, device)
-    for tag in (second, third):
-        await extension._process_datagram(
-            tag.heartbeat(), tag.address, time.monotonic()
-        )
-    for tag in (device, second, third):
-        await _feed_stats(extension, tag, GEOM_STATS, now=time.monotonic())
-
-    # before the identity refill cached the frame, a fit is not certified
-    response = await geom_message(extension, builder, hub)
-    assert response.body["consistent"] is False
-    incomplete = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert incomplete["status"] == "incomplete"
-    assert "POS_YAW_DEG" in incomplete["missingParams"]
-
-    # the frame params as the identity refill would have cached them
-    cache_frame(extension, DEVICE_SYSID, DEVICE_SYSID + 2)
-    cache_frame(extension, DEVICE_SYSID + 1, lat=413900100)
-
-    response = await geom_message(extension, builder, hub)
-    body = response.body
-    assert body["consistent"] is False
-    odd = body["devices"][str(DEVICE_SYSID + 1)]
-    assert odd["status"] == "frame"
-    assert odd["frame"] == ["ORIGIN_LAT_E7"]
-    assert body["devices"][str(DEVICE_SYSID)]["status"] == "agree"
-    assert body["devices"][str(DEVICE_SYSID + 2)]["status"] == "agree"
-
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1],
-        "ORIGIN_LAT_E7",
-        413900000,
-        "int32",
-    )
-    # the same rotation written as 360 is not a differing frame...
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 450.0, "real32"
-    )
-    response = await geom_message(extension, builder, hub)
-    assert "frame" not in response.body["devices"][str(DEVICE_SYSID + 1)]
-    # ...while a non-finite yaw is no frame at all
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1],
-        "POS_YAW_DEG",
-        float("inf"),
-        "real32",
-    )
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["status"] == "incomplete"
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["missingParams"] == [
-        "POS_YAW_DEG"
-    ]
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "POS_YAW_DEG", 90.0, "real32"
-    )
-
-    # a different anchor count consumes a different table
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 4, "uint8"
-    )
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == ["UWB_AN_COUNT"]
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN_COUNT", 8, "uint8"
-    )
-
-    # a different range bias on one anchor solves differently too
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1],
-        "ORIGIN_LAT_E7",
-        413900000,
-        "int32",
-    )
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.25, "real32"
-    )
-    response = await geom_message(extension, builder, hub)
-    assert response.body["devices"][str(DEVICE_SYSID + 1)]["frame"] == [
-        "UWB_AN3_BIAS_M"
-    ]
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN3_BIAS_M", 0.0, "real32"
-    )
-
-    # two slots swapped on one tag: same distances, different anchors
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1],
-        "ORIGIN_LAT_E7",
-        413900000,
-        "int32",
-    )
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN1_MAC", 3, "uint16"
-    )
-    set_cached_param(
-        extension._protocol.devices[DEVICE_SYSID + 1], "UWB_AN2_MAC", 2, "uint16"
-    )
-    response = await geom_message(extension, builder, hub)
-    odd = response.body["devices"][str(DEVICE_SYSID + 1)]
-    assert odd["status"] == "frame"
-    assert odd["frame"] == ["UWB_AN1_MAC", "UWB_AN2_MAC"]
-
-
-async def test_verify_passes_an_all_manual_fleet(
-    extension, device, dialect, builder, hub
-):
-    second = wire_verify_fleet(extension, device, dialect)
-    await discover(extension, device)
-    await extension._process_datagram(
-        second.heartbeat(), second.address, time.monotonic()
-    )
-    for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
-        extension._stats[sysid]["geometryState"] = 0  # provisioned tables
-
-    response = await verify_message(extension, builder, hub)
-    rule = next(r for r in response.body["rules"] if r["id"] == "geometry")
-    assert rule["status"] == "pass", rule
-    assert "provisioned table" in rule["detail"]
-
-
-async def test_geom_reports_requested_ids_that_are_not_online(
-    extension, device, builder, hub
-):
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    cache_frame(extension, DEVICE_SYSID)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-
-    response = await geom_message(extension, builder, hub, {"ids": [DEVICE_SYSID, 77]})
-    body = response.body
-    assert body["consistent"] is False
-    assert body["devices"]["77"]["status"] == "missing"
-
-
 # ---- anchors rendered from the tag's own fit ----------------------------
-
-
-def test_fitted_anchor_positions_follow_the_convention():
-    from flockwave.server.ext.rtls.fitted_cell import fitted_anchor_positions
-
-    d1, d2, d3, h, d5, d6, d7 = FLEET_DISTANCES
-    stats = {"geometryState": 3, "geometryDistancesM": list(FLEET_DISTANCES)}
-    positions = fitted_anchor_positions(stats)
-    assert positions is not None and len(positions) == 8
-    assert positions[:4] == [
-        (0.0, 0.0, 0.0),
-        (d1, 0.0, 0.0),
-        (0.0, d2, 0.0),
-        (d1, d2, 0.0),
-    ]
-    y6 = math.sqrt(d6**2 - h**2)
-    assert positions[4] == (0.0, 0.0, -h)
-    assert positions[5] == pytest.approx((math.sqrt(d5**2 - h**2), 0.0, -h))
-    assert positions[6] == pytest.approx((0.0, y6, -h))
-    assert positions[7] == pytest.approx((math.sqrt(d7**2 - h**2 - y6**2), y6, -h))
-
-    # a four-anchor cell reports the bottom plane only
-    four = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3] + [None] * 4}
-    assert fitted_anchor_positions(four) == positions[:4]
-    # no applied fit, or an incomplete one: nothing to render
-    assert fitted_anchor_positions({**stats, "geometryState": 2}) is None
-    assert fitted_anchor_positions(None) is None
-    partial = {"geometryState": 3, "geometryDistancesM": [d1, d2, d3, h, None, d6, d7]}
-    assert fitted_anchor_positions(partial) is None
-
-
-def add_four_anchor_cell_params(device):
-    """A tag whose provisioned UWB_AN* table is stale (not the rig it
-    fits): four anchors on a 1 m square."""
-    add_rtls_cell_params(device)
-    set_fake_param(device, "UWB_AN_COUNT", 4, "uint8")
-    for index, (x, y) in enumerate(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0))):
-        for suffix, value, param_type in (
-            ("X", x, "real32"),
-            ("Y", y, "real32"),
-            ("Z", 0.0, "real32"),
-            ("MAC", index + 1, "uint16"),
-            ("BIAS_M", 0.0, "real32"),
-        ):
-            set_fake_param(device, f"UWB_AN{index}_{suffix}", value, param_type)
-
-
-async def test_anchors_render_from_the_tag_fit(extension, device, builder, hub):
-    add_four_anchor_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-
-    async def site_anchors():
-        message = make_message(builder, {"type": "X-RTLS-INF"})
-        response = await extension._handle_RTLS_INF(message, None, hub)
-        return {a["index"]: a for a in response.body["anchors"]}
-
-    # no fit yet: the provisioned table
-    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
-
-    d1, d2, d3 = FLEET_DISTANCES[:3]
-    fit = {**FULL_STATS, "geom": 3.0, "gd1": d1, "gd2": d2, "gd3": d3}
-    fit.update({f"gd{i}": 0.0 for i in range(4, 8)})
-    await _feed_stats(extension, device, fit, now=time.monotonic())
-
-    anchors = await site_anchors()
-    assert anchors[1]["ned"] == {"north": d1, "east": 0.0, "down": 0.0}
-    assert anchors[3]["ned"] == {"north": d1, "east": d2, "down": 0.0}
-    assert anchors[3]["mac"] == 4  # slot identity still from the params
-    beacon = extension._beacon_api.beacons["rtls::default::anchor_3"]
-    lat, lon, _ = ned_to_global_e7_for_test(d1, d2)
-    assert beacon.position.lat == pytest.approx(lat)
-    assert beacon.position.lon == pytest.approx(lon)
-
-    # the fit goes away (recalibrating): back to the provisioned table
-    await _feed_stats(extension, device, {"geom": 2.0}, now=time.monotonic())
-    assert (await site_anchors())[3]["ned"] == {"north": 1.0, "east": 1.0, "down": 0.0}
-
-
-def ned_to_global_e7_for_test(north, east):
-    from flockwave.server.ext.rtls.cell_compat import ned_to_global_e7
-
-    origin = SimpleNamespace(
-        lat_e7=413900000, lon_e7=21500000, alt_mm=10000, lat_deg=41.39
-    )
-    lat_e7, lon_e7, alt_mm = ned_to_global_e7(origin, north, east, 0.0)
-    return lat_e7 * 1e-7, lon_e7 * 1e-7, alt_mm * 1e-3
 
 
 # ---- one health report per datagram ---------------------------------------
@@ -4228,40 +3287,6 @@ async def test_forget_rejects_malformed_requests(extension, builder, hub):
         assert response.body.get("type") == "ACK-NAK", body
 
 
-async def test_lost_anchor_is_not_active_anywhere(extension, device, dialect):
-    """A lost anchor stays listed, but no consumer counts it as live: the
-    site anchor list, the map beacons and command targets."""
-    extension._beacon_api = StubBeaconAPI()
-    add_rtls_cell_params(device)
-    await discover(extension, device)
-    anchor = FakeDevice(dialect, system_id=DEVICE_SYSID + 1)
-    anchor.address = ("192.168.4.43", 3333)
-    set_fake_param(anchor, "UWB_ROLE", 3, "uint8")
-    set_fake_param(anchor, "UWB_MAC", 2, "uint16")
-    await extension._process_datagram(anchor.heartbeat(), anchor.address, 0.0)
-    extension._send = lambda payload, address: _noop()  # the tag stays quiet
-    await extension._process_datagram(
-        anchor._param_value("UWB_ROLE", 0), anchor.address, 0.0
-    )
-    await extension._process_datagram(
-        anchor._param_value("UWB_MAC", 1), anchor.address, 0.0
-    )
-    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
-    assert slot["active"] is True
-
-    # only the anchor times out (the tag was seen at the real clock)
-    extension._expire_devices(5.0 + DEFAULT_DEVICE_TIMEOUT)
-
-    assert str(anchor.system_id) in extension._inf_status(10.0)
-    slot = next(a for a in extension._site_anchors() if a["mac"] == 2)
-    assert slot["active"] is False
-    assert slot["systemId"] is None
-    beacon = extension._beacon_api.beacons["rtls::default::anchor_1"]
-    assert beacon.active is False
-    with pytest.raises(KeyError):
-        await extension.set_param(anchor.system_id, "SLEEP", 1, "uint8")
-
-
 async def _noop():
     return None
 
@@ -4482,15 +3507,12 @@ async def test_ota_job_names_the_species_and_its_source(
 # ---- audit round: stale snapshots, lost devices, OTA export, forget ------
 
 
-async def test_stale_snapshots_pass_neither_verify_nor_geom(
-    extension, device, builder, hub
-):
+async def test_a_stale_snapshot_does_not_pass_verify(extension, device, builder, hub):
     from flockwave.server.ext.rtls.verify import _uwb_rule
 
     await discover(extension, device)
-    await _feed_stats(extension, device, GEOM_STATS, now=time.monotonic())
-    body = (await geom_message(extension, builder, hub)).body
-    assert body["devices"][str(DEVICE_SYSID)]["status"] != "unknown"
+    await _feed_stats(extension, device, FULL_STATS, now=time.monotonic())
+    assert "no telemetry" not in _uwb_rule(extension)["detail"]
 
     # the tag is lost and returns before it reports again: its kept snapshot
     # is recent by harvest time, but stale
@@ -4498,8 +3520,6 @@ async def test_stale_snapshots_pass_neither_verify_nor_geom(
     await discover(extension, device)
     assert extension._stats[DEVICE_SYSID]["stale"] is True
 
-    body = (await geom_message(extension, builder, hub)).body
-    assert body["devices"][str(DEVICE_SYSID)]["status"] == "unknown"
     rule = _uwb_rule(extension)
     assert rule["status"] == "fail"
     assert "no telemetry" in rule["detail"]
@@ -4580,30 +3600,6 @@ async def test_forget_dedupes_ids_and_checks_a_single_id(
             make_message(builder, {"type": "X-RTLS-FORGET", **body}), None, hub
         )
         assert response.body["type"] == "ACK-NAK", body
-
-
-async def test_a_stale_tag_fit_falls_back_to_its_table(extension, device, builder, hub):
-    add_four_anchor_cell_params(device)
-    extension._beacon_api = StubBeaconAPI()
-    await discover(extension, device)
-    d1, d2, d3 = FLEET_DISTANCES[:3]
-    fit = {**FULL_STATS, "geom": 3.0, "gd1": d1, "gd2": d2, "gd3": d3}
-    fit.update({f"gd{i}": 0.0 for i in range(4, 8)})
-    await extension._on_stats(DEVICE_SYSID, fit, 0.0)
-    beacon = extension._beacon_api.beacons["rtls::default::anchor_3"]
-    fitted = (beacon.position.lat, beacon.position.lon)
-
-    # the tag's stream goes silent: its cell renders from the provisioned
-    # table again, the beacons too
-    await extension._flush_pending_stats(now=STATS_STALE_AFTER + 1.0)
-    lat, lon, _ = ned_to_global_e7_for_test(1.0, 1.0)
-    assert (beacon.position.lat, beacon.position.lon) != fitted
-    assert beacon.position.lat == pytest.approx(lat)
-    assert beacon.position.lon == pytest.approx(lon)
-
-    # the same fit reported again renders again
-    await extension._on_stats(DEVICE_SYSID, fit, STATS_STALE_AFTER + 2.0)
-    assert (beacon.position.lat, beacon.position.lon) == fitted
 
 
 async def test_commands_ignore_the_role_retained_from_before_a_loss(

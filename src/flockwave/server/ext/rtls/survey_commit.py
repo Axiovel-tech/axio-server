@@ -11,9 +11,7 @@ none, the tags exclude it, and the same commit again brings it in.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
-from functools import reduce
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
@@ -27,6 +25,7 @@ from .anchor_sleep import lacks_param
 from .cell_settings import write_refusal
 from .survey_fit import DirectedRange, SurveyFit
 from .survey_group import Anchor
+from .survey_view import newest_survey_id, stored_location
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -70,21 +69,8 @@ def next_survey_id(stored: Iterable[int]) -> int:
     ids = list(stored)
     if not ids:
         return 1
-    newest = reduce(
-        lambda newest, other: other if (other - newest) & 0xFFFF < 0x8000 else newest,
-        ids,
-    )
+    newest = newest_survey_id(ids)
     return 1 if newest >= 0xFFFE else newest + 1
-
-
-def _stored_location(device: Any) -> Optional[StoredLocation]:
-    """The location in a device's cached ``UWB_LOC``, None without one."""
-    from .extension import _decoded_device_params
-
-    text = _decoded_device_params(device, (LOC_PARAM,)).get(LOC_PARAM, "")
-    with suppress(ValueError):
-        return anchor_location.decode_param(str(text))
-    return None
 
 
 def stored_positions(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, Point]:
@@ -93,7 +79,7 @@ def stored_positions(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, Poin
     positions = {}
     for system_id in ids:
         device = devices.get(system_id)
-        stored = None if device is None else _stored_location(device)
+        stored = None if device is None else stored_location(device)
         if stored is not None:
             positions[system_id] = stored.location.ned_m
     return positions
@@ -107,7 +93,7 @@ def known_survey_ids(ext: "RtlsExtension") -> list[int]:
     for view in anchor_views(ext):
         system_id = view["systemId"]
         device = devices.get(system_id) or ext._lost.get(system_id)
-        stored = None if device is None else _stored_location(device)
+        stored = None if device is None else stored_location(device)
         if stored is not None:
             ids.append(stored.location.survey_id)
     return ids

@@ -22,11 +22,10 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import trio
+from rtlslink import role_from_params
 from rtlslink.cell_settings import RATE_PRESETS, TX_GAIN_PARAM, rate_hz, tx_gain_range
 
 from flockwave.server.ext.show.extension import authorizes_flight
-
-from .cell_compat import role_from_params
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension

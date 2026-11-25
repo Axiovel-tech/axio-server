@@ -4,6 +4,7 @@ one extension, routed by address."""
 import time
 
 from rtls_support import FakeDevice, StubApp, discover, make_message, set_fake_param
+from rtlslink.anchor_location import AnchorLocation, StoredLocation, encode_param
 from rtlslink.cell_settings import code
 from rtlslink.protocol import RtlsProtocol
 
@@ -60,6 +61,16 @@ async def _cell(dialect, *, anchors=((201, 2, 1), (202, 3, 2)), prepare=None):
     return ext, devices
 
 
+#: the survey every anchor of the cell stores and reports
+SURVEY_ID = 1
+
+
+def location(north, east, down, survey_id=SURVEY_ID, *, planar=False, reference_mm=0):
+    """A ``UWB_LOC`` value: a position in metres on a survey."""
+    surveyed = AnchorLocation.from_metres(north, east, down, survey_id, planar=planar)
+    return encode_param(StoredLocation(surveyed, reference_mm))
+
+
 def _anchor(dialect, system_id, role=3, mac=9):
     anchor = FakeDevice(dialect, system_id=system_id)
     anchor.address = (f"192.168.4.{system_id}", 3333)
@@ -67,6 +78,7 @@ def _anchor(dialect, system_id, role=3, mac=9):
     set_fake_param(anchor, "UWB_MAC", mac, "uint16")
     set_fake_param(anchor, "LOCK", 0, "uint8")
     set_fake_param(anchor, "UWB_TX_GAIN", 47, "uint8")
+    set_fake_param(anchor, "UWB_LOC", location(float(mac), 0.0, 0.0), "custom")
     return anchor
 
 
@@ -77,6 +89,7 @@ HEALTHY_A0 = {
     "uwbst": 1.0,
     "cellcfg": float(CODE_50),
     "txgain": 47.0,
+    "sid": float(SURVEY_ID),
 }
 
 

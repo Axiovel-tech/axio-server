@@ -3,9 +3,14 @@
 One message runs the whole "are my drones consistent?" rule set that
 used to be checked by hand before every flight:
 
-- **geometry** — every tag has fitted the cell itself and the fleet
-  agrees on it (delegates to the X-RTLS-GEOM agreement check over the
-  live geometry stats; see geometry_agreement.py);
+- **survey** — every online anchor is on one survey and every online,
+  awake tag follows it, leaves out no anchor and uses as many anchors as
+  are on it (survey_view.py);
+- **frame** — the tags of a cell hold the same origin and yaw, so that one
+  survey is not flown in two frames;
+- **anchors** (warning) — no anchor's range check warns or reports
+  ``moved``, and no tag sees its live ranges drift from the advertised
+  positions (survey_view.py);
 - **firmware** — uniform firmware version within each role group;
 - **pairing** — every online tag is associated with a drone (and every
   drone reached through a tag);
@@ -31,14 +36,17 @@ isolation — one unreachable drone never fails the whole run.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
+from rtlslink import role_from_params
 
+from .anchor_lock import anchor_views
 from .cell_settings import cell_rule
-from .extension import _decoded_device_params
-from .geometry_agreement import run_agreement
+from .extension import _cell_id_from_params, _decoded_device_params
+from .survey_view import anchors_rule, survey_rule
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -146,64 +154,80 @@ def _angles_agree(values: list[float]) -> bool:
     return True
 
 
-def _geometry_rule(agreement: dict[str, Any]) -> dict:
-    """Grades the fleet agreement body: fails when a tag deviates from
-    the fleet reference or cannot be certified (still calibrating,
-    failed, silent, or without geometry telemetry); manual tags are
-    named but do not fail the rule."""
-    devices = agreement["devices"]
-    if not devices:
-        return _rule(
-            "geometry",
-            "Cell geometry agreement",
-            "error",
-            "fail",
-            "no online tags",
+#: what places a tag's positions in the world: the origin its frame hangs
+#: off and the yaw of that frame. The tags of a cell must hold the same.
+FRAME_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "POS_YAW_DEG")
+
+
+def _frame_value(name: str, value: Any) -> Any:
+    """A frame parameter as compared across a cell: a non-finite real is not
+    a value, and the yaw is one revolution modulo."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if name == "POS_YAW_DEG":
+            return round(value % 360.0, 6) % 360.0
+    return value
+
+
+def _cell_known(device: Any, params: dict[str, Any]) -> bool:
+    """Whether a tag's cell can be trusted: ``CELL_ID`` is cached, or the
+    parameter listing is complete and lacks it (the default cell)."""
+    if params.get("CELL_ID") or params.get("RTLS_CELL_ID"):
+        return True
+    return device.param_count is not None and len(device.params) >= device.param_count
+
+
+def _frame_problems(frames: dict[int, tuple[Any, ...]]) -> list[str]:
+    """What keeps the tags of one cell, by system ID, from one frame: a
+    parameter not read yet, or one that differs from what most tags hold
+    (of several frames held equally often, the lowest tag's)."""
+    complete = [f for f in frames.values() if all(v is not None for v in f)]
+    majority = max(complete, key=complete.count) if complete else None
+    problems = []
+    for system_id, frame in frames.items():
+        missing = [name for name, value in zip(FRAME_PARAMS, frame) if value is None]
+        if missing:
+            problems.append(f"tag {system_id}: {', '.join(missing)} not read yet")
+        elif frame != majority:
+            differing = [
+                name
+                for name, value, reference in zip(FRAME_PARAMS, frame, majority or ())
+                if value != reference
+            ]
+            problems.append(
+                f"tag {system_id}: {', '.join(differing)} differ from the rest "
+                "of the cell"
+            )
+    return problems
+
+
+def _frame_rule(ext: "RtlsExtension") -> dict[str, Any]:
+    """Fails when the online tags of a cell do not hold one origin and yaw.
+    A device whose role is not read yet counts as a tag, so that it is
+    named instead of passed over."""
+    cells: dict[str, dict[int, tuple[Any, ...]]] = {}
+    problems = []
+    for system_id, device in sorted(ext._require_protocol().devices.items()):
+        params = _decoded_device_params(device)
+        if role_from_params(params) not in (None, "tag"):
+            continue
+        if not _cell_known(device, params):
+            problems.append(f"tag {system_id}: CELL_ID not read yet")
+            continue
+        cells.setdefault(_cell_id_from_params(params), {})[system_id] = tuple(
+            _frame_value(name, params.get(name)) for name in FRAME_PARAMS
         )
-    problems = [
-        f"tag {device_id}: {entry.get('detail', entry['status'])}"
-        for device_id, entry in devices.items()
-        if entry["status"] not in ("agree", "manual")
-    ]
-    manual = [
-        device_id for device_id, entry in devices.items() if entry["status"] == "manual"
-    ]
+    for frames in cells.values():
+        problems += _frame_problems(frames)
+    label = "Coordinate frame"
+    if not cells and not problems:
+        return _rule("frame", label, "error", "skipped", "no online tags")
     if problems:
-        return _rule(
-            "geometry",
-            "Cell geometry agreement",
-            "error",
-            "fail",
-            "; ".join(problems),
-        )
-    if len(manual) == len(devices):
-        # a layout outside the convention, provisioned on every tag: the
-        # operator's deliberate choice, nothing to compare
-        return _rule(
-            "geometry",
-            "Cell geometry agreement",
-            "error",
-            "pass",
-            "every tag uses its provisioned table (UWB_GEOM_MODE=0)",
-        )
-    if not agreement["consistent"]:
-        return _rule(
-            "geometry",
-            "Cell geometry agreement",
-            "error",
-            "fail",
-            "no tag has fitted the cell yet",
-        )
-    max_deviation = max(
-        (entry.get("maxDeviationM", 0.0) for entry in devices.values()), default=0.0
+        return _rule("frame", label, "error", "fail", "; ".join(problems))
+    return _rule(
+        "frame", label, "error", "pass", "the tags of each cell hold one origin and yaw"
     )
-    detail = (
-        f"every fitted tag agrees within {agreement['tolerance'] * 100:.0f} cm "
-        f"(largest deviation {max_deviation * 100:.1f} cm)"
-    )
-    if manual:
-        detail += "; provisioned table on tag " + ", ".join(sorted(manual))
-    return _rule("geometry", "Cell geometry agreement", "error", "pass", detail)
 
 
 def _firmware_rule(ext: "RtlsExtension") -> dict[str, Any]:
@@ -520,10 +544,12 @@ async def run_verify(
         raise ValueError("A fleet verification is already in progress")
     ext._verify_running = True
     try:
-        geometry = run_agreement(ext)
-
+        views = anchor_views(ext)
+        now = time.monotonic()
         rules = [
-            _geometry_rule(geometry),
+            survey_rule(ext, views, now),
+            _frame_rule(ext),
+            anchors_rule(ext, views, now),
             _firmware_rule(ext),
             _pairing_rule(ext),
             await _yaw_rule(ext),
@@ -543,7 +569,7 @@ async def run_verify(
                 )
             )
 
-        body: dict[str, Any] = {
+        return {
             "type": "X-RTLS-VERIFY",
             "inDepth": bool(in_depth),
             "rules": rules,
@@ -552,8 +578,5 @@ async def run_verify(
                 for rule in rules
             ),
         }
-        # the agreement body rides along for UI reuse
-        body["geometry"] = geometry
-        return body
     finally:
         ext._verify_running = False
