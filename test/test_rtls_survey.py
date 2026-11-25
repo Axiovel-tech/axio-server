@@ -2,17 +2,20 @@
 on the anchors, what ends it early, and what it tells its clients."""
 
 import math
+import time
 
 import pytest
 import trio
-from anchor_lock_support import CODE_50, _lock
+from anchor_lock_support import CODE_50, HEALTHY_A1, _lock
 from cell_settings_support import _request as cell_request
 from cell_settings_support import _states as cell_states
 from rtls_support import make_message
 from rtlslink.dialect import load_dialect
 from rtlslink.survey import SurveyAnchor, encode_step
 from survey_support import (
+    ASLEEP,
     FLAT,
+    TIERS,
     TWO_TIERS,
     authorize_show,
     commit,
@@ -185,6 +188,7 @@ async def test_the_steps_follow_the_stored_slots_not_the_request(
 async def test_a_group_that_is_not_the_whole_cell_keeps_its_order(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[203, 201, 202])
 
     assert cell.steps()[0].endswith("0003" + "00010002")
@@ -347,6 +351,7 @@ async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
     ext = cell.ext
     restarting = {"cellcfg": -1.0, "txgain": -1.0, "sid": -1.0}
     cell.collect_s = 1.2
+    await cell.asleep(204)
     await _start(cell, builder, hub, anchors=[201, 202, 203])
     await trio.sleep(0.5)
     ext._inf_pending = False
@@ -362,10 +367,8 @@ async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
     assert ext._stats[204]["cellConfig"] is None
     assert cell_states(ext)[201] == cell_states(ext)[202] == ("ok", None)
     assert cell_states(ext)[204] == ("unknown", None)
-    warned = {
-        w["device"] for w in (await _lock(ext, builder, hub, "status"))["warnings"]
-    }
-    assert warned == {204}
+    warnings = (await _lock(ext, builder, hub, "status"))["warnings"]
+    assert {w["device"] for w in warnings if w["code"] == "cell-settings"} == {204}
 
     # once the survey is over, an anchor without a session reads as one
     await until(cell, "returning")
@@ -756,6 +759,59 @@ async def test_start_is_refused_for_an_anchor_that_cannot_take_part(
     assert await _refusal(cell, builder, hub) == "RTLS anchor A2 is offline"
 
 
+async def test_start_waits_for_an_anchor_that_has_not_reported_its_session(
+    cell, builder, hub, autojump_clock
+):
+    # after a server restart the health report comes first, the session
+    # only with the status report
+    health = {k: v for k, v in HEALTHY_A1.items() if k not in ("cellcfg", "txgain")}
+    await cell.ext._on_stats(202, health, time.monotonic())
+
+    assert await _refusal(cell, builder, hub) == (
+        "Still waiting for RTLS anchor A1 to report its session"
+    )
+    await cell.report([202])
+    assert (await _start(cell, builder, hub))["result"] == "started"
+
+
+async def test_start_refuses_to_leave_an_operating_anchor_of_the_cell_out(
+    cell, builder, hub, autojump_clock
+):
+    assert await _refusal(cell, builder, hub, anchors=[201, 202, 203]) == (
+        "Include RTLS anchor A3 in the survey, or put it to sleep"
+    )
+
+
+async def test_start_names_every_anchor_left_out(
+    dialect, nursery, builder, hub, autojump_clock
+):
+    cell = await survey_cell(dialect, nursery, TIERS)
+
+    reason = await _refusal(cell, builder, hub, anchors=list(TIERS)[:6])
+
+    assert reason == (
+        "Include RTLS anchor A6, RTLS anchor A7 in the survey, or put them to sleep"
+    )
+
+
+@pytest.mark.parametrize("state", ["asleep", "standby", "offline", "other cell"])
+async def test_an_anchor_that_does_not_range_in_the_cell_may_be_left_out(
+    cell, builder, hub, autojump_clock, state
+):
+    if state == "asleep":
+        await cell.asleep(204)
+    elif state == "standby":
+        await cell.report([204], **(ASLEEP | {"pwrst": 2.0}))
+    elif state == "offline":
+        cell.lose(204)
+    else:
+        await cell.ext.set_param(204, "CELL_ID", "hall-b", "custom")
+
+    answer = await _start(cell, builder, hub, anchors=[201, 202, 203])
+
+    assert (answer["result"], answer["reason"]) == ("started", None)
+
+
 @pytest.mark.parametrize(
     "body, reason",
     [
@@ -836,6 +892,7 @@ async def test_other_writes_to_the_cell_are_refused_while_a_survey_runs(
 ):
     ext = cell.ext
     cell.collect_s = 1.2
+    await cell.asleep(204)
     await _start(cell, builder, hub, anchors=[201, 202, 203])
     await trio.sleep(0.5)
     refusal = ("refused", "A survey is running")

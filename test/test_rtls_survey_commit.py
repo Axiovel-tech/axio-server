@@ -181,6 +181,7 @@ async def test_the_reference_is_the_range_the_anchor_itself_measured(
 async def test_the_reference_is_unknown_without_the_stored_initiator(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(201)
     await measure(cell, builder, hub, anchors=[202, 203, 204])
     answer = await commit(cell, builder, hub, reporting=[202, 203, 204])
 
@@ -337,6 +338,7 @@ async def test_the_survey_id_is_not_given_without_every_anchors_stored_one(
 ):
     # 204 holds survey 1 of another server; this one never read it and its
     # read gets no answer
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     _store(cell, 204, 1)
     del cell.ext._protocol.devices[204].params[LOC_PARAM]
@@ -361,6 +363,7 @@ async def test_an_anchor_shown_to_have_no_position_parameter_holds_no_survey(
     cell, builder, hub, autojump_clock
 ):
     # an anchor image from before UWB_LOC: its complete list has no such name
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     old = cell.ext._protocol.devices[204]
     del old.params[LOC_PARAM]
@@ -803,6 +806,7 @@ async def test_commit_is_refused_while_the_cell_may_not_be_written(
 async def test_commit_is_refused_by_a_lock_of_a_device_of_unknown_role(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     del cell.ext._protocol.devices[204].params["UWB_ROLE"]
     await cell.report([204], lock=1.0)

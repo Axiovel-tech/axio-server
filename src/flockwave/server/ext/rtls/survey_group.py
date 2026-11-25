@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from rtlslink.cell_settings import RATE_PRESETS
 from rtlslink.survey import MAX_GROUP
 
-from .anchor_lock import anchor_views, lock_refusal
+from .anchor_lock import AnchorView, anchor_views, lock_refusal
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -61,15 +61,9 @@ def select_group(
     if unknown:
         return [], f"Device {unknown[0]} is not a known anchor"
     group = [views[system_id] for system_id in ids]
-    offline = [view["name"] for view in group if not view["online"]]
-    if offline:
-        return [], f"{offline[0]} is offline"
-    reason = lock_refusal(group)
+    reason = _state_refusal(group) or _left_out(ext, views, set(ids))
     if reason:
         return [], reason
-    idle = [view["name"] for view in group if view["stats"].get("cellConfig") is None]
-    if idle:
-        return [], f"{idle[0]} is not ranging"
     anchors = []
     for view in group:
         mac = _params(ext, view["systemId"]).get("UWB_MAC")
@@ -80,6 +74,48 @@ def select_group(
     if len({anchor.mac for anchor in anchors}) != len(anchors):
         return [], "Two anchors of the survey have the same UWB_MAC"
     return anchors, None
+
+
+def _state_refusal(group: list[AnchorView]) -> Optional[str]:
+    """Why an anchor of the group cannot take a survey step now."""
+    offline = [view["name"] for view in group if not view["online"]]
+    if offline:
+        return f"{offline[0]} is offline"
+    reason = lock_refusal(group)
+    if reason:
+        return reason
+    # the session comes with the status report, every 10 s: until the first
+    # one, an anchor's stats do not say whether it ranges
+    unreported = [view["name"] for view in group if "cellConfig" not in view["stats"]]
+    if unreported:
+        return f"Still waiting for {unreported[0]} to report its session"
+    idle = [view["name"] for view in group if view["stats"]["cellConfig"] is None]
+    return f"{idle[0]} is not ranging" if idle else None
+
+
+def _left_out(
+    ext: "RtlsExtension", views: dict[int, AnchorView], group: set[int]
+) -> Optional[str]:
+    """Why the group cannot be surveyed without the rest of its cell. An
+    operating anchor of the cell that is left out loses its initiator at
+    every step and keeps its old survey ID after the commit, so every tag
+    then leaves it out. An anchor that is offline or not operating may stay
+    out."""
+    from .extension import _cell_id_from_params
+
+    cells = {_cell_id_from_params(_params(ext, system_id)) for system_id in group}
+    names = [
+        view["name"]
+        for system_id, view in views.items()
+        if system_id not in group
+        and view["online"]
+        and view["stats"].get("powerState") == "operating"
+        and _cell_id_from_params(_params(ext, system_id)) in cells
+    ]
+    if not names:
+        return None
+    them = "it" if len(names) == 1 else "them"
+    return f"Include {', '.join(names)} in the survey, or put {them} to sleep"
 
 
 def step_order(ext: "RtlsExtension", anchors: list[Anchor]) -> list[Anchor]:

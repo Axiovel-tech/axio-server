@@ -30,6 +30,9 @@ TIERS = FLAT | {
     208: (0.2, 2.9, -2.4),
 }
 
+#: what a sleeping anchor reports instead of a session
+ASLEEP = {"pwrst": 3.0, "cellcfg": -1.0, "txgain": -1.0, "sid": -1.0, "rnghz": 0.0}
+
 STEP_PARAM = "UWB_SURVEY"
 LOC_PARAM = "UWB_LOC"
 
@@ -123,6 +126,13 @@ class SurveyCell:
                 **stats,
             }
             await self.ext._on_stats(system_id, body, time.monotonic())
+
+    async def asleep(self, *ids):
+        """The anchors of ``ids`` sleep from now on: they run no session,
+        and a survey may leave them out."""
+        for system_id in ids:
+            self.stats[system_id] = ASLEEP
+        await self.report(ids)
 
     def lose(self, system_id):
         """The anchor's heartbeats stopped long ago: the extension loses it."""
