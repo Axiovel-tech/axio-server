@@ -19,6 +19,7 @@ from survey_support import (
     TWO_TIERS,
     authorize_show,
     commit,
+    fly_drone,
     held,
     measure,
     request,
@@ -317,6 +318,7 @@ def _while_the_commit_reads(monkeypatch, happen):
         ("lost", "Survey again"),
         ("locked", "Unlock the anchors first"),
         ("authorized", "A show is authorized"),
+        ("armed", "Drone 17 is armed"),
     ],
 )
 async def test_what_changes_while_the_commit_reads_still_refuses_it(
@@ -331,6 +333,8 @@ async def test_what_changes_while_the_commit_reads_still_refuses_it(
             cell.lose(203)
         elif change == "locked":
             await cell.report([203], lock=1.0)
+        elif change == "armed":
+            fly_drone(cell.ext, armed=True)
         else:
             authorize_show(cell.ext)
 

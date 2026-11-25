@@ -49,7 +49,7 @@ from .survey_fit import (
     fit_survey,
     frame_refusal,
 )
-from .survey_group import Anchor, block_ms, select_group, step_order
+from .survey_group import Anchor, armed_refusal, block_ms, select_group, step_order
 from .survey_notify import Pulse, StatePusher
 from .survey_request import (
     Placement,
@@ -282,7 +282,7 @@ class Survey:
         if nursery is None:
             return "refused", "RTLS is not running"
         anchors: list[Anchor] = []
-        reason = write_refusal(ext)
+        reason = write_refusal(ext) or armed_refusal(ext)
         if reason is None:
             anchors, reason = select_group(ext, requested)
         if reason is not None:

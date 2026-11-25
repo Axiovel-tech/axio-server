@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Optional
 from rtlslink.cell_settings import RATE_PRESETS
 from rtlslink.survey import MAX_GROUP
 
+from flockwave.server.model.uav import UAV
+
 from .anchor_lock import AnchorView, anchor_views, lock_refusal
 
 if TYPE_CHECKING:
@@ -100,6 +102,18 @@ def _state_refusal(group: list[AnchorView]) -> Optional[str]:
         return f"Still waiting for {unreported[0]} to report its session"
     idle = [view["name"] for view in group if view["stats"]["cellConfig"] is None]
     return f"{idle[0]} is not ranging" if idle else None
+
+
+def armed_refusal(ext: "RtlsExtension") -> Optional[str]:
+    """Why no survey may start or be committed now: a drone reports itself
+    armed. Each step moves the initiator and a commit restarts every anchor's
+    radio, so the positions of the tags jump. An arming state that is not
+    known does not refuse: the server cannot tell a drone that is off."""
+    registry = getattr(ext.app, "object_registry", None)
+    for uav_id in sorted(registry.ids_by_type(UAV)) if registry else ():
+        if registry.find_by_id(uav_id).status.armed:
+            return f"Drone {uav_id} is armed"
+    return None
 
 
 def _left_out(

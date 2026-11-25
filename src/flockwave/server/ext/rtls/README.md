@@ -121,7 +121,10 @@ enables it.
   write is not rolled back, and the commit does not lock (Control locks
   after it). The same commit again brings in an anchor that missed it,
   unless an anchor of the group moved or restarted since the measurement, or
-  something else was written to the group. While a survey runs, the cell
+  something else was written to the group. A start and a commit are refused
+  while a drone reports itself armed; an unknown arming state does not
+  refuse, and a drone armed during a run does not stop it. While a survey
+  runs, the cell
   settings, the lock, and sleep and OTA of its anchors are refused, and its
   anchors keep the session they last reported through the restarts of their
   ranging. An online anchor of the group's cell must be in the group unless

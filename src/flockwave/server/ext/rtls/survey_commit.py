@@ -24,7 +24,7 @@ from .anchor_lock import anchor_views
 from .anchor_sleep import lacks_param
 from .cell_settings import write_refusal
 from .survey_fit import DirectedRange, SurveyFit
-from .survey_group import Anchor
+from .survey_group import Anchor, armed_refusal
 from .survey_view import newest_survey_id, stored_location
 
 if TYPE_CHECKING:
@@ -245,7 +245,7 @@ def commit_refusal(
         for coordinate in report.position
     ):
         return "A fitted position is farther than an anchor can store"
-    return write_refusal(ext)
+    return write_refusal(ext) or armed_refusal(ext)
 
 
 def location_values(

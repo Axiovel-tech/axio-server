@@ -19,6 +19,7 @@ from survey_support import (
     TWO_TIERS,
     authorize_show,
     commit,
+    fly_drone,
     held,
     measure,
     request,
@@ -754,6 +755,21 @@ async def test_start_is_refused_while_a_show_is_authorized(
 ):
     authorize_show(cell.ext)
     assert await _refusal(cell, builder, hub) == "A show is authorized"
+
+
+async def test_start_is_refused_while_a_drone_is_armed(
+    cell, builder, hub, autojump_clock
+):
+    fly_drone(cell.ext, armed=True)
+    assert await _refusal(cell, builder, hub) == "Drone 17 is armed"
+
+
+@pytest.mark.parametrize("armed", [False, None])
+async def test_a_drone_not_known_to_be_armed_does_not_refuse_a_start(
+    cell, builder, hub, autojump_clock, armed
+):
+    fly_drone(cell.ext, armed=armed)
+    await measure(cell, builder, hub)
 
 
 async def test_start_is_refused_while_an_apply_runs(cell, builder, hub, autojump_clock):

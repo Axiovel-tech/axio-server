@@ -6,6 +6,7 @@ the survey ID it runs included, when the test lets it."""
 
 import math
 import time
+from types import SimpleNamespace
 
 import trio
 from anchor_lock_support import HEALTHY_A0, HEALTHY_A1, _cell
@@ -287,6 +288,14 @@ def held(state):
 
 
 TWO_TIERS = {"preset": "two-tiers"}
+
+
+def fly_drone(ext, armed):
+    """The server knows drone 17, with this arming state (None: unknown)."""
+    uav = SimpleNamespace(status=SimpleNamespace(armed=armed))
+    ext.app.object_registry = SimpleNamespace(
+        ids_by_type=lambda _type: ["17"], find_by_id=lambda _id: uav
+    )
 
 
 def authorize_show(ext):
