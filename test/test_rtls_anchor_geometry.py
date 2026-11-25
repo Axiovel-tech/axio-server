@@ -24,10 +24,8 @@ from rtlslink.dialect import load_dialect
 from survey_support import TWO_TIERS, commit, measure, survey_cell
 from survey_view_support import (
     NO_POSITION,
-    NO_ROW,
     ORIGIN,
     OTHER_SURVEY,
-    TABLE_FULL,
     TAG,
     TAG_STATS,
     UNKNOWN_LAYOUT,
@@ -42,7 +40,6 @@ from survey_view_support import (
 )
 
 from flockwave.server.ext.rtls.extension import RtlsExtension, _stats_json
-from flockwave.server.ext.rtls.tag_table import decode_anchor_table_entry
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -353,25 +350,36 @@ def test_the_stats_of_the_tags_own_fit_are_gone():
     assert not [key for key in body if key.lower().startswith("geometry")]
 
 
-@pytest.mark.parametrize(
-    ("value", "decoded"),
-    [
-        (antbl(0x0203, row=5), {"mac": 0x0203, "state": 1, "row": 5}),
-        (antbl(0xFFFE, row=0), {"mac": 0xFFFE, "state": 1, "row": 0}),
-        (antbl(7, state=OTHER_SURVEY), {"mac": 7, "state": 2, "row": None}),
-        (antbl(7, state=TABLE_FULL), {"mac": 7, "state": 5, "row": None}),
-        (0.0, None),
-        # in use without a row, left out with one, an unknown state, no entry
-        (antbl(7, row=NO_ROW, state=1), None),
-        (antbl(7, row=3, state=NO_POSITION), None),
-        (antbl(7, state=6), None),
-        (antbl(7, row=0) + 0.5, None),
-        (float(1 << 24), None),
-        (-1.0, None),
-    ],
-)
-def test_an_anchor_table_entry_decodes_as_the_firmware_packs_it(value, decoded):
-    assert decode_anchor_table_entry(value) == decoded
+async def test_a_tags_report_reaches_the_stats_as_the_firmware_sends_it(dialect):
+    ext, devices = await surveyed_cell(dialect)
+    tag = devices[TAG]
+
+    def report(entry, boot_ms):
+        """A whole health report in one datagram."""
+        stats = {**TAG_STATS, "antbl": entry}
+        return b"".join(
+            tag.named_value_float(name, value, boot_ms) for name, value in stats.items()
+        )
+
+    for boot_ms, entry in (
+        (500, antbl(1, row=0)),
+        (1000, antbl(4, state=OTHER_SURVEY)),
+    ):
+        await ext._process_datagram(
+            report(entry, boot_ms), tag.address, time.monotonic()
+        )
+
+    stats = ext._stats[TAG]
+    assert (stats["surveyId"], stats["anchorsUsed"], stats["anchorsExcluded"]) == (
+        1,
+        4,
+        0,
+    )
+    assert stats["surveyDriftM"] == 0.02
+    assert stats["anchorTable"] == [
+        {"row": 0, "mac": 1, "state": "in-use", "systemId": 201},
+        {"row": None, "mac": 4, "state": "other-survey", "systemId": 204},
+    ]
 
 
 async def test_the_anchor_table_is_assembled_over_the_rotation(dialect):

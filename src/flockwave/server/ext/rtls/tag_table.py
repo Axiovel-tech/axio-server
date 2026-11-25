@@ -8,58 +8,18 @@ rows it uses (``anuse``), how many anchors it hears and leaves out
 (``sdrift``) and, one anchor per report in rotation, who holds which row
 (``antbl``). The server assembles the table over the rotation.
 
-This module is also the one place that names what the SDK gains with the
-tag's switch (the four stats and the ``antbl`` packing), so that a pin
-without them still imports.
+The packing of ``antbl`` and its states are the SDK's
+(``rtlslink.protocol``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Optional
 
-from rtlslink import protocol as _sdk
+from rtlslink.protocol import ANCHOR_TABLE_STATES, decode_anchor_table_entry
 
-_STATES = {
-    1: "in-use",
-    2: "other-survey",
-    3: "no-position",
-    4: "unknown-layout",
-    5: "table-full",
-}
-
-_NO_ROW = 15
-
-
-def _decode(value: float) -> dict[str, int | None] | None:
-    """One ``antbl`` stat (``row * 2**20 + state * 2**16 + mac``) as ``mac``,
-    ``state`` and ``row``, which is None for an anchor the tag leaves out;
-    None for 0 and for a value that is no entry."""
-    entry = int(value)
-    if entry != value or not 0 < entry < 1 << 24:
-        return None
-    row, state, mac = entry >> 20, (entry >> 16) & 0xF, entry & 0xFFFF
-    if state not in _STATES or (state == 1) != (row != _NO_ROW):
-        return None
-    return {"mac": mac, "state": state, "row": row if state == 1 else None}
-
-
-#: the SDK's own once the pin has them
-ANCHOR_TABLE_STATES: dict[int, str] = getattr(_sdk, "ANCHOR_TABLE_STATES", _STATES)
-decode_anchor_table_entry: Callable[[float], Optional[dict[str, Optional[int]]]] = (
-    getattr(_sdk, "decode_anchor_table_entry", _decode)
-)
-
-__all__ = (
-    "ANCHOR_TABLE_STATES",
-    "IN_USE",
-    "TABLE_STAT",
-    "TAG_SURVEY_STATS",
-    "AnchorTable",
-    "TableEntry",
-    "decode_anchor_table_entry",
-)
+__all__ = ("IN_USE", "TABLE_STAT", "TAG_SURVEY_STATS", "AnchorTable", "TableEntry")
 
 #: wire name, X-RTLS-STATS key and decimals (None: an integer) of the stats
 #: a tag reports of its table besides ``sid``

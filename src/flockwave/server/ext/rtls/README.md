@@ -146,8 +146,7 @@ enables it.
 - `survey_view.py`: the survey the cell is on: the `survey` member of
   `X-RTLS-INF`, the lock warnings `not-surveyed` and `range-deviation`, the
   Verify rules `survey` and `anchors`.
-- `tag_table.py`: a tag's anchor table assembled from `antbl`, and the names
-  the SDK gains with it, with a fallback for a pin without them.
+- `tag_table.py`: a tag's anchor table assembled from `antbl`.
 - `survey.py`: `X-RTLS-SURVEY`, the survey run as a state machine and its
   commit; `survey_group.py` who takes part and in which order,
   `survey_request.py` the request's frame and placement,
