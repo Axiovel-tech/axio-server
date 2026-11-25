@@ -196,6 +196,18 @@ async def test_a_group_that_is_not_the_whole_cell_keeps_its_order(
     assert _initiators(cell) == [3, 1, 2]
 
 
+async def test_the_frame_is_echoed_as_it_is_used(cell, builder, hub, autojump_clock):
+    frame = FRAME | {"heightGroups": [[201], [202, 203, 204]], "yPositive": 203}
+
+    survey = await measure(cell, builder, hub, frame=frame)
+
+    # a group of one is no group: the origin's height is free of the others
+    assert survey["frame"]["heightGroups"] == [[202, 203, 204]]
+    assert survey["state"] == "ready"
+    assert survey["fit"]["anchors"]["201"]["heightOffsetM"] is None
+    assert survey["fit"]["anchors"]["202"]["heightOffsetM"] == 0.0
+
+
 async def test_no_anchors_named_means_every_online_anchor_in_slot_order(
     dialect, nursery, builder, hub, autojump_clock
 ):

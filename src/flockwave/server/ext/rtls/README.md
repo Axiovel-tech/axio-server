@@ -141,11 +141,14 @@ enables it.
   every anchor gets its own height, held within 0.05 m (one sigma,
   `HEIGHT_TOLERANCE_M`) of its group's common height, and
   `fit.anchors[id].heightOffsetM` says how far it stands above it (null for
-  an anchor in no group, 0 in the exact case). z = 0 is the common height of
-  the origin's group. Ranges do not know which way is up either: "level" is
-  the tilt of the cell that leaves the least offsets, so one anchor 4 cm off
-  a four-anchor tier reads about +2 cm and its neighbours the rest. The
-  pulls are not part of `rmsM` or of any pair's residual.
+  an anchor in no group, 0 in the exact case). A group of one is no group:
+  the server drops it when it reads the frame, that anchor's height is free,
+  and the frame echoed in the state is the frame as used. z = 0 is the
+  common height of the origin's group. Ranges do not know which way is up
+  either: "level" is the tilt of the cell that leaves the least offsets, so
+  one anchor 4 cm off a four-anchor tier reads about +2 cm and its
+  neighbours the rest. The pulls are not part of `rmsM` or of any pair's
+  residual.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.

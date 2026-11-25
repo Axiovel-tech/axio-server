@@ -1196,3 +1196,43 @@ def test_a_noisy_survey_is_not_blocked_by_the_heights_it_cannot_see():
     # the tolerance of a height holds whatever the ranges' noise
     assert fit.blocked == ()
     assert max(sigma_of(fit, anchor) for anchor in TWO_TIERS) < 0.20
+
+
+def test_a_height_group_of_one_is_no_group():
+    frame = Frame(
+        origin=301, x_axis=302, height_groups=((301,), (302, 303)), upper=(304,)
+    )
+
+    fit = fit_survey(list(FIVE), survey(FIVE), frame, placement=FIVE)
+
+    # the frame as it is used: the origin is in no group, its height is zero
+    assert frame.height_groups == ((302, 303),)
+    assert fit.anchors[301].position[2] == 0.0
+    assert fit.anchors[301].height_offset_m is None
+    # one group left: its two anchors share their height exactly
+    assert fit.anchors[302].position[2] == fit.anchors[303].position[2]
+    assert (offset_of(fit, 302), offset_of(fit, 303)) == (0.0, 0.0)
+
+
+def test_a_group_of_one_does_not_make_the_other_heights_similar():
+    lower, upper = (101, 102, 103, 104), (105, 106, 107, 108)
+    frame = Frame(
+        origin=101,
+        x_axis=102,
+        height_groups=(lower, (105,)),
+        upper=upper,
+        y_positive=103,
+    )
+
+    fit = fit_survey(list(TWO_TIERS), survey(TWO_TIERS), frame, placement=TWO_TIERS)
+
+    assert frame == LEVEL_AND_FREE
+    assert [fit.anchors[a].position[2] for a in lower] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in lower] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in upper] == [None] * 4
+
+
+def test_the_preset_of_five_anchors_has_one_group():
+    frame = Frame.two_tiers([1, 2, 3, 4, 5])
+
+    assert (frame.height_groups, frame.upper) == (((1, 2, 3, 4),), (5,))

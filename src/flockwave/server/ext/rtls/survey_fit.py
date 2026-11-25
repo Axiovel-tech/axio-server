@@ -128,8 +128,10 @@ class Frame:
     cannot tell its anchors' heights apart, so they share their z exactly.
     With two or more, every anchor has a z of its own, held within
     ``HEIGHT_TOLERANCE_M`` of its group's common height. An anchor in no
-    group has a free z. ``upper`` names anchors above the origin's group and
-    ``y_positive`` one anchor at y > 0; they settle the mirror images.
+    group has a free z, and a group of one is no group: it is dropped here,
+    so that the frame reads as it is used. ``upper`` names anchors above the
+    origin's group and ``y_positive`` one anchor at y > 0; they settle the
+    mirror images.
     """
 
     origin: int
@@ -137,6 +139,10 @@ class Frame:
     height_groups: tuple[tuple[int, ...], ...] = ()
     upper: tuple[int, ...] = ()
     y_positive: int | None = None
+
+    def __post_init__(self) -> None:
+        groups = tuple(tuple(g) for g in self.height_groups if len(g) >= 2)
+        object.__setattr__(self, "height_groups", groups)
 
     @classmethod
     def two_tiers(cls, anchors: Sequence[int]) -> Frame:
@@ -319,7 +325,7 @@ class _Problem:
         self.y_positive = None if frame.y_positive is None else index[frame.y_positive]
 
         groups = [[index[anchor] for anchor in group] for group in frame.height_groups]
-        self.groups = [group for group in groups if group]
+        self.groups = groups
         self.level = next((g for g in groups if self.origin in g), [self.origin])
         grouped = {i for group in groups for i in group} | {self.origin}
         self.free_heights = [g for g in groups if self.origin not in g and g]
