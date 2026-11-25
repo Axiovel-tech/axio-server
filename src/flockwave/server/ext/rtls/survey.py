@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import random
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -141,13 +142,14 @@ def _merged(first: StepResult, again: StepResult) -> StepResult:
 class Survey:
     """The extension's one survey: its state, the run and the commit."""
 
-    def __init__(self, ext: "RtlsExtension", revision: int = 0):
+    def __init__(self, ext: "RtlsExtension", revision: Optional[int] = None):
         self._ext = ext
         self.state = "idle"
         self.reason: Optional[str] = None
-        #: raised on every change of what the survey holds; never lowered
-        #: while the server runs
-        self.revision = revision
+        #: raised on every change of what the survey holds and never lowered.
+        #: It starts at the wall clock in milliseconds, above what an earlier
+        #: instance of the extension sent: the changes are fewer than that.
+        self.revision = time.time_ns() // 1_000_000 if revision is None else revision
         self._run: Optional[_Run] = None
         self._changed = Pulse()
         self._push = StatePusher(ext, self._notification).notify

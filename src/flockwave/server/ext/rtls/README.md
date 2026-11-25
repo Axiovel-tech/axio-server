@@ -131,7 +131,8 @@ enables it.
 - **A commit names the survey it commits.** The survey state carries a
   `revision`, in every reply and notification, that the server raises on
   every change of what it holds (a phase, a measurement, a fit, a commit's
-  result, a cancel) and never lowers while it runs. `commit` must carry the
+  result, a cancel) and never lowers: a new instance of the extension starts
+  at the wall clock in milliseconds. `commit` must carry the
   current one and `fit` may; a request with another is refused with the
   reason `stale` and writes nothing, so a client cannot commit a fit another
   client replaced while it was looking at the old one.

@@ -91,7 +91,7 @@ async def test_an_idle_server_reports_an_empty_survey(
         "action": "status",
         "result": "status",
         "reason": None,
-        "survey": IDLE | {"revision": 0},
+        "survey": IDLE | {"revision": cell.ext._survey.revision},
     }
 
 

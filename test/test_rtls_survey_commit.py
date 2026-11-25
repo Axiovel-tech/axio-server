@@ -27,7 +27,7 @@ from survey_support import (
 )
 
 from flockwave.server.ext.rtls import survey as survey_module
-from flockwave.server.ext.rtls.extension import _stats_json
+from flockwave.server.ext.rtls.extension import RtlsExtension, _stats_json
 from flockwave.server.ext.rtls.survey_commit import next_survey_id, write_locations
 from flockwave.server.ext.rtls.survey_group import Anchor
 from flockwave.server.message_hub import MessageHub
@@ -1005,6 +1005,20 @@ async def test_the_revision_rises_with_every_change_and_never_falls(
     # an extension that stops and starts again goes on counting
     cell.ext._forget_run_state()
     assert cell.ext._survey.revision > seen[-1]
+
+
+async def test_a_new_instance_of_the_extension_goes_on_above_the_last_revision(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+    cell.ext._forget_run_state()
+    last = cell.ext._survey.revision
+    time.sleep(0.1)  # a reload of the extension takes longer
+
+    revision = RtlsExtension()._survey.revision
+
+    assert revision > last
+    assert type(revision) is int and revision < 2**53  # exact in a JSON double
 
 
 # ---- an anchor that rebooted since it was measured -------------------------
