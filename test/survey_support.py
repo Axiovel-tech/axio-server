@@ -302,9 +302,10 @@ async def measure(cell, builder, hub, **body):
     return cell.ext._survey.json
 
 
-async def commit(cell, builder, hub, reporting=None, **body):
+async def commit(cell, builder, hub, reporting=None, after=0.1, **body):
     """The answer to a commit, during which the anchors of ``reporting``
-    (default: all) report their health once the writes are out."""
+    (default: all) report their health once the writes are out, ``after``
+    seconds into it."""
     answer = {}
 
     async def ask():
@@ -312,6 +313,6 @@ async def commit(cell, builder, hub, reporting=None, **body):
 
     async with trio.open_nursery() as nursery:
         nursery.start_soon(ask)
-        await trio.sleep(0.1)
+        await trio.sleep(after)
         await cell.report(reporting)
     return answer

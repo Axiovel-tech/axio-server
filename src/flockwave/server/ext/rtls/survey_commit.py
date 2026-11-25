@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -19,7 +20,10 @@ import trio
 from rtlslink import anchor_location
 from rtlslink.anchor_location import AnchorLocation, StoredLocation
 
+from flockwave.server.errors import FlockwaveError
+
 from .anchor_lock import anchor_views
+from .anchor_sleep import lacks_param
 from .cell_settings import write_refusal
 from .survey_fit import DirectedRange, SurveyFit
 from .survey_group import Anchor
@@ -29,11 +33,12 @@ if TYPE_CHECKING:
 
 __all__ = (
     "CONFIRM_TIMEOUT",
+    "CommitRefused",
+    "Plan",
     "commit_refusal",
-    "known_survey_ids",
-    "location_values",
     "next_survey_id",
-    "read_params",
+    "plan_commit",
+    "read_stored",
     "running_ids",
     "stored_positions",
     "write_locations",
@@ -45,6 +50,8 @@ __all__ = (
 CONFIRM_TIMEOUT = 10.0
 
 LOC_PARAM = anchor_location.PARAM
+
+SURVEY_AGAIN = "Survey again"
 
 _READ_TIMEOUT = 2.0
 
@@ -106,16 +113,25 @@ def known_survey_ids(ext: "RtlsExtension") -> list[int]:
     return ids
 
 
-async def read_params(ext: "RtlsExtension", ids: Sequence[int], *, fresh: bool) -> None:
+async def read_stored(
+    ext: "RtlsExtension", ids: Sequence[int], *, fresh: bool
+) -> list[int]:
     """Reads what a fit and a commit need of the live anchors ``ids`` into
     their parameter caches: the stored location, again when ``fresh`` asks,
-    and the stored initiator where it is not cached. An anchor that does not
-    answer keeps what was cached."""
+    and the stored initiator where it is not cached. Returns the anchors
+    whose stored location did not come: what they hold is not known, unless
+    their parameter list shows they have no such parameter."""
     devices = ext._require_protocol().devices
+    unread: list[int] = []
 
     async def read(system_id: int, name: str) -> None:
-        with suppress(KeyError, trio.TooSlowError):
+        try:
             await ext.get_param(system_id, name, timeout=_READ_TIMEOUT)
+        except trio.TooSlowError:
+            if name == LOC_PARAM:
+                unread.append(system_id)
+        except KeyError:
+            pass
 
     async with trio.open_nursery() as nursery:
         for system_id in ids:
@@ -123,17 +139,104 @@ async def read_params(ext: "RtlsExtension", ids: Sequence[int], *, fresh: bool) 
             if device is None:
                 continue
             for name in (LOC_PARAM, _STORED_INITIATOR):
-                if name not in device.params or (fresh and name == LOC_PARAM):
+                wanted = name not in device.params or (fresh and name == LOC_PARAM)
+                if wanted and not lacks_param(device, name):
                     nursery.start_soon(read, system_id, name)
+    return sorted(unread)
+
+
+def _stored_values(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, str]:
+    """The ``UWB_LOC`` value each of the anchors ``ids`` holds, as cached."""
+    from .extension import _decoded_device_params
+
+    devices = ext._require_protocol().devices
+    values = {}
+    for system_id in ids:
+        device = devices.get(system_id)
+        cached = _decoded_device_params(device, (LOC_PARAM,)) if device else {}
+        values[system_id] = str(cached.get(LOC_PARAM, ""))
+    return values
+
+
+class CommitRefused(FlockwaveError):
+    """A commit cannot be written; the message is the reason."""
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What a commit writes, kept so that a commit an anchor missed is sent
+    again unchanged."""
+
+    survey_id: int
+    #: the ``UWB_LOC`` value of each anchor of the group
+    values: dict[int, str]
+    #: what each of them held when the plan was made
+    before: dict[int, str]
+
+
+def _not_read(ext: "RtlsExtension", unread: Sequence[int]) -> Optional[str]:
+    names = {view["systemId"]: view["name"] for view in anchor_views(ext)}
+    if not unread:
+        return None
+    return f"{names[unread[0]]}: its stored survey could not be read"
+
+
+async def plan_commit(
+    ext: "RtlsExtension",
+    anchors: Sequence[Anchor],
+    fit: SurveyFit,
+    measurements: Mapping[tuple[int, int], DirectedRange],
+    held: Optional[Plan],
+) -> Plan:
+    """The plan of a commit, from what the anchors store now.
+
+    A new plan takes the next survey ID, which needs the stored ID of every
+    online anchor. A plan ``held`` from a commit an anchor missed is taken
+    again only while every anchor of the group holds either its value or
+    what it held before: anything else was written since, and the plan
+    would overwrite it.
+
+    Raises:
+        CommitRefused: a stored value could not be read, or the held plan
+            is no longer the newest thing written.
+    """
+    ids = [anchor.system_id for anchor in anchors]
+    if held is None:
+        online = [view["systemId"] for view in anchor_views(ext) if view["online"]]
+        reason = _not_read(ext, await read_stored(ext, online, fresh=True))
+        if reason is not None:
+            raise CommitRefused(reason)
+        survey_id = next_survey_id(known_survey_ids(ext))
+        values = location_values(ext, anchors, fit, measurements, survey_id)
+        return Plan(survey_id, values, _stored_values(ext, ids))
+    reason = _not_read(ext, await read_stored(ext, ids, fresh=True))
+    if reason is not None:
+        raise CommitRefused(reason)
+    stored = _stored_values(ext, ids)
+    if any(stored[i] not in (held.values[i], held.before[i]) for i in ids):
+        raise CommitRefused(SURVEY_AGAIN)
+    return held
 
 
 def commit_refusal(
-    ext: "RtlsExtension", anchors: Sequence[Anchor], fit: SurveyFit, stale: bool
+    ext: "RtlsExtension",
+    anchors: Sequence[Anchor],
+    fit: SurveyFit,
+    *,
+    moved: bool,
+    lost: bool,
+    retry: bool,
 ) -> Optional[str]:
-    """Why a held fit cannot be written now, if it cannot."""
+    """Why a held fit cannot be written now, if it cannot. A fit is no
+    longer the cell's when an anchor ``moved`` since the measurement, or was
+    ``lost`` by the server (it may have been carried away while off). The
+    ``retry`` of a commit an anchor missed only needs every anchor back."""
     devices = ext._require_protocol().devices
-    if stale or any(anchor.system_id not in devices for anchor in anchors):
-        return "Survey again"
+    offline = [a.name for a in anchors if a.system_id not in devices]
+    if moved or (not retry and (lost or offline)):
+        return SURVEY_AGAIN
+    if offline:
+        return f"{offline[0]} is offline"
     if ext._cell_applying:
         return "An apply is running"
     if any(

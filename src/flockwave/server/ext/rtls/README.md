@@ -99,10 +99,14 @@ enables it.
   when the server goes away), fits the positions to the ranges, and on the
   operator's commit writes each anchor its `UWB_LOC`: position, survey ID
   and its own measured range to the stored initiator. The anchors are the
-  only store: the survey ID continues from what they hold, a missed write
-  is not rolled back, and the commit does not lock (Control locks after
-  it). While a survey runs, the cell settings, the lock, and sleep and OTA
-  of its anchors are refused. Tags do not use these positions yet.
+  only store: the survey ID continues from what they hold (a commit is
+  refused while an online anchor's stored value cannot be read), a missed
+  write is not rolled back, and the commit does not lock (Control locks
+  after it). The same commit again brings in an anchor that missed it,
+  unless something else was written to the group since. While a survey
+  runs, the cell settings, the lock, and sleep and OTA of its anchors are
+  refused, and its anchors keep the session they last reported through the
+  restarts of their ranging. Tags do not use these positions yet.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -129,6 +133,7 @@ enables it.
 - `survey.py`: `X-RTLS-SURVEY`, the survey run as a state machine and its
   commit; `survey_group.py` who takes part and in which order,
   `survey_request.py` the request's frame and placement,
+  `survey_notify.py` the pushes of its state,
   `survey_commit.py` the survey ID and the `UWB_LOC` values and write.
 - `survey_step.py`: one survey step on the anchors, over the extension's
   own socket: the command and the report are the SDK's (`rtlslink.survey`),

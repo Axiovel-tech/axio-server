@@ -28,15 +28,14 @@ from typing import TYPE_CHECKING, Any, Optional
 import trio
 from rtlslink.survey import ROLE_RESPONDER, SurveyAnchor, hold_for, time_limit
 
-from .anchor_lock import anchor_views
 from .cell_settings import write_refusal
 from .survey_commit import (
     CONFIRM_TIMEOUT,
+    CommitRefused,
+    Plan,
     commit_refusal,
-    known_survey_ids,
-    location_values,
-    next_survey_id,
-    read_params,
+    plan_commit,
+    read_stored,
     running_ids,
     stored_positions,
     write_locations,
@@ -50,6 +49,7 @@ from .survey_fit import (
     frame_refusal,
 )
 from .survey_group import Anchor, block_ms, select_group, step_order
+from .survey_notify import Pulse, StatePusher
 from .survey_request import (
     Placement,
     frame_json,
@@ -64,10 +64,6 @@ if TYPE_CHECKING:
     from .extension import RtlsExtension
 
 __all__ = ("Survey", "handle_survey_request")
-
-#: the state is pushed at most this often, in seconds; the last change of a
-#: burst is pushed when the interval is over
-NOTIFY_INTERVAL = 0.5
 
 RUNNING_STATES = ("measuring", "returning", "committing")
 
@@ -100,11 +96,12 @@ class _Run:
     fit: Optional[SurveyFit] = None
     #: the ``commit`` member of the state
     commit: Optional[dict[str, Any]] = None
-    #: the survey ID and ``UWB_LOC`` values of the commit of this fit, kept
-    #: so that a commit an anchor missed is sent again unchanged
-    plan: Optional[tuple[int, dict[int, str]]] = None
-    #: an anchor went offline or moved since the run started
-    stale: bool = False
+    #: what the commit of this fit wrote, while an anchor has yet to take it
+    plan: Optional[Plan] = None
+    #: since the run started, an anchor newly reported ``moved``, and the
+    #: server lost an anchor
+    moved_since: bool = False
+    lost: bool = False
     cancelled: bool = False
     scope: trio.CancelScope = field(default_factory=trio.CancelScope)
     #: the anchors that reported ranging since the end command was answered
@@ -113,20 +110,6 @@ class _Run:
     @property
     def ids(self) -> list[int]:
         return [anchor.system_id for anchor in self.anchors]
-
-
-class _Pulse:
-    """Wakes every task that waits for the next change."""
-
-    def __init__(self) -> None:
-        self._event = trio.Event()
-
-    def set(self) -> None:
-        self._event.set()
-        self._event = trio.Event()
-
-    async def wait(self) -> None:
-        await self._event.wait()
 
 
 def _merged(first: StepResult, again: StepResult) -> StepResult:
@@ -150,10 +133,8 @@ class Survey:
         self.state = "idle"
         self.reason: Optional[str] = None
         self._run: Optional[_Run] = None
-        self._changed = _Pulse()
-        self._dirty = False
-        self._pushing = False
-        self._pushed_at: Optional[float] = None
+        self._changed = Pulse()
+        self._notify = StatePusher(ext, self._notification).notify
 
     @property
     def running(self) -> bool:
@@ -197,6 +178,9 @@ class Survey:
             state |= run.fit.json
         return state
 
+    def _notification(self) -> dict[str, Any]:
+        return {"type": "X-RTLS-SURVEY", "survey": self.json}
+
     # ---- what the extension tells the survey ----
 
     def keep_session(
@@ -216,45 +200,14 @@ class Survey:
         run = self._run
         if run is not None and system_id in run.moved:
             if stats.get("moved") and not run.moved[system_id]:
-                run.stale = True
+                run.moved_since = True
             if (stats.get("rangingRateHz") or 0) > 0:
                 run.returned.add(system_id)
         self._changed.set()
 
     def on_lost(self, system_id: int) -> None:
         if self._run is not None and system_id in self._run.moved:
-            self._run.stale = True
-
-    def _notify(self) -> None:
-        """Marks the state as changed. A task of its own delivers it, so that
-        an outbound queue without room holds up neither the run, which has
-        anchors to return, nor an answer."""
-        self._dirty = True
-        nursery = self._ext._nursery
-        if nursery is not None and not self._pushing:
-            self._pushing = True
-            nursery.start_soon(self._push)
-
-    async def _push(self) -> None:
-        """Pushes the state while it has changed since the last push, at
-        most twice a second: the last change of a burst goes out when the
-        half second is over."""
-        try:
-            while self._dirty:
-                if self._pushed_at is not None:
-                    await trio.sleep_until(self._pushed_at + NOTIFY_INTERVAL)
-                self._dirty, self._pushed_at = False, trio.current_time()
-                if self._ext.app is None:
-                    self._ext._warn_no_app()
-                    continue
-                hub = self._ext.app.message_hub
-                body = {"type": "X-RTLS-SURVEY", "survey": self.json}
-                await hub.broadcast_message(hub.create_notification(body))
-        except Exception as ex:
-            if self._ext.log:
-                self._ext.log.warning(f"rtls: survey notification not sent: {ex!r}")
-        finally:
-            self._pushing = False
+            self._run.lost = True
 
     # ---- the actions ----
 
@@ -341,40 +294,58 @@ class Survey:
         if run is None or self.state != "ready" or run.fit is None:
             return "refused", "There is no fit to commit"
         fit = run.fit
-        reason = commit_refusal(self._ext, run.anchors, fit, run.stale)
+        reason = self._commit_refusal(run, fit)
         if reason is not None:
             return "refused", reason
         if fit.blocked:
             return "blocked", None
         if fit.warnings and body.get("acknowledgeWarnings") is not True:
             return "warnings", None
-        self.state, self.reason = "committing", None
+        held, self.state, self.reason = self.reason, "committing", None
+        self._notify()
         committed = False
         try:
-            self._notify()
-            committed = await self._write_and_confirm(run, fit)
+            try:
+                plan = await plan_commit(
+                    self._ext, run.anchors, fit, run.measurements, run.plan
+                )
+                # the reads took time: what allowed the commit may be gone
+                reason = self._commit_refusal(run, fit)
+            except CommitRefused as ex:
+                reason = str(ex)
+            else:
+                if reason is None:
+                    run.plan = plan
+                    committed = await self._write_and_confirm(run, plan)
         finally:
             self.state = "committed" if committed else "ready"
-            self.reason = None if committed else INCOMPLETE
+            self.reason = None if committed else held if reason else INCOMPLETE
         self._notify()
+        if reason is not None:
+            return "refused", reason
         return ("committed", None) if committed else ("incomplete", INCOMPLETE)
 
-    async def _write_and_confirm(self, run: _Run, fit: SurveyFit) -> bool:
+    def _commit_refusal(self, run: _Run, fit: SurveyFit) -> Optional[str]:
+        return commit_refusal(
+            self._ext,
+            run.anchors,
+            fit,
+            moved=run.moved_since,
+            lost=run.lost,
+            retry=run.plan is not None,
+        )
+
+    async def _write_and_confirm(self, run: _Run, plan: Plan) -> bool:
         """Writes every anchor of the group its position and waits until
         each reports the new survey ID; whether every anchor did both. The
         ID is the one an anchor reports, never the -1 of a restart, which a
         simulated anchor does not show."""
-        ext = self._ext
-        if run.plan is None:
-            online = [view["systemId"] for view in anchor_views(ext) if view["online"]]
-            await read_params(ext, online, fresh=True)
-            survey_id = next_survey_id(known_survey_ids(ext))
-            values = location_values(ext, run.anchors, fit, run.measurements, survey_id)
-            run.plan = survey_id, values
-        survey_id, values = run.plan
+        ext, survey_id = self._ext, plan.survey_id
         running: list[int] = []
         commit = run.commit = {"surveyId": survey_id, "results": {}, "running": running}
-        results = commit["results"] = await write_locations(ext, run.anchors, values)
+        results = commit["results"] = await write_locations(
+            ext, run.anchors, plan.values
+        )
         self._notify()
         written = {
             anchor.system_id
@@ -407,7 +378,7 @@ class Survey:
         try:
             await self._return(run)
             if failure is None and not run.cancelled:
-                await read_params(self._ext, run.ids, fresh=False)
+                await read_stored(self._ext, run.ids, fresh=False)
                 try:
                     run.fit = self._fitted(run, run.frame, run.placement)
                 except SurveyFitError as ex:

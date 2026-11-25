@@ -344,10 +344,12 @@ async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
     ext._inf_pending = False
 
     # 201 is the cell's reference: without it every device reads unknown
-    await cell.report([201, 204], **restarting)
+    await cell.report([201], **restarting)
 
-    kept = {"cellConfig": CODE_50, "txGain": 47, "surveyId": None}
+    kept = {"cellConfig": CODE_50, "txGain": 47}
     assert {key: ext._stats[201][key] for key in kept} == kept
+    assert not ext._inf_pending
+    await cell.report([204], **restarting)
     # an anchor outside the survey is believed
     assert ext._stats[204]["cellConfig"] is None
     assert cell_states(ext)[201] == cell_states(ext)[202] == ("ok", None)
