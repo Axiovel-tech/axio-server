@@ -65,10 +65,12 @@ class AnchorTable:
             key=lambda entry: (entry.row is None, entry.row or 0, entry.mac),
         )
 
-    def report(self, value: float) -> None:
+    def report(self, value: float, left_out: Optional[float] = None) -> None:
         """Takes the ``antbl`` of one report: 0 empties the table, an entry
         replaces what its anchor and its row held, and an anchor the
-        rotation stopped naming leaves."""
+        rotation stopped naming leaves. The table never names more anchors
+        left out than the tag counts in the same report (``left_out``, its
+        ``anexc``): those named longest ago left its tracker."""
         self._reports += 1
         if value == 0:
             self._entries.clear()
@@ -80,6 +82,11 @@ class AnchorTable:
         kept = ROTATIONS_KEPT * len(self._entries)
         for mac, named_at in list(self._named_at.items()):
             if self._reports - named_at > kept:
+                self._forget(mac)
+        if left_out is not None:
+            named = [mac for mac, entry in self._entries.items() if entry.row is None]
+            named.sort(key=self._named_at.__getitem__)
+            for mac in named[: max(0, len(named) - int(left_out))]:
                 self._forget(mac)
 
     def _name(self, mac: int, state: int, row: Optional[int]) -> None:

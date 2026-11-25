@@ -1314,7 +1314,7 @@ class RtlsExtension(Extension):
             self._anchor_tables.pop(system_id, None)
             return None
         table = self._anchor_tables.setdefault(system_id, AnchorTable())
-        table.report(value)
+        table.report(value, _finite_stat(data, "anexc"))
         system_ids = self._anchor_system_ids()
         return [
             {

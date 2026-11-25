@@ -376,7 +376,7 @@ async def test_a_tags_report_reaches_the_stats_as_the_firmware_sends_it(dialect)
 
     def report(entry, boot_ms):
         """A whole health report in one datagram."""
-        stats = {**TAG_STATS, "antbl": entry}
+        stats = {**TAG_STATS, "anexc": 1.0, "antbl": entry}
         return b"".join(
             tag.named_value_float(name, value, boot_ms) for name, value in stats.items()
         )
@@ -393,7 +393,7 @@ async def test_a_tags_report_reaches_the_stats_as_the_firmware_sends_it(dialect)
     assert (stats["surveyId"], stats["anchorsUsed"], stats["anchorsExcluded"]) == (
         1,
         4,
-        0,
+        1,
     )
     assert stats["surveyDriftM"] == 0.02
     assert stats["anchorTable"] == [
@@ -416,6 +416,7 @@ async def test_the_anchor_table_is_assembled_over_the_rotation(dialect):
         antbl(4, state=OTHER_SURVEY),
         antbl(1, row=0),
         antbl(3, row=2),
+        anexc=2.0,
     )
 
     # the rows first, by row; then the anchors left out; an anchor that is
@@ -463,12 +464,39 @@ async def test_an_anchor_that_changes_state_or_takes_a_row_replaces_the_old(dial
     ext, _ = await surveyed_cell(dialect)
     await tag_reports(ext, antbl(1, row=0), antbl(2, row=1))
 
-    await tag_reports(ext, antbl(2, state=NO_POSITION), antbl(3, row=0))
+    await tag_reports(ext, antbl(2, state=NO_POSITION), antbl(3, row=0), anexc=1.0)
 
     assert anchor_table(ext) == [
         {"row": 0, "mac": 3, "state": "in-use", "systemId": 203},
         {"row": None, "mac": 2, "state": "no-position", "systemId": 202},
     ]
+
+
+async def test_the_table_names_no_more_left_out_anchors_than_the_tag_counts(
+    dialect, builder, hub
+):
+    ext, _ = await surveyed_cell(dialect)
+    await anchors_report(ext)
+    await tag_reports(
+        ext,
+        antbl(1, row=0),
+        antbl(4, state=OTHER_SURVEY),
+        antbl(0x0777, state=NO_POSITION),
+        anexc=2.0,
+    )
+
+    def left_out():
+        return [entry["mac"] for entry in anchor_table(ext) if entry["row"] is None]
+
+    assert left_out() == [4, 0x0777]
+    # one left the tag's tracker: the one named longest ago goes
+    await tag_reports(ext, antbl(1, row=0), anexc=1.0)
+    assert left_out() == [0x0777]
+
+    # the tag leaves no anchor out: none is named, whatever was cached
+    await tag_reports(ext, antbl(1, row=0), anexc=0.0)
+    assert left_out() == []
+    assert (await inf(ext, builder, hub))["survey"]["excluding"] == {}
 
 
 async def test_a_tag_that_tracks_no_anchor_has_an_empty_table(dialect):
