@@ -60,8 +60,10 @@ class SurveyCell:
         self.refused_steps = {}
         #: anchors whose radio does not start a step
         self.failing = set()
-        #: anchors that report a range to another peer than the initiator
+        #: anchors that report a range to another peer than the initiator,
+        #: and responders that report a step as if they led it
         self.misreporting = set()
+        self.wrong_role = set()
         #: how many more step commands an anchor does not hear
         self.unheard = {}
         #: which of the steps an anchor is commanded it completes no report
@@ -195,7 +197,7 @@ class SurveyCell:
         }
         if system_id in self.failing:
             frames["svst"] = 3
-        elif system_id == initiator:
+        elif system_id == initiator or system_id in self.wrong_role:
             frames |= {"svrole": 2, "svn": rounds}
         else:
             pair = (initiator, system_id)

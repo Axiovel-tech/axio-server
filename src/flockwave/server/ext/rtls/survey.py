@@ -425,8 +425,7 @@ class Survey:
             if result.ends_survey:
                 return self._step_failure(run, result)
             for system_id, report in result.reports.items():
-                ranged = report.role == ROLE_RESPONDER and report.samples
-                if ranged and report.peer_mac == initiator.mac:
+                if report.role == ROLE_RESPONDER and report.samples:
                     run.measurements[initiator.system_id, system_id] = DirectedRange(
                         range_m=report.range_m or 0.0,
                         mad_m=report.mad_m or 0.0,

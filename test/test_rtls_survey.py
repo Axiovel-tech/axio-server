@@ -163,6 +163,8 @@ async def test_a_run_steps_every_anchor_returns_them_and_fits(
             "share": 0.98,
         }
     )
+    # a range is what a responder measured: twelve directions, no other
+    assert len(cell.ext._survey._run.measurements) == 12
     fit = survey["fit"]
     assert fit["planar"] is True
     for system_id, truth in FLAT.items():
@@ -282,11 +284,17 @@ async def test_a_report_still_missing_leaves_its_range_out(
     assert pair["ab"] is None and pair["ba"]["n"] == 98
 
 
-async def test_a_range_to_another_peer_than_the_initiator_is_not_taken(
-    cell, builder, hub, autojump_clock
+@pytest.mark.parametrize("fault", ["misreporting", "wrong_role"])
+async def test_a_report_counts_only_from_the_anchors_role_and_to_the_initiator(
+    cell, builder, hub, autojump_clock, fault
 ):
-    cell.misreporting.add(203)
+    # 203 reports its range to another peer, or reports as if it led the step
+    getattr(cell, fault).add(203)
+
     survey = await measure(cell, builder, hub)
+
+    # the steps it does not lead are not complete without it: each runs twice
+    assert _initiators(cell) == [1, 1, 2, 2, 3, 4, 4]
     for pair in survey["pairs"]:
         measured_by_203 = "ab" if pair["b"] == 203 else "ba"
         if 203 in (pair["a"], pair["b"]):

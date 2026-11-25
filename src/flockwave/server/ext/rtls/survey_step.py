@@ -27,6 +27,8 @@ from rtlslink.survey import (
     END,
     HOLD_MARGIN_S,
     PARAM,
+    ROLE_INITIATOR,
+    ROLE_RESPONDER,
     STATE_COMPLETE,
     STATE_FAILED,
     StepReport,
@@ -141,12 +143,19 @@ async def run_step(
     Writes the command to every anchor at once, then waits up to ``timeout``
     seconds for a complete report from each, repeating the command when the
     anchors would not hold the step that long. Returns at once when an anchor
-    does not take the command or goes offline. The anchors are left in the
-    step: the next step or :func:`end_survey` moves them on.
+    does not take the command or goes offline. A report counts only when it
+    is this step's by more than its ID: from the role the anchor has in the
+    step and, for a responder, with the step's initiator as its peer. The
+    anchors are left in the step: the next step or :func:`end_survey` moves
+    them on.
     """
     responders = [member.mac for member in group if member != initiator]
     command = encode_step(step_id, rounds, hold, initiator.mac, responders)
-    waiting = {member.system_id for member in group}
+    roles = {
+        member.system_id: ROLE_INITIATOR if member == initiator else ROLE_RESPONDER
+        for member in group
+    }
+    waiting = roles.keys()
     reports: dict[int, StepReport] = {}
     renew_every = hold / 2 if hold < timeout + HOLD_MARGIN_S else math.inf
 
@@ -170,6 +179,9 @@ async def run_step(
                     problems[event.system_id] = StepProblem("offline", "went offline")
                 elif event.kind == REPORT_EVENT and event.data["stepId"] == step_id:
                     report = StepReport.from_event(event)
+                    ranged_elsewhere = report.peer_mac not in (None, initiator.mac)
+                    if report.role != roles[report.system_id] or ranged_elsewhere:
+                        continue
                     reported = report.system_id in reports
                     if report.state == STATE_COMPLETE:
                         reports[report.system_id] = report
