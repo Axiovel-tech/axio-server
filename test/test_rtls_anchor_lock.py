@@ -270,7 +270,8 @@ async def test_a_board_without_a_power_path_locks(dialect, builder, hub):
     # such a board reports only pwrst 5 (operating); that is enough
     ext, devices = await _cell(dialect, anchors=((201, 2, 1),))
     anchor = devices[201]
-    for name, value in (("pwrst", 5.0), ("cellcfg", CODE_50), ("txgain", 47.0)):
+    stats = (("pwrst", 5.0), ("cellcfg", CODE_50), ("txgain", 47.0), ("sid", 1.0))
+    for name, value in stats:
         await ext._process_datagram(
             anchor.named_value_float(name, value), anchor.address, time.monotonic()
         )

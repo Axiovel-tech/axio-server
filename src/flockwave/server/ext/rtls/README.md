@@ -3,7 +3,7 @@
 Manages rtls-link UWB anchors and tags over their MAVLink management link
 and exposes them to Control as the `X-RTLS-*` messages: discovery and
 presence, parameters, sleep and wake, OTA, health and position telemetry,
-anchors as map beacons, the fleet geometry check and the pre-flight
+anchors as map beacons, the anchor survey and the pre-flight
 verification. It also owns the server's estimate of the UWB cluster clock,
 which the `mavlink` extension needs to send a show start in cluster time.
 
@@ -12,7 +12,6 @@ What other repos rely on lives in [AxioStack `contracts/`](https://github.com/Ax
 | Topic | Contract |
 |---|---|
 | the `X-RTLS-*` messages Control and axio-e2e use | [`rtls-client-api.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-client-api.md) |
-| the tag's geometry stats and what each failure code means | [`rtls-geometry-stats.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-geometry-stats.md) |
 | the pre-show health metrics and their zones | [`rtls-fleet-health.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/rtls-fleet-health.md) |
 | the cluster clock and the show start | [`show-timing.md`](https://github.com/Axiovel-tech/AxioStack/blob/main/contracts/show-timing.md) |
 
@@ -66,9 +65,27 @@ enables it.
 
 ## Things the code does not make obvious
 
-- **The server never writes anchor tables.** Every tag fits the cell itself
-  at boot. `X-RTLS-GEOM` only compares the fits across the fleet, and a tag
-  refits on `UWB_GEOM_RECAL=1`.
+- **The anchors own the geometry.** Each anchor stores its position and a
+  survey ID (`UWB_LOC`) and advertises them; a tag holds no anchor list and
+  positions on the anchors of one survey ID that it hears. So the server
+  writes no table and no bias to a tag and reads none from it. An anchor's
+  position in `X-RTLS-INF` is the one that anchor stores (its `UWB_LOC` is
+  read again when the survey ID it advertises is not the cached one), and
+  only its place on the map needs a tag: the origin of the lowest online
+  tag of its cell.
+- **The survey the cell is on is derived, never stored.** An anchor is on
+  the survey ID its session advertises (`sid`), or on the one it stores
+  while it runs no session; the cell is on the ID most online anchors are
+  on, the newer of two held equally. One server is one cell here too. A tag
+  is positioned when it follows that ID and uses four anchors, or three when
+  every anchor that advertises it is `planar` (`survey_view.positioned`),
+  and it is expected to use the anchors that advertise the ID now: what a
+  sleeping anchor stores is that anchor's own finding.
+- **A tag's anchor table arrives one anchor per report.** `antbl` rotates
+  over the anchors the tag tracks; the server assembles `anchorTable` and
+  drops an anchor not named for two rotations. A rotation is counted in
+  stats events of the tag, of which its 10 s status report is one more.
+  Bit *i* of a tag's anchor masks is row *i* of that table.
 - **OTA has no bootloader revert.** MCUboot on the ESP32-S3 is
   overwrite-only, and the SDK confirms every uploaded image, so a bad image
   is recovered by uploading the previous one. Tag and anchor images are
@@ -103,10 +120,44 @@ enables it.
   refused while an online anchor's stored value cannot be read), a missed
   write is not rolled back, and the commit does not lock (Control locks
   after it). The same commit again brings in an anchor that missed it,
-  unless something else was written to the group since. While a survey
-  runs, the cell settings, the lock, and sleep and OTA of its anchors are
-  refused, and its anchors keep the session they last reported through the
-  restarts of their ranging. Tags do not use these positions yet.
+  unless an anchor of the group moved or restarted since the measurement, or
+  something else was written to the group. A start and a commit are refused
+  while a drone reports itself armed; an unknown arming state does not
+  refuse, and a drone armed during a run does not stop it. While a survey
+  runs, the cell
+  settings, the lock, and sleep and OTA of its anchors are refused, and its
+  anchors keep the session they last reported through the restarts of their
+  ranging. An online anchor of the group's cell must be in the group unless
+  it reports another power state than operating: left out while it ranges,
+  it would lose its initiator at every step and keep the old survey ID. A
+  start that leaves one out is refused, and a start that names no group
+  takes exactly those anchors.
+- **A commit names the survey it commits.** The survey state carries a
+  `revision`, in every reply and notification, that the server raises on
+  every change of what it holds (a phase, a measurement, a fit, a commit's
+  result, a cancel) and never lowers: a new instance of the extension starts
+  at the wall clock in milliseconds. `commit` must carry the
+  current one and `fit` may; a request with another is refused with the
+  reason `stale` and writes nothing, so a client cannot commit a fit another
+  client replaced while it was looking at the old one.
+- **A height group is "about the same height".** With one height group in
+  the frame its anchors share one height exactly: ranges within one plane
+  cannot tell heights apart, and the survey is `planar`. With two or more,
+  every anchor gets its own height, held within 0.05 m (one sigma,
+  `HEIGHT_TOLERANCE_M`) of its group's common height, and
+  `fit.anchors[id].heightOffsetM` says how far it stands above it (null for
+  an anchor in no group, 0 in the exact case). A group of one is no group:
+  the server drops it when it reads the frame, that anchor's height is free,
+  and the frame echoed in the state is the frame as used. z = 0 is the
+  common height of the origin's group. Ranges do not know which way is up
+  either: "level" is the tilt of the cell that leaves the least offsets, so
+  one anchor 4 cm off a four-anchor tier reads about +2 cm and its
+  neighbours the rest. The pulls are not part of `rmsM` or of any pair's
+  residual.
+- **Firmware lane stalls are in the server log only.** A board sends a stall
+  of 250 ms or more once, after it ended; the `logging` extension's
+  `skybrushd.log` keeps the line with its time. The cause is in the board's
+  `lanes` shell command until it reboots.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
@@ -128,8 +179,10 @@ enables it.
 - `cell_settings.py`: `X-RTLS-CELL`, the per-device cell-settings state,
   the `cellSettings` summary, its lock warning and Verify rule.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
-- `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
-  stats.
+- `survey_view.py`: the survey the cell is on: the `survey` member of
+  `X-RTLS-INF`, the lock warnings `not-surveyed` and `range-deviation`, the
+  Verify rules `survey` and `anchors`.
+- `tag_table.py`: a tag's anchor table assembled from `antbl`.
 - `survey.py`: `X-RTLS-SURVEY`, the survey run as a state machine and its
   commit; `survey_group.py` who takes part and in which order,
   `survey_request.py` the request's frame and placement,
@@ -142,8 +195,6 @@ enables it.
   survey, and the gate on committing them. Pure, numpy only.
 - `verify.py`: `X-RTLS-VERIFY`.
 - `fc_identity.py`: the tag-to-drone pairing.
-- `fitted_cell.py`, `cell_compat.py`: the anchor cell built from a tag's
-  fit, and fallbacks for SDK pins that predate the cell helpers.
 - `selfcheck.py`: deprecated shim for `rtls-link selfcheck`.
 
 ## Tests
@@ -155,5 +206,6 @@ uv run pytest test/test_ext_rtls.py test/test_rtls_*.py
 The tests drive the handlers against the SDK's sans-IO protocol core with a
 scripted fake device, without sockets. Protocol tests belong to the SDK, in
 rtls-link-zephyr `py/tests/`. `test/rtls_support.py`,
-`test/anchor_lock_support.py` and `test/survey_support.py` (anchors that
-take survey steps and store positions) hold the fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.
+`test/anchor_lock_support.py`, `test/survey_support.py` (anchors that
+take survey steps and store positions) and `test/survey_view_support.py`
+(a surveyed cell and a tag that reports its table) hold the fakes; `test/test_ext_show_anchor_gate.py` covers the show gate.

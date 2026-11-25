@@ -6,6 +6,7 @@ the survey ID it runs included, when the test lets it."""
 
 import math
 import time
+from types import SimpleNamespace
 
 import trio
 from anchor_lock_support import HEALTHY_A0, HEALTHY_A1, _cell
@@ -29,6 +30,9 @@ TIERS = FLAT | {
     207: (4.1, 3.0, -2.4),
     208: (0.2, 2.9, -2.4),
 }
+
+#: what a sleeping anchor reports instead of a session
+ASLEEP = {"pwrst": 3.0, "cellcfg": -1.0, "txgain": -1.0, "sid": -1.0, "rnghz": 0.0}
 
 STEP_PARAM = "UWB_SURVEY"
 LOC_PARAM = "UWB_LOC"
@@ -123,6 +127,13 @@ class SurveyCell:
                 **stats,
             }
             await self.ext._on_stats(system_id, body, time.monotonic())
+
+    async def asleep(self, *ids):
+        """The anchors of ``ids`` sleep from now on: they run no session,
+        and a survey may leave them out."""
+        for system_id in ids:
+            self.stats[system_id] = ASLEEP
+        await self.report(ids)
 
     def lose(self, system_id):
         """The anchor's heartbeats stopped long ago: the extension loses it."""
@@ -259,15 +270,32 @@ async def survey_cell(dialect, nursery, positions=FLAT):
 
 
 async def request(cell, builder, hub, action=None, **body):
-    """The body of the answer to an X-RTLS-SURVEY request."""
+    """The body of the answer to an X-RTLS-SURVEY request. A commit names
+    the revision the server holds, as a client that shows the last status
+    does, unless the test names one."""
     if action is not None:
         body["action"] = action
+    if action == "commit":
+        body.setdefault("revision", cell.ext._survey.revision)
     message = make_message(builder, {"type": "X-RTLS-SURVEY"} | body)
     response = await cell.ext._handle_RTLS_SURVEY(message, None, hub)
     return response.body
 
 
+def held(state):
+    """A survey state without its revision: what the survey holds."""
+    return {key: value for key, value in state.items() if key != "revision"}
+
+
 TWO_TIERS = {"preset": "two-tiers"}
+
+
+def fly_drone(ext, armed):
+    """The server knows drone 17, with this arming state (None: unknown)."""
+    uav = SimpleNamespace(status=SimpleNamespace(armed=armed))
+    ext.app.object_registry = SimpleNamespace(
+        ids_by_type=lambda _type: ["17"], find_by_id=lambda _id: uav
+    )
 
 
 def authorize_show(ext):

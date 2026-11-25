@@ -3,6 +3,7 @@
 what each anchor is written, and an anchor that misses it."""
 
 import math
+import time
 
 import pytest
 import trio
@@ -18,6 +19,8 @@ from survey_support import (
     TWO_TIERS,
     authorize_show,
     commit,
+    fly_drone,
+    held,
     measure,
     request,
     survey_cell,
@@ -25,7 +28,7 @@ from survey_support import (
 )
 
 from flockwave.server.ext.rtls import survey as survey_module
-from flockwave.server.ext.rtls.extension import _stats_json
+from flockwave.server.ext.rtls.extension import RtlsExtension, _stats_json
 from flockwave.server.ext.rtls.survey_commit import next_survey_id, write_locations
 from flockwave.server.ext.rtls.survey_group import Anchor
 from flockwave.server.message_hub import MessageHub
@@ -90,6 +93,47 @@ def _codes(entries):
 )
 def test_the_survey_id_is_one_more_than_the_newest_stored(stored, expected):
     assert next_survey_id(stored) == expected
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ([1, 0x8000, 0xFFFE], 2),
+        ([0xFFFE, 0x8000, 1], 2),
+        ([0x8000, 1, 0xFFFE], 2),
+        ([0xFFFE, 1, 2, 3], 4),
+        ([0x8000, 0xFFFE, 1, 2], 3),
+        ([5, 6, 7, 0x8006], 0x8007),
+    ],
+)
+def test_the_survey_id_is_never_one_an_anchor_still_holds(stored, expected):
+    assert next_survey_id(stored) == expected
+
+
+def test_a_survey_id_is_found_whatever_ids_the_anchors_hold():
+    stored = [1 + (step * 0x1FFF) % 0xFFFE for step in range(16)]
+
+    for turn in range(len(stored)):
+        held_ids = stored[turn:] + stored[:turn]
+        assert 1 <= next_survey_id(held_ids) <= 0xFFFE
+        assert next_survey_id(held_ids) not in held_ids
+
+
+async def test_a_commit_does_not_reuse_the_id_of_an_offline_anchor(
+    cell, builder, hub, autojump_clock
+):
+    for system_id, survey_id in ((202, 1), (203, 0x8000), (204, 0xFFFE)):
+        _store(cell, system_id, survey_id)
+        await cell.ext.get_param(system_id, LOC_PARAM)
+    cell.lose(202)
+    group = [201, 203, 204]
+    await measure(cell, builder, hub, anchors=group)
+
+    answer = await commit(cell, builder, hub, reporting=group)
+
+    assert answer["result"] == "committed"
+    assert answer["survey"]["commit"]["surveyId"] == 2
+    assert {cell.stored(system_id).location.survey_id for system_id in group} == {2}
 
 
 async def test_commit_writes_every_anchor_its_position_and_confirms(
@@ -181,6 +225,7 @@ async def test_the_reference_is_the_range_the_anchor_itself_measured(
 async def test_the_reference_is_unknown_without_the_stored_initiator(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(201)
     await measure(cell, builder, hub, anchors=[202, 203, 204])
     answer = await commit(cell, builder, hub, reporting=[202, 203, 204])
 
@@ -273,6 +318,7 @@ def _while_the_commit_reads(monkeypatch, happen):
         ("lost", "Survey again"),
         ("locked", "Unlock the anchors first"),
         ("authorized", "A show is authorized"),
+        ("armed", "Drone 17 is armed"),
     ],
 )
 async def test_what_changes_while_the_commit_reads_still_refuses_it(
@@ -287,6 +333,8 @@ async def test_what_changes_while_the_commit_reads_still_refuses_it(
             cell.lose(203)
         elif change == "locked":
             await cell.report([203], lock=1.0)
+        elif change == "armed":
+            fly_drone(cell.ext, armed=True)
         else:
             authorize_show(cell.ext)
 
@@ -337,6 +385,7 @@ async def test_the_survey_id_is_not_given_without_every_anchors_stored_one(
 ):
     # 204 holds survey 1 of another server; this one never read it and its
     # read gets no answer
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     _store(cell, 204, 1)
     del cell.ext._protocol.devices[204].params[LOC_PARAM]
@@ -361,6 +410,7 @@ async def test_an_anchor_shown_to_have_no_position_parameter_holds_no_survey(
     cell, builder, hub, autojump_clock
 ):
     # an anchor image from before UWB_LOC: its complete list has no such name
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     old = cell.ext._protocol.devices[204]
     del old.params[LOC_PARAM]
@@ -389,7 +439,7 @@ async def test_a_retry_does_not_write_over_a_newer_survey(
     answer = await commit(cell, builder, hub)
 
     assert (answer["result"], answer["reason"]) == ("refused", "Survey again")
-    assert answer["survey"] == incomplete["survey"]
+    assert held(answer["survey"]) == held(incomplete["survey"])
     assert cell.locations == []
     assert {cell.stored(system_id).location.survey_id for system_id in IDS} == {2}
 
@@ -803,6 +853,7 @@ async def test_commit_is_refused_while_the_cell_may_not_be_written(
 async def test_commit_is_refused_by_a_lock_of_a_device_of_unknown_role(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[201, 202, 203])
     del cell.ext._protocol.devices[204].params["UWB_ROLE"]
     await cell.report([204], lock=1.0)
@@ -836,7 +887,7 @@ async def test_a_commit_runs_alone_and_tells_its_clients(
     await trio.sleep(0.5)
 
     states = [(s["state"], s["commit"] is not None) for s in cell.broadcasts[pushed:]]
-    assert states == [("committing", False), ("ready", True)]
+    assert states == [("committing", False), ("committing", True), ("ready", True)]
 
 
 async def test_each_push_of_a_commit_says_what_was_known_then(
@@ -863,3 +914,255 @@ def test_the_survey_id_stat_reads_null_without_a_survey():
     assert _stats_json(201, {"sid": 0.0}, "anchor-responder")["surveyId"] is None
     assert _stats_json(201, {"sid": -1.0}, "anchor-responder")["surveyId"] is None
     assert "surveyId" not in _stats_json(201, {}, "anchor-responder")
+
+
+# ---- the revision of the held survey ---------------------------------------
+
+
+async def test_a_commit_of_a_fit_another_client_replaced_writes_nothing(
+    cell, builder, hub, autojump_clock
+):
+    shown = (await measure(cell, builder, hub)).get("revision")
+    # another client fits again, with another origin and +x anchor
+    frame = {"origin": 202, "xAxis": 201, "heightGroups": [IDS], "yPositive": 203}
+    refit = await request(cell, builder, hub, "fit", frame=frame)
+    assert refit["result"] == "fitted"
+
+    answer = await request(cell, builder, hub, "commit", revision=shown)
+
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert answer["survey"]["state"] == "ready"
+    assert cell.locations == []
+    current = answer["survey"]["revision"]
+    assert current == refit["survey"]["revision"] > shown
+
+    answer = await commit(cell, builder, hub, revision=current)
+    assert answer["result"] == "committed"
+    assert cell.stored(202).location.ned_m == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize("revision", [None, True, "7", -1])
+async def test_a_commit_needs_the_current_revision(
+    cell, builder, hub, autojump_clock, revision
+):
+    await measure(cell, builder, hub)
+
+    answer = await request(cell, builder, hub, "commit", revision=revision)
+
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert cell.locations == []
+
+
+async def test_a_fit_that_carries_a_revision_needs_the_current_one(
+    cell, builder, hub, autojump_clock
+):
+    survey = await measure(cell, builder, hub)
+    frame = {"origin": 202, "xAxis": 201, "heightGroups": [IDS], "yPositive": 203}
+
+    answer = await request(
+        cell, builder, hub, "fit", frame=frame, revision=survey["revision"] - 1
+    )
+    assert (answer["result"], answer["reason"]) == ("refused", "stale")
+    assert answer["survey"]["frame"]["origin"] == 201
+    assert answer["survey"]["revision"] == survey["revision"]
+
+    answer = await request(
+        cell, builder, hub, "fit", frame=frame, revision=survey["revision"]
+    )
+    assert answer["result"] == "fitted"
+    # a fit that carries none is taken as before
+    assert (await request(cell, builder, hub, "fit"))["result"] == "fitted"
+
+
+async def test_the_revision_rises_with_every_change_and_never_falls(
+    cell, builder, hub, autojump_clock
+):
+    seen = [(await request(cell, builder, hub))["survey"]["revision"]]
+
+    async def after(action=None, **body):
+        answer = await request(cell, builder, hub, action, **body)
+        seen.append(answer["survey"]["revision"])
+        return answer
+
+    await after("start", anchors=IDS, frame=TWO_TIERS)
+    await until(cell, "returning")
+    await after()
+    await cell.report()
+    await until(cell, "ready")
+    await after()
+    await after("fit")
+    await after("commit", revision=None)
+    unchanged = len(seen)
+    seen.append((await commit(cell, builder, hub))["survey"]["revision"])
+    await after("start", anchors=IDS, frame=TWO_TIERS)
+    await after("cancel")
+    await until(cell, "idle")
+    await after()
+
+    assert seen[unchanged - 1] == seen[unchanged - 2]  # a refusal changes nothing
+    rises = [b - a for a, b in zip(seen, seen[1:])]
+    assert min(rises) >= 0 and sum(1 for rise in rises if rise) >= 8
+    # every push carries it, and in order
+    pushed = [state["revision"] for state in cell.broadcasts]
+    assert pushed == sorted(pushed) and pushed[-1] == seen[-1]
+
+    # an extension that stops and starts again goes on counting
+    cell.ext._forget_run_state()
+    assert cell.ext._survey.revision > seen[-1]
+
+
+async def test_a_commit_that_waits_for_its_writes_is_a_new_revision(
+    cell, builder, hub, nursery, autojump_clock, monkeypatch
+):
+    await measure(cell, builder, hub)
+    cell.location_silent.add(204)
+    seen = []
+
+    async def look():
+        seen.append(cell.ext._survey.json)
+
+    _while_the_commit_reads(monkeypatch, look)
+    for _ in range(2):  # the commit and its retry
+        nursery.start_soon(request, cell, builder, hub, "commit")
+        await trio.sleep(0.1)
+        await look()
+        await cell.report()
+        await until(cell, "ready")
+
+    none_yet, writing, retry, writing_again = seen
+    waiting = {"surveyId": 1, "results": {}, "running": []}
+    assert none_yet["commit"] is None
+    assert writing["commit"] == writing_again["commit"] == waiting
+    assert retry["commit"]["results"] != {}
+    assert writing["revision"] == none_yet["revision"] + 1
+    assert writing_again["revision"] == retry["revision"] + 1
+
+
+async def test_a_new_instance_of_the_extension_goes_on_above_the_last_revision(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+    cell.ext._forget_run_state()
+    last = cell.ext._survey.revision
+    time.sleep(0.1)  # a reload of the extension takes longer
+
+    revision = RtlsExtension()._survey.revision
+
+    assert revision > last
+    assert type(revision) is int and revision < 2**53  # exact in a JSON double
+
+
+# ---- an anchor that rebooted since it was measured -------------------------
+
+REBOOTED = "RTLS anchor A2 restarted since it was surveyed; survey again"
+
+
+async def test_a_commit_is_refused_after_an_anchor_of_the_group_rebooted(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+
+    # 203 was off and is back: one more boot, and its motion latch is new
+    await cell.report([203], boots=4.0, moved=0.0)
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+    assert cell.locations == []
+    # and stays refused: the measurement is no longer the cell's
+    await cell.report()
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+
+
+async def _health(cell, uptime_ms):
+    """A stat frame of 203 at that uptime through the SDK, then the anchor's
+    whole health as the other tests report it."""
+    anchor = cell.devices[203]
+    frame = anchor.named_value_float("rnghz", 50.0, uptime_ms)
+    await cell.ext._process_datagram(frame, anchor.address, time.monotonic())
+    await cell.report([203])
+
+
+async def test_a_reboot_shows_in_the_uptime_of_an_anchors_stats(
+    cell, builder, hub, autojump_clock
+):
+    await _health(cell, 900_000)
+    await measure(cell, builder, hub)
+    await _health(cell, 901_000)
+    assert (await commit(cell, builder, hub, acknowledgeWarnings=True))[
+        "result"
+    ] == "committed"
+
+    cell.locations.clear()
+    await measure(cell, builder, hub)
+    await _health(cell, 4_000)  # the SDK forgets its stats: no boot count yet
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+
+
+async def test_a_reboot_refuses_the_retry_of_a_commit_an_anchor_missed(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+    cell.location_silent.add(204)
+    assert (await commit(cell, builder, hub))["result"] == "incomplete"
+    cell.location_silent.clear()
+    cell.locations.clear()
+
+    # the anchor that missed the write is off, moved and back
+    cell.lose(204)
+    anchor = cell.devices[204]
+    await cell.ext._process_datagram(anchor.heartbeat(), anchor.address, 0.0)
+    assert await _commit_refusal(cell, builder, hub) == (
+        "Still waiting for RTLS anchor A3 to report"
+    )
+    await cell.report([204], boots=4.0)
+
+    assert await _commit_refusal(cell, builder, hub) == (
+        "RTLS anchor A3 restarted since it was surveyed; survey again"
+    )
+    assert cell.locations == []
+
+
+@pytest.mark.parametrize(
+    ("measured", "since"),
+    [
+        # two frames of one boot swapped places
+        (102_000, (100_000, 103_000)),
+        # the 32-bit uptime wrapped, without and with frames that swapped
+        (2**32 - 700, (300, 1_300)),
+        (2**32 - 700, (300, 2**32 - 200, 1_300)),
+    ],
+)
+async def test_an_uptime_that_is_late_or_wraps_is_no_reboot(
+    cell, builder, hub, autojump_clock, measured, since
+):
+    await _health(cell, measured)
+    await measure(cell, builder, hub)
+
+    for uptime_ms in since:
+        await _health(cell, uptime_ms)
+
+    assert (await commit(cell, builder, hub))["result"] == "committed"
+
+
+@pytest.mark.parametrize("measured", [20_000, 2**31 + 50_000, 2**32 - 70_000])
+async def test_an_uptime_that_starts_again_is_a_reboot(
+    cell, builder, hub, autojump_clock, measured
+):
+    await _health(cell, measured)
+    await measure(cell, builder, hub)
+
+    await _health(cell, 4_000)
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+
+
+async def test_an_anchor_outside_the_group_may_reboot(
+    cell, builder, hub, autojump_clock
+):
+    await cell.asleep(204)
+    await measure(cell, builder, hub, anchors=[201, 202, 203])
+
+    await cell.report([204], boots=4.0)
+
+    answer = await commit(cell, builder, hub, reporting=[201, 202, 203])
+    assert answer["result"] == "committed"

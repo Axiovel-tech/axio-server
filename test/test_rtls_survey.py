@@ -2,20 +2,25 @@
 on the anchors, what ends it early, and what it tells its clients."""
 
 import math
+import time
 
 import pytest
 import trio
-from anchor_lock_support import CODE_50, _lock
+from anchor_lock_support import CODE_50, HEALTHY_A1, _lock
 from cell_settings_support import _request as cell_request
 from cell_settings_support import _states as cell_states
 from rtls_support import make_message
 from rtlslink.dialect import load_dialect
 from rtlslink.survey import SurveyAnchor, encode_step
 from survey_support import (
+    ASLEEP,
     FLAT,
+    TIERS,
     TWO_TIERS,
     authorize_show,
     commit,
+    fly_drone,
+    held,
     measure,
     request,
     survey_cell,
@@ -87,7 +92,7 @@ async def test_an_idle_server_reports_an_empty_survey(
         "action": "status",
         "result": "status",
         "reason": None,
-        "survey": IDLE,
+        "survey": IDLE | {"revision": cell.ext._survey.revision},
     }
 
 
@@ -104,7 +109,7 @@ async def test_a_run_steps_every_anchor_returns_them_and_fits(
         "started",
         None,
     )
-    assert answer["survey"] | {"frame": None} == IDLE | {
+    assert held(answer["survey"]) | {"frame": None} == IDLE | {
         "state": "measuring",
         "anchors": IDS,
         "step": 1,
@@ -185,10 +190,23 @@ async def test_the_steps_follow_the_stored_slots_not_the_request(
 async def test_a_group_that_is_not_the_whole_cell_keeps_its_order(
     cell, builder, hub, autojump_clock
 ):
+    await cell.asleep(204)
     await measure(cell, builder, hub, anchors=[203, 201, 202])
 
     assert cell.steps()[0].endswith("0003" + "00010002")
     assert _initiators(cell) == [3, 1, 2]
+
+
+async def test_the_frame_is_echoed_as_it_is_used(cell, builder, hub, autojump_clock):
+    frame = FRAME | {"heightGroups": [[201], [202, 203, 204]], "yPositive": 203}
+
+    survey = await measure(cell, builder, hub, frame=frame)
+
+    # a group of one is no group: the origin's height is free of the others
+    assert survey["frame"]["heightGroups"] == [[202, 203, 204]]
+    assert survey["state"] == "ready"
+    assert survey["fit"]["anchors"]["201"]["heightOffsetM"] is None
+    assert survey["fit"]["anchors"]["202"]["heightOffsetM"] == 0.0
 
 
 async def test_no_anchors_named_means_every_online_anchor_in_slot_order(
@@ -200,6 +218,36 @@ async def test_no_anchors_named_means_every_online_anchor_in_slot_order(
     answer = await request(cell, builder, hub, "start", frame=TWO_TIERS)
     assert answer["survey"]["anchors"] == [204, 202, 201]
     assert answer["survey"]["frame"]["origin"] == 204
+
+
+@pytest.mark.parametrize("state", ["asleep", "standby", "off"])
+async def test_no_anchors_named_leaves_out_the_anchors_that_do_not_operate(
+    dialect, nursery, builder, hub, autojump_clock, state
+):
+    cell = await survey_cell(dialect, nursery, TIERS)
+    await cell.asleep(206)
+    code = {"asleep": 3.0, "standby": 2.0, "off": 4.0}[state]
+    await cell.report([203], **(ASLEEP | {"pwrst": code}))
+
+    answer = await request(cell, builder, hub, "start", frame=TWO_TIERS)
+
+    assert (answer["result"], answer["reason"]) == ("started", None)
+    assert answer["survey"]["anchors"] == [201, 202, 204, 205, 207, 208]
+
+
+async def test_no_anchors_named_waits_for_an_anchor_of_unknown_power_state(
+    cell, builder, hub, autojump_clock
+):
+    # it may well be ranging: leaving it out would restart it at every step
+    health = {k: v for k, v in HEALTHY_A1.items() if k != "pwrst"}
+    await cell.ext._on_stats(203, health, time.monotonic())
+
+    answer = await request(cell, builder, hub, "start", frame=TWO_TIERS)
+
+    assert (answer["result"], answer["reason"]) == (
+        "refused",
+        "RTLS anchor A2 has not reported its power state",
+    )
 
 
 async def test_a_step_is_timed_by_the_longest_block_the_group_stores(
@@ -347,6 +395,7 @@ async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
     ext = cell.ext
     restarting = {"cellcfg": -1.0, "txgain": -1.0, "sid": -1.0}
     cell.collect_s = 1.2
+    await cell.asleep(204)
     await _start(cell, builder, hub, anchors=[201, 202, 203])
     await trio.sleep(0.5)
     ext._inf_pending = False
@@ -362,10 +411,8 @@ async def test_a_restart_in_a_step_does_not_read_as_a_cell_that_differs(
     assert ext._stats[204]["cellConfig"] is None
     assert cell_states(ext)[201] == cell_states(ext)[202] == ("ok", None)
     assert cell_states(ext)[204] == ("unknown", None)
-    warned = {
-        w["device"] for w in (await _lock(ext, builder, hub, "status"))["warnings"]
-    }
-    assert warned == {204}
+    warnings = (await _lock(ext, builder, hub, "status"))["warnings"]
+    assert {w["device"] for w in warnings if w["code"] == "cell-settings"} == {204}
 
     # once the survey is over, an anchor without a session reads as one
     await until(cell, "returning")
@@ -558,7 +605,7 @@ async def test_cancel_returns_the_anchors_and_ends_idle(
     await trio.sleep(0.1)
     await cell.report()
     await until(cell, "idle")
-    assert cell.ext._survey.json == IDLE | {"reason": "cancelled"}
+    assert held(cell.ext._survey.json) == IDLE | {"reason": "cancelled"}
     assert _initiators(cell) == [1, 2]
     assert {to for to, value, _ in cell.commands if value == "0000"} == set(IDS)
 
@@ -576,7 +623,7 @@ async def test_cancel_while_the_anchors_return_drops_the_measurement(
     assert (answer["result"], answer["survey"]["state"]) == ("cancelled", "returning")
     await cell.report()
     await until(cell, "idle")
-    assert cell.ext._survey.json == IDLE | {"reason": "cancelled"}
+    assert held(cell.ext._survey.json) == IDLE | {"reason": "cancelled"}
 
 
 async def test_a_step_names_an_anchor_that_is_not_live(cell, autojump_clock):
@@ -680,7 +727,7 @@ async def test_a_defect_in_the_run_fails_the_survey_only(
 async def _refusal(cell, builder, hub, **body):
     answer = await _start(cell, builder, hub, **body)
     assert answer["result"] == "refused"
-    assert answer["survey"] == IDLE
+    assert held(answer["survey"]) == IDLE
     assert cell.commands == []
     return answer["reason"]
 
@@ -708,6 +755,21 @@ async def test_start_is_refused_while_a_show_is_authorized(
 ):
     authorize_show(cell.ext)
     assert await _refusal(cell, builder, hub) == "A show is authorized"
+
+
+async def test_start_is_refused_while_a_drone_is_armed(
+    cell, builder, hub, autojump_clock
+):
+    fly_drone(cell.ext, armed=True)
+    assert await _refusal(cell, builder, hub) == "Drone 17 is armed"
+
+
+@pytest.mark.parametrize("armed", [False, None])
+async def test_a_drone_not_known_to_be_armed_does_not_refuse_a_start(
+    cell, builder, hub, autojump_clock, armed
+):
+    fly_drone(cell.ext, armed=armed)
+    await measure(cell, builder, hub)
 
 
 async def test_start_is_refused_while_an_apply_runs(cell, builder, hub, autojump_clock):
@@ -754,6 +816,71 @@ async def test_start_is_refused_for_an_anchor_that_cannot_take_part(
     )
     cell.lose(203)
     assert await _refusal(cell, builder, hub) == "RTLS anchor A2 is offline"
+
+
+async def test_start_waits_for_an_anchor_that_has_not_reported_its_session(
+    cell, builder, hub, autojump_clock
+):
+    # after a server restart the health report comes first, the session
+    # only with the status report
+    health = {k: v for k, v in HEALTHY_A1.items() if k not in ("cellcfg", "txgain")}
+    await cell.ext._on_stats(202, health, time.monotonic())
+
+    assert await _refusal(cell, builder, hub) == (
+        "Still waiting for RTLS anchor A1 to report its session"
+    )
+    await cell.report([202])
+    assert (await _start(cell, builder, hub))["result"] == "started"
+
+
+async def test_start_refuses_to_leave_an_operating_anchor_of_the_cell_out(
+    cell, builder, hub, autojump_clock
+):
+    assert await _refusal(cell, builder, hub, anchors=[201, 202, 203]) == (
+        "Include RTLS anchor A3 in the survey, or put it to sleep"
+    )
+
+
+async def test_start_names_every_anchor_left_out(
+    dialect, nursery, builder, hub, autojump_clock
+):
+    cell = await survey_cell(dialect, nursery, TIERS)
+
+    reason = await _refusal(cell, builder, hub, anchors=list(TIERS)[:6])
+
+    assert reason == (
+        "Include RTLS anchor A6, RTLS anchor A7 in the survey, or put them to sleep"
+    )
+
+
+async def test_start_refuses_to_leave_out_an_anchor_of_unknown_power_state(
+    cell, builder, hub, autojump_clock
+):
+    # the same rule as for the default group: it may well be ranging
+    health = {k: v for k, v in HEALTHY_A1.items() if k != "pwrst"}
+    await cell.ext._on_stats(204, health, time.monotonic())
+
+    assert await _refusal(cell, builder, hub, anchors=[201, 202, 203]) == (
+        "Include RTLS anchor A3 in the survey, or put it to sleep"
+    )
+
+
+@pytest.mark.parametrize("state", ["asleep", "standby", "offline", "other cell"])
+async def test_an_anchor_that_does_not_range_in_the_cell_may_be_left_out(
+    cell, builder, hub, autojump_clock, state
+):
+    if state == "asleep":
+        await cell.asleep(204)
+    elif state == "standby":
+        await cell.report([204], **(ASLEEP | {"pwrst": 2.0}))
+    elif state == "offline":
+        cell.lose(204)
+    else:
+        await cell.ext.set_param(204, "CELL_ID", "hall-b", "custom")
+
+    answer = await _start(cell, builder, hub, anchors=[201, 202, 203])
+
+    assert (answer["result"], answer["reason"]) == ("started", None)
 
 
 @pytest.mark.parametrize(
@@ -836,6 +963,7 @@ async def test_other_writes_to_the_cell_are_refused_while_a_survey_runs(
 ):
     ext = cell.ext
     cell.collect_s = 1.2
+    await cell.asleep(204)
     await _start(cell, builder, hub, anchors=[201, 202, 203])
     await trio.sleep(0.5)
     refusal = ("refused", "A survey is running")
@@ -933,4 +1061,4 @@ async def test_a_notification_that_cannot_be_sent_does_not_stop_the_survey(
 async def test_a_stopped_extension_keeps_no_survey(cell, builder, hub, autojump_clock):
     await measure(cell, builder, hub)
     cell.ext._forget_run_state()
-    assert cell.ext._survey.json == IDLE
+    assert held(cell.ext._survey.json) == IDLE

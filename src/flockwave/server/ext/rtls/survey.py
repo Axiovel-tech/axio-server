@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import random
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -48,7 +49,7 @@ from .survey_fit import (
     fit_survey,
     frame_refusal,
 )
-from .survey_group import Anchor, block_ms, select_group, step_order
+from .survey_group import Anchor, armed_refusal, block_ms, select_group, step_order
 from .survey_notify import Pulse, StatePusher
 from .survey_request import (
     Placement,
@@ -68,11 +69,21 @@ __all__ = ("Survey", "handle_survey_request")
 RUNNING_STATES = ("measuring", "returning", "committing")
 
 INCOMPLETE = "Not every anchor took the survey"
+#: why a commit or a fit is refused that does not name the held survey's
+#: revision: another client changed the survey since the request's was shown
+STALE = "stale"
 CANCELLED = "cancelled"
 _INTERNAL_ERROR = "The survey stopped on an internal error"
 
 #: what an anchor reports of the session it runs: -1 (here None) while none
 _SESSION_STATS = ("cellConfig", "txGain", "surveyId")
+
+#: an uptime that falls by more than this comes from an anchor that booted
+#: again, not from frames that swapped places, in ms
+_REORDER_MS = 5000
+#: the uptime has 32 bits: a fall that is a step forward of at most this
+#: across their wrap (49.7 days) is the wrap, in ms
+_WRAP_STEP_MS = 60_000
 
 _Answer = tuple[str, Optional[str]]
 
@@ -90,6 +101,9 @@ class _Run:
     placement: Optional[Placement]
     #: each anchor's ``moved`` latch when the run started
     moved: dict[int, bool]
+    #: each anchor's boot count and the uptime of its stat frames, as last
+    #: seen; None while not reported
+    booted: dict[int, tuple[Optional[int], Optional[int]]]
     #: by ``(initiator, responder)`` system ID
     measurements: dict[tuple[int, int], DirectedRange] = field(default_factory=dict)
     step: int = 1
@@ -102,6 +116,9 @@ class _Run:
     #: server lost an anchor
     moved_since: bool = False
     lost: bool = False
+    #: the anchors that booted again since the run started: the motion
+    #: latch of such an anchor is new and says nothing of the time it was off
+    rebooted: set[int] = field(default_factory=set)
     cancelled: bool = False
     scope: trio.CancelScope = field(default_factory=trio.CancelScope)
     #: the anchors that reported ranging since the end command was answered
@@ -110,6 +127,11 @@ class _Run:
     @property
     def ids(self) -> list[int]:
         return [anchor.system_id for anchor in self.anchors]
+
+
+def _restarted(before: int, now: int) -> bool:
+    """Whether an uptime that went from ``before`` to ``now`` started again."""
+    return before - now > _REORDER_MS and (now - before) % 2**32 > _WRAP_STEP_MS
 
 
 def _merged(first: StepResult, again: StepResult) -> StepResult:
@@ -128,13 +150,25 @@ def _merged(first: StepResult, again: StepResult) -> StepResult:
 class Survey:
     """The extension's one survey: its state, the run and the commit."""
 
-    def __init__(self, ext: "RtlsExtension"):
+    def __init__(self, ext: "RtlsExtension", revision: Optional[int] = None):
         self._ext = ext
         self.state = "idle"
         self.reason: Optional[str] = None
+        #: raised on every change of what the survey holds and never lowered.
+        #: It starts at the wall clock in milliseconds, above what an earlier
+        #: instance of the extension sent: the changes are fewer than that.
+        self.revision = time.time_ns() // 1_000_000 if revision is None else revision
         self._run: Optional[_Run] = None
         self._changed = Pulse()
-        self._notify = StatePusher(ext, self._notification).notify
+        self._push = StatePusher(ext, self._notification).notify
+
+    def _notify(self) -> None:
+        """Every change of the survey makes a new revision, which is pushed."""
+        self.revision += 1
+        self._push()
+
+    def _is_current(self, revision: Any) -> bool:
+        return type(revision) in (int, float) and revision == self.revision
 
     @property
     def running(self) -> bool:
@@ -148,6 +182,7 @@ class Survey:
     def json(self) -> dict[str, Any]:
         """The state object."""
         state: dict[str, Any] = {
+            "revision": self.revision,
             "state": self.state,
             "reason": self.reason,
             "anchors": [],
@@ -203,7 +238,28 @@ class Survey:
                 run.moved_since = True
             if (stats.get("rangingRateHz") or 0) > 0:
                 run.returned.add(system_id)
+            boots, uptime = run.booted[system_id]
+            now_boots, now_uptime = self._boot_marks(system_id, stats)
+            if (None not in (boots, now_boots) and now_boots != boots) or (
+                uptime is not None
+                and now_uptime is not None
+                and _restarted(uptime, now_uptime)
+            ):
+                run.rebooted.add(system_id)
+            run.booted[system_id] = (
+                boots if now_boots is None else now_boots,
+                uptime if now_uptime is None else now_uptime,
+            )
         self._changed.set()
+
+    def _boot_marks(
+        self, system_id: int, stats: dict[str, Any]
+    ) -> tuple[Optional[int], Optional[int]]:
+        """What tells that an anchor booted again: its boot count, which
+        comes with the status report, and the uptime of its last stat
+        frame, which starts again from zero."""
+        device = self._ext._require_protocol().devices.get(system_id)
+        return stats.get("bootCount"), getattr(device, "stats_time_boot_ms", None)
 
     def on_lost(self, system_id: int) -> None:
         if self._run is not None and system_id in self._run.moved:
@@ -226,7 +282,7 @@ class Survey:
         if nursery is None:
             return "refused", "RTLS is not running"
         anchors: list[Anchor] = []
-        reason = write_refusal(ext)
+        reason = write_refusal(ext) or armed_refusal(ext)
         if reason is None:
             anchors, reason = select_group(ext, requested)
         if reason is not None:
@@ -250,6 +306,12 @@ class Survey:
                 system_id: bool((ext._fresh_stats(system_id) or {}).get("moved"))
                 for system_id in ids
             },
+            booted={
+                system_id: self._boot_marks(
+                    system_id, ext._fresh_stats(system_id) or {}
+                )
+                for system_id in ids
+            },
         )
         self.state, self.reason = "measuring", None
         nursery.start_soon(self._survey, run)
@@ -270,6 +332,8 @@ class Survey:
 
     async def fit(self, body: dict[str, Any]) -> _Answer:
         run = self._run
+        if "revision" in body and not self._is_current(body["revision"]):
+            return "refused", STALE
         if self.running:
             return "refused", "A survey is running"
         if run is None or self.state != "ready":
@@ -289,6 +353,8 @@ class Survey:
 
     async def commit(self, body: dict[str, Any]) -> _Answer:
         run = self._run
+        if not self._is_current(body.get("revision")):
+            return "refused", STALE
         if self.running:
             return "refused", "A survey is running"
         if run is None or self.state != "ready" or run.fit is None:
@@ -332,6 +398,7 @@ class Survey:
             fit,
             moved=run.moved_since,
             lost=run.lost,
+            rebooted=[a.name for a in run.anchors if a.system_id in run.rebooted],
             retry=run.plan is not None,
         )
 
@@ -343,6 +410,7 @@ class Survey:
         ext, survey_id = self._ext, plan.survey_id
         running: list[int] = []
         commit = run.commit = {"surveyId": survey_id, "results": {}, "running": running}
+        self._notify()
         results = commit["results"] = await write_locations(
             ext, run.anchors, plan.values
         )

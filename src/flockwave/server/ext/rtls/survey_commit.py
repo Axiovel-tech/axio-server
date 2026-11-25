@@ -11,9 +11,7 @@ none, the tags exclude it, and the same commit again brings it in.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
-from functools import reduce
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
@@ -26,7 +24,8 @@ from .anchor_lock import anchor_views
 from .anchor_sleep import lacks_param
 from .cell_settings import write_refusal
 from .survey_fit import DirectedRange, SurveyFit
-from .survey_group import Anchor
+from .survey_group import Anchor, armed_refusal
+from .survey_view import newest_survey_id, stored_location
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
@@ -65,26 +64,19 @@ Point = tuple[float, float, float]
 
 
 def next_survey_id(stored: Iterable[int]) -> int:
-    """One more than the newest of the stored IDs in 16-bit serial order,
-    skipping 0 and 0xFFFF, which no anchor advertises; 1 without any."""
-    ids = list(stored)
-    if not ids:
+    """The survey ID of a new commit: the first after the newest of the
+    stored IDs, in 16-bit serial order, that no anchor stores; 1 without
+    any. IDs spread over more than half the range have no newest one, so
+    the one after it may be taken. 0 and 0xFFFF are skipped: no anchor
+    advertises them."""
+    taken = set(stored)
+    if not taken:
         return 1
-    newest = reduce(
-        lambda newest, other: other if (other - newest) & 0xFFFF < 0x8000 else newest,
-        ids,
-    )
-    return 1 if newest >= 0xFFFE else newest + 1
-
-
-def _stored_location(device: Any) -> Optional[StoredLocation]:
-    """The location in a device's cached ``UWB_LOC``, None without one."""
-    from .extension import _decoded_device_params
-
-    text = _decoded_device_params(device, (LOC_PARAM,)).get(LOC_PARAM, "")
-    with suppress(ValueError):
-        return anchor_location.decode_param(str(text))
-    return None
+    candidate = newest_survey_id(sorted(taken))
+    while True:
+        candidate = 1 if candidate >= 0xFFFE else candidate + 1
+        if candidate not in taken:
+            return candidate
 
 
 def stored_positions(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, Point]:
@@ -93,7 +85,7 @@ def stored_positions(ext: "RtlsExtension", ids: Sequence[int]) -> dict[int, Poin
     positions = {}
     for system_id in ids:
         device = devices.get(system_id)
-        stored = None if device is None else _stored_location(device)
+        stored = None if device is None else stored_location(device)
         if stored is not None:
             positions[system_id] = stored.location.ned_m
     return positions
@@ -107,7 +99,7 @@ def known_survey_ids(ext: "RtlsExtension") -> list[int]:
     for view in anchor_views(ext):
         system_id = view["systemId"]
         device = devices.get(system_id) or ext._lost.get(system_id)
-        stored = None if device is None else _stored_location(device)
+        stored = None if device is None else stored_location(device)
         if stored is not None:
             ids.append(stored.location.survey_id)
     return ids
@@ -225,18 +217,26 @@ def commit_refusal(
     *,
     moved: bool,
     lost: bool,
+    rebooted: Sequence[str],
     retry: bool,
 ) -> Optional[str]:
     """Why a held fit cannot be written now, if it cannot. A fit is no
     longer the cell's when an anchor ``moved`` since the measurement, or was
-    ``lost`` by the server (it may have been carried away while off). The
-    ``retry`` of a commit an anchor missed only needs every anchor back."""
+    ``lost`` by the server or ``rebooted`` (by name; either may have been
+    carried away while off, and its motion latch starts anew). The ``retry``
+    of a commit an anchor missed takes an anchor that was lost when it is
+    back and reports, which tells whether it rebooted."""
     devices = ext._require_protocol().devices
     offline = [a.name for a in anchors if a.system_id not in devices]
+    if rebooted:
+        return f"{rebooted[0]} restarted since it was surveyed; survey again"
     if moved or (not retry and (lost or offline)):
         return SURVEY_AGAIN
     if offline:
         return f"{offline[0]} is offline"
+    silent = [a.name for a in anchors if ext._fresh_stats(a.system_id) is None]
+    if retry and silent:
+        return f"Still waiting for {silent[0]} to report"
     if ext._cell_applying:
         return "An apply is running"
     if any(
@@ -245,7 +245,7 @@ def commit_refusal(
         for coordinate in report.position
     ):
         return "A fitted position is farther than an anchor can store"
-    return write_refusal(ext)
+    return write_refusal(ext) or armed_refusal(ext)
 
 
 def location_values(
