@@ -3,6 +3,7 @@
 what each anchor is written, and an anchor that misses it."""
 
 import math
+import time
 
 import pytest
 import trio
@@ -963,3 +964,75 @@ async def test_the_revision_rises_with_every_change_and_never_falls(
     # an extension that stops and starts again goes on counting
     cell.ext._forget_run_state()
     assert cell.ext._survey.revision > seen[-1]
+
+
+# ---- an anchor that rebooted since it was measured -------------------------
+
+REBOOTED = "RTLS anchor A2 restarted since it was surveyed; survey again"
+
+
+async def test_a_commit_is_refused_after_an_anchor_of_the_group_rebooted(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+
+    # 203 was off and is back: one more boot, and its motion latch is new
+    await cell.report([203], boots=4.0, moved=0.0)
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+    assert cell.locations == []
+    # and stays refused: the measurement is no longer the cell's
+    await cell.report()
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+
+
+async def test_a_reboot_shows_in_the_uptime_of_an_anchors_stats(
+    cell, builder, hub, autojump_clock
+):
+    anchor = cell.devices[203]
+
+    async def health(uptime_ms):
+        """A stat frame at that uptime through the SDK, then the anchor's
+        whole health as the other tests report it."""
+        frame = anchor.named_value_float("rnghz", 50.0, uptime_ms)
+        await cell.ext._process_datagram(frame, anchor.address, time.monotonic())
+        await cell.report([203])
+
+    await health(900_000)
+    await measure(cell, builder, hub)
+    await health(901_000)
+    assert (await commit(cell, builder, hub, acknowledgeWarnings=True))[
+        "result"
+    ] == "committed"
+
+    cell.locations.clear()
+    await measure(cell, builder, hub)
+    await health(4_000)  # the SDK forgets its stats: no boot count yet
+
+    assert await _commit_refusal(cell, builder, hub) == REBOOTED
+
+
+async def test_a_reboot_does_not_refuse_the_retry_of_a_commit_an_anchor_missed(
+    cell, builder, hub, autojump_clock
+):
+    await measure(cell, builder, hub)
+    cell.location_silent.add(204)
+    assert (await commit(cell, builder, hub))["result"] == "incomplete"
+    cell.location_silent.clear()
+
+    # the anchor that missed the write was off: it is back, with one more boot
+    await cell.report([204], boots=4.0)
+
+    assert (await commit(cell, builder, hub))["result"] == "committed"
+
+
+async def test_an_anchor_outside_the_group_may_reboot(
+    cell, builder, hub, autojump_clock
+):
+    await cell.asleep(204)
+    await measure(cell, builder, hub, anchors=[201, 202, 203])
+
+    await cell.report([204], boots=4.0)
+
+    answer = await commit(cell, builder, hub, reporting=[201, 202, 203])
+    assert answer["result"] == "committed"
