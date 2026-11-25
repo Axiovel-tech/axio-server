@@ -503,6 +503,22 @@ async def test_inter_anchor_twr_surfaced_in_inf(extension, device, builder, hub)
     assert all(row["ageMs"] >= 0 for row in entry["twr"])
 
 
+async def test_a_lane_gap_is_logged_even_from_a_lost_device(extension, device, caplog):
+    """A stall longer than device_timeout ends while its board counts as lost."""
+    extension.log = logging.getLogger("test.rtls")
+    add_rtls_cell_params(device, role=3, uwb_mac=2)
+    await discover(extension, device)
+    later = time.monotonic() + 60
+    extension._expire_devices(later)
+    assert DEVICE_SYSID in extension._lost
+    await extension._process_datagram(
+        device.named_value_float("gapcomms", 7300.0, 81_000), device.address, later
+    )
+    (record,) = [r for r in caplog.records if "stalled" in r.message]
+    assert f"sysid {DEVICE_SYSID}: comms lane stalled for 7300 ms" in record.message
+    assert "uptime 81.0 s" in record.message
+
+
 async def test_twr_does_not_pollute_health_stats(extension, device):
     await discover(extension, device)
     # a TWR float must not be mistaken for a solve stat

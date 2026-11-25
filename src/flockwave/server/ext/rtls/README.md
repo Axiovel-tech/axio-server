@@ -151,6 +151,10 @@ enables it.
   one anchor 4 cm off a four-anchor tier reads about +2 cm and its
   neighbours the rest. The pulls are not part of `rmsM` or of any pair's
   residual.
+- **Firmware lane stalls are in the server log only.** A board sends a stall
+  of 250 ms or more once, after it ended; the `logging` extension's
+  `skybrushd.log` keeps the line with its time. The cause is in the board's
+  `lanes` shell command until it reboots.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
