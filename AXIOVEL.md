@@ -15,7 +15,7 @@ it. `main` tracks upstream and takes no Axiovel commit.
 
 | Area | Code | Read |
 |---|---|---|
-| rtls-link anchors and tags: discovery, parameters, sleep, OTA, health, geometry check, pre-flight verify, cluster clock | `ext/rtls/` | `ext/rtls/README.md`; contracts `rtls-client-api.md`, `rtls-geometry-stats.md`, `rtls-fleet-health.md` |
+| rtls-link anchors and tags: discovery, parameters, sleep, OTA, health, anchor survey, pre-flight verify, cluster clock | `ext/rtls/` | `ext/rtls/README.md`; contracts `rtls-client-api.md`, `rtls-anchor-geometry.md`, `rtls-fleet-health.md` |
 | `armed` in `UAV-INF`: the autopilot's arming state from its heartbeat, absent when stale or unknown; Control's RTLS guards read it, not `DISARMED` | `model/uav.py`, `ext/mavlink/driver.py` | `rtls-client-api.md` ("The drones' arming state") |
 | Pre-show fleet health: the drones' IMU temperatures joined to their tags' stats | `ext/rtls/extension.py`, `ext/mavlink/network.py` | `rtls-fleet-health.md` |
 | Show upload: `__show_upload` compiles a `.skyc` to `.skyb`, `__gdm_upload` validates an engine `.gdmb`; both write the drone's show slot `/axio/show.bin` over MAVFTP | `ext/mavlink/show_slot.py`, `show/gdm_upload.py`, `show/gdmb.py` | `show-artifacts.md`, `gdm-format.md` |
