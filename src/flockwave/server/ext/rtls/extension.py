@@ -2781,8 +2781,10 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     # one a tag's table follows
     ("sid", "surveyId", _survey_id_or_none),
     # an anchor's live range to its stored initiator minus the one its
-    # survey measured; absent while it has no reading
-    ("rdev", "rangeDeviationM", _rounded(4)),
+    # survey measured; absent while it has no reading. As reported: the
+    # warning compares it with a bound, and a rounded 0.08004 would not warn
+    # where the anchor's own ring does.
+    ("rdev", "rangeDeviationM", float),
     *(
         (name, key, int if digits is None else _rounded(digits))
         for name, key, digits in TAG_SURVEY_STATS

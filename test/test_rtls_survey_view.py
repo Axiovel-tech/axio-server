@@ -167,7 +167,15 @@ async def test_an_offline_anchor_is_in_no_list(dialect, builder, hub):
 
 @pytest.mark.parametrize(
     ("deviation", "warns"),
-    [(0.08, False), (-0.08, False), (0.0801, True), (-0.12, True), (None, False)],
+    [
+        (0.08, False),
+        (-0.08, False),
+        (0.08004, True),
+        (-0.08004, True),
+        (0.0801, True),
+        (-0.12, True),
+        (None, False),
+    ],
 )
 async def test_the_range_check_warns_strictly_above_its_bound(
     dialect, builder, hub, deviation, warns
@@ -179,6 +187,23 @@ async def test_the_range_check_warns_strictly_above_its_bound(
 
     survey = await _survey(ext, builder, hub)
     assert survey["rangeDeviation"] == ([203] if warns else [])
+
+
+async def test_a_deviation_just_over_the_bound_warns_everywhere(dialect, builder, hub):
+    # the firmware's ring warns at 0.08004 m: so must the server, which
+    # used to round the value to 0.0800 before it compared
+    ext, _ = await _positioned(dialect)
+    await anchors_report(ext, [203], rdev=0.08004)
+
+    assert ext._stats[203]["rangeDeviationM"] == 0.08004
+    assert (await _survey(ext, builder, hub))["rangeDeviation"] == [203]
+    warnings = (await _lock(ext, builder, hub, "status"))["warnings"]
+    assert [(w["code"], w["device"]) for w in warnings] == [("range-deviation", 203)]
+    rule = await _rule(ext, "anchors")
+    assert (rule["status"], rule["detail"]) == (
+        "fail",
+        "RTLS anchor A2 is 8 cm farther from its initiator than when surveyed",
+    )
 
 
 async def test_the_anchors_a_tag_leaves_out_are_the_fleet_warning(
