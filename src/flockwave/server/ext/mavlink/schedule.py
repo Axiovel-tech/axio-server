@@ -5,6 +5,7 @@ shared by every MAVLink network of the server.
 from __future__ import annotations
 
 from collections.abc import Callable
+from time import monotonic
 from typing import Protocol
 
 from trio import Event
@@ -27,6 +28,15 @@ before the start until the start, every `PERIOD` seconds otherwise."""
 
 FAST_PERIOD = 0.2
 PERIOD = 1.0
+
+RESEND_GRACE = 3.0
+"""Seconds after a re-send during which a drone may still echo the start it
+replaced: the re-send and the echo of it are on their way."""
+
+RESEND_GRACE_MAX_STEP_US = 5000
+"""Largest re-send step, in microseconds, for which the replaced start is
+accepted during `RESEND_GRACE`: the wobble of the cluster clock estimate, not a
+restart of the cluster clock."""
 
 
 class ClusterClock(Protocol):
@@ -70,6 +80,8 @@ class ShowSchedule:
         self.active = False
         self._start: float | None = None
         self._last_start: float | None = None
+        self._replaced_start_us = 0
+        self._replaced_at = 0.0
         self._changed = Event()
 
     @property
@@ -99,6 +111,7 @@ class ShowSchedule:
             self._last_start = start
         self.id = self.id % 0xFFFF + 1
         self.start_cluster_us = self._derive() or 0
+        self._replaced_start_us = 0
         self._changed.set()
         self._changed = Event()
 
@@ -112,6 +125,8 @@ class ShowSchedule:
             derived is not None
             and abs(derived - self.start_cluster_us) > MOVE_THRESHOLD_US
         ):
+            self._replaced_start_us = self.start_cluster_us
+            self._replaced_at = monotonic()
             self.start_cluster_us = derived
 
     def packet(self, now: float) -> MAVLinkMessageSpecification | None:
@@ -140,6 +155,18 @@ class ShowSchedule:
         A committed drone's start moves with the drift of its crystal."""
         return echo.schedule_id != self.id or (
             not echo.committed and echo.start_cluster_us != self.start_cluster_us
+        )
+
+    def was_just_resent_from(self, start_cluster_us: int) -> bool:
+        """Whether the given start is the one that the last re-send under this
+        schedule ID replaced, less than `RESEND_GRACE` seconds ago and by a
+        step of at most `RESEND_GRACE_MAX_STEP_US`."""
+        return (
+            self._replaced_start_us != 0
+            and start_cluster_us == self._replaced_start_us
+            and abs(self.start_cluster_us - self._replaced_start_us)
+            <= RESEND_GRACE_MAX_STEP_US
+            and monotonic() - self._replaced_at < RESEND_GRACE
         )
 
     def wall_at(self, cluster_us: int) -> float | None:

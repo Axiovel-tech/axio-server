@@ -1,10 +1,11 @@
 import logging
 from struct import pack
-from time import time
+from time import monotonic, time
 from types import SimpleNamespace
 
+from flockwave.server.ext.mavlink import schedule as schedule_module
 from flockwave.server.ext.mavlink.packets import ShowScheduleStatus
-from flockwave.server.ext.mavlink.schedule import ShowSchedule
+from flockwave.server.ext.mavlink.schedule import RESEND_GRACE, ShowSchedule
 from flockwave.server.ext.mavlink.takeoff import MAVLinkScheduledTakeoffManager
 from flockwave.server.ext.show.config import AuthorizationScope
 from flockwave.server.ext.show.takeoff import TakeoffConfiguration
@@ -60,10 +61,11 @@ def make_echo(schedule_id, start_offset_us=0, *, flags=0x01 | 0x04, age=0.5):
     return ShowScheduleStatus.from_mavlink_message(message, time() - age)
 
 
-def check_start_agreement(uavs, lead, schedule_id=5):
-    schedule = ShowSchedule()
-    schedule.id = schedule_id
-    schedule.start_cluster_us = SENT_START_US
+def check_start_agreement(uavs, lead, schedule_id=5, schedule=None):
+    if schedule is None:
+        schedule = ShowSchedule()
+        schedule.id = schedule_id
+        schedule.start_cluster_us = SENT_START_US
     for uav in uavs:
         uav.send_log_message_to_gcs = lambda message, severity, uav=uav: (
             uav.messages.append((message, severity))
@@ -184,3 +186,59 @@ def test_reported_start_resolves_to_the_nearest_gps_week():
     # Saturday 23:59:50 -> start at Sunday 00:00:20, read in the current week
     assert nearest_week(now + 30 - week, now) == now + 30
     assert nearest_week(now - 30 + week, now) == now - 30
+
+
+def resent_schedule(monkeypatch, replaced_ago, step_us=2000):
+    """A schedule whose start was re-sent `step_us` later `replaced_ago` seconds
+    ago."""
+    offset_us = [0]
+    clock = SimpleNamespace(
+        cluster_us_at=lambda wall: (
+            SENT_START_US + round((wall - CONFIG.takeoff_time) * 1e6) + offset_us[0]
+        )
+    )
+    schedule = ShowSchedule()
+    schedule.cluster_clock = lambda: clock
+    schedule.update(CONFIG)
+    offset_us[0] = step_us
+    monkeypatch.setattr(
+        schedule_module, "monotonic", lambda: monotonic() - replaced_ago
+    )
+    schedule.tick()
+    monkeypatch.undo()
+    assert schedule.start_cluster_us == SENT_START_US + step_us
+    return schedule
+
+
+def test_start_agreement_accepts_the_start_that_a_resend_just_replaced(monkeypatch):
+    schedule = resent_schedule(monkeypatch, replaced_ago=0.5)
+    uavs = {
+        "replaced start": make_uav(None, 0, echo=make_echo(schedule.id)),
+        "re-sent start": make_uav(None, 0, echo=make_echo(schedule.id, 2000)),
+        "start off": make_uav(None, 0, echo=make_echo(schedule.id, -2000)),
+    }
+    check_start_agreement(list(uavs.values()), 15, schedule=schedule)
+
+    assert uavs["replaced start"].messages == []
+    assert uavs["re-sent start"].messages == []
+    assert "-4.0 ms off" in uavs["start off"].messages[0][0]
+
+
+def test_start_agreement_warns_when_the_replaced_start_outlives_the_grace(
+    monkeypatch,
+):
+    schedule = resent_schedule(monkeypatch, replaced_ago=RESEND_GRACE + 0.5)
+    uav = make_uav(None, 0, echo=make_echo(schedule.id))
+    check_start_agreement([uav], 15, schedule=schedule)
+
+    assert "-2.0 ms off" in uav.messages[0][0]
+
+
+def test_start_agreement_warns_when_the_resend_was_a_cluster_clock_restart(
+    monkeypatch,
+):
+    schedule = resent_schedule(monkeypatch, replaced_ago=0.5, step_us=-3_600_000_000)
+    uav = make_uav(None, 0, echo=make_echo(schedule.id))
+    check_start_agreement([uav], 15, schedule=schedule)
+
+    assert "+3600000.0 ms off" in uav.messages[0][0]
