@@ -120,6 +120,8 @@ enables it.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `geometry_agreement.py`: `X-RTLS-GEOM`, a pure function over the cached
   stats.
+- `survey_fit.py`: anchor positions fitted to the ranges of an anchor
+  survey, and the gate on committing them. Pure, numpy only.
 - `verify.py`: `X-RTLS-VERIFY`.
 - `fc_identity.py`: the tag-to-drone pairing.
 - `fitted_cell.py`, `cell_compat.py`: the anchor cell built from a tag's
