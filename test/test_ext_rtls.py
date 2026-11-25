@@ -2933,6 +2933,36 @@ def _bundle(device, values):
 BUNDLED_REPORT = {**FULL_STATS, "urssi": -81.5, "rmse": 0.025}
 
 
+async def test_a_lane_gap_reaches_the_watchers_and_changes_no_stats(extension, device):
+    await discover(extension, device)
+    await extension._process_datagram(
+        _bundle(device, BUNDLED_REPORT), device.address, time.monotonic()
+    )
+    before = dict(extension._stats[DEVICE_SYSID])
+
+    with extension._subscribed_events() as events:
+        await extension._process_datagram(
+            _bundle(device, {**BUNDLED_REPORT, "gapcomms": 1800.0}),
+            device.address,
+            time.monotonic(),
+        )
+        # and from a device that is not known: a stall outlasts the timeout
+        stranger = FakeDevice(device.dialect, system_id=77)
+        await extension._process_datagram(
+            stranger.named_value_float("gaprt", 40.0), ("192.168.4.77", 3333), 0.0
+        )
+        kinds = []
+        while True:
+            try:
+                kinds.append(events.receive_nowait().kind)
+            except trio.WouldBlock:
+                break
+
+    assert kinds.count("lane_gap") == 2
+    assert extension._stats[DEVICE_SYSID] == before
+    assert 77 not in extension._stats
+
+
 async def test_a_bundled_report_is_handled_once(extension, device):
     _claim_flight_controller(device, 5, 1)
     await discover(extension, device)
