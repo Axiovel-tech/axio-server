@@ -39,7 +39,11 @@ from survey_view_support import (
     tag_reports,
 )
 
-from flockwave.server.ext.rtls.extension import RtlsExtension, _stats_json
+from flockwave.server.ext.rtls.extension import (
+    LOCATION_READ_INTERVAL,
+    RtlsExtension,
+    _stats_json,
+)
 from flockwave.server.message_hub import MessageHub
 from flockwave.server.model.builders import FlockwaveMessageBuilder
 
@@ -284,19 +288,35 @@ async def test_a_position_written_past_the_server_is_read_again(dialect, builder
     assert len(requests) == 1
 
 
-async def test_a_lost_read_of_the_position_is_asked_once_per_advertised_id(dialect):
+async def test_a_lost_read_of_the_position_is_asked_again_at_a_bounded_rate(
+    dialect, builder, hub
+):
     ext, devices = await surveyed_cell(dialect)
-    devices[202].respond_to_read = False
-    requests = record_requests(devices[202], dialect)
+    anchor = devices[202]
+    anchor.respond_to_read = False
+    requests = record_requests(anchor, dialect)
 
-    for _ in range(3):
-        await anchors_report(ext, [202], sid=7.0)
-    assert len(requests) == 1
+    async def reports(at, sid=7.0):
+        await ext._on_stats(202, {**HEALTHY_A1, "sid": sid}, at)
+        return len(requests)
+
+    assert await reports(100.0) == 1
+    assert await reports(101.0) == 1
+    assert await reports(100.0 + LOCATION_READ_INTERVAL - 0.1) == 1
+    # the answer was lost: the anchor still advertises what is not cached
+    assert await reports(100.0 + LOCATION_READ_INTERVAL) == 2
     # no session runs through a restart or a sleep: that is not another survey
-    await anchors_report(ext, [202], sid=-1.0)
-    assert len(requests) == 1
-    await anchors_report(ext, [202], sid=8.0)
-    assert len(requests) == 2
+    assert await reports(120.0, sid=-1.0) == 2
+    # another survey is asked for at once
+    assert await reports(121.0, sid=8.0) == 3
+
+    set_fake_param(anchor, "UWB_LOC", location(9.0, 9.0, -1.0, 8), "custom")
+    anchor.respond_to_read = True
+    assert await reports(121.0 + LOCATION_READ_INTERVAL, sid=8.0) == 4
+    entry = (await _anchors(ext, builder, hub))["rtls::default::anchor_1"]
+    assert (entry["surveyId"], entry["ned"]["north"]) == (8, 9.0)
+    # the cache has it: nothing more is asked
+    assert await reports(500.0, sid=8.0) == 4
 
 
 async def test_a_tags_survey_id_does_not_make_the_server_read_a_position(dialect):

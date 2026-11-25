@@ -231,6 +231,10 @@ ORIGIN_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM")
 #: capped retry rounds and is then left alone.
 TAG_IDENTITY_PARAMS = (*ORIGIN_PARAMS, "POS_YAW_DEG", "CELL_ID")
 
+#: how often an anchor's ``UWB_LOC`` is read again at most, in seconds, while
+#: it advertises another survey ID than the cached value holds
+LOCATION_READ_INTERVAL = 5.0
+
 #: how long an accepted sleep/wake transaction's outcome overrides
 #: contradicting heartbeats, in seconds. The firmware acks the SLEEP write
 #: before its power task cuts over, so in-flight pre-transition heartbeats
@@ -313,8 +317,8 @@ class RtlsExtension(Extension):
         #: ``antbl`` stat
         self._anchor_tables: dict[int, AnchorTable] = {}
         #: the advertised survey ID an anchor's ``UWB_LOC`` was last read
-        #: again for (see :meth:`_follow_advertised_survey`)
-        self._location_asked: dict[int, int] = {}
+        #: again for, and when (see :meth:`_follow_advertised_survey`)
+        self._location_asked: dict[int, tuple[float, float]] = {}
         #: wall-clock estimate of the UWB cluster clock that the drones count
         #: the show start in
         self._cluster_clock = ClusterClock()
@@ -1284,7 +1288,7 @@ class RtlsExtension(Extension):
         self._survey.on_stats(system_id, body)
         self._cluster_clock.on_stats(system_id, data)
         if _is_anchor_stats(role):
-            await self._follow_advertised_survey(system_id, data)
+            await self._follow_advertised_survey(system_id, data, now)
         # STATS_FIELDS is the SDK's required legacy set of a tag; newer stats
         # (``slp`` sleep state, ``vbat`` battery voltage, the cluster clock)
         # are optional and must not gate the broadcast, or firmware without
@@ -1323,21 +1327,23 @@ class RtlsExtension(Extension):
         ]
 
     async def _follow_advertised_survey(
-        self, system_id: int, data: dict[str, Any]
+        self, system_id: int, data: dict[str, Any], now: float
     ) -> None:
-        """Reads an anchor's ``UWB_LOC`` again when the survey ID it
+        """Reads an anchor's ``UWB_LOC`` again while the survey ID it
         advertises is not the cached one: its position was written past this
-        server, or the read of it was lost. Once per advertised ID."""
+        server, or the read of it was lost. At once for an ID not asked for
+        yet, then every ``LOCATION_READ_INTERVAL``."""
         advertised = _finite_stat(data, "sid")
         device = self._protocol.devices.get(system_id) if self._protocol else None
         if advertised is None or advertised < 0 or device is None:
             return
         stored = stored_location(device)
         cached = 0 if stored is None else stored.location.survey_id
+        asked_for, asked_at = self._location_asked.get(system_id, (None, 0.0))
         if advertised == cached:
             self._location_asked.pop(system_id, None)
-        elif self._location_asked.get(system_id) != advertised:
-            self._location_asked[system_id] = int(advertised)
+        elif asked_for != advertised or now - asked_at >= LOCATION_READ_INTERVAL:
+            self._location_asked[system_id] = (advertised, now)
             request = self._require_protocol().request_param_read(
                 system_id, anchor_location.PARAM
             )
