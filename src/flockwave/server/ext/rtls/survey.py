@@ -410,6 +410,7 @@ class Survey:
         ext, survey_id = self._ext, plan.survey_id
         running: list[int] = []
         commit = run.commit = {"surveyId": survey_id, "results": {}, "running": running}
+        self._notify()
         results = commit["results"] = await write_locations(
             ext, run.anchors, plan.values
         )

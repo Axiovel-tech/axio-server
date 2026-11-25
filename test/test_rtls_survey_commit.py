@@ -883,7 +883,7 @@ async def test_a_commit_runs_alone_and_tells_its_clients(
     await trio.sleep(0.5)
 
     states = [(s["state"], s["commit"] is not None) for s in cell.broadcasts[pushed:]]
-    assert states == [("committing", False), ("ready", True)]
+    assert states == [("committing", False), ("committing", True), ("ready", True)]
 
 
 async def test_each_push_of_a_commit_says_what_was_known_then(
@@ -1005,6 +1005,33 @@ async def test_the_revision_rises_with_every_change_and_never_falls(
     # an extension that stops and starts again goes on counting
     cell.ext._forget_run_state()
     assert cell.ext._survey.revision > seen[-1]
+
+
+async def test_a_commit_that_waits_for_its_writes_is_a_new_revision(
+    cell, builder, hub, nursery, autojump_clock, monkeypatch
+):
+    await measure(cell, builder, hub)
+    cell.location_silent.add(204)
+    seen = []
+
+    async def look():
+        seen.append(cell.ext._survey.json)
+
+    _while_the_commit_reads(monkeypatch, look)
+    for _ in range(2):  # the commit and its retry
+        nursery.start_soon(request, cell, builder, hub, "commit")
+        await trio.sleep(0.1)
+        await look()
+        await cell.report()
+        await until(cell, "ready")
+
+    none_yet, writing, retry, writing_again = seen
+    waiting = {"surveyId": 1, "results": {}, "running": []}
+    assert none_yet["commit"] is None
+    assert writing["commit"] == writing_again["commit"] == waiting
+    assert retry["commit"]["results"] != {}
+    assert writing["revision"] == none_yet["revision"] + 1
+    assert writing_again["revision"] == retry["revision"] + 1
 
 
 async def test_a_new_instance_of_the_extension_goes_on_above_the_last_revision(
