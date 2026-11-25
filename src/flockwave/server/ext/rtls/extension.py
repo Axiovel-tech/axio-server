@@ -607,6 +607,15 @@ class RtlsExtension(Extension):
                 self._on_twr(event.system_id, event.data, now)
             elif event.kind == "twr_summary":
                 self._on_twr_summary(event.system_id, event.data, now)
+            elif event.kind == "lane_gap" and self.log:
+                # the log file is the record that places a stall in time
+                # after a bench day or a show
+                self.log.warning(
+                    f"rtls: {self._device_role(event.system_id) or 'device'} "
+                    f"sysid {event.system_id}: {event.data['lane']} lane "
+                    f"stalled for {event.data['gapMs']:.0f} ms, reported at "
+                    f"uptime {event.data['timeBootMs'] / 1000:.1f} s"
+                )
             elif event.kind == "param_value":
                 # a freshly learned parameter may complete a tag's cell or
                 # change an anchor's MAC/role; resync the anchor beacons

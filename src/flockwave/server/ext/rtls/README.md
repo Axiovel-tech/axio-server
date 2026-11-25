@@ -93,6 +93,10 @@ enables it.
   compares it with what A0 runs. A write applies on the board at once, so
   `X-RTLS-CELL` only writes: the tags first, the anchors only when every tag
   took it. One apply at a time; one server is one cell.
+- **Firmware lane stalls are in the server log only.** A board sends a stall
+  of 250 ms or more once, after it ended; the `logging` extension's
+  `skybrushd.log` keeps the line with its time. The cause is in the board's
+  `lanes` shell command until it reboots.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
