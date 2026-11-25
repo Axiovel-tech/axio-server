@@ -121,7 +121,9 @@ enables it.
   refused, and its anchors keep the session they last reported through the
   restarts of their ranging. A start is refused while it leaves out an
   operating anchor of the group's cell: that anchor would lose its
-  initiator at every step and keep the old survey ID.
+  initiator at every step and keep the old survey ID. A start that names no
+  group takes the online anchors that do not report another power state
+  than operating.
 - **A height group is "about the same height".** With one height group in
   the frame its anchors share one height exactly: ranges within one plane
   cannot tell heights apart, and the survey is `planar`. With two or more,

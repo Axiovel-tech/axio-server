@@ -206,6 +206,36 @@ async def test_no_anchors_named_means_every_online_anchor_in_slot_order(
     assert answer["survey"]["frame"]["origin"] == 204
 
 
+@pytest.mark.parametrize("state", ["asleep", "standby", "off"])
+async def test_no_anchors_named_leaves_out_the_anchors_that_do_not_operate(
+    dialect, nursery, builder, hub, autojump_clock, state
+):
+    cell = await survey_cell(dialect, nursery, TIERS)
+    await cell.asleep(206)
+    code = {"asleep": 3.0, "standby": 2.0, "off": 4.0}[state]
+    await cell.report([203], **(ASLEEP | {"pwrst": code}))
+
+    answer = await request(cell, builder, hub, "start", frame=TWO_TIERS)
+
+    assert (answer["result"], answer["reason"]) == ("started", None)
+    assert answer["survey"]["anchors"] == [201, 202, 204, 205, 207, 208]
+
+
+async def test_no_anchors_named_waits_for_an_anchor_of_unknown_power_state(
+    cell, builder, hub, autojump_clock
+):
+    # it may well be ranging: leaving it out would restart it at every step
+    health = {k: v for k, v in HEALTHY_A1.items() if k != "pwrst"}
+    await cell.ext._on_stats(203, health, time.monotonic())
+
+    answer = await request(cell, builder, hub, "start", frame=TWO_TIERS)
+
+    assert (answer["result"], answer["reason"]) == (
+        "refused",
+        "RTLS anchor A2 has not reported its power state",
+    )
+
+
 async def test_a_step_is_timed_by_the_longest_block_the_group_stores(
     cell, builder, hub, autojump_clock
 ):

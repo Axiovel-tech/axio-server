@@ -48,13 +48,18 @@ def _slot(ext: "RtlsExtension", system_id: int) -> int:
 def select_group(
     ext: "RtlsExtension", requested: Optional[list[int]]
 ) -> tuple[list[Anchor], Optional[str]]:
-    """The group a start names (by default every online anchor, in slot
-    order), or why no survey can run with it."""
+    """The group a start names, or why no survey can run with it. By default
+    the online anchors in slot order, without those that report another
+    power state than operating (asleep, standby, off): they do not range."""
     views = {view["systemId"]: view for view in anchor_views(ext)}
     ids = requested
     if ids is None:
-        online = [system_id for system_id, view in views.items() if view["online"]]
-        ids = sorted(online, key=lambda system_id: _slot(ext, system_id))
+        ranging = [
+            system_id
+            for system_id, view in views.items()
+            if view["online"] and view["stats"].get("powerState") in (None, "operating")
+        ]
+        ids = sorted(ranging, key=lambda system_id: _slot(ext, system_id))
     if not 3 <= len(ids) <= MAX_GROUP:
         return [], f"A survey takes three to eight anchors, not {len(ids)}"
     unknown = [system_id for system_id in ids if system_id not in views]
