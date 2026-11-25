@@ -825,6 +825,18 @@ async def test_start_names_every_anchor_left_out(
     )
 
 
+async def test_start_refuses_to_leave_out_an_anchor_of_unknown_power_state(
+    cell, builder, hub, autojump_clock
+):
+    # the same rule as for the default group: it may well be ranging
+    health = {k: v for k, v in HEALTHY_A1.items() if k != "pwrst"}
+    await cell.ext._on_stats(204, health, time.monotonic())
+
+    assert await _refusal(cell, builder, hub, anchors=[201, 202, 203]) == (
+        "Include RTLS anchor A3 in the survey, or put it to sleep"
+    )
+
+
 @pytest.mark.parametrize("state", ["asleep", "standby", "offline", "other cell"])
 async def test_an_anchor_that_does_not_range_in_the_cell_may_be_left_out(
     cell, builder, hub, autojump_clock, state

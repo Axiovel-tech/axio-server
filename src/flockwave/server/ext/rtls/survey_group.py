@@ -45,19 +45,23 @@ def _slot(ext: "RtlsExtension", system_id: int) -> int:
     return MAX_GROUP if index is None else index
 
 
+def _must_take_part(view: AnchorView) -> bool:
+    """Whether a survey of its cell needs this anchor in the group: it is
+    online and reports no other power state than operating. Asleep, in
+    standby or off it does not range; with no report yet it may well."""
+    return view["online"] and view["stats"].get("powerState") in (None, "operating")
+
+
 def select_group(
     ext: "RtlsExtension", requested: Optional[list[int]]
 ) -> tuple[list[Anchor], Optional[str]]:
     """The group a start names, or why no survey can run with it. By default
-    the online anchors in slot order, without those that report another
-    power state than operating (asleep, standby, off): they do not range."""
+    the anchors that must take part, in slot order."""
     views = {view["systemId"]: view for view in anchor_views(ext)}
     ids = requested
     if ids is None:
         ranging = [
-            system_id
-            for system_id, view in views.items()
-            if view["online"] and view["stats"].get("powerState") in (None, "operating")
+            system_id for system_id in views if _must_take_part(views[system_id])
         ]
         ids = sorted(ranging, key=lambda system_id: _slot(ext, system_id))
     if not 3 <= len(ids) <= MAX_GROUP:
@@ -104,8 +108,7 @@ def _left_out(
     """Why the group cannot be surveyed without the rest of its cell. An
     operating anchor of the cell that is left out loses its initiator at
     every step and keeps its old survey ID after the commit, so every tag
-    then leaves it out. An anchor that is offline or not operating may stay
-    out."""
+    then leaves it out."""
     from .extension import _cell_id_from_params
 
     cells = {_cell_id_from_params(_params(ext, system_id)) for system_id in group}
@@ -113,8 +116,7 @@ def _left_out(
         view["name"]
         for system_id, view in views.items()
         if system_id not in group
-        and view["online"]
-        and view["stats"].get("powerState") == "operating"
+        and _must_take_part(view)
         and _cell_id_from_params(_params(ext, system_id)) in cells
     ]
     if not names:
