@@ -251,8 +251,11 @@ def survey_warnings(
     return warnings
 
 
-def _tag_problems(tag: _Tag, cell: int, surveyed: int) -> list[str]:
-    """Why a tag does not position on the cell's survey with every anchor."""
+def _tag_problems(
+    tag: _Tag, cell: int, surveyed: int, names: Mapping[int, str]
+) -> list[str]:
+    """Why a tag does not position on the cell's survey with every anchor;
+    an anchor it leaves out by the name of the device that has its MAC."""
     name = f"tag {tag.system_id}"
     stats = tag.stats
     if stats is None:
@@ -264,9 +267,7 @@ def _tag_problems(tag: _Tag, cell: int, surveyed: int) -> list[str]:
     problems = []
     excluded = stats["anchorsExcluded"]
     if excluded:
-        named = ", ".join(
-            f"{_anchor_label(entry)} ({entry['state']})" for entry in tag.excluded
-        )
+        named = ", ".join(_left_out(entry, names) for entry in tag.excluded)
         problems.append(
             f"{name} leaves out {excluded} anchor(s)" + (f": {named}" if named else "")
         )
@@ -277,10 +278,11 @@ def _tag_problems(tag: _Tag, cell: int, surveyed: int) -> list[str]:
     return problems
 
 
-def _anchor_label(entry: Mapping[str, Any]) -> str:
-    if entry["systemId"] is not None:
-        return f"anchor {entry['systemId']}"
-    return f"MAC {entry['mac']:#06x}"
+def _left_out(entry: Mapping[str, Any], names: Mapping[int, str]) -> str:
+    """An anchor a tag leaves out, by the name of the device that has its
+    MAC, and why."""
+    name = names.get(entry["systemId"]) or f"MAC {entry['mac']:#06x}"
+    return f"{name} ({entry['state']})"
 
 
 def _rule(rule_id: str, label: str, severity: str, problems: list[str], ok: str):
@@ -309,8 +311,9 @@ def survey_rule(
     else:
         surveyed = sum(1 for anchor in anchors if anchor.survey_id == cell)
         problems += [off for a in anchors if (off := _off_survey(a, cell)) is not None]
+        names = {view["systemId"]: view["name"] for view in views}
         for tag in _tags(ext, now):
-            problems += _tag_problems(tag, cell, surveyed)
+            problems += _tag_problems(tag, cell, surveyed, names)
     ok = f"every anchor is on survey {cell} and every tag uses all of them"
     return _rule("survey", "Anchor survey", "error", problems, ok)
 

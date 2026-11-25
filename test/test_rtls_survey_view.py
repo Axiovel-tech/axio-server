@@ -391,8 +391,21 @@ async def test_verify_fails_on_a_tag_that_leaves_anchors_out(dialect):
 
     assert (rule["status"], rule["detail"]) == (
         "fail",
-        f"tag {TAG} leaves out 3 anchor(s): anchor 204 (other-survey), "
+        f"tag {TAG} leaves out 3 anchor(s): RTLS anchor A3 (other-survey), "
         "MAC 0x0777 (no-position)",
+    )
+
+
+async def test_verify_names_a_left_out_anchor_the_server_lost(dialect):
+    ext, _ = await _positioned(dialect)
+    ext._protocol.devices[204].last_seen = -1e9
+    ext._expire_devices(time.monotonic())
+    await tag_reports(ext, antbl(4, state=OTHER_SURVEY), anuse=3.0, anexc=1.0)
+
+    rule = await _rule(ext, "survey")
+
+    assert rule["detail"] == (
+        f"tag {TAG} leaves out 1 anchor(s): RTLS anchor A3 (other-survey)"
     )
 
 
