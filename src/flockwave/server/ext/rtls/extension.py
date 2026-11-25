@@ -12,11 +12,10 @@ experimental (``X-`` prefixed) message types on the message hub; see
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import math
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
@@ -25,15 +24,19 @@ import trio.socket
 from flockwave.gps.vectors import GPSCoordinate
 from rtlslink import (
     STATS_FIELDS,
+    Origin,
     ProtocolEvent,
     RtlsDevice,
     RtlsProtocol,
+    anchor_location,
     decode_param_value,
     encode_param_value,
     firmware_version,
+    ned_to_global_e7,
     param_type_from_name,
     param_type_to_name,
     parse_address,
+    role_from_params,
 )
 from rtlslink.dialect import load_dialect
 from rtlslink.flash import read_receipt
@@ -58,18 +61,30 @@ except ImportError:  # pragma: no cover
 from flockwave.server.ext.base import Extension
 from flockwave.server.registries.errors import RegistryFull
 
-from .anchor_lock import handle_lock_request, lock_json, locked_detail, show_gate
+from .anchor_lock import (
+    anchor_views,
+    handle_lock_request,
+    lock_json,
+    locked_detail,
+    show_gate,
+)
 from .anchor_sleep import (
     ANCHOR_WRITE_TIMEOUT,
     lacks_param,
     set_anchor_sleep,
     sleep_error,
 )
-from .cell_compat import cell_from_params, ned_to_global_e7, role_from_params
 from .cell_settings import cell_view, handle_cell_request
 from .cluster_clock import ClusterClock
 from .fc_identity import FlightController, flight_controller_claims, uav_ids_for_claims
-from .fitted_cell import fitted_anchor_positions
+from .survey import Survey, handle_survey_request
+from .survey_view import (
+    location_from_params,
+    stored_location,
+    survey_inputs,
+    survey_json,
+)
+from .tag_table import TABLE_STAT, TAG_SURVEY_STATS, AnchorTable
 
 if TYPE_CHECKING:
     from flockwave.server.message_hub import MessageHub
@@ -205,20 +220,20 @@ REFILL_READ_SPACING = 0.01
 #: into an unbounded burst of read requests)
 REFILL_MAX_ANCHOR_TABLE = 16
 
-#: identity params a tag must carry for its cell geometry to render
-#: (see :func:`_has_cell_geometry`) — plus ``POS_YAW_DEG`` (reported by
-#: the fleet-verification yaw rule) and ``CELL_ID`` (cell naming), which
-#: are optional on older registries: the refill repairs dump-loss holes
-#: in them too. A name genuinely absent from an older registry costs the
+#: what places a tag's cell frame on the map; the lowest online tag of a cell
+#: gives its anchors their map positions
+ORIGIN_PARAMS = ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM")
+
+#: identity params of a tag: the origin, ``POS_YAW_DEG`` (the fleet
+#: verification compares both across a cell) and ``CELL_ID`` (cell naming),
+#: which are optional on older registries: the refill repairs dump-loss
+#: holes in them. A name genuinely absent from an older registry costs the
 #: capped retry rounds and is then left alone.
-TAG_IDENTITY_PARAMS = (
-    "ORIGIN_LAT_E7",
-    "ORIGIN_LON_E7",
-    "ORIGIN_ALT_MM",
-    "UWB_AN_COUNT",
-    "POS_YAW_DEG",
-    "CELL_ID",
-)
+TAG_IDENTITY_PARAMS = (*ORIGIN_PARAMS, "POS_YAW_DEG", "CELL_ID")
+
+#: how often an anchor's ``UWB_LOC`` is read again at most, in seconds, while
+#: it advertises another survey ID than the cached value holds
+LOCATION_READ_INTERVAL = 5.0
 
 #: how long an accepted sleep/wake transaction's outcome overrides
 #: contradicting heartbeats, in seconds. The firmware acks the SLEEP write
@@ -279,6 +294,8 @@ class RtlsExtension(Extension):
         self._smp_ports: dict[tuple[str, int], int] = {}
         #: an X-RTLS-CELL apply is running (cell_settings.py: one at a time)
         self._cell_applying = False
+        #: the anchor survey (survey.py: one at a time)
+        self._survey = Survey(self)
         #: True while an X-RTLS-VERIFY run is in flight; a second
         #: concurrent run is refused (fleet-wide MAVLink param reads
         #: must not be hammered)
@@ -293,16 +310,15 @@ class RtlsExtension(Extension):
         #: anchor-beacon registration (config ``register_beacons: false`` or no
         #: beacon extension loaded)
         self._beacon_api = None
-        #: live anchor beacons we own, keyed by stable beacon id
-        #: (``rtls::<cell>::anchor_<i>``) -> (beacon, ExitStack-less context)
+        #: live anchor beacons we own, keyed by the anchor's X-RTLS-INF id
+        #: -> (beacon, ExitStack-less context)
         self._anchor_beacons: dict[str, tuple[Any, Any]] = {}
-        #: which device (a tag) currently supplies the cell geometry for a
-        #: given cell id; lets us re-home a cell onto another live tag when the
-        #: source tag is lost
-        self._anchor_cell_sources: dict[str, int] = {}
-        #: the anchor positions each tag fitted itself (automatic geometry),
-        #: as last applied to the cell it sources; None without a fit
-        self._fitted_cells: dict[int, Optional[list[tuple[float, float, float]]]] = {}
+        #: each tag's anchor table, assembled over the rotation of its
+        #: ``antbl`` stat
+        self._anchor_tables: dict[int, AnchorTable] = {}
+        #: the advertised survey ID an anchor's ``UWB_LOC`` was last read
+        #: again for, and when (see :meth:`_follow_advertised_survey`)
+        self._location_asked: dict[int, tuple[float, float]] = {}
         #: wall-clock estimate of the UWB cluster clock that the drones count
         #: the show start in
         self._cluster_clock = ClusterClock()
@@ -447,11 +463,11 @@ class RtlsExtension(Extension):
                         "X-RTLS-OTA": self._handle_RTLS_OTA,
                         "X-RTLS-STATS": self._handle_RTLS_STATS,
                         "X-RTLS-POS": self._handle_RTLS_POS,
-                        "X-RTLS-GEOM": self._handle_RTLS_GEOM,
                         "X-RTLS-VERIFY": self._handle_RTLS_VERIFY,
                         "X-RTLS-FORGET": self._handle_RTLS_FORGET,
                         "X-RTLS-LOCK": self._handle_RTLS_LOCK,
                         "X-RTLS-CELL": self._handle_RTLS_CELL,
+                        "X-RTLS-SURVEY": self._handle_RTLS_SURVEY,
                     }
                 ):
                     await self._run_protocol_loop(protocol, sock, logger)
@@ -463,11 +479,14 @@ class RtlsExtension(Extension):
         """What a stopped extension keeps of no device."""
         self._nursery = None
         self._sock = None
+        self._survey = Survey(self, self._survey.revision + 1)
         self._uptime_ms.clear()
         self._lost.clear()
         self._retained_params.clear()
         self._sleeping.clear()
         self._sleep_pins.clear()
+        self._anchor_tables.clear()
+        self._location_asked.clear()
         self._mavlink_api = None
         self._fc_claims.clear()
         self._uav_map.clear()
@@ -582,6 +601,7 @@ class RtlsExtension(Extension):
                 request = self._protocol.request_param_list(event.system_id)
                 if request is not None:
                     await self._send(*request)
+                self._sync_anchor_beacons()
                 # push the new device list so clients that only listen (the
                 # GUI queries X-RTLS-INF once) see the device appear
                 await self._on_inf_change(now)
@@ -617,10 +637,9 @@ class RtlsExtension(Extension):
                     f"uptime {event.data['timeBootMs'] / 1000:.1f} s"
                 )
             elif event.kind == "param_value":
-                # a freshly learned parameter may complete a tag's cell or
-                # change an anchor's MAC/role; resync the anchor beacons
-                self._sync_anchor_beacons_for_system(event.system_id)
-                self._refresh_anchor_cells()
+                # a freshly learned parameter may be an anchor's position,
+                # its MAC or role, or the origin a tag holds
+                self._on_param_cached(event.data["name"])
                 # a reply to a refill round may have just plugged the last
                 # hole: finish promptly instead of on the next poll round
                 self._check_refill_completion(event.system_id)
@@ -801,10 +820,13 @@ class RtlsExtension(Extension):
         *,
         timeout: float = DEFAULT_PARAM_TIMEOUT,
         exact: bool = False,
+        resend_after: float | None = None,
     ) -> dict[str, Any]:
         """Writes a single parameter and waits for the device-side ack.
         With ``exact``, an accepted ack of another value is taken for a late
-        ack of an earlier write and skipped.
+        ack of an earlier write and skipped. With ``resend_after``, the write
+        is sent again every so many seconds while no ack comes, which only a
+        write that may arrive twice allows.
         Returns ``{"value", "type", "result", "accepted"}`` where
         ``value`` is the value *acknowledged by the device* (decoded) and
         ``result`` is the raw PARAM_ACK code.
@@ -876,11 +898,16 @@ class RtlsExtension(Extension):
                     request = protocol.set_param(system_id, name, encoded, param_type)
                     if request is None:
                         raise KeyError(system_id)
-                    await self._send(*request)
+
+                    async def send_until_acked():
+                        while True:
+                            await self._send(*request)
+                            with trio.move_on_after(resend_after or math.inf):
+                                return await wait_for_final_ack(events)
 
                     try:
                         with trio.fail_at(deadline):
-                            event = await wait_for_final_ack(events)
+                            event = await send_until_acked()
                     except trio.TooSlowError:
                         # keep holding the lock through a short drain:
                         # a LATE final ack caught here is adopted as
@@ -906,10 +933,7 @@ class RtlsExtension(Extension):
                         if live is not None:
                             live.params[name] = event.data["value"]
                             live.param_types[name] = param_type
-                            self._sync_anchor_beacons(
-                                live, _decoded_device_params(live)
-                            )
-                            self._refresh_anchor_cells()
+                            self._on_param_cached(name)
                     return {
                         "value": decode_param_value(event.data["value"], param_type),
                         "type": param_type_to_name(param_type),
@@ -951,6 +975,8 @@ class RtlsExtension(Extension):
         Returns ``{"requested", "accepted", "sleeping", "detail"}``.
         Raises KeyError for unknown devices and trio.TooSlowError on
         timeout."""
+        if self._survey.involves(system_id):
+            return sleep_error(sleeping, "A survey is running")
         role = await self._command_role(system_id, timeout)
         if role is None:
             return sleep_error(
@@ -1126,6 +1152,8 @@ class RtlsExtension(Extension):
         not running."""
         if system_id not in self._require_protocol().devices:
             raise KeyError(system_id)
+        if self._survey.involves(system_id):
+            raise RuntimeError("A survey is running")
         species, source = _image_species(image_path, role)
         if species is None:
             raise ValueError(
@@ -1246,21 +1274,30 @@ class RtlsExtension(Extension):
             # The drone's own telemetry rides its tag's snapshot so that one
             # row shows the whole pre-show health of a drone
             body["imuTemperaturesC"] = temperatures
+        table = self._anchor_table_json(system_id, data)
+        if table is not None:
+            body["anchorTable"] = table
         previous = self._stats.get(system_id) or {}
+        self._survey.keep_session(system_id, body, previous)
         # anchorLock and cellSettings follow the lock, cellcfg and txgain stats;
         # an anchor's INF sleeping follows its powerState (standby <-> asleep
         # keeps the same heartbeat)
-        if any(
-            body.get(key) != previous.get(key)
-            for key in ("locked", "cellConfig", "txGain")
-        ) or (body.get("powerState") == "asleep") != (
-            previous.get("powerState") == "asleep"
+        if (
+            any(
+                body.get(key) != previous.get(key)
+                for key in ("locked", "cellConfig", "txGain")
+            )
+            or (body.get("powerState") == "asleep")
+            != (previous.get("powerState") == "asleep")
+            or survey_inputs(body) != survey_inputs(previous)
         ):
             self._inf_pending = True
         self._stats[system_id] = body
         self._stats_at[system_id] = now
+        self._survey.on_stats(system_id, body)
         self._cluster_clock.on_stats(system_id, data)
-        await self._follow_fitted_cell(system_id, now)
+        if _is_anchor_stats(role):
+            await self._follow_advertised_survey(system_id, data, now)
         # STATS_FIELDS is the SDK's required legacy set of a tag; newer stats
         # (``slp`` sleep state, ``vbat`` battery voltage, the cluster clock)
         # are optional and must not gate the broadcast, or firmware without
@@ -1275,17 +1312,52 @@ class RtlsExtension(Extension):
             return
         await self._broadcast_stats(system_id, now)
 
-    async def _follow_fitted_cell(self, system_id: int, now: float) -> None:
-        """Re-renders the cell a tag sources when its own fit appears,
-        changes (a recalibration) or goes away: the anchors then sit where
-        the tag positions them, not where its provisioned table says."""
-        fitted = fitted_anchor_positions(self._stats.get(system_id))
-        if fitted == self._fitted_cells.get(system_id):
+    def _anchor_table_json(
+        self, system_id: int, data: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        """A tag's anchor table after the ``antbl`` of this report, each
+        anchor with the system ID of the device that has its MAC (null while
+        no known anchor has); None while the tag reports no table."""
+        value = _finite_stat(data, TABLE_STAT)
+        if value is None:
+            self._anchor_tables.pop(system_id, None)
+            return None
+        table = self._anchor_tables.setdefault(system_id, AnchorTable())
+        table.report(value, _finite_stat(data, "anexc"))
+        system_ids = self._anchor_system_ids()
+        return [
+            {
+                "row": entry.row,
+                "mac": entry.mac,
+                "state": entry.state,
+                "systemId": system_ids.get(entry.mac),
+            }
+            for entry in table.entries
+        ]
+
+    async def _follow_advertised_survey(
+        self, system_id: int, data: dict[str, Any], now: float
+    ) -> None:
+        """Reads an anchor's ``UWB_LOC`` again while the survey ID it
+        advertises is not the cached one: its position was written past this
+        server, or the read of it was lost. At once for an ID not asked for
+        yet, then every ``LOCATION_READ_INTERVAL``."""
+        advertised = _finite_stat(data, "sid")
+        device = self._protocol.devices.get(system_id) if self._protocol else None
+        if advertised is None or advertised < 0 or device is None:
             return
-        self._fitted_cells[system_id] = fitted
-        if system_id in self._anchor_cell_sources.values():
-            self._sync_anchor_beacons_for_system(system_id)
-            await self._on_inf_change(now)
+        stored = stored_location(device)
+        cached = 0 if stored is None else stored.location.survey_id
+        asked_for, asked_at = self._location_asked.get(system_id, (None, 0.0))
+        if advertised == cached:
+            self._location_asked.pop(system_id, None)
+        elif asked_for != advertised or now - asked_at >= LOCATION_READ_INTERVAL:
+            self._location_asked[system_id] = (advertised, now)
+            request = self._require_protocol().request_param_read(
+                system_id, anchor_location.PARAM
+            )
+            if request is not None:
+                await self._send(*request)
 
     async def _flush_pending_stats(self, now: float) -> None:
         """Broadcast any cached stats snapshot that is newer than the last
@@ -1300,11 +1372,9 @@ class RtlsExtension(Extension):
                 and now - harvested > STATS_STALE_AFTER
             ):
                 stats = self._stats[system_id] = {**stats, "stale": True}
-                # the cell this tag sources falls back to its provisioned
-                # table; a returning identical fit then re-renders it
-                if self._fitted_cells.pop(system_id, None) is not None:
-                    self._sync_anchor_beacons_for_system(system_id)
-                    self._inf_pending = True
+                self._anchor_tables.pop(system_id, None)
+                # a silent tag no longer says which anchors it leaves out
+                self._inf_pending = True
             if stats == self._last_stats_sent.get(system_id):
                 continue
             last = self._last_stats_broadcast.get(system_id)
@@ -1466,17 +1536,18 @@ class RtlsExtension(Extension):
         """React to a device-``lost`` event: keep the device as last seen
         (listed offline in X-RTLS-INF) with its last stats marked stale, drop
         the live-only state (TWR telemetry, position stream, uptime, sleep
-        latch, fitted cell), re-home any cell it sourced, then forward the
-        event to subscribers. Also marks the device list dirty; the periodic
-        flush in the protocol loop broadcasts the updated X-RTLS-INF and the
-        stale stats (this handler is synchronous, so it cannot broadcast
-        itself)."""
+        latch, anchor table), then forward the event to subscribers. Also
+        marks the device list dirty; the periodic flush in the protocol loop
+        broadcasts the updated X-RTLS-INF and the stale stats (this handler
+        is synchronous, so it cannot broadcast itself)."""
         if device is not None:
             self._lost[event.system_id] = device
         stats = self._stats.get(event.system_id)
         if stats is not None:
             self._stats[event.system_id] = {**stats, "stale": True}
-        self._fitted_cells.pop(event.system_id, None)
+        self._anchor_tables.pop(event.system_id, None)
+        self._location_asked.pop(event.system_id, None)
+        self._survey.on_lost(event.system_id)
         self._prune_pos(event.system_id)
         self._refill.pop(event.system_id, None)
         self._twr.pop(event.system_id, None)
@@ -1486,8 +1557,7 @@ class RtlsExtension(Extension):
         # _sleep_pins deliberately survives loss: a woken device reboots off
         # the network (lost + rediscovered) inside its pin window
         self._cluster_clock.forget_device(event.system_id)
-        self._drop_anchor_cells_for_source(event.system_id)
-        self._refresh_anchor_cells()
+        self._sync_anchor_beacons()
         self._inf_pending = True
         self._dispatch_event(event)
 
@@ -1495,7 +1565,6 @@ class RtlsExtension(Extension):
         """Drop all cached stats state for a device (when it is forgotten)."""
         self._stats.pop(system_id, None)
         self._stats_at.pop(system_id, None)
-        self._fitted_cells.pop(system_id, None)
         self._last_stats_broadcast.pop(system_id, None)
         self._last_stats_sent.pop(system_id, None)
 
@@ -2032,27 +2101,6 @@ class RtlsExtension(Extension):
             in_response_to=message,
         )
 
-    async def _handle_RTLS_GEOM(
-        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
-    ):
-        # Lazy import: geometry_agreement.py imports helpers from this module.
-        from .geometry_agreement import DEFAULT_TOLERANCE_M, run_agreement
-
-        body = message.body
-        try:
-            ids = _get_optional_device_ids(body)
-            tolerance = body.get("tolerance", DEFAULT_TOLERANCE_M)
-            if (
-                isinstance(tolerance, bool)
-                or not isinstance(tolerance, (int, float))
-                or not 0.0 < float(tolerance) <= 1.0
-            ):
-                raise ValueError("Invalid tolerance (metres, 0 < tolerance <= 1)")
-            result = run_agreement(self, ids=ids, tolerance=float(tolerance))
-        except ValueError as ex:
-            return hub.reject(message, reason=str(ex))
-        return hub.create_response_or_notification(body=result, in_response_to=message)
-
     async def _handle_RTLS_FORGET(
         self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
     ):
@@ -2087,6 +2135,7 @@ class RtlsExtension(Extension):
         self._retained_params.pop(system_id, None)
         self._prune_stats(system_id)
         self._sleep_pins.pop(system_id, None)
+        self._sync_anchor_beacons()
         return {"forgotten": True}
 
     async def _handle_RTLS_LOCK(
@@ -2120,6 +2169,15 @@ class RtlsExtension(Extension):
             return hub.reject(message, reason=str(ex))
         if body["results"]:
             await self._on_inf_change(time.monotonic())
+        return hub.create_response_or_notification(body=body, in_response_to=message)
+
+    async def _handle_RTLS_SURVEY(
+        self, message: "FlockwaveMessage", sender: "Client", hub: "MessageHub"
+    ):
+        try:
+            body = await handle_survey_request(self, message.body)
+        except ValueError as ex:
+            return hub.reject(message, reason=str(ex))
         return hub.create_response_or_notification(body=body, in_response_to=message)
 
     async def _handle_RTLS_VERIFY(
@@ -2205,7 +2263,8 @@ class RtlsExtension(Extension):
         return {
             "type": "X-RTLS-INF",
             "status": self._inf_status(now, cell_states),
-            "anchors": self._site_anchors(),
+            "anchors": [entry for _, entry in self._site_anchors()],
+            "survey": survey_json(self, anchor_views(self), now),
             "anchorLock": lock_json(self),
             "cellSettings": cell,
         }
@@ -2280,7 +2339,6 @@ class RtlsExtension(Extension):
         if role is not None:
             body["role"] = role
         if role == "tag":
-            # the cell whose anchor slots the tag's anchor masks index
             body["cell"] = _cell_id_from_params(params)
         name = _device_name(device.system_id, params, role)
         if name is not None:
@@ -2318,234 +2376,95 @@ class RtlsExtension(Extension):
 
     # ---- site / cell / anchor beacons ----
 
-    def _site_anchors(self) -> list[dict[str, Any]]:
-        """The site-level anchor list for X-RTLS-INF: one entry per anchor in
-        every known cell, with its stable beacon id, GPS position (origin+NED)
-        and ``active`` flag (true iff a matching live anchor device is online,
-        whose ``systemId`` it then carries).
-        Derived from the same cell the anchor beacons render."""
-        out: list[dict[str, Any]] = []
-        if self._protocol is None:
-            return out
-        for cell_id, source in sorted(self._anchor_cell_sources.items()):
-            device = self._protocol.devices.get(source)
-            if device is None:
-                continue
-            try:
-                cell = self._source_cell(
-                    source, _decoded_device_params(device), cell_id
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-            for anchor in cell.anchors:
-                lat_e7, lon_e7, alt_mm = ned_to_global_e7(
-                    cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
-                )
-                anchor_system_id = self._anchor_device_system_id(anchor.mac)
-                out.append(
-                    {
-                        "id": _anchor_beacon_id(cell_id, anchor.index),
-                        "cell": cell_id,
-                        "index": anchor.index,
-                        "mac": anchor.mac,
-                        "position": {
-                            "lat": round(lat_e7 * 1e-7, 7),
-                            "lon": round(lon_e7 * 1e-7, 7),
-                            "amsl": round(alt_mm * 1e-3, 3),
-                        },
-                        # native cell-frame NED (meters) alongside the derived
-                        # GPS position: the position-debug view plots anchors
-                        # and the X-RTLS-POS estimates in the same frame
-                        # without a lossy GPS round-trip
-                        "ned": {
-                            "north": round(anchor.north_m, 3),
-                            "east": round(anchor.east_m, 3),
-                            "down": round(anchor.down_m, 3),
-                        },
-                        "active": anchor_system_id is not None,
-                        # names the anchor in a tag's anchor masks, whose
-                        # bits are these slots
-                        "systemId": anchor_system_id,
-                    }
-                )
-        return out
-
-    def _source_cell(self, system_id: int, params: dict[str, Any], cell_id: str):
-        """The cell a tag sources: origin, slot MACs and biases from its
-        parameters; anchor positions from its own fit when it has one (the
-        positions it actually solves on), its UWB_AN* table otherwise."""
-        cell = cell_from_params(params, cell_id=cell_id)
-        stats = self._stats.get(system_id)
-        fitted = fitted_anchor_positions(
-            None if stats is None or stats.get("stale") else stats
-        )
-        if fitted is None or len(fitted) != len(cell.anchors):
-            return cell
-        return dataclasses.replace(
-            cell,
-            anchors=tuple(
-                dataclasses.replace(anchor, north_m=n, east_m=e, down_m=d)
-                for anchor, (n, e, d) in zip(cell.anchors, fitted)
-            ),
-        )
-
-    def _sync_anchor_beacons_for_system(self, system_id: int) -> None:
-        if self._protocol is None:
-            return
-        device = self._protocol.devices.get(system_id)
-        if device is not None:
-            self._sync_anchor_beacons(device, _decoded_device_params(device))
-
-    def _sync_anchor_beacons(self, device, params: dict[str, Any]) -> None:
-        """Reconcile the cell that ``device`` sources, and (when the beacon API
-        is available) the anchor beacons rendered from it. Only a tag carries
-        the cell geometry; any other role (or an invalid role) drops the cell
-        this device used to source.
-
-        Cell-source bookkeeping (``_anchor_cell_sources``) is maintained
-        unconditionally so the X-RTLS-INF site anchors list reflects the
-        advertised geometry even with ``register_beacons: false``; only the
-        per-anchor beacon create/update/drop is gated on the beacon API."""
-        role = _cell_source_role(device, params)
-        if role is None:
-            if "UWB_ROLE" in params:
-                self._drop_anchor_cells_for_source(device.system_id)
-            return
-        if role != "tag":
-            self._drop_anchor_cells_for_source(device.system_id)
-            return
-
-        try:
-            cell = self._source_cell(
-                device.system_id, params, _cell_id_from_params(params)
+    def _site_anchors(self) -> list[tuple[int, dict[str, Any]]]:
+        """The X-RTLS-INF ``anchors`` list with each anchor's system ID:
+        every known anchor, online or lost, by cell and by its row in its
+        own ``UWB_AN*_MAC`` table (see :meth:`_site_anchor`)."""
+        devices = self._protocol.devices if self._protocol else {}
+        known = [(device, True) for device in devices.values()] + [
+            (device, False)
+            for system_id, device in self._lost.items()
+            if system_id not in devices
+        ]
+        origins = self._cell_origins()
+        anchors = []
+        for device, online in known:
+            params = self._identity_params(device)
+            if role_from_params(params) in ANCHOR_ROLES:
+                entry = _site_anchor(device.system_id, params, online, origins)
+                anchors.append((device.system_id, entry))
+        anchors.sort(
+            key=lambda anchor: (
+                anchor[1]["cell"],
+                anchor[1]["index"] is None,
+                anchor[1]["index"] or 0,
+                anchor[0],
             )
-        except (KeyError, TypeError, ValueError):
-            return
-
-        self._anchor_cell_sources[cell.cell_id] = device.system_id
-        # a CELL_ID change re-homes the device: without this, the old
-        # cell id would keep pointing at it and render a phantom cell
-        # with the NEW cell's geometry
-        self._drop_stale_anchor_cells_for_source(
-            device.system_id, keep_cell_id=cell.cell_id
         )
+        return anchors
 
+    def _cell_origins(self) -> dict[str, Origin]:
+        """Each cell's origin as its lowest online tag holds it: the anchors
+        store positions in the cell frame, and only a tag says where on the
+        map that frame is."""
+        devices = self._protocol.devices if self._protocol else {}
+        names = (*ORIGIN_PARAMS, "UWB_ROLE", "CELL_ID", "RTLS_CELL_ID")
+        origins: dict[str, Origin] = {}
+        for _, device in sorted(devices.items()):
+            params = _decoded_device_params(device, names)
+            if role_from_params(params) == "tag" and all(
+                name in params for name in ORIGIN_PARAMS
+            ):
+                lat_e7, lon_e7, alt_mm = (int(params[name]) for name in ORIGIN_PARAMS)
+                origins.setdefault(
+                    _cell_id_from_params(params), Origin(lat_e7, lon_e7, alt_mm)
+                )
+        return origins
+
+    def _anchor_system_ids(self) -> dict[int, int]:
+        """The system ID of the known anchor that has each ``UWB_MAC``; an
+        online anchor before a lost one."""
+        devices = self._protocol.devices if self._protocol else {}
+        system_ids: dict[int, int] = {}
+        for device in (*devices.values(), *self._lost.values()):
+            params = _decoded_device_params(device, ("UWB_ROLE", "UWB_MAC"))
+            if role_from_params(params) in ANCHOR_ROLES and "UWB_MAC" in params:
+                system_ids.setdefault(int(params["UWB_MAC"]), device.system_id)
+        return system_ids
+
+    def _on_param_cached(self, name: str) -> None:
+        """A parameter entered a device's cache: the anchors on the map
+        follow, and a position that changed is pushed."""
+        self._sync_anchor_beacons()
+        if name == anchor_location.PARAM:
+            self._inf_pending = True
+
+    def _sync_anchor_beacons(self) -> None:
+        """Renders every anchor that has a map position as a beacon and
+        drops the beacon of every other."""
         if self._beacon_api is None:
             return
-
-        active_ids = set()
-        for anchor in cell.anchors:
-            beacon_id = _anchor_beacon_id(cell.cell_id, anchor.index)
-            active_ids.add(beacon_id)
-            beacon = self._get_or_create_anchor_beacon(beacon_id)
+        placed = set()
+        for system_id, anchor in self._site_anchors():
+            position = anchor["position"]
+            beacon = (
+                self._get_or_create_anchor_beacon(anchor["id"]) if position else None
+            )
             if beacon is None:
                 continue
-
-            lat_e7, lon_e7, alt_mm = ned_to_global_e7(
-                cell.origin, anchor.north_m, anchor.east_m, anchor.down_m
+            placed.add(anchor["id"])
+            index = anchor["index"]
+            beacon.basic_properties.name = (
+                f"RTLS anchor {system_id}" if index is None else f"RTLS A{index}"
             )
-            beacon.basic_properties.name = f"RTLS A{anchor.index}"
             beacon.update_status(
                 position=GPSCoordinate(
-                    lat=lat_e7 * 1e-7,
-                    lon=lon_e7 * 1e-7,
-                    amsl=alt_mm * 1e-3,
+                    lat=position["lat"], lon=position["lon"], amsl=position["amsl"]
                 ),
-                active=self._anchor_device_system_id(anchor.mac) is not None,
+                active=anchor["active"],
             )
-
         for beacon_id in list(self._anchor_beacons):
-            if (
-                beacon_id.startswith(f"rtls::{cell.cell_id}::")
-                and beacon_id not in active_ids
-            ):
-                self._drop_anchor_beacon(beacon_id)
-
-    def _drop_anchor_cells_for_source(self, system_id: int) -> None:
-        for cell_id, source in list(self._anchor_cell_sources.items()):
-            if source != system_id:
-                continue
-            replacement = self._find_anchor_cell_source(cell_id)
-            if replacement is None:
-                self._drop_anchor_cell(cell_id)
-            else:
-                device, params = replacement
-                self._sync_anchor_beacons(device, params)
-
-    def _drop_stale_anchor_cells_for_source(
-        self, system_id: int, *, keep_cell_id: str
-    ) -> None:
-        """Drops (or re-homes onto another live tag) every cell mapping
-        this device sources under a cell id OTHER than ``keep_cell_id``
-        — its current one. The recursion through ``_sync_anchor_beacons``
-        terminates: a replacement source found for a cell id advertises
-        exactly that cell id, so its own resync keeps it."""
-        for cell_id, source in list(self._anchor_cell_sources.items()):
-            if source != system_id or cell_id == keep_cell_id:
-                continue
-            replacement = self._find_anchor_cell_source(cell_id)
-            if replacement is None:
-                self._drop_anchor_cell(cell_id)
-            else:
-                device, params = replacement
-                self._sync_anchor_beacons(device, params)
-
-    def _refresh_anchor_cells(self) -> None:
-        if self._protocol is None:
-            return
-        for cell_id, source in list(self._anchor_cell_sources.items()):
-            device = self._protocol.devices.get(source)
-            if device is None:
-                replacement = self._find_anchor_cell_source(cell_id)
-                if replacement is None:
-                    self._drop_anchor_cell(cell_id)
-                else:
-                    device, params = replacement
-                    self._sync_anchor_beacons(device, params)
-            else:
-                self._sync_anchor_beacons(device, _decoded_device_params(device))
-
-    def _find_anchor_cell_source(
-        self, cell_id: str
-    ) -> tuple[Any, dict[str, Any]] | None:
-        if self._protocol is None:
-            return None
-        for device in self._protocol.devices.values():
-            params = _decoded_device_params(device)
-            if _cell_source_role(device, params) != "tag":
-                continue
-            try:
-                cell = cell_from_params(params, cell_id=_cell_id_from_params(params))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if cell.cell_id == cell_id:
-                return device, params
-        return None
-
-    def _anchor_device_system_id(self, mac: int | None) -> int | None:
-        """System id of the online anchor device whose ``UWB_MAC`` is
-        ``mac``, None while none is."""
-        if mac is None or self._protocol is None:
-            return None
-        for system_id, device in self._protocol.devices.items():
-            params = _decoded_device_params(device)
-            if role_from_params(params) not in (
-                "anchor-initiator",
-                "anchor-responder",
-            ):
-                continue
-            try:
-                if int(params.get("UWB_MAC")) == int(mac):
-                    return int(system_id)
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _drop_anchor_cell(self, cell_id: str) -> None:
-        self._anchor_cell_sources.pop(cell_id, None)
-        prefix = f"rtls::{cell_id}::"
-        for beacon_id in list(self._anchor_beacons):
-            if beacon_id.startswith(prefix):
+            if beacon_id not in placed:
                 self._drop_anchor_beacon(beacon_id)
 
     def _get_or_create_anchor_beacon(self, beacon_id: str):
@@ -2576,7 +2495,6 @@ class RtlsExtension(Extension):
     def _clear_anchor_beacons(self) -> None:
         for beacon_id in list(self._anchor_beacons):
             self._drop_anchor_beacon(beacon_id)
-        self._anchor_cell_sources.clear()
 
     def exports(self):
         return {
@@ -2670,34 +2588,55 @@ def _cell_id_from_params(params: dict[str, Any]) -> str:
     return str(value) if value not in (None, "") else "default"
 
 
-def _cell_source_role(device, params: dict[str, Any]) -> str | None:
-    """The role to treat a device as for cell sourcing. A configured
-    ``UWB_ROLE`` is authoritative; lacking it, a device that has finished
-    listing and carries a full cell geometry is treated as a legacy tag (the
-    'cell inferred from tag params' compatibility bridge)."""
-    role = role_from_params(params)
-    if role is not None:
-        return role
-    if "UWB_ROLE" in params:
-        return None
-    if (
-        device.param_count is not None
-        and len(device.params) >= device.param_count
-        and _has_cell_geometry(params)
-    ):
-        return "tag"
-    return None
-
-
-def _has_cell_geometry(params: dict[str, Any]) -> bool:
-    return all(
-        name in params
-        for name in ("ORIGIN_LAT_E7", "ORIGIN_LON_E7", "ORIGIN_ALT_MM", "UWB_AN_COUNT")
-    )
-
-
-def _anchor_beacon_id(cell_id: str, index: int) -> str:
+def _anchor_beacon_id(cell_id: str, index: int | None, system_id: int) -> str:
+    """An anchor's X-RTLS-INF id: by its row in its own table, or by its
+    system ID while its ``UWB_MAC`` is in no row of it."""
+    if index is None:
+        return f"rtls::{cell_id}::device_{system_id}"
     return f"rtls::{cell_id}::anchor_{index}"
+
+
+def _site_anchor(
+    system_id: int, params: dict[str, Any], online: bool, origins: dict[str, Origin]
+) -> dict[str, Any]:
+    """One entry of the X-RTLS-INF ``anchors`` list: the anchor's row in its
+    own table, the position and survey ID it stores itself (``UWB_LOC``;
+    ``ned`` is null while it is not surveyed) and, through the origin of its
+    cell, where that is on the map (``position``, null without either)."""
+    cell_id = _cell_id_from_params(params)
+    index = _anchor_index_for_device(params)
+    stored = location_from_params(params)
+    location = None if stored is None else stored.location
+    ned = position = None
+    if location is not None:
+        north, east, down = location.ned_m
+        ned = {
+            "north": round(north, 3),
+            "east": round(east, 3),
+            "down": round(down, 3),
+        }
+        origin = origins.get(cell_id)
+        with suppress(ValueError):
+            if origin is not None:
+                lat_e7, lon_e7, alt_mm = ned_to_global_e7(origin, north, east, down)
+                position = {
+                    "lat": round(lat_e7 * 1e-7, 7),
+                    "lon": round(lon_e7 * 1e-7, 7),
+                    "amsl": round(alt_mm * 1e-3, 3),
+                }
+    mac = params.get("UWB_MAC")
+    return {
+        "id": _anchor_beacon_id(cell_id, index, system_id),
+        "cell": cell_id,
+        "index": index,
+        "mac": None if mac is None else int(mac),
+        "position": position,
+        "ned": ned,
+        "surveyId": None if location is None else location.survey_id,
+        "planar": location is not None and location.planar,
+        "active": online,
+        "systemId": system_id if online else None,
+    }
 
 
 def _device_name(
@@ -2743,8 +2682,8 @@ def _missing_identity_param_names(
 
 def _missing_naming_param_names(params: dict[str, Any], role: str | None) -> list[str]:
     """The identity params a device's snapshot must gain before its name
-    (anchor A-index) or cell geometry (tag) can resolve — an empty list
-    when nothing needs re-requesting.
+    (anchor A-index) or its frame (tag) can resolve — an empty list when
+    nothing needs re-requesting.
 
     Missing means absent from the snapshot, never present-but-mismatched:
     an anchor with a complete MAC table that simply does not contain its
@@ -2754,34 +2693,23 @@ def _missing_naming_param_names(params: dict[str, Any], role: str | None) -> lis
         if _anchor_index_for_device(params) is not None:
             return []  # A-index already resolves
         missing = [name for name in ("UWB_MAC", "UWB_AN_COUNT") if name not in params]
-        missing.extend(_missing_anchor_table_names(params, ("MAC",)))
+        missing.extend(_missing_anchor_table_names(params))
         return missing
     if role == "tag":
-        missing = [name for name in TAG_IDENTITY_PARAMS if name not in params]
-        # cell_from_params() also needs every counted anchor's NED triple
-        # (and the MAC drives the beacon's live/active matching); a hole
-        # there keeps the whole cell — hence the map beacons — unrendered
-        missing.extend(
-            _missing_anchor_table_names(params, ("X", "Y", "Z", "MAC", "BIAS_M"))
-        )
-        return missing
+        return [name for name in TAG_IDENTITY_PARAMS if name not in params]
     if role is None and "UWB_ROLE" not in params:
-        # the device cannot be classified (UWB_ROLE lost with the dump —
-        # or genuinely absent on a legacy tag, the _cell_source_role
-        # compatibility bridge, which is recognized only once the snapshot
-        # is count-complete). The marker makes the poll re-request the
-        # whole dump: holes whose names were never listed cannot be
-        # enumerated by targeted reads.
+        # the device cannot be classified (UWB_ROLE lost with the dump, or
+        # a legacy tag that genuinely lacks it). The marker makes the poll
+        # re-request the whole dump: holes whose names were never listed
+        # cannot be enumerated by targeted reads.
         return ["UWB_ROLE"]
     return []
 
 
-def _missing_anchor_table_names(
-    params: dict[str, Any], suffixes: tuple[str, ...]
-) -> list[str]:
-    """The absent ``UWB_AN{i}_{suffix}`` names for every anchor index the
-    snapshot's ``UWB_AN_COUNT`` declares — empty when the count itself is
-    absent (it is requested first) or undecodable."""
+def _missing_anchor_table_names(params: dict[str, Any]) -> list[str]:
+    """The absent ``UWB_AN{i}_MAC`` names for every row an anchor's
+    ``UWB_AN_COUNT`` declares — empty when the count itself is absent (it is
+    requested first) or undecodable."""
     if "UWB_AN_COUNT" not in params:
         return []
     try:
@@ -2791,8 +2719,7 @@ def _missing_anchor_table_names(
     count = max(0, min(count, REFILL_MAX_ANCHOR_TABLE))
     return [
         name
-        for index in range(count)
-        for name in (f"UWB_AN{index}_{suffix}" for suffix in suffixes)
+        for name in (f"UWB_AN{index}_MAC" for index in range(count))
         if name not in params
     ]
 
@@ -2819,6 +2746,12 @@ A0_RATE_PARAMS = ("UWB_BLOCK_MS", "UWB_SLOTS_RR", "UWB_SLOT_RSTU")
 def _running_or_none(value: float) -> int | None:
     """``cellcfg`` and ``txgain``: -1 while the device runs no session."""
     return None if value < 0 else int(value)
+
+
+def _survey_id_or_none(value: float) -> int | None:
+    """``sid``: 0 while the session advertises no location, -1 while no
+    session runs."""
+    return None if value <= 0 else int(value)
 
 
 #: stats (wire name) carried 1:1 into the X-RTLS-STATS body (key, converter),
@@ -2853,19 +2786,23 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     # the code and TX level of the session the device runs (cell_settings.py)
     ("cellcfg", "cellConfig", _running_or_none),
     ("txgain", "txGain", _running_or_none),
+    # the survey ID of the position an anchor's session advertises, and the
+    # one a tag's table follows
+    ("sid", "surveyId", _survey_id_or_none),
+    # an anchor's live range to its stored initiator minus the one its
+    # survey measured; absent while it has no reading. As reported: the
+    # warning compares it with a bound, and a rounded 0.08004 would not warn
+    # where the anchor's own ring does.
+    ("rdev", "rangeDeviationM", float),
+    *(
+        (name, key, int if digits is None else _rounded(digits))
+        for name, key, digits in TAG_SURVEY_STATS
+    ),
     ("rstc", "resetCause", int),
     # cluster-clock sync freshness (fleet-verify clock rule and the UI)
     ("clkok", "clockSyncOk", bool),
-    # Automatic cell geometry (rtls-link-zephyr#210): the tag's fit state,
-    # why the last fit was rejected (codes in geometry_agreement.py), the
-    # rectangle-diagonal residual and the largest live drift since
-    # calibration
-    ("geom", "geometryState", int),
-    ("gfail", "geometryReason", int),
-    ("gres", "geometryResidualM", _rounded(4)),
-    ("gdrift", "geometryDriftM", _rounded(4)),
     # the anchors the tag's chip flagged NLOS on most rows and the anchors
-    # its solver is outvoting
+    # its solver is outvoting: bit i is row i of the tag's anchorTable
     ("nlosmask", "nlosMask", int),
     ("outmask", "outvotedMask", int),
 )
@@ -2931,18 +2868,6 @@ def _stats_json(
     rmse = _finite_stat(data, "rmse")
     if rmse is not None:
         body["residualRmsM"] = round(rmse, 4) if rmse >= 0.0 else None
-    # the seven fitted AN0-ANi distances (0 without a fit; a four-anchor
-    # cell reports the first three), compared by X-RTLS-GEOM
-    distances = [data.get(f"gd{i}") for i in range(1, 8)]
-    if any(d is not None for d in distances):
-        # the firmware sends 0 for a distance it has no fit for (a
-        # four-anchor cell's top plane, or no fit at all): not a distance
-        body["geometryDistancesM"] = [
-            round(float(d), 4)
-            if d is not None and math.isfinite(float(d)) and float(d) > 0.0
-            else None
-            for d in distances
-        ]
     return body
 
 

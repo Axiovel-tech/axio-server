@@ -132,6 +132,12 @@ def sigma_of(fit, anchor) -> float:
     return sigma
 
 
+def offset_of(fit, anchor) -> float:
+    offset = fit.anchors[anchor].height_offset_m
+    assert offset is not None
+    return offset
+
+
 def moved_of(fit, anchor) -> float:
     moved = fit.anchors[anchor].moved_m
     assert moved is not None
@@ -151,7 +157,9 @@ def test_two_tiers_preset_needs_no_placement():
     assert not fit.planar
     assert fit.blocked == () and fit.warnings == () and fit.notes == ()
     assert [report.links for report in fit.anchors.values()] == [7] * 8
-    assert len({fit.anchors[a].position[2] for a in (105, 106, 107, 108)}) == 1
+    # two groups: every anchor has its own height, near its group's
+    offsets = [offset_of(fit, a) for a in TWO_TIERS]
+    assert len(set(offsets)) == 8 and max(map(abs, offsets)) < 0.05
     assert len(fit.pairs) == 28
 
 
@@ -329,10 +337,12 @@ def test_flat_sketch_finds_a_height_group_the_frame_does_not_call_upper():
 
     assert fit.rms_m < 0.02
     assert abs(fit.anchors[304].position[2]) == pytest.approx(2.2, abs=0.1)
-    assert codes(fit.blocked) == [
-        ("not-located", 304, None),
-        ("not-located", 305, None),
-    ]
+    # the mirror image also turns over the few millimetres an anchor of the
+    # lower group stands off it, so one of those can be named too
+    assert {("not-located", 304, None), ("not-located", 305, None)} <= set(
+        codes(fit.blocked)
+    )
+    assert {code for code, _, _ in codes(fit.blocked)} == {"not-located"}
     assert "neither the placement nor the frame" in fit.blocked[0].detail
 
 
@@ -374,7 +384,8 @@ def test_upper_tier_barely_above_the_lower_leaves_the_mirror_open():
 
     fit = fit_survey(list(layout), measurements, frame)
 
-    assert codes(fit.blocked) == [("not-located", a, None) for a in (5, 6, 7, 8)]
+    assert {("not-located", a, None) for a in (5, 6, 7, 8)} <= set(codes(fit.blocked))
+    assert {code for code, _, _ in codes(fit.blocked)} == {"not-located"}
     assert "nearly level" in fit.blocked[0].detail
     assert abs(fit.anchors[5].position[2]) == pytest.approx(0.25, abs=0.03)
 
@@ -467,12 +478,12 @@ def test_anchor_with_two_links_is_not_located():
         placement=rough(FIVE),
     )
 
-    assert codes(fit.blocked) == [
+    assert codes(fit.blocked)[:2] == [
         ("pair-missing", 301, 305),
         ("pair-missing", 302, 305),
-        ("not-located", 305, None),
     ]
-    assert fit.blocked[2].detail == "2 links, a position needs three"
+    assert codes(fit.blocked)[-1] == ("not-located", 305, None)
+    assert fit.blocked[-1].detail == "2 links, a position needs three"
     assert fit.anchors[305].links == 2
 
 
@@ -616,6 +627,15 @@ def test_stored_positions_in_another_frame_start_the_fit():
 # Above the 2.5 cm floor of the prediction, which would otherwise be what is
 # compared with the spread.
 MONTE_CARLO_NOISE_M = 0.04
+#: the cell with heights the ranges alone decide: one exact group, the rest
+#: free. In two groups the tolerance of a height adds what no noise shows.
+LEVEL_AND_FREE = Frame(
+    origin=101,
+    x_axis=102,
+    height_groups=((101, 102, 103, 104),),
+    upper=(105, 106, 107, 108),
+    y_positive=103,
+)
 
 
 def test_predicted_sigma_matches_the_monte_carlo_spread():
@@ -626,7 +646,7 @@ def test_predicted_sigma_matches_the_monte_carlo_spread():
         fit = fit_survey(
             list(TWO_TIERS),
             survey(TWO_TIERS, seed=run, noise=MONTE_CARLO_NOISE_M),
-            TWO_TIERS_FRAME,
+            LEVEL_AND_FREE,
             placement=TWO_TIERS,
         )
         positions[run] = [report.position for report in fit.anchors.values()]
@@ -646,8 +666,8 @@ def test_ranges_that_agree_exactly_are_not_taken_for_a_perfect_survey():
     fit = fit_survey(list(TWO_TIERS), survey(TWO_TIERS, noise=0.0), TWO_TIERS_FRAME)
 
     assert fit.rms_m < 1e-6
-    sigmas = [report.sigma_m for report in fit.anchors.values()][1:]
-    assert 0.015 < min(sigmas) and max(sigmas) < 0.04
+    sigmas = [report.sigma_m for report in fit.anchors.values()]
+    assert 0.015 < min(sigmas) and max(sigmas) < 0.06
 
 
 def test_stored_positions_start_the_fit_and_give_the_move():
@@ -662,7 +682,9 @@ def test_stored_positions_start_the_fit_and_give_the_move():
     assert fit.blocked == ()
     assert moved_of(fit, 104) == pytest.approx(0.3, abs=0.05)
     assert moved_of(fit, 107) < 0.05
-    assert moved_of(fit, 101) == 0.0
+    # the origin keeps its x and y; its height is its own, near its group's
+    assert fit.anchors[101].position[:2] == (0.0, 0.0)
+    assert moved_of(fit, 101) < 0.03
 
 
 def test_partly_stored_positions_give_the_move_but_no_start():
@@ -897,6 +919,7 @@ def test_result_fills_the_survey_state_object():
                     "residualRmsM": 0.0,
                     "worstPairM": 0.0,
                     "sigmaM": 0.0,
+                    "heightOffsetM": 0.0,
                 },
                 "2": {
                     "x": 4.02,
@@ -906,6 +929,7 @@ def test_result_fills_the_survey_state_object():
                     "residualRmsM": 0.0,
                     "worstPairM": 0.0,
                     "sigmaM": 0.03,
+                    "heightOffsetM": 0.0,
                 },
                 "3": {
                     "x": 0.02,
@@ -915,6 +939,7 @@ def test_result_fills_the_survey_state_object():
                     "residualRmsM": 0.0,
                     "worstPairM": 0.0,
                     "sigmaM": 0.0606,
+                    "heightOffsetM": 0.0,
                     "movedM": 0.5005,
                 },
             },
@@ -1061,3 +1086,153 @@ def test_every_solution_comes_with_its_mirror_images():
     assert sides_of_304 == {(1.0, -1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)}
     assert len(in_space) == 4
     assert [layout.positions[2, 1] for layout in in_a_plane] == [3.0, -3.0]
+
+
+# ---- height groups: about the same height ---------------------------------
+
+
+def levelled_offsets(layout, groups):
+    """How far each anchor stands above the common height of its group once
+    the cell is tilted to leave the least of that: all that ranges can show
+    of the heights, since they do not know which way is up."""
+    anchors = [anchor for group in groups for anchor in group]
+    design = np.array(
+        [
+            [*(float(anchor in group) for group in groups), *layout[anchor][:2]]
+            for anchor in anchors
+        ]
+    )
+    height = np.array([-layout[anchor][2] for anchor in anchors])
+    level = design @ np.linalg.lstsq(design, height, rcond=None)[0]
+    return dict(zip(anchors, height - level))
+
+
+def test_an_anchor_off_its_tier_keeps_its_own_height():
+    off = dict(TWO_TIERS)
+    x, y, z = off[107]
+    off[107] = (x, y, z - 0.04)
+
+    fit = fit_survey(list(off), survey(off, noise=0.0), TWO_TIERS_FRAME)
+
+    # the cell is found as it stands: no pair is bent to level the tier
+    for a, b in combinations(off, 2):
+        found = dist(fit.anchors[a].position, fit.anchors[b].position)
+        assert found == pytest.approx(dist(off[a], off[b]), abs=0.005)
+    assert fit.rms_m < 0.002 and fit.blocked == () and fit.warnings == ()
+    # a tilt of the whole cell explains half of one anchor's 4 cm, so level
+    # is the plane that leaves the least: 2 cm on that anchor, less on others
+    truth = levelled_offsets(off, TWO_TIERS_FRAME.height_groups)
+    assert truth[107] == pytest.approx(0.02, abs=0.002)
+    offsets = {a: offset_of(fit, a) for a in off}
+    assert offsets == pytest.approx(truth, abs=0.01)
+    assert offsets[107] == max(offsets.values()) > 0.015
+    mates = np.mean([fit.anchors[a].position[2] for a in (105, 106, 108)])
+    assert mates - fit.anchors[107].position[2] > 0.02
+
+
+def test_the_exact_fit_cannot_show_an_anchor_off_its_tier():
+    off = dict(TWO_TIERS)
+    x, y, z = off[107]
+    off[107] = (x, y, z - 0.04)
+    one_group = Frame(
+        origin=101, x_axis=102, height_groups=((101, 102, 103, 104),), y_positive=103
+    )
+
+    fit = fit_survey(list(off), survey(off, noise=0.0), LEVEL_AND_FREE)
+    flat = fit_survey(
+        list(off)[:4], survey({a: off[a] for a in list(off)[:4]}), one_group
+    )
+
+    # a single group shares its height exactly, whatever the ranges say
+    assert [fit.anchors[a].position[2] for a in (101, 102, 103, 104)] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in (101, 102, 103, 104)] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in (105, 106, 107, 108)] == [None] * 4
+    assert flat.planar and not fit.planar
+    assert {report.height_offset_m for report in flat.anchors.values()} == {0.0}
+    assert {report.position[2] for report in flat.anchors.values()} == {0.0}
+
+
+def test_a_group_of_its_own_away_from_the_origin_shares_one_height_exactly():
+    apart = Frame(origin=301, x_axis=302, height_groups=((304, 305),), upper=(304,))
+
+    fit = fit_survey(list(FIVE), survey(FIVE), apart, placement=FIVE)
+
+    assert fit.anchors[304].position[2] == fit.anchors[305].position[2]
+    assert (fit.anchors[304].height_offset_m, fit.anchors[305].height_offset_m) == (
+        0.0,
+        0.0,
+    )
+    assert fit.anchors[303].height_offset_m is None
+
+
+def test_the_pulls_are_not_in_the_residuals():
+    # level tiers, exact ranges: the pulls have nothing to pull
+    exact = survey(TWO_TIERS, noise=0.0)
+    similar = fit_survey(list(TWO_TIERS), exact, TWO_TIERS_FRAME)
+    free = fit_survey(list(TWO_TIERS), exact, LEVEL_AND_FREE)
+
+    assert similar.rms_m == pytest.approx(free.rms_m, abs=1e-6)
+    assert similar.rms_m < 1e-6 and similar.worst_m < 1e-6
+    assert worst_error(similar, TWO_TIERS) < 1e-4
+    assert max(abs(offset_of(similar, a)) for a in TWO_TIERS) < 1e-4
+
+    # noisy ranges: the rms is of the pairs alone, though the pulls are at work
+    noisy = fit_survey(list(TWO_TIERS), survey(TWO_TIERS), TWO_TIERS_FRAME)
+    residuals = np.array([pair.residual_m for pair in noisy.pairs])
+    assert len(residuals) == 28
+    assert noisy.rms_m == pytest.approx(float(np.sqrt(np.mean(residuals**2))))
+    assert noisy.worst_m == pytest.approx(float(np.abs(residuals).max()))
+    assert max(abs(offset_of(noisy, a)) for a in TWO_TIERS) > 0.005
+    for report, anchor in zip(noisy.anchors.values(), TWO_TIERS):
+        own = [p.residual_m for p in noisy.pairs if anchor in (p.a, p.b)]
+        assert report.residual_rms_m == pytest.approx(
+            float(np.sqrt(np.mean(np.square(own))))
+        )
+
+
+def test_a_noisy_survey_is_not_blocked_by_the_heights_it_cannot_see():
+    fit = fit_survey(list(TWO_TIERS), survey(TWO_TIERS, noise=0.09), TWO_TIERS_FRAME)
+
+    # the tolerance of a height holds whatever the ranges' noise
+    assert fit.blocked == ()
+    assert max(sigma_of(fit, anchor) for anchor in TWO_TIERS) < 0.20
+
+
+def test_a_height_group_of_one_is_no_group():
+    frame = Frame(
+        origin=301, x_axis=302, height_groups=((301,), (302, 303)), upper=(304,)
+    )
+
+    fit = fit_survey(list(FIVE), survey(FIVE), frame, placement=FIVE)
+
+    # the frame as it is used: the origin is in no group, its height is zero
+    assert frame.height_groups == ((302, 303),)
+    assert fit.anchors[301].position[2] == 0.0
+    assert fit.anchors[301].height_offset_m is None
+    # one group left: its two anchors share their height exactly
+    assert fit.anchors[302].position[2] == fit.anchors[303].position[2]
+    assert (offset_of(fit, 302), offset_of(fit, 303)) == (0.0, 0.0)
+
+
+def test_a_group_of_one_does_not_make_the_other_heights_similar():
+    lower, upper = (101, 102, 103, 104), (105, 106, 107, 108)
+    frame = Frame(
+        origin=101,
+        x_axis=102,
+        height_groups=(lower, (105,)),
+        upper=upper,
+        y_positive=103,
+    )
+
+    fit = fit_survey(list(TWO_TIERS), survey(TWO_TIERS), frame, placement=TWO_TIERS)
+
+    assert frame == LEVEL_AND_FREE
+    assert [fit.anchors[a].position[2] for a in lower] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in lower] == [0.0] * 4
+    assert [fit.anchors[a].height_offset_m for a in upper] == [None] * 4
+
+
+def test_the_preset_of_five_anchors_has_one_group():
+    frame = Frame.two_tiers([1, 2, 3, 4, 5])
+
+    assert (frame.height_groups, frame.upper) == (((1, 2, 3, 4),), (5,))

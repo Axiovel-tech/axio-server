@@ -22,16 +22,21 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import trio
+from rtlslink import role_from_params
 from rtlslink.cell_settings import RATE_PRESETS, TX_GAIN_PARAM, rate_hz, tx_gain_range
 
 from flockwave.server.ext.show.extension import authorizes_flight
 
-from .cell_compat import role_from_params
-
 if TYPE_CHECKING:
     from .extension import RtlsExtension
 
-__all__ = ("cell_rule", "cell_view", "cell_warnings", "handle_cell_request")
+__all__ = (
+    "cell_rule",
+    "cell_view",
+    "cell_warnings",
+    "handle_cell_request",
+    "write_refusal",
+)
 
 _BLOCK_PARAM = "UWB_BLOCK_MS"
 _PARAM_TYPES = {_BLOCK_PARAM: "uint16", TX_GAIN_PARAM: "uint8"}
@@ -189,19 +194,28 @@ def _request(body: dict[str, Any]) -> dict[str, int]:
     return named
 
 
-def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
-    """Why nothing may be written now, if anything."""
-    if not members:
-        return "No online devices"
-    if any(
-        m.anchor and (ext._fresh_stats(m.system_id) or {}).get("locked")
-        for m in members
-    ):
+def write_refusal(ext: "RtlsExtension") -> Optional[str]:
+    """Why neither cell settings nor a survey may be written now: a live
+    device reports its lock, or a show is authorized. The lock counts
+    whatever else is known of the device: an anchor that was lost reports it
+    again before its role is read."""
+    devices = ext._protocol.devices if ext._protocol else {}
+    if any((ext._fresh_stats(sid) or {}).get("locked") for sid in devices):
         return "Unlock the anchors first"
     if ext.app is not None:
         with suppress(AttributeError, KeyError, RuntimeError):
             if authorizes_flight(ext.app.import_api("show").get_configuration()):
                 return "A show is authorized"
+    return None
+
+
+def _refusal(ext: "RtlsExtension", members: list[_Member]) -> Optional[str]:
+    """Why nothing may be written now, if anything."""
+    if not members:
+        return "No online devices"
+    reason = write_refusal(ext)
+    if reason is not None:
+        return reason
     if _reference(members) is None:
         a0_online = any(m.role == "anchor-initiator" for m in members)
         return "A0 is not ranging" if a0_online else "A0 is offline"
@@ -310,6 +324,8 @@ async def handle_cell_request(
     named = _request(body)
     if ext._cell_applying:
         result, reason, results = "refused", "An apply is running", {}
+    elif ext._survey.running:
+        result, reason, results = "refused", "A survey is running", {}
     else:
         ext._cell_applying = True
         try:
