@@ -59,6 +59,12 @@ NOISE_FLOOR_M = 0.025
 #: range noise assumed when the fit has no spare measurement to estimate it
 NOISE_PRIOR_M = 0.03
 
+#: how far an anchor of a height group may stand off the group's common
+#: height, one sigma, metres, when the frame declares two or more groups. It
+#: is weighed against the range error the fit assumes: an anchor this far
+#: off costs as much as one range off by ``NOISE_FLOOR_M``.
+HEIGHT_TOLERANCE_M = 0.05
+
 #: two layouts closer than this at every anchor are one solution, metres
 SAME_SOLUTION_M = 0.01
 
@@ -116,11 +122,14 @@ class DirectedRange:
 class Frame:
     """The operator's declaration of the cell frame.
 
-    ``origin`` sits at x = y = 0 and ``x_axis`` on +x. The anchors of one
-    height group share their z, the group of ``origin`` is z = 0, and an
-    anchor in no group has a z of its own. ``upper`` names anchors above the
-    origin's group and ``y_positive`` one anchor at y > 0; they settle the
-    mirror images.
+    ``origin`` sits at x = y = 0 and ``x_axis`` on +x. A height group is a
+    set of anchors at about one height, its common height, and z = 0 is the
+    common height of the group of ``origin``. With one group the ranges
+    cannot tell its anchors' heights apart, so they share their z exactly.
+    With two or more, every anchor has a z of its own, held within
+    ``HEIGHT_TOLERANCE_M`` of its group's common height. An anchor in no
+    group has a free z. ``upper`` names anchors above the origin's group and
+    ``y_positive`` one anchor at y > 0; they settle the mirror images.
     """
 
     origin: int
@@ -155,6 +164,10 @@ class AnchorFit:
     sigma_m: float | None
     #: ``None`` when the anchor stores no position
     moved_m: float | None
+    #: how far it stands above its height group's common height (below:
+    #: negative); 0 in a group whose anchors share one height exactly,
+    #: ``None`` in no group
+    height_offset_m: float | None
 
     @property
     def json(self) -> dict[str, Any]:
@@ -167,6 +180,9 @@ class AnchorFit:
             "residualRmsM": _metres(self.residual_rms_m),
             "worstPairM": _metres(self.worst_pair_m),
             "sigmaM": None if self.sigma_m is None else _metres(self.sigma_m),
+            "heightOffsetM": (
+                None if self.height_offset_m is None else _metres(self.height_offset_m)
+            ),
         }
         if self.moved_m is not None:
             result["movedM"] = _metres(self.moved_m)
@@ -275,6 +291,7 @@ def frame_refusal(frame: Frame, anchors: Sequence[int]) -> str | None:
 @dataclass(frozen=True)
 class _Solution:
     positions: np.ndarray
+    #: of what the descent minimised: the pairs' residuals, and the pulls
     rms: float
 
 
@@ -282,7 +299,10 @@ class _Problem:
     """The unknowns of one group and the residuals of its measured pairs.
 
     Every coordinate is either fixed at zero or equal to one unknown, so the
-    flat positions are ``expand @ params``.
+    flat positions are ``expand @ params``. With two or more height groups
+    the unknowns also hold the common height of every group but the
+    origin's, and ``pull @ params`` are the residuals that hold each anchor
+    near its group's: rows after the pairs', in the same units.
     """
 
     def __init__(
@@ -299,42 +319,78 @@ class _Problem:
         self.y_positive = None if frame.y_positive is None else index[frame.y_positive]
 
         groups = [[index[anchor] for anchor in group] for group in frame.height_groups]
+        self.groups = [group for group in groups if group]
         self.level = next((g for g in groups if self.origin in g), [self.origin])
         grouped = {i for group in groups for i in group} | {self.origin}
         self.free_heights = [g for g in groups if self.origin not in g and g]
         self.free_heights += [[i] for i in range(self.count) if i not in grouped]
         self.planar = len(self.level) == self.count
+        self.similar = len(self.groups) >= 2
 
-        self.expand = self._expansion()
+        self.expand, self.common, self.pull = self._unknowns()
 
         self.pairs = list(ranges)
         self.first = np.array([index[a] for a, _ in self.pairs], dtype=int)
         self.second = np.array([index[b] for _, b in self.pairs], dtype=int)
         self.ranges = np.array([ranges[pair] for pair in self.pairs], dtype=float)
 
-    def _expansion(self) -> np.ndarray:
-        """One column per unknown: x of every anchor but the origin, y of
-        every anchor off the x axis, one z per free height."""
+    def _unknowns(self) -> tuple[np.ndarray, dict[int, int], np.ndarray]:
+        """``expand``, with one column per unknown: x of every anchor but the
+        origin, y of every anchor off the x axis, then the heights. Exact
+        heights are one z per free height. Similar heights are a z per
+        anchor (but an origin in no group, which stays at zero) and the
+        common height of every group but the origin's: the column of each
+        such group by its index in ``groups``, and the ``pull`` rows."""
         columns = [[3 * i] for i in range(self.count) if i != self.origin]
         columns += [
             [3 * i + 1]
             for i in range(self.count)
             if i not in (self.origin, self.x_axis)
         ]
-        columns += [[3 * i + 2 for i in members] for members in self.free_heights]
+        if not self.similar:
+            columns += [[3 * i + 2 for i in members] for members in self.free_heights]
+            return self._expanded(columns), {}, np.zeros((0, len(columns)))
+        grouped_origin = len(self.level) > 1
+        free = [i for i in range(self.count) if i != self.origin or grouped_origin]
+        own = {i: len(columns) + k for k, i in enumerate(free)}
+        columns += [[3 * i + 2] for i in free]
+        common = {}
+        for g, members in enumerate(self.groups):
+            if self.origin not in members:
+                common[g] = len(columns)
+                columns.append([])
+        weight = NOISE_FLOOR_M / HEIGHT_TOLERANCE_M
+        pull = np.zeros((sum(len(g) for g in self.groups), len(columns)))
+        row = 0
+        for g, members in enumerate(self.groups):
+            for i in members:
+                pull[row, own[i]] = weight
+                if g in common:
+                    pull[row, common[g]] = -weight
+                row += 1
+        return self._expanded(columns), common, pull
+
+    def _expanded(self, columns: list[list[int]]) -> np.ndarray:
         expand = np.zeros((3 * self.count, len(columns)))
         for column, rows in enumerate(columns):
             expand[rows, column] = 1.0
         return expand
 
     def pack(self, positions: np.ndarray) -> np.ndarray:
-        return (self.expand.T @ positions.ravel()) / self.expand.sum(axis=0)
+        """The unknowns of a layout; a common height is the mean height of
+        its group, which is where the fit leaves it."""
+        shared = np.maximum(self.expand.sum(axis=0), 1.0)
+        params = (self.expand.T @ positions.ravel()) / shared
+        for g, column in self.common.items():
+            params[column] = positions[self.groups[g], 2].mean()
+        return params
 
     def positions(self, params: np.ndarray) -> np.ndarray:
         return (self.expand @ params).reshape(-1, 3)
 
     def linearised(self, params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """The residuals (fitted distance minus range) and their Jacobian."""
+        """The residuals and their Jacobian: of every pair (fitted distance
+        minus range), then of every pull."""
         positions = self.positions(params)
         difference = positions[self.first] - positions[self.second]
         distance = np.linalg.norm(difference, axis=1)
@@ -344,7 +400,25 @@ class _Problem:
         for axis in range(3):
             by_coordinate[rows, 3 * self.first + axis] = unit[:, axis]
             by_coordinate[rows, 3 * self.second + axis] = -unit[:, axis]
-        return distance - self.ranges, by_coordinate @ self.expand
+        return (
+            np.concatenate([distance - self.ranges, self.pull @ params]),
+            np.vstack([by_coordinate @ self.expand, self.pull]),
+        )
+
+    def range_residuals(self, positions: np.ndarray) -> np.ndarray:
+        """Fitted distance minus range of every pair, without the pulls."""
+        return self.linearised(self.pack(positions))[0][: len(self.pairs)]
+
+    def height_offsets(self, positions: np.ndarray) -> list[float | None]:
+        """Per anchor, how far it stands above its group's common height;
+        ``None`` in no group."""
+        offsets: list[float | None] = [None] * self.count
+        params = self.pack(positions)
+        for g, members in enumerate(self.groups):
+            height = params[self.common[g]] if g in self.common else 0.0
+            for i in members:
+                offsets[i] = float(height - positions[i, 2]) if self.similar else 0.0
+        return offsets
 
     def aligned(self, positions: np.ndarray) -> np.ndarray:
         """The layout moved and turned about z so that the origin is at zero
@@ -481,10 +555,12 @@ class _Problem:
         """Per anchor: the predicted standard deviation of its position, and
         whether the ranges leave it undetermined."""
         residual, jacobian = self.linearised(self.pack(positions))
-        spare = len(self.pairs) - jacobian.shape[1]
+        spare = len(residual) - jacobian.shape[1]
         variance = NOISE_PRIOR_M**2
         if spare > 0:
             variance = max(float(residual @ residual) / spare, NOISE_FLOOR_M**2)
+        # the pulls hold a height to its tolerance however noisy the ranges
+        jacobian[len(self.pairs) :] *= np.sqrt(variance) / NOISE_FLOOR_M
         _, singular, basis = np.linalg.svd(jacobian, full_matrices=True)
         strength = np.zeros(jacobian.shape[1])
         strength[: len(singular)] = singular
@@ -714,6 +790,7 @@ def _anchor_fits(
     """The report of every anchor, and why the ranges do not locate the ones
     they do not."""
     sigma, loose = problem.uncertainty(positions)
+    offsets = problem.height_offsets(positions)
     reports, reasons = {}, {}
     for i, anchor in enumerate(anchors):
         own = residual[(problem.first == i) | (problem.second == i)]
@@ -731,6 +808,7 @@ def _anchor_fits(
             worst_pair_m=float(np.abs(own).max(initial=0.0)),
             sigma_m=None if loose[i] else float(sigma[i]),
             moved_m=moved,
+            height_offset_m=offsets[i],
         )
         if loose[i]:
             reasons[anchor] = "the ranges do not fix its position"
@@ -783,7 +861,8 @@ def fit_survey(
             " below the origin's group"
         )
 
-    residual, _ = problem.linearised(problem.pack(positions))
+    residual = problem.range_residuals(positions)
+    rms = float(np.sqrt(np.mean(residual**2))) if len(residual) else 0.0
     pairs = tuple(
         PairFit(
             a=a,
@@ -799,13 +878,11 @@ def fit_survey(
     reports, reasons = _anchor_fits(problem, anchors, positions, residual, stored)
     for i, why in undecided.items():
         reasons.setdefault(anchors[i], why)
-    blocked, warnings = _gate(
-        anchors, measurements, pairs, reports, reasons, winner.rms
-    )
+    blocked, warnings = _gate(anchors, measurements, pairs, reports, reasons, rms)
     return SurveyFit(
         anchors=reports,
         pairs=pairs,
-        rms_m=winner.rms,
+        rms_m=rms,
         worst_m=float(np.abs(residual).max(initial=0.0)),
         planar=problem.planar,
         notes=tuple(notes),

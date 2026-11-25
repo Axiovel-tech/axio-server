@@ -122,6 +122,17 @@ enables it.
   restarts of their ranging. A start is refused while it leaves out an
   operating anchor of the group's cell: that anchor would lose its
   initiator at every step and keep the old survey ID.
+- **A height group is "about the same height".** With one height group in
+  the frame its anchors share one height exactly: ranges within one plane
+  cannot tell heights apart, and the survey is `planar`. With two or more,
+  every anchor gets its own height, held within 0.05 m (one sigma,
+  `HEIGHT_TOLERANCE_M`) of its group's common height, and
+  `fit.anchors[id].heightOffsetM` says how far it stands above it (null for
+  an anchor in no group, 0 in the exact case). z = 0 is the common height of
+  the origin's group. Ranges do not know which way is up either: "level" is
+  the tilt of the cell that leaves the least offsets, so one anchor 4 cm off
+  a four-anchor tier reads about +2 cm and its neighbours the rest. The
+  pulls are not part of `rmsM` or of any pair's residual.
 - **Lost boards stay listed.** A board that misses `device_timeout` stays in
   `X-RTLS-INF` offline, with its last stats marked stale, until an operator
   forgets it or the server restarts; nothing treats it as live.
