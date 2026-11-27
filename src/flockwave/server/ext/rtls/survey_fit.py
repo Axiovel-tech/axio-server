@@ -36,6 +36,7 @@ __all__ = (
     "SurveyFitError",
     "fit_survey",
     "frame_refusal",
+    "off_layout",
 )
 
 #: a direction with fewer inliers or a smaller valid share is not used
@@ -77,6 +78,10 @@ START_HEIGHT_M = 1.0
 #: ``y_positive``) settles that image only when it is this far on a side,
 #: and three of its predicted sigmas, metres
 SIDE_MARGIN_M = 0.3
+
+#: the anchors a layout is aligned on must stand this far off one line,
+#: across it, rms, metres: their positions settle its turn about z
+ALIGN_SPREAD_M = 0.3
 
 MAX_ITERATIONS = 200
 STEP_TOLERANCE_M = 1e-10
@@ -631,22 +636,73 @@ def _closest(
     return [item for item, value in zip(items, scores) if value <= min(scores) + margin]
 
 
-def _onto(reference: np.ndarray, positions: np.ndarray) -> np.ndarray:
+def _onto(
+    reference: np.ndarray,
+    positions: np.ndarray,
+    on: np.ndarray | None = None,
+    heights: bool = False,
+) -> np.ndarray:
     """The reference turned about z and moved in x and y to lie as close to
-    the positions as it can, never mirrored. A sketch is compared this way
+    the positions as it can, never mirrored; only the rows ``on`` place it,
+    and with ``heights`` it also moves in z. A sketch is compared this way
     because its origin and +x anchors are as rough as the others, and may be
     the ones in the wrong place."""
-    centre = positions[:, :2].mean(axis=0)
-    ours = positions[:, :2] - centre
-    theirs = reference[:, :2] - reference[:, :2].mean(axis=0)
+    on = np.ones(len(positions), dtype=bool) if on is None else on
+    centre = positions[on, :2].mean(axis=0)
+    middle = reference[on, :2].mean(axis=0)
+    ours = positions[on, :2] - centre
+    theirs = reference[on, :2] - middle
     angle = np.arctan2(
         np.sum(theirs[:, 0] * ours[:, 1] - theirs[:, 1] * ours[:, 0]),
         np.sum(theirs * ours),
     )
     cos, sin = np.cos(angle), np.sin(angle)
     moved = reference.copy()
-    moved[:, :2] = theirs @ np.array([[cos, sin], [-sin, cos]]) + centre
+    moved[:, :2] = (reference[:, :2] - middle) @ np.array(
+        [[cos, sin], [-sin, cos]]
+    ) + centre
+    if heights:
+        moved[:, 2] += np.mean(positions[on, 2] - reference[on, 2])
     return moved
+
+
+def _spread(points: np.ndarray) -> bool:
+    """Whether at least three points stand off one line in x and y."""
+    if len(points) < 3:
+        return False
+    across = np.linalg.svd(points[:, :2] - points[:, :2].mean(axis=0))[1][1]
+    return bool(across / np.sqrt(len(points)) >= ALIGN_SPREAD_M)
+
+
+def off_layout(
+    layout: np.ndarray,
+    positions: np.ndarray,
+    tolerance: float,
+    *,
+    heights: bool,
+) -> np.ndarray | None:
+    """Per row, how far ``positions`` is off ``layout`` turned about z and
+    moved (in z too, with ``heights``; else only x and y count) onto the
+    rows that did not move, never mirrored. A row is measured against the
+    layout placed on the others, so that it cannot pull the layout towards
+    itself; the farthest beyond ``tolerance`` is left out and the rest
+    measured again, until none is. ``None`` when the rows left do not stand
+    off one line: too many moved to tell which."""
+    on = np.ones(len(positions), dtype=bool)
+    while _spread(positions[on]):
+        apart = np.zeros(len(positions))
+        for i in range(len(positions)):
+            others = on.copy()
+            others[i] = False
+            difference = positions[i] - _onto(layout, positions, others, heights)[i]
+            if not heights:
+                difference[2] = 0.0
+            apart[i] = np.linalg.norm(difference)
+        worst = int(np.argmax(np.where(on, apart, -1.0)))
+        if apart[worst] <= tolerance:
+            return apart
+        on[worst] = False
+    return None
 
 
 def _match(

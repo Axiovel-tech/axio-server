@@ -976,7 +976,7 @@ class RtlsExtension(Extension):
         Raises KeyError for unknown devices and trio.TooSlowError on
         timeout."""
         if self._survey.involves(system_id):
-            return sleep_error(sleeping, "A survey is running")
+            return sleep_error(sleeping, self._survey.busy or "A survey is running")
         role = await self._command_role(system_id, timeout)
         if role is None:
             return sleep_error(
@@ -1152,8 +1152,7 @@ class RtlsExtension(Extension):
         not running."""
         if system_id not in self._require_protocol().devices:
             raise KeyError(system_id)
-        if self._survey.involves(system_id):
-            raise RuntimeError("A survey is running")
+        self._refuse_while_surveyed(system_id)
         species, source = _image_species(image_path, role)
         if species is None:
             raise ValueError(
@@ -1162,6 +1161,8 @@ class RtlsExtension(Extension):
                 "permanent upload of an unchecked image)"
             )
         await self.verify_species(system_id, species)
+        # a survey or a resurvey check may have taken it meanwhile
+        self._refuse_while_surveyed(system_id)
         device, nursery = self._require_ota_slot(system_id)
 
         job = {
@@ -1178,14 +1179,22 @@ class RtlsExtension(Extension):
         nursery.start_soon(self._run_ota, device.address[0], image_path, job)
         return dict(job)
 
+    def _refuse_while_surveyed(self, system_id: int) -> None:
+        if self._survey.involves(system_id):
+            raise RuntimeError(self._survey.busy or "A survey is running")
+
+    def ota_running(self, system_id: int) -> bool:
+        """Whether an OTA job is running for the device."""
+        job = self._ota_jobs.get(system_id)
+        return job is not None and job["status"] == "running"
+
     def _require_ota_slot(self, system_id: int) -> tuple[RtlsDevice, trio.Nursery]:
         """The live device and the nursery to run its job, when an OTA job
         may start for it now."""
         device = self._require_protocol().devices.get(system_id)
         if device is None:
             raise KeyError(system_id)
-        job = self._ota_jobs.get(system_id)
-        if job is not None and job["status"] == "running":
+        if self.ota_running(system_id):
             raise RuntimeError(f"OTA already in progress for device {system_id}")
         if self._nursery is None:
             raise RuntimeError("extension is not running")

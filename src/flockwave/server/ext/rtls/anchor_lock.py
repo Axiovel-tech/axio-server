@@ -4,7 +4,8 @@ The firmware owns the lock (rtls-link-zephyr
 ``docs/reference/anchor-power-path.md``, "Lock") and reports it as the
 ``lock`` stat. The server writes ``LOCK`` to the online anchors, warns before
 locking, derives the cell's lock state from the stats and gates the show
-start on it.
+start on it. A lock may first measure the cell against the stored survey
+(``resurvey``, lock_resurvey.py).
 """
 
 from __future__ import annotations
@@ -14,10 +15,12 @@ from typing import TYPE_CHECKING, Any, Optional, TypedDict
 import trio
 
 from .cell_settings import cell_warnings
+from .lock_resurvey import with_resurvey
 from .survey_view import survey_warnings
 
 if TYPE_CHECKING:
     from .extension import RtlsExtension
+    from .survey import Check
 
 __all__ = (
     "handle_lock_request",
@@ -161,9 +164,22 @@ async def handle_lock_request(
         raise ValueError(
             f"Invalid action: {action!r} (expected status, lock or unlock)"
         )
+    resurvey = body.get("resurvey", False)
+    if not isinstance(resurvey, bool):
+        raise ValueError("Invalid resurvey: expected true or false")
     views = anchor_views(ext)
+    reason = _refusal(ext, views)
+    check: Optional["Check"] = None
+    live: list[LockWarning] = []
+    if action == "lock" and resurvey and reason is None:
+        live = survey_warnings(ext, views)
+        check = await ext._survey.check()
+        # the check took a while: what follows is the cell after it
+        views = anchor_views(ext)
+        reason = _refusal(ext, views)
     warnings = lock_warnings(views) + survey_warnings(ext, views) + cell_warnings(ext)
-    reason = "A survey is running" if ext._survey.running else lock_refusal(views)
+    if check is not None:
+        warnings = with_resurvey(warnings, live, check, views)
     result, results = action, None
     if action == "lock":
         if reason:
@@ -188,7 +204,12 @@ async def handle_lock_request(
         "warnings": warnings,
         "results": results or {},
         "anchorLock": lock_json(ext),
+        "resurvey": {"ran": check is not None},
     }
+
+
+def _refusal(ext: "RtlsExtension", views: list[AnchorView]) -> Optional[str]:
+    return ext._survey.busy or lock_refusal(views)
 
 
 async def _write_lock(

@@ -104,7 +104,14 @@ enables it.
   reported as its `lock` stat) refuses every remote change itself. The
   server only writes `LOCK`, derives the cell's lock from the stats, and
   answers the show extension (`show_start_refusal()`) before it authorizes a
-  flight.
+  flight. A lock with `resurvey` first measures the cell as a survey does,
+  without holding or writing anything, lays the stored layout onto the fitted
+  one (turned about z and moved, never mirrored, each anchor measured against
+  the others with the farthest left out until none is beyond 0.08 m) and
+  warns of each anchor off its stored position (the range check's 0.08 m and
+  0.20 m), of what it did not check (heights in a flat cell, an anchor online
+  or restarted since it measured) and of a check that could not run or
+  measured poorly. The live range check warnings from before the check stay.
 - **Cell settings are derived, never stored.** Each board reports the code
   of the session it runs (`cellcfg`, anchors also `txgain`) and the server
   compares it with what A0 runs. A write applies on the board at once, so
@@ -175,7 +182,7 @@ enables it.
   entry points for other extensions.
 - `anchor_sleep.py`: an anchor's sleep and wake, answered by the ack.
 - `anchor_lock.py`: `X-RTLS-LOCK`, the lock state derived from the stats
-  and the show gate.
+  and the show gate; `lock_resurvey.py` the lock's resurvey check.
 - `cell_settings.py`: `X-RTLS-CELL`, the per-device cell-settings state,
   the `cellSettings` summary, its lock warning and Verify rule.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
