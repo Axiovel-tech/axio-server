@@ -10,7 +10,8 @@ used to be checked by hand before every flight:
   survey is not flown in two frames;
 - **anchors** (warning) — no anchor's range check warns (beyond 0.08 m)
   or reads danger (beyond 0.20 m), and no tag sees its live ranges drift
-  from the advertised positions (survey_view.py);
+  from the advertised positions (survey_view.py); it names the anchors
+  without a reading, and is skipped while none has one;
 - **firmware** — uniform firmware version within each role group;
 - **pairing** — every online tag is associated with a drone (and every
   drone reached through a tag);

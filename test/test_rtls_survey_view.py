@@ -4,6 +4,7 @@ X-RTLS-INF with its fleet warning, the lock warnings and the Verify rules
 
 import time
 
+import numpy as np
 import pytest
 import trio
 from anchor_lock_support import _lock, location
@@ -190,6 +191,23 @@ async def test_the_range_check_warns_strictly_above_its_bound(
     assert survey["rangeDeviation"] == ([203] if warns else [])
 
 
+@pytest.mark.parametrize("bound", [0.08, 0.2])
+@pytest.mark.parametrize("sign", [1, -1])
+async def test_a_float32_reading_at_a_bound_is_the_level_below_it(
+    dialect, builder, hub, bound, sign
+):
+    # the wire carries 0.2F as 0.2000000030: the ring compares it with
+    # 0.2F and shows a warning, not a danger
+    ext, _ = await _positioned(dialect)
+    await anchors_report(ext, [203], rdev=sign * float(np.float32(bound)))
+
+    survey = await _survey(ext, builder, hub)
+    assert (survey["rangeDeviation"], survey["rangeDanger"]) == (
+        [203] if bound == 0.2 else [],
+        [],
+    )
+
+
 async def test_a_deviation_just_over_the_bound_warns_everywhere(dialect, builder, hub):
     # the firmware's ring warns at 0.08004 m: so must the server, which
     # used to round the value to 0.0800 before it compared
@@ -357,6 +375,7 @@ async def test_a_surveyed_cell_locks_without_a_warning(dialect, builder, hub):
 
 async def test_verify_passes_a_fleet_positioned_on_one_survey(dialect):
     ext, _ = await _positioned(dialect)
+    await anchors_report(ext, [202, 203, 204], rdev=0.01)
 
     body = await run_verify(ext)
 
@@ -707,12 +726,31 @@ async def test_verify_warns_of_both_range_check_levels_and_drift(dialect):
 
 async def test_the_anchors_rule_passes_at_its_bounds(dialect):
     ext, _ = await _positioned(dialect)
-    await anchors_report(ext, [202], rdev=-0.08)
+    await anchors_report(ext, [202, 203, 204], rdev=-0.08)
     await tag_reports(ext, sdrift=0.10)
 
     rule = await _rule(ext, "anchors")
 
+    # the initiator A0 is what the others range to: it has no check
     assert (rule["status"], rule["detail"]) == (
         "pass",
-        "every anchor is on its surveyed range and no tag sees its ranges drift",
+        "every anchor is on its surveyed range; no tag sees its ranges drift",
+    )
+
+
+async def test_the_anchors_rule_names_the_anchors_it_cannot_check(dialect):
+    ext, _ = await _positioned(dialect)
+
+    rule = await _rule(ext, "anchors")
+    assert (rule["status"], rule["detail"]) == (
+        "skipped",
+        "no anchor reports its range check; no tag sees its ranges drift",
+    )
+
+    await anchors_report(ext, [203], rdev=0.01)
+    rule = await _rule(ext, "anchors")
+    assert (rule["status"], rule["detail"]) == (
+        "pass",
+        "range not checked: RTLS anchor A1, RTLS anchor A3; "
+        "no tag sees its ranges drift",
     )

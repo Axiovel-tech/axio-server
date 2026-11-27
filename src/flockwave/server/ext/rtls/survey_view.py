@@ -13,6 +13,7 @@ One server is one cell, as for the cell settings.
 
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -58,6 +59,11 @@ RANGE_DEVIATION_DANGER_M = 0.20
 #: the advertised positions are worth a look, metres. The stat includes the
 #: survey fit's own residual on each pair, so it informs and blocks nothing.
 SURVEY_DRIFT_WARNING_M = 0.10
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
 
 #: a tag's snapshot older than this many seconds says nothing of its table
 STATS_FRESH_S = 10.0
@@ -119,6 +125,8 @@ class _Anchor:
     #: the flag of the position it stores
     planar: bool
     range_deviation_m: Optional[float]
+    #: the initiator has no range check: it is the one ranged to
+    initiator: bool
 
     @property
     def deviates(self) -> bool:
@@ -132,9 +140,14 @@ class _Anchor:
 def range_level(deviation: Optional[float]) -> Optional[str]:
     """``warning`` or ``danger`` while a range check is beyond that bound,
     None within it or without a reading."""
-    if deviation is None or abs(deviation) <= RANGE_DEVIATION_WARNING_M:
+    if deviation is None:
         return None
-    return "danger" if abs(deviation) > RANGE_DEVIATION_DANGER_M else "warning"
+    # in float32, as the firmware compares: its 0.2F arrives as 0.2000000030,
+    # beyond 0.20 here while its ring shows a warning
+    size = _float32(abs(deviation))
+    if size <= _float32(RANGE_DEVIATION_WARNING_M):
+        return None
+    return "danger" if size > _float32(RANGE_DEVIATION_DANGER_M) else "warning"
 
 
 @dataclass(frozen=True)
@@ -173,6 +186,7 @@ def _anchors(ext: "RtlsExtension", views: Sequence["AnchorView"]) -> list[_Ancho
                 advertised is not None,
                 stored is not None and stored.location.planar,
                 stats.get("rangeDeviationM"),
+                view["role"] == "anchor-initiator",
             )
         )
     return anchors
@@ -369,9 +383,11 @@ def anchors_rule(
 ) -> dict[str, Any]:
     """The X-RTLS-VERIFY ``anchors`` rule: a warning while an anchor's range
     check warns, at either level, or a tag's live ranges drifted from the
-    advertised positions."""
+    advertised positions. Without a problem it names the responders that
+    report no range check, and is ``skipped`` when none reports one."""
     problems = []
-    for anchor in _anchors(ext, views):
+    anchors = _anchors(ext, views)
+    for anchor in anchors:
         if anchor.deviates:
             problems.append(_deviation(anchor))
     for tag in _tags(ext, now):
@@ -381,5 +397,16 @@ def anchors_rule(
                 f"tag {tag.system_id}: live ranges are {drift * 100:.0f} cm off "
                 "the surveyed positions"
             )
-    ok = "every anchor is on its surveyed range and no tag sees its ranges drift"
-    return _rule("anchors", "Anchor positions", "warning", problems, ok)
+    responders = [a for a in anchors if not a.initiator]
+    unchecked = [a.name for a in responders if a.range_deviation_m is None]
+    if len(unchecked) == len(responders):
+        ok = "no anchor reports its range check"
+    elif unchecked:
+        ok = f"range not checked: {', '.join(unchecked)}"
+    else:
+        ok = "every anchor is on its surveyed range"
+    ok += "; no tag sees its ranges drift"
+    rule = _rule("anchors", "Anchor positions", "warning", problems, ok)
+    if not problems and len(unchecked) == len(responders):
+        rule["status"] = "skipped"
+    return rule
