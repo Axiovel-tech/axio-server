@@ -2640,6 +2640,7 @@ def wire_verify_fleet(extension, device, dialect, *, drone_params=None):
             "cellConfig": SESSION_CODE,
             "txGain": 47,
             "surveyId": SURVEY_ID,
+            **({} if anchor == 200 else {"rangeDeviationM": 0.01}),
         }
         extension._stats_at[anchor] = time.monotonic()
     for sysid in (DEVICE_SYSID, DEVICE_SYSID + 1):
