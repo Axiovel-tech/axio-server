@@ -12,7 +12,9 @@ session, then ends in ``failed`` or ``idle``, and so does a measurement the
 fit cannot start from; a commit an anchor misses falls back to ``ready``. The measurement and the fit are kept in memory for the
 page only: after a restart the positions come from the anchors. A server
 that dies mid-run leaves anchors that return by themselves when the hold
-time of their last step is over.
+time of their last step is over. The lock's resurvey check (``check``)
+measures in the same way, alongside what the survey holds, and keeps
+nothing.
 
 The message, its state object and the refusals: AxioStack
 ``contracts/rtls-client-api.md``, ``X-RTLS-SURVEY``.
@@ -29,7 +31,9 @@ from typing import TYPE_CHECKING, Any, Optional
 import trio
 from rtlslink.survey import ROLE_RESPONDER, SurveyAnchor, hold_for, time_limit
 
+from .anchor_lock import anchor_views
 from .cell_settings import write_refusal
+from .lock_resurvey import stored_frame
 from .survey_commit import (
     CONFIRM_TIMEOUT,
     CommitRefused,
@@ -52,6 +56,7 @@ from .survey_fit import (
 from .survey_group import Anchor, armed_refusal, block_ms, select_group, step_order
 from .survey_notify import Pulse, StatePusher
 from .survey_request import (
+    DEFAULT_ROUNDS,
     Placement,
     frame_json,
     parse_frame,
@@ -155,6 +160,9 @@ class Survey:
         #: instance of the extension sent: the changes are fewer than that.
         self.revision = time.time_ns() // 1_000_000 if revision is None else revision
         self._run: Optional[_Run] = None
+        #: the measurement of the lock's resurvey check while it runs: the
+        #: survey holds nothing of it
+        self._check: Optional[_Run] = None
         self._changed = Pulse()
         self._push = StatePusher(ext, self._notification).notify
 
@@ -168,11 +176,23 @@ class Survey:
 
     @property
     def running(self) -> bool:
-        return self.state in RUNNING_STATES
+        """Whether a run or a resurvey check measures, returns or commits."""
+        return self.state in RUNNING_STATES or self._check is not None
+
+    def _active(self) -> list[_Run]:
+        """The runs whose anchors the survey has in hand."""
+        held = self._run if self.state in RUNNING_STATES else None
+        return [run for run in (held, self._check) if run is not None]
+
+    def _watched(self) -> list[_Run]:
+        """The runs that follow their anchors' boots and losses: the held
+        one, whose fit may yet be committed, and a resurvey check."""
+        return [run for run in (self._run, self._check) if run is not None]
 
     def involves(self, system_id: int) -> bool:
-        """Whether a running survey has this anchor in its group."""
-        return self.running and self._run is not None and system_id in self._run.ids
+        """Whether a running survey or resurvey check has this anchor in its
+        group."""
+        return any(system_id in run.ids for run in self._active())
 
     @property
     def json(self) -> dict[str, Any]:
@@ -228,8 +248,12 @@ class Survey:
                     stats[key] = previous[key]
 
     def on_stats(self, system_id: int, stats: dict[str, Any]) -> None:
-        run = self._run
-        if run is not None and system_id in run.booted:
+        for run in self._watched():
+            self._follow(run, system_id, stats)
+        self._changed.set()
+
+    def _follow(self, run: _Run, system_id: int, stats: dict[str, Any]) -> None:
+        if system_id in run.booted:
             if (stats.get("rangingRateHz") or 0) > 0:
                 run.returned.add(system_id)
             boots, uptime = run.booted[system_id]
@@ -244,7 +268,6 @@ class Survey:
                 boots if now_boots is None else now_boots,
                 uptime if now_uptime is None else now_uptime,
             )
-        self._changed.set()
 
     def _boot_marks(
         self, system_id: int, stats: dict[str, Any]
@@ -256,8 +279,9 @@ class Survey:
         return stats.get("bootCount"), getattr(device, "stats_time_boot_ms", None)
 
     def on_lost(self, system_id: int) -> None:
-        if self._run is not None and system_id in self._run.booted:
-            self._run.lost = True
+        for run in self._watched():
+            if system_id in run.booted:
+                run.lost = True
 
     # ---- the actions ----
 
@@ -269,18 +293,9 @@ class Survey:
         placement = parse_placement(body.get("placement"))
         ext = self._ext
         nursery = ext._nursery
-        if self.running:
-            return "refused", "A survey is running"
-        if ext._cell_applying:
-            return "refused", "An apply is running"
-        if nursery is None:
-            return "refused", "RTLS is not running"
-        anchors: list[Anchor] = []
-        reason = write_refusal(ext) or armed_refusal(ext)
-        if reason is None:
-            anchors, reason = select_group(ext, requested)
-        if reason is not None:
-            return "refused", reason
+        anchors, reason = self._group(requested)
+        if reason is not None or nursery is None:
+            return "refused", reason or "RTLS is not running"
         ids = [anchor.system_id for anchor in anchors]
         try:
             frame = parse_frame(raw_frame, ids)
@@ -289,7 +304,37 @@ class Survey:
         reason = frame_refusal(frame, ids)
         if reason is not None:
             return "refused", reason
-        run = self._run = _Run(
+        run = self._run = self._new_run(anchors, rounds, frame, placement)
+        self.state, self.reason = "measuring", None
+        nursery.start_soon(self._survey, run)
+        self._notify()
+        return "started", None
+
+    def _group(
+        self, requested: Optional[list[int]]
+    ) -> tuple[list[Anchor], Optional[str]]:
+        """The group of a run, or why none may start now."""
+        ext = self._ext
+        if self.running:
+            return [], "A survey is running"
+        if ext._cell_applying:
+            return [], "An apply is running"
+        if ext._nursery is None:
+            return [], "RTLS is not running"
+        reason = write_refusal(ext) or armed_refusal(ext)
+        if reason is not None:
+            return [], reason
+        return select_group(ext, requested)
+
+    def _new_run(
+        self,
+        anchors: list[Anchor],
+        rounds: int,
+        frame: Frame,
+        placement: Optional[Placement],
+    ) -> _Run:
+        ext = self._ext
+        return _Run(
             anchors=anchors,
             order=step_order(ext, anchors),
             rounds=rounds,
@@ -297,22 +342,57 @@ class Survey:
             frame=frame,
             placement=placement,
             booted={
-                system_id: self._boot_marks(
-                    system_id, ext._fresh_stats(system_id) or {}
+                anchor.system_id: self._boot_marks(
+                    anchor.system_id, ext._fresh_stats(anchor.system_id) or {}
                 )
-                for system_id in ids
+                for anchor in anchors
             },
         )
-        self.state, self.reason = "measuring", None
-        nursery.start_soon(self._survey, run)
-        self._notify()
-        return "started", None
+
+    async def check(self) -> tuple[Optional[SurveyFit], Optional[str]]:
+        """The lock's resurvey check: measures the anchors a start without a
+        group takes, as a start does, and fits them in the frame of the
+        positions they store; the fit, or why there is none. The held run,
+        its fit and the revision stay as they were, and nothing is written.
+        Refused, and refusing a start and a commit, as a running survey."""
+        ext = self._ext
+        online = [view["systemId"] for view in anchor_views(ext) if view["online"]]
+        unread = await read_stored(ext, online, fresh=False)
+        anchors, reason = self._group(None)
+        if reason is not None:
+            return None, reason
+        missing = [anchor.name for anchor in anchors if anchor.system_id in unread]
+        if missing:
+            return None, f"{missing[0]}: its stored survey could not be read"
+        ids = [anchor.system_id for anchor in anchors]
+        frame = stored_frame(stored_positions(ext, ids))
+        if frame is None:
+            return None, "no anchor stores the origin and +x of a survey"
+        run = self._check = self._new_run(anchors, DEFAULT_ROUNDS, frame, None)
+        failure: Optional[str] = None
+        try:
+            try:
+                failure = await self._measure(run)
+            except Exception as ex:
+                failure = self._defect(ex)
+            try:
+                await self._return(run)
+            except Exception as ex:
+                failure = failure or self._defect(ex)
+        finally:
+            self._check = None
+        if failure is not None:
+            return None, failure
+        try:
+            return self._fitted(run, frame, None), None
+        except SurveyFitError as ex:
+            return None, str(ex)
 
     async def cancel(self, body: dict[str, Any]) -> _Answer:
         run = self._run
         if self.state == "committing":
             return "refused", "A commit cannot be cancelled"
-        if run is None or not self.running:
+        if run is None or self.state not in RUNNING_STATES:
             return "refused", "No survey is running"
         run.cancelled = True
         run.scope.cancel()
@@ -433,6 +513,8 @@ class Survey:
         except Exception as ex:
             failure = self._defect(ex)
         try:
+            self.state = "returning"
+            self._notify()
             await self._return(run)
             if failure is None and not run.cancelled:
                 await read_stored(self._ext, run.ids, fresh=False)
@@ -474,7 +556,8 @@ class Survey:
         for index, initiator in enumerate(group, start=1):
             if index > 1:
                 run.step = index
-                self._notify()
+                if run is self._run:
+                    self._notify()
             result = await step(initiator)
             if not (result.complete or result.ends_survey):
                 again = await step(initiator)
@@ -514,8 +597,6 @@ class Survey:
         """Ends the survey on every anchor and waits until every boot
         responder reports ranging again. An anchor that did not take the end
         returns by itself, so the wait is then the hold time."""
-        self.state = "returning"
-        self._notify()
         group = [SurveyAnchor(anchor.system_id, anchor.mac) for anchor in run.order]
         waiting = {a.system_id for a in run.order if a.boot_responder}
         deadline = trio.current_time() + hold_for(run.rounds, run.block_ms)
