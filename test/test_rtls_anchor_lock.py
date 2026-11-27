@@ -92,15 +92,15 @@ async def test_lock_with_warnings_needs_acknowledgement(dialect, builder, hub):
     ext, devices = await _cell(dialect)
     await ext._on_stats(201, HEALTHY_A0, time.monotonic())
     await ext._on_stats(
-        202, {**HEALTHY_A1, "lowbat": 1.0, "moved": 1.0, "urst": 2.0}, time.monotonic()
+        202, {**HEALTHY_A1, "lowbat": 1.0, "rdev": 0.25, "urst": 2.0}, time.monotonic()
     )
 
     body = await _lock(ext, builder, hub)
     assert body["result"] == "warnings"
     assert [(w["code"], w["device"]) for w in body["warnings"]] == [
         ("battery-warning", 202),
-        ("moved", 202),
         ("radio-restarts", 202),
+        ("range-deviation-danger", 202),
     ]
     assert _lock_param(devices[202]) == 0
 

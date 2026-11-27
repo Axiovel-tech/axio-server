@@ -120,7 +120,7 @@ enables it.
   refused while an online anchor's stored value cannot be read), a missed
   write is not rolled back, and the commit does not lock (Control locks
   after it). The same commit again brings in an anchor that missed it,
-  unless an anchor of the group moved or restarted since the measurement, or
+  unless an anchor of the group was lost or restarted since the measurement, or
   something else was written to the group. A start and a commit are refused
   while a drone reports itself armed; an unknown arming state does not
   refuse, and a drone armed during a run does not stop it. While a survey
@@ -180,7 +180,8 @@ enables it.
   the `cellSettings` summary, its lock warning and Verify rule.
 - `cluster_clock.py`: the wall-clock estimate of the cluster clock.
 - `survey_view.py`: the survey the cell is on: the `survey` member of
-  `X-RTLS-INF`, the lock warnings `not-surveyed` and `range-deviation`, the
+  `X-RTLS-INF`, the lock warnings `not-surveyed`, `range-deviation` and
+  `range-deviation-danger`, the
   Verify rules `survey` and `anchors`.
 - `tag_table.py`: a tag's anchor table assembled from `antbl`.
 - `survey.py`: `X-RTLS-SURVEY`, the survey run as a state machine and its

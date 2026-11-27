@@ -215,22 +215,21 @@ def commit_refusal(
     anchors: Sequence[Anchor],
     fit: SurveyFit,
     *,
-    moved: bool,
     lost: bool,
     rebooted: Sequence[str],
     retry: bool,
 ) -> Optional[str]:
     """Why a held fit cannot be written now, if it cannot. A fit is no
-    longer the cell's when an anchor ``moved`` since the measurement, or was
-    ``lost`` by the server or ``rebooted`` (by name; either may have been
-    carried away while off, and its motion latch starts anew). The ``retry``
+    longer the cell's when an anchor was ``lost`` by the server or
+    ``rebooted`` (by name) since the measurement: either may have been
+    carried away while off. The ``retry``
     of a commit an anchor missed takes an anchor that was lost when it is
     back and reports, which tells whether it rebooted."""
     devices = ext._require_protocol().devices
     offline = [a.name for a in anchors if a.system_id not in devices]
     if rebooted:
         return f"{rebooted[0]} restarted since it was surveyed; survey again"
-    if moved or (not retry and (lost or offline)):
+    if not retry and (lost or offline):
         return SURVEY_AGAIN
     if offline:
         return f"{offline[0]} is offline"

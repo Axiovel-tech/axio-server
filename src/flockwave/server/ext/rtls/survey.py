@@ -99,8 +99,6 @@ class _Run:
     block_ms: int
     frame: Frame
     placement: Optional[Placement]
-    #: each anchor's ``moved`` latch when the run started
-    moved: dict[int, bool]
     #: each anchor's boot count and the uptime of its stat frames, as last
     #: seen; None while not reported
     booted: dict[int, tuple[Optional[int], Optional[int]]]
@@ -112,12 +110,10 @@ class _Run:
     commit: Optional[dict[str, Any]] = None
     #: what the commit of this fit wrote, while an anchor has yet to take it
     plan: Optional[Plan] = None
-    #: since the run started, an anchor newly reported ``moved``, and the
-    #: server lost an anchor
-    moved_since: bool = False
+    #: since the run started, the server lost an anchor
     lost: bool = False
-    #: the anchors that booted again since the run started: the motion
-    #: latch of such an anchor is new and says nothing of the time it was off
+    #: the anchors that booted again since the run started: such an anchor
+    #: may have been carried away while it was off
     rebooted: set[int] = field(default_factory=set)
     cancelled: bool = False
     scope: trio.CancelScope = field(default_factory=trio.CancelScope)
@@ -233,9 +229,7 @@ class Survey:
 
     def on_stats(self, system_id: int, stats: dict[str, Any]) -> None:
         run = self._run
-        if run is not None and system_id in run.moved:
-            if stats.get("moved") and not run.moved[system_id]:
-                run.moved_since = True
+        if run is not None and system_id in run.booted:
             if (stats.get("rangingRateHz") or 0) > 0:
                 run.returned.add(system_id)
             boots, uptime = run.booted[system_id]
@@ -262,7 +256,7 @@ class Survey:
         return stats.get("bootCount"), getattr(device, "stats_time_boot_ms", None)
 
     def on_lost(self, system_id: int) -> None:
-        if self._run is not None and system_id in self._run.moved:
+        if self._run is not None and system_id in self._run.booted:
             self._run.lost = True
 
     # ---- the actions ----
@@ -302,10 +296,6 @@ class Survey:
             block_ms=block_ms(ext, anchors),
             frame=frame,
             placement=placement,
-            moved={
-                system_id: bool((ext._fresh_stats(system_id) or {}).get("moved"))
-                for system_id in ids
-            },
             booted={
                 system_id: self._boot_marks(
                     system_id, ext._fresh_stats(system_id) or {}
@@ -396,7 +386,6 @@ class Survey:
             self._ext,
             run.anchors,
             fit,
-            moved=run.moved_since,
             lost=run.lost,
             rebooted=[a.name for a in run.anchors if a.system_id in run.rebooted],
             retry=run.plan is not None,

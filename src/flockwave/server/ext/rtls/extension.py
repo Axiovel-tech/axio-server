@@ -2771,11 +2771,8 @@ STATS_BODY_FIELDS: tuple[tuple[str, str, Callable[[float], Any]], ...] = (
     ("uwbst", "uwbStatus", int),
     ("rnghz", "rangingRateHz", _rounded(2)),
     ("urst", "radioRestarts", int),
-    ("moved", "moved", bool),
     # the anchor's LOCK: it refuses every remote change while set
     ("lock", "locked", bool),
-    ("tilt", "tiltDeg", _rounded(1)),
-    ("knocks", "knocks", int),
     ("elink", "ethernetLink", bool),
     ("edrop", "ethernetDrops", int),
     # rssi only while associated; wdisc/wtxerr count since boot
