@@ -175,6 +175,7 @@ async def test_inf_empty_before_discovery(extension, builder, hub):
             "otherSurvey": [],
             "excluding": {},
             "rangeDeviation": [],
+            "rangeDanger": [],
         },
         "anchorLock": {
             "locked": False,
@@ -3068,6 +3069,7 @@ ANCHOR_STATS = {
     "uwbst": 2.0,
     "rnghz": 49.876,
     "urst": 1.0,
+    # the retired motion watch of older firmware: ignored
     "moved": 1.0,
     "tilt": 3.21,
     "knocks": 4.0,
@@ -3099,9 +3101,6 @@ def test_stats_json_anchor_fields():
         "uwbStatus": 2,
         "rangingRateHz": 49.88,
         "radioRestarts": 1,
-        "moved": True,
-        "tiltDeg": 3.2,
-        "knocks": 4,
         "ethernetLink": True,
         "ethernetDrops": 2,
         "wifiRssiDbm": -61,

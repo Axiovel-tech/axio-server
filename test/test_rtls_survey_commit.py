@@ -314,7 +314,6 @@ def _while_the_commit_reads(monkeypatch, happen):
 @pytest.mark.parametrize(
     "change, reason",
     [
-        ("moved", "Survey again"),
         ("lost", "Survey again"),
         ("locked", "Unlock the anchors first"),
         ("authorized", "A show is authorized"),
@@ -327,9 +326,7 @@ async def test_what_changes_while_the_commit_reads_still_refuses_it(
     await measure(cell, builder, hub)
 
     async def happen():
-        if change == "moved":
-            await cell.report([203], moved=1.0)
-        elif change == "lost":
+        if change == "lost":
             cell.lose(203)
         elif change == "locked":
             await cell.report([203], lock=1.0)
@@ -495,20 +492,6 @@ async def test_a_retry_brings_in_an_anchor_the_server_lost_and_found_again(
     assert (answer["result"], answer["reason"]) == ("committed", None)
     assert answer["survey"]["commit"]["surveyId"] == 1
     assert dict(cell.locations) == first
-
-
-async def test_a_retry_is_refused_once_an_anchor_moved(
-    cell, builder, hub, autojump_clock
-):
-    await measure(cell, builder, hub)
-    cell.location_silent.add(204)
-    await commit(cell, builder, hub)
-    cell.locations.clear()
-    cell.location_silent.clear()
-
-    await cell.report([202], moved=1.0)
-
-    assert await _commit_refusal(cell, builder, hub) == "Survey again"
 
 
 async def test_a_position_an_anchor_cannot_store_is_not_committed(
@@ -805,10 +788,6 @@ async def test_commit_is_refused_when_the_cell_changed_since_the_survey(
     cell, builder, hub, autojump_clock
 ):
     await measure(cell, builder, hub)
-    await cell.report([203], moved=1.0)
-    assert await _commit_refusal(cell, builder, hub) == "Survey again"
-
-    await measure(cell, builder, hub)
     cell.lose(203)
     assert await _commit_refusal(cell, builder, hub) == "Survey again"
 
@@ -827,12 +806,13 @@ async def test_an_anchor_that_came_back_since_the_survey_needs_a_new_one(
     assert await _commit_refusal(cell, builder, hub) == "Survey again"
 
 
-async def test_an_anchor_marked_moved_before_the_survey_can_be_committed(
+async def test_the_retired_moved_stat_of_older_firmware_refuses_nothing(
     cell, builder, hub, autojump_clock
 ):
     cell.stats[203] = {"moved": 1.0}
     await cell.report()
     await measure(cell, builder, hub)
+    await cell.report([202], moved=1.0)
     assert (await commit(cell, builder, hub))["result"] == "committed"
 
 
@@ -1062,8 +1042,8 @@ async def test_a_commit_is_refused_after_an_anchor_of_the_group_rebooted(
 ):
     await measure(cell, builder, hub)
 
-    # 203 was off and is back: one more boot, and its motion latch is new
-    await cell.report([203], boots=4.0, moved=0.0)
+    # 203 was off and is back: one more boot
+    await cell.report([203], boots=4.0)
 
     assert await _commit_refusal(cell, builder, hub) == REBOOTED
     assert cell.locations == []

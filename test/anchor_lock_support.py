@@ -85,7 +85,6 @@ def _anchor(dialect, system_id, role=3, mac=9):
 HEALTHY_A0 = {
     "pwrst": 5.0,
     "boots": 3.0,
-    "moved": 0.0,
     "uwbst": 1.0,
     "cellcfg": float(CODE_50),
     "txgain": 47.0,

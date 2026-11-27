@@ -92,6 +92,7 @@ async def test_the_cell_is_on_the_survey_its_anchors_advertise(dialect, builder,
         "otherSurvey": [],
         "excluding": {},
         "rangeDeviation": [],
+        "rangeDanger": [],
     }
 
 
@@ -202,7 +203,7 @@ async def test_a_deviation_just_over_the_bound_warns_everywhere(dialect, builder
     rule = await _rule(ext, "anchors")
     assert (rule["status"], rule["detail"]) == (
         "fail",
-        "RTLS anchor A2 is 8 cm farther from its initiator than when surveyed",
+        "RTLS anchor A2 is 8 cm off its surveyed range",
     )
 
 
@@ -266,7 +267,9 @@ async def test_a_change_of_the_survey_is_pushed(dialect):
     assert await pushes(anchors_report, [203], sid=2.0)
     assert not await pushes(anchors_report, [203], sid=2.0)
     assert await pushes(anchors_report, [204], rdev=0.2)
-    assert not await pushes(anchors_report, [204], rdev=0.21)
+    assert not await pushes(anchors_report, [204], rdev=-0.19)
+    assert await pushes(anchors_report, [204], rdev=0.21)
+    assert not await pushes(anchors_report, [204], rdev=-0.3)
     assert await pushes(tag_reports, antbl(3, state=OTHER_SURVEY), anexc=1.0)
     assert not await pushes(tag_reports, antbl(3, state=OTHER_SURVEY), anexc=1.0)
     assert await pushes(tag_reports, antbl(3, row=2))
@@ -290,7 +293,7 @@ async def test_lock_warns_of_anchors_off_the_survey_and_of_a_range_deviation(
         (
             "range-deviation",
             202,
-            "RTLS anchor A1 is 12 cm closer to its initiator than when surveyed",
+            "RTLS anchor A1 is 12 cm off its surveyed range",
         ),
         ("not-surveyed", 203, "RTLS anchor A2 is not surveyed"),
         ("not-surveyed", 204, "RTLS anchor A3 is on survey 9, the cell on 1"),
@@ -301,15 +304,43 @@ async def test_lock_warns_of_anchors_off_the_survey_and_of_a_range_deviation(
     assert body["result"] == "locked"
 
 
-async def test_lock_names_which_way_an_anchor_moved(dialect, builder, hub):
+@pytest.mark.parametrize(
+    "deviation,code,detail",
+    [
+        (0.094, "range-deviation", "RTLS anchor A2 is 9 cm off its surveyed range"),
+        (0.2, "range-deviation", "RTLS anchor A2 is 20 cm off its surveyed range"),
+        (
+            -0.2001,
+            "range-deviation-danger",
+            "RTLS anchor A2 moved: 20 cm off its surveyed range",
+        ),
+        (
+            0.35,
+            "range-deviation-danger",
+            "RTLS anchor A2 moved: 35 cm off its surveyed range",
+        ),
+    ],
+)
+async def test_lock_warns_at_the_range_checks_two_levels(
+    dialect, builder, hub, deviation, code, detail
+):
     ext, _ = await _positioned(dialect)
-    await anchors_report(ext, [203], rdev=0.094)
+    await anchors_report(ext, [203], rdev=deviation)
 
-    warnings = (await _lock(ext, builder, hub, "status"))["warnings"]
+    body = await _lock(ext, builder, hub)
 
-    assert [w["detail"] for w in warnings] == [
-        "RTLS anchor A2 is 9 cm farther from its initiator than when surveyed"
+    assert [(w["code"], w["device"], w["detail"]) for w in body["warnings"]] == [
+        (code, 203, detail)
     ]
+    survey = await _survey(ext, builder, hub)
+    danger = code == "range-deviation-danger"
+    assert (survey["rangeDeviation"], survey["rangeDanger"]) == (
+        [203],
+        [203] if danger else [],
+    )
+    # a warning at either level: the operator may still lock
+    body = await _lock(ext, builder, hub, acknowledgeWarnings=True)
+    assert body["result"] == "locked"
 
 
 async def test_a_surveyed_cell_locks_without_a_warning(dialect, builder, hub):
@@ -654,18 +685,20 @@ async def test_an_anchor_table_or_bias_a_tag_still_holds_is_not_its_frame(dialec
 # ---- X-RTLS-VERIFY anchors --------------------------------------------------
 
 
-async def test_verify_warns_of_a_range_deviation_a_moved_anchor_and_drift(dialect):
+async def test_verify_warns_of_both_range_check_levels_and_drift(dialect):
     ext, _ = await _positioned(dialect)
     await anchors_report(ext, [202], rdev=0.0801)
-    await anchors_report(ext, [203], moved=1.0)
+    await anchors_report(ext, [203], rdev=-0.25)
+    # the retired motion watch of older firmware says nothing
+    await anchors_report(ext, [204], moved=1.0)
     await tag_reports(ext, sdrift=0.1234)
 
     rule = await _rule(ext, "anchors")
 
     assert (rule["severity"], rule["status"]) == ("warning", "fail")
     assert rule["detail"] == (
-        "RTLS anchor A1 is 8 cm farther from its initiator than when surveyed; "
-        "RTLS anchor A2 moved since it was placed; "
+        "RTLS anchor A1 is 8 cm off its surveyed range; "
+        "RTLS anchor A2 moved: 25 cm off its surveyed range; "
         f"tag {TAG}: live ranges are 12 cm off the surveyed positions"
     )
     # judgment material: it does not fail the survey itself
@@ -681,5 +714,5 @@ async def test_the_anchors_rule_passes_at_its_bounds(dialect):
 
     assert (rule["status"], rule["detail"]) == (
         "pass",
-        "no anchor moved and no tag sees its ranges drift",
+        "every anchor is on its surveyed range and no tag sees its ranges drift",
     )

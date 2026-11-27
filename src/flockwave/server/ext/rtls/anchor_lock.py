@@ -123,10 +123,6 @@ def lock_warnings(views: list[AnchorView]) -> list[LockWarning]:
                     f"{name}: battery below its warning level",
                 )
             )
-        if stats.get("moved"):
-            warnings.append(
-                _warning("moved", system_id, f"{name} moved since it was placed")
-            )
         if stats.get("radioRestarts"):
             restarts = stats["radioRestarts"]
             warnings.append(

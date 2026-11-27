@@ -5,7 +5,7 @@ The anchors own the geometry: each stores its position and a survey ID
 survey ID that it hears. An anchor is on the survey ID its ranging session
 advertises (the ``sid`` stat); while it runs no session, on the one it
 stores. The cell is on the ID most online anchors are on. From that follow
-the ``survey`` member of X-RTLS-INF with its fleet warning, two lock
+the ``survey`` member of X-RTLS-INF with its fleet warning, three lock
 warnings and two Verify rules.
 
 One server is one cell, as for the cell settings.
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .extension import RtlsExtension
 
 __all__ = (
+    "RANGE_DEVIATION_DANGER_M",
     "RANGE_DEVIATION_WARNING_M",
     "SURVEY_DRIFT_WARNING_M",
     "anchors_rule",
@@ -48,6 +49,10 @@ __all__ = (
 #: own bound (rtls-link-zephyr ``docs/reference/anchor-health.md``, "Range
 #: check"), which its ring shows.
 RANGE_DEVIATION_WARNING_M = 0.08
+
+#: beyond this the range check says the anchor stands elsewhere, metres,
+#: either sign; the firmware's second bound. Still a warning on the ground.
+RANGE_DEVIATION_DANGER_M = 0.20
 
 #: a tag's live initiator ranges farther than this from the distances between
 #: the advertised positions are worth a look, metres. The stat includes the
@@ -114,12 +119,22 @@ class _Anchor:
     #: the flag of the position it stores
     planar: bool
     range_deviation_m: Optional[float]
-    moved: bool
 
     @property
     def deviates(self) -> bool:
-        deviation = self.range_deviation_m
-        return deviation is not None and abs(deviation) > RANGE_DEVIATION_WARNING_M
+        return range_level(self.range_deviation_m) is not None
+
+    @property
+    def deviates_far(self) -> bool:
+        return range_level(self.range_deviation_m) == "danger"
+
+
+def range_level(deviation: Optional[float]) -> Optional[str]:
+    """``warning`` or ``danger`` while a range check is beyond that bound,
+    None within it or without a reading."""
+    if deviation is None or abs(deviation) <= RANGE_DEVIATION_WARNING_M:
+        return None
+    return "danger" if abs(deviation) > RANGE_DEVIATION_DANGER_M else "warning"
 
 
 @dataclass(frozen=True)
@@ -158,7 +173,6 @@ def _anchors(ext: "RtlsExtension", views: Sequence["AnchorView"]) -> list[_Ancho
                 advertised is not None,
                 stored is not None and stored.location.planar,
                 stats.get("rangeDeviationM"),
-                bool(stats.get("moved")),
             )
         )
     return anchors
@@ -167,12 +181,11 @@ def _anchors(ext: "RtlsExtension", views: Sequence["AnchorView"]) -> list[_Ancho
 def survey_inputs(stats: Mapping[str, Any]) -> tuple[Any, ...]:
     """What of a device's stats the ``survey`` member of X-RTLS-INF is made
     from: it is pushed when this changes."""
-    deviation = stats.get("rangeDeviationM")
     table = stats.get("anchorTable")
     return (
         stats.get("surveyId"),
         stats.get("cellConfig") is None,
-        deviation is not None and abs(deviation) > RANGE_DEVIATION_WARNING_M,
+        range_level(stats.get("rangeDeviationM")),
         stats.get("anchorsExcluded"),
         table and [entry for entry in table if entry["state"] != IN_USE],
         stats.get("sleeping"),
@@ -211,7 +224,8 @@ def survey_json(
 ) -> dict[str, Any]:
     """The ``survey`` member of X-RTLS-INF: the ID the cell is on, how many
     online anchors are on it, the online anchors that are not, the anchors
-    each tag leaves out and the anchors whose range check warns."""
+    each tag leaves out, the anchors whose range check warns and those of
+    them beyond the danger bound."""
     anchors = _anchors(ext, views)
     cell = _cell_survey_id(anchors)
     excluding = {}
@@ -230,6 +244,7 @@ def survey_json(
         ],
         "excluding": excluding,
         "rangeDeviation": [a.system_id for a in anchors if a.deviates],
+        "rangeDanger": [a.system_id for a in anchors if a.deviates_far],
     }
 
 
@@ -243,19 +258,17 @@ def _off_survey(anchor: _Anchor, cell: Optional[int]) -> Optional[str]:
 
 
 def _deviation(anchor: _Anchor) -> str:
-    deviation = anchor.range_deviation_m or 0.0
-    where = "closer to" if deviation < 0 else "farther from"
-    return (
-        f"{anchor.name} is {abs(deviation) * 100:.0f} cm {where} its initiator "
-        "than when surveyed"
-    )
+    cm = abs(anchor.range_deviation_m or 0.0) * 100
+    if anchor.deviates_far:
+        return f"{anchor.name} moved: {cm:.0f} cm off its surveyed range"
+    return f"{anchor.name} is {cm:.0f} cm off its surveyed range"
 
 
 def survey_warnings(
     ext: "RtlsExtension", views: Sequence["AnchorView"]
 ) -> list["LockWarning"]:
-    """The lock preflight's acknowledgeable ``not-surveyed`` and
-    ``range-deviation`` warnings."""
+    """The lock preflight's acknowledgeable ``not-surveyed``,
+    ``range-deviation`` and ``range-deviation-danger`` warnings."""
     anchors = _anchors(ext, views)
     cell = _cell_survey_id(anchors)
     warnings: list["LockWarning"] = []
@@ -268,7 +281,9 @@ def survey_warnings(
         if anchor.deviates:
             warnings.append(
                 {
-                    "code": "range-deviation",
+                    "code": "range-deviation-danger"
+                    if anchor.deviates_far
+                    else "range-deviation",
                     "device": anchor.system_id,
                     "detail": _deviation(anchor),
                 }
@@ -353,14 +368,12 @@ def anchors_rule(
     ext: "RtlsExtension", views: Sequence["AnchorView"], now: float
 ) -> dict[str, Any]:
     """The X-RTLS-VERIFY ``anchors`` rule: a warning while an anchor's range
-    check warns or it reports ``moved``, or a tag's live ranges drifted from
-    the advertised positions."""
+    check warns, at either level, or a tag's live ranges drifted from the
+    advertised positions."""
     problems = []
     for anchor in _anchors(ext, views):
         if anchor.deviates:
             problems.append(_deviation(anchor))
-        if anchor.moved:
-            problems.append(f"{anchor.name} moved since it was placed")
     for tag in _tags(ext, now):
         drift = (tag.stats or {}).get("surveyDriftM")
         if drift is not None and drift > SURVEY_DRIFT_WARNING_M:
@@ -368,5 +381,5 @@ def anchors_rule(
                 f"tag {tag.system_id}: live ranges are {drift * 100:.0f} cm off "
                 "the surveyed positions"
             )
-    ok = "no anchor moved and no tag sees its ranges drift"
+    ok = "every anchor is on its surveyed range and no tag sees its ranges drift"
     return _rule("anchors", "Anchor positions", "warning", problems, ok)
