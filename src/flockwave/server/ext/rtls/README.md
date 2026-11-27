@@ -105,11 +105,13 @@ enables it.
   server only writes `LOCK`, derives the cell's lock from the stats, and
   answers the show extension (`show_start_refusal()`) before it authorizes a
   flight. A lock with `resurvey` first measures the cell as a survey does,
-  without holding or writing anything, and warns of each anchor whose fitted
-  position is off its stored one (the range check's 0.08 m and 0.20 m), or
-  that the check could not run. The fit is in the frame the stored positions
-  give: the anchor at x = y = 0 is its origin, so a moved origin or +x anchor
-  reads as the others moving.
+  without holding or writing anything, lays the stored layout onto the fitted
+  one (turned about z and moved, never mirrored, each anchor measured against
+  the others with the farthest left out until none is beyond 0.08 m) and
+  warns of each anchor off its stored position (the range check's 0.08 m and
+  0.20 m), of what it did not check (heights in a flat cell, an anchor online
+  or restarted since it measured) and of a check that could not run or
+  measured poorly. The live range check warnings from before the check stay.
 - **Cell settings are derived, never stored.** Each board reports the code
   of the session it runs (`cellcfg`, anchors also `txgain`) and the server
   compares it with what A0 runs. A write applies on the board at once, so

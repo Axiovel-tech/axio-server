@@ -264,7 +264,8 @@ async def survey_cell(dialect, nursery, positions=FLAT):
 
     ext, devices = await _cell(dialect, anchors=anchors, prepare=prepare)
     ext._nursery = nursery
-    cell = SurveyCell(ext, devices, dialect, positions, nursery)
+    # a copy: a test that moves an anchor leaves FLAT and TIERS as they are
+    cell = SurveyCell(ext, devices, dialect, dict(positions), nursery)
     await cell.report()
     return cell
 

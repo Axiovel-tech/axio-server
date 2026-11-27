@@ -25,7 +25,8 @@ from __future__ import annotations
 import copy
 import random
 import time
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import trio
@@ -48,6 +49,7 @@ from .survey_commit import (
 from .survey_fit import (
     DirectedRange,
     Frame,
+    Point,
     SurveyFit,
     SurveyFitError,
     fit_survey,
@@ -69,9 +71,12 @@ from .survey_step import StepResult, end_survey, next_step_id, run_step
 if TYPE_CHECKING:
     from .extension import RtlsExtension
 
-__all__ = ("Survey", "handle_survey_request")
+__all__ = ("Check", "Survey", "handle_survey_request")
 
 RUNNING_STATES = ("measuring", "returning", "committing")
+
+SURVEY_RUNNING = "A survey is running"
+CHECK_RUNNING = "A resurvey check is running"
 
 INCOMPLETE = "Not every anchor took the survey"
 #: why a commit or a fit is refused that does not name the held survey's
@@ -130,6 +135,19 @@ class _Run:
         return [anchor.system_id for anchor in self.anchors]
 
 
+@dataclass(frozen=True)
+class Check:
+    """What the lock's resurvey check measured: the fit, or why there is
+    none; the anchors it measured, those of them that restarted while it
+    ran, and the positions they store."""
+
+    fit: Optional[SurveyFit]
+    reason: Optional[str]
+    ids: tuple[int, ...] = ()
+    rebooted: frozenset[int] = frozenset()
+    stored: Mapping[int, Point] = field(default_factory=dict)
+
+
 def _restarted(before: int, now: int) -> bool:
     """Whether an uptime that went from ``before`` to ``now`` started again."""
     return before - now > _REORDER_MS and (now - before) % 2**32 > _WRAP_STEP_MS
@@ -177,7 +195,15 @@ class Survey:
     @property
     def running(self) -> bool:
         """Whether a run or a resurvey check measures, returns or commits."""
-        return self.state in RUNNING_STATES or self._check is not None
+        return self.busy is not None
+
+    @property
+    def busy(self) -> Optional[str]:
+        """Why nothing else may use the anchors now: a resurvey check or a
+        run measures, returns or commits."""
+        if self._check is not None:
+            return CHECK_RUNNING
+        return SURVEY_RUNNING if self.state in RUNNING_STATES else None
 
     def _active(self) -> list[_Run]:
         """The runs whose anchors the survey has in hand."""
@@ -315,8 +341,8 @@ class Survey:
     ) -> tuple[list[Anchor], Optional[str]]:
         """The group of a run, or why none may start now."""
         ext = self._ext
-        if self.running:
-            return [], "A survey is running"
+        if self.busy is not None:
+            return [], self.busy
         if ext._cell_applying:
             return [], "An apply is running"
         if ext._nursery is None:
@@ -324,7 +350,11 @@ class Survey:
         reason = write_refusal(ext) or armed_refusal(ext)
         if reason is not None:
             return [], reason
-        return select_group(ext, requested)
+        anchors, reason = select_group(ext, requested)
+        updating = [a.name for a in anchors if ext.ota_running(a.system_id)]
+        if updating:
+            return [], f"{updating[0]} is being updated"
+        return anchors, reason
 
     def _new_run(
         self,
@@ -349,25 +379,28 @@ class Survey:
             },
         )
 
-    async def check(self) -> tuple[Optional[SurveyFit], Optional[str]]:
+    async def check(self) -> Check:
         """The lock's resurvey check: measures the anchors a start without a
         group takes, as a start does, and fits them in the frame of the
-        positions they store; the fit, or why there is none. The held run,
-        its fit and the revision stay as they were, and nothing is written.
-        Refused, and refusing a start and a commit, as a running survey."""
+        positions they store. The held run, its fit and the revision stay as
+        they were, and nothing is written. Refused, and refusing a start and
+        a commit, as a running survey."""
         ext = self._ext
+        if self.busy is not None:
+            return Check(None, self.busy)
         online = [view["systemId"] for view in anchor_views(ext) if view["online"]]
         unread = await read_stored(ext, online, fresh=False)
         anchors, reason = self._group(None)
         if reason is not None:
-            return None, reason
+            return Check(None, reason)
         missing = [anchor.name for anchor in anchors if anchor.system_id in unread]
         if missing:
-            return None, f"{missing[0]}: its stored survey could not be read"
+            return Check(None, f"{missing[0]}: its stored survey could not be read")
         ids = [anchor.system_id for anchor in anchors]
-        frame = stored_frame(stored_positions(ext, ids))
+        stored = stored_positions(ext, ids)
+        frame, reason = stored_frame(stored)
         if frame is None:
-            return None, "no anchor stores the origin and +x of a survey"
+            return Check(None, reason)
         run = self._check = self._new_run(anchors, DEFAULT_ROUNDS, frame, None)
         failure: Optional[str] = None
         try:
@@ -375,18 +408,21 @@ class Survey:
                 failure = await self._measure(run)
             except Exception as ex:
                 failure = self._defect(ex)
-            try:
-                await self._return(run)
-            except Exception as ex:
-                failure = failure or self._defect(ex)
         finally:
+            # cancelled or not, the anchors go back to ranging
+            with trio.CancelScope(shield=True):
+                try:
+                    await self._return(run)
+                except Exception as ex:
+                    failure = failure or self._defect(ex)
             self._check = None
+        done = Check(None, failure, tuple(ids), frozenset(run.rebooted), stored)
         if failure is not None:
-            return None, failure
+            return done
         try:
-            return self._fitted(run, frame, None), None
+            return replace(done, fit=self._fitted(run, frame, None))
         except SurveyFitError as ex:
-            return None, str(ex)
+            return replace(done, reason=str(ex))
 
     async def cancel(self, body: dict[str, Any]) -> _Answer:
         run = self._run
@@ -404,8 +440,8 @@ class Survey:
         run = self._run
         if "revision" in body and not self._is_current(body["revision"]):
             return "refused", STALE
-        if self.running:
-            return "refused", "A survey is running"
+        if self.busy is not None:
+            return "refused", self.busy
         if run is None or self.state != "ready":
             return "refused", "There is no measurement to fit"
         placement = parse_placement(body.get("placement"))
@@ -425,8 +461,8 @@ class Survey:
         run = self._run
         if not self._is_current(body.get("revision")):
             return "refused", STALE
-        if self.running:
-            return "refused", "A survey is running"
+        if self.busy is not None:
+            return "refused", self.busy
         if run is None or self.state != "ready" or run.fit is None:
             return "refused", "There is no fit to commit"
         fit = run.fit

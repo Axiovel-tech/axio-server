@@ -324,8 +324,8 @@ async def handle_cell_request(
     named = _request(body)
     if ext._cell_applying:
         result, reason, results = "refused", "An apply is running", {}
-    elif ext._survey.running:
-        result, reason, results = "refused", "A survey is running", {}
+    elif ext._survey.busy is not None:
+        result, reason, results = "refused", ext._survey.busy, {}
     else:
         ext._cell_applying = True
         try:
